@@ -1,0 +1,24 @@
+name: Set up Rust
+description: Installs a pinned toolchain, restoring it from the cache when possible.
+inputs:
+  toolchain:
+    description: A toolchain to install instead of the one in rust-toolchain.toml.
+    default: ''
+  components:
+    description: Components to install with `toolchain`.
+    default: ''
+runs:
+  using: composite
+  steps:
+    # Only our pinned toolchains are cached, not the runner's own.
+    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ~/.rustup/toolchains/${{ inputs.toolchain || '1.' }}*
+        key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ inputs.toolchain || hashFiles('rust-toolchain.toml') }}
+    - shell: bash
+      run: |
+        if [ -n "${{ inputs.toolchain }}" ]; then
+          rustup toolchain install "${{ inputs.toolchain }}" --profile minimal --component "${{ inputs.components }}"
+        else
+          rustup toolchain install
+        fi
