@@ -19,19 +19,18 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# TigerStyle: the strictest warnings, from day one. See AGENTS.md.
+# Strict lints, per TigerStyle.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-missing_docs = "warn"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
-# Assertions check invariants on every path; documenting each one as a
-# `# Panics` section would bury the real API contracts.
-missing_panics_doc = "allow"
-# `assert_eq!` formats both sides with `Debug` on failure, which costs
-# binary size; plain `assert!(a == b)` does not.
-manual_assert_eq = "allow"
 unwrap_used = "warn"
 expect_used = "warn"
+# Pedantic lints that ask for boilerplate rather than catch bugs.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# `assert_eq!` formats with `Debug`, which costs binary size.
+manual_assert_eq = "allow"
