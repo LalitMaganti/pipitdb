@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
@@ -33,6 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - run: cargo clippy -p pipitdb-size --target ${{ matrix.target }}
       # `shell: bash` sets pipefail, so `tee` doesn't hide a failure.
       - shell: bash
@@ -48,6 +52,8 @@ jobs:
           fetch-depth: 0
       - run: sudo apt-get update && sudo apt-get install -y valgrind
       - run: rustup toolchain install
+      # Also caches the gungraun-runner binary, so installing it is quick.
+      - uses: Swatinem/rust-cache@v2
       # Must match the gungraun version in Cargo.lock.
       - run: cargo install gungraun-runner --version 0.20.0 --locked
       - name: Measure the base
@@ -70,4 +76,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri test
