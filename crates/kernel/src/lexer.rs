@@ -199,9 +199,15 @@ impl<'a> Lexer<'a> {
             if self.peek(0) != Some(b'-') || self.peek(1) != Some(b'-') {
                 return;
             }
-            let rest = self.rest();
-            self.advance(find_byte(rest, b'\n').unwrap_or(rest.len()));
+            self.skip_comment();
         }
+    }
+
+    /// Not inlined, so `next_token` doesn't need its registers on every token.
+    #[inline(never)]
+    fn skip_comment(&mut self) {
+        let rest = self.rest();
+        self.advance(find_byte(rest, b'\n').unwrap_or(rest.len()));
     }
 
     /// Skips bytes whose class is in `first..=last`.
