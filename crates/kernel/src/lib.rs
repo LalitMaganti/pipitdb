@@ -8,4 +8,5 @@ mod check;
 pub mod allocator;
 pub mod buffer;
 pub mod column;
+pub mod lexer;
 pub mod row_batch;
