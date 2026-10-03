@@ -130,15 +130,15 @@ impl Parser<'_> {
                     if token.kind != TokenKind::RightParen {
                         return Err(Error::expected(TokenKind::RightParen, token.span));
                     }
-                    (operand, min_power) = self.call(&mut stack, operand)?;
+                    (operand, min_power) = self.call(&mut stack, operand);
                     continue;
                 }
                 stack.depth -= 1;
                 min_power = frame.min_power;
                 operand = match frame.pending {
-                    Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand])?,
+                    Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand]),
                     Pending::Binary(operator, left) => {
-                        self.operation(Tag::Binary, operator, &[left, operand])?
+                        self.operation(Tag::Binary, operator, &[left, operand])
                     }
                     Pending::Parenthesis => {
                         self.expect(TokenKind::RightParen)?;
@@ -153,7 +153,7 @@ impl Parser<'_> {
     /// Pops a call and its arguments off `stack`, `last` being its last
     /// argument, and writes them to the tree. Returns the call and the binding
     /// power to go back to.
-    fn call(&mut self, stack: &mut Stack, last: Node) -> Result<(Node, u8), Error> {
+    fn call(&mut self, stack: &mut Stack, last: Node) -> (Node, u8) {
         let mut call = stack.depth - 1;
         while let Pending::Argument(_) = at!(stack.frames, call).pending {
             call -= 1;
@@ -162,13 +162,13 @@ impl Parser<'_> {
         let first_child = self.node_count();
         for frame in frames {
             if let Pending::Call(node) | Pending::Argument(node) = frame.pending {
-                self.write(&[node])?;
+                self.write(&[node]);
             }
         }
-        self.write(&[last])?;
+        self.write(&[last]);
         stack.depth = call;
         let node = Node::list(Tag::Call, self.node_count() - first_child, first_child);
-        Ok((node, at!(stack.frames, call).min_power))
+        (node, at!(stack.frames, call).min_power)
     }
 
     /// What `token`, in operand position, does.
@@ -185,7 +185,7 @@ impl Parser<'_> {
                     let name = leaf(token)?;
                     if self.current().kind == TokenKind::RightParen {
                         self.advance()?;
-                        Step::Operand(Node::list(Tag::Call, 1, self.write(&[name])?))
+                        Step::Operand(Node::list(Tag::Call, 1, self.write(&[name])))
                     } else {
                         Step::Push(Pending::Call(name), 0)
                     }

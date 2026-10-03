@@ -32,6 +32,7 @@ pub(crate) struct Parser<'a> {
     current: Token,
     nodes: Buffer,
     node_count: u32,
+    full: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -41,9 +42,11 @@ impl<'a> Parser<'a> {
     ) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        let nodes = Buffer::allocate(allocator, BLOCK_BYTES)
+        // SAFETY: nodes are only read up to `node_count`, after they are
+        // written.
+        let nodes = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { source, lexer, current, nodes, node_count: 0 })
+        Ok(Parser { source, lexer, current, nodes, node_count: 0, full: false })
     }
 
     /// The token the parser is on.
@@ -53,6 +56,9 @@ impl<'a> Parser<'a> {
 
     /// Moves to the next token and returns the one it was on.
     pub(crate) fn advance(&mut self) -> Result<Token, Error> {
+        if self.full {
+            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        }
         let token = self.current;
         self.current = self.lexer.next_token()?;
         Ok(token)
@@ -73,23 +79,18 @@ impl<'a> Parser<'a> {
 
     /// Writes `children` to the tree, next to each other, and returns their
     /// parent, which is not in the tree yet.
-    pub(crate) fn operation(
-        &mut self,
-        tag: Tag,
-        operator: Operator,
-        children: &[Node],
-    ) -> Result<Node, Error> {
-        Ok(Node::operation(tag, operator, self.write(children)?))
+    pub(crate) fn operation(&mut self, tag: Tag, operator: Operator, children: &[Node]) -> Node {
+        Node::operation(tag, operator, self.write(children))
     }
 
     /// Writes `nodes` to the tree, next to each other, and returns the index
     /// of the first.
-    pub(crate) fn write(&mut self, nodes: &[Node]) -> Result<u32, Error> {
+    pub(crate) fn write(&mut self, nodes: &[Node]) -> u32 {
         let first = self.node_count;
         for &node in nodes {
-            self.push(node)?;
+            self.push(node);
         }
-        Ok(first)
+        first
     }
 
     pub(crate) fn node_count(&self) -> u32 {
@@ -98,17 +99,23 @@ impl<'a> Parser<'a> {
 
     /// Writes `root` to the tree, last, and returns the tree.
     pub(crate) fn finish(mut self, root: Node) -> Result<Ast, Error> {
-        self.push(root)?;
+        self.push(root);
+        if self.full {
+            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        }
         Ok(Ast::new(self.nodes, self.node_count))
     }
 
-    fn push(&mut self, node: Node) -> Result<(), Error> {
+    /// When the block is full, sets `full` instead of failing, so writing a
+    /// node stays cheap. `advance` reports it at the next token.
+    fn push(&mut self, node: Node) {
         if self.node_count as usize == BLOCK_NODES {
-            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+            self.full = true;
+            return;
         }
-        *at_mut!(self.nodes.as_mut_slice::<Node>(), self.node_count as usize) = node;
+        // SAFETY: `node_count` is below `BLOCK_NODES`, so this is in the block.
+        unsafe { self.nodes.as_mut_ptr::<Node>().add(self.node_count as usize).write(node) };
         self.node_count += 1;
-        Ok(())
     }
 }
 
@@ -182,6 +189,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
+    fn reports_a_full_block() {
+        let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
+        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
+    }
+
+    #[test]
     fn reports_errors() {
         assert_eq!(error("a +"), (ErrorCode::ExpectedExpression, 3));
         assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
@@ -192,7 +206,5 @@ mod tests {
         assert_eq!(error("f(a,"), (ErrorCode::ExpectedExpression, 4));
         let many = format!("f({})", vec!["a"; NESTING_MAX + 1].join(","));
         assert_eq!(error(&many).0, ErrorCode::NestingTooDeep);
-        let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
     }
 }
