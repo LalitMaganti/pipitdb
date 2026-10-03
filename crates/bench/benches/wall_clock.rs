@@ -15,7 +15,7 @@ fn lexer(c: &mut Criterion) {
 }
 
 fn parser(c: &mut Criterion) {
-    let source = expression(10_000);
+    let source = expression(100);
     let mut group = c.benchmark_group("parser");
     group.throughput(Throughput::Bytes(source.len() as u64));
     group.bench_function("expression", |b| b.iter(|| count_nodes(black_box(source.as_bytes()))));

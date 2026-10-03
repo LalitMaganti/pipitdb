@@ -53,6 +53,23 @@ impl Buffer {
         allocator: A,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
+        // SAFETY: the bytes are zeroed before anything can read them.
+        let buffer = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
+        // SAFETY: the buffer holds `size_bytes` bytes.
+        unsafe { buffer.data.write_bytes(0, buffer.size_bytes) };
+        Ok(buffer)
+    }
+
+    /// Allocates `size_bytes` bytes without zeroing them.
+    ///
+    /// # Safety
+    ///
+    /// No byte may be read, through `as_slice` or otherwise, before it is
+    /// written.
+    pub unsafe fn allocate_uninit<A: Allocator + 'static>(
+        allocator: A,
+        size_bytes: usize,
+    ) -> Result<Buffer, AllocError> {
         const { assert!(align_of::<Header<A>>() == BUFFER_ALIGNMENT_BYTES) };
         let header_bytes = size_of::<Header<A>>();
         let total_bytes = header_bytes.checked_add(size_bytes).ok_or(AllocError)?;
@@ -64,9 +81,7 @@ impl Buffer {
         // SAFETY: `layout` fits a header followed by `size_bytes` bytes.
         let data = unsafe {
             header.write(Header { owner, allocator, layout });
-            let data = header.cast::<u8>().add(header_bytes);
-            data.write_bytes(0, size_bytes);
-            data
+            header.cast::<u8>().add(header_bytes)
         };
         check!(data.addr().get().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
         Ok(Buffer { data, size_bytes, owner: header.cast() })
@@ -89,6 +104,20 @@ impl Buffer {
         check!(self.owner().references.get() == 1);
         // SAFETY: as in `as_slice`, and this is the only reference.
         unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len::<T>()) }
+    }
+
+    /// The first byte, for buffers whose bytes are tracked as written by the
+    /// caller, which `as_slice` can't read.
+    pub(crate) fn as_ptr<T: Primitive>(&self) -> *const T {
+        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        self.data.as_ptr().cast()
+    }
+
+    /// As `as_ptr`, for writing.
+    pub(crate) fn as_mut_ptr<T: Primitive>(&mut self) -> *mut T {
+        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.owner().references.get() == 1);
+        self.data.as_ptr().cast()
     }
 
     fn len<T: Primitive>(&self) -> usize {

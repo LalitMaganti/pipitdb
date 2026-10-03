@@ -6,7 +6,7 @@
 mod expression;
 
 use crate::allocator::Allocator;
-use crate::ast::{Ast, Node, Operator, Tag};
+use crate::ast::{Ast, BLOCK_BYTES, BLOCK_NODES, Node, Operator, Tag};
 use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
@@ -23,7 +23,7 @@ pub fn parse_expression<A: Allocator + 'static>(allocator: A, source: &[u8]) -> 
     if current.kind != TokenKind::End {
         return Err(Error::new(ErrorCode::UnexpectedToken, current.span));
     }
-    Ok(parser.finish(root))
+    parser.finish(root)
 }
 
 pub(crate) struct Parser<'a> {
@@ -32,6 +32,7 @@ pub(crate) struct Parser<'a> {
     current: Token,
     nodes: Buffer,
     node_count: u32,
+    full: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -41,15 +42,11 @@ impl<'a> Parser<'a> {
     ) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        // Each node takes a token of at least a byte, so there are at most
-        // as many nodes as bytes.
-        let first_byte = Span { start: 0, len: 1 };
-        let Some(size_bytes) = source.len().checked_mul(size_of::<Node>()) else {
-            return Err(Error::new(ErrorCode::QueryTooLarge, first_byte));
-        };
-        let nodes = Buffer::allocate(allocator, size_bytes)
-            .map_err(|_| Error::new(ErrorCode::OutOfMemory, first_byte))?;
-        Ok(Parser { source, lexer, current, nodes, node_count: 0 })
+        // SAFETY: nodes are only read up to `node_count`, after they are
+        // written.
+        let nodes = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
+            .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
+        Ok(Parser { source, lexer, current, nodes, node_count: 0, full: false })
     }
 
     /// The token the parser is on.
@@ -59,6 +56,9 @@ impl<'a> Parser<'a> {
 
     /// Moves to the next token and returns the one it was on.
     pub(crate) fn advance(&mut self) -> Result<Token, Error> {
+        if self.full {
+            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        }
         let token = self.current;
         self.current = self.lexer.next_token()?;
         Ok(token)
@@ -98,15 +98,23 @@ impl<'a> Parser<'a> {
     }
 
     /// Writes `root` to the tree, last, and returns the tree.
-    pub(crate) fn finish(mut self, root: Node) -> Ast {
+    pub(crate) fn finish(mut self, root: Node) -> Result<Ast, Error> {
         self.push(root);
-        Ast::new(self.nodes, self.node_count)
+        if self.full {
+            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        }
+        Ok(Ast::new(self.nodes, self.node_count))
     }
 
+    /// When the block is full, sets `full` instead of failing, so writing a
+    /// node stays cheap. `advance` reports it at the next token.
     fn push(&mut self, node: Node) {
-        let nodes = self.nodes.as_mut_slice::<Node>();
-        check!((self.node_count as usize) < nodes.len());
-        *at_mut!(nodes, self.node_count as usize) = node;
+        if self.node_count as usize == BLOCK_NODES {
+            self.full = true;
+            return;
+        }
+        // SAFETY: `node_count` is below `BLOCK_NODES`, so this is in the block.
+        unsafe { self.nodes.as_mut_ptr::<Node>().add(self.node_count as usize).write(node) };
         self.node_count += 1;
     }
 }
@@ -178,6 +186,13 @@ mod tests {
             parse("max(a + 1, f(g(x), y)) * 2"),
             "(Multiply (Call max (Add a 1) (Call f (Call g x) y)) 2)"
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
+    fn reports_a_full_block() {
+        let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
+        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
     }
 
     #[test]

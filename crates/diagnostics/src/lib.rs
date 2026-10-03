@@ -61,7 +61,7 @@ fn describe(error: &Error, found: &str) -> (String, String) {
     let expected = kind.map_or("?", token);
     match error.code {
         ErrorCode::QueryTooLarge => {
-            ("the query is too large".into(), "queries are limited to 4 GiB".into())
+            ("the query is too large to parse".into(), "parsing stopped here".into())
         }
         ErrorCode::UnexpectedCharacter => {
             (format!("unexpected character {found}"), "not part of any token".into())

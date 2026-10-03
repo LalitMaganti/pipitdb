@@ -62,6 +62,14 @@ const _: () = assert!(size_of::<Node>() == 8);
 // `operator` check their values before converting.
 unsafe impl Primitive for Node {}
 
+/// The size of the block of memory that holds the tree's nodes.
+pub const BLOCK_BYTES: usize = 64 * 1024;
+
+/// How many nodes a block holds.
+pub const BLOCK_NODES: usize = BLOCK_BYTES / size_of::<Node>();
+
+const _: () = assert!(BLOCK_NODES.is_power_of_two());
+
 /// The longest token a leaf can hold, and the most children a `Call` can
 /// have, as both are stored in 24 bits.
 pub const DATA_MAX: u32 = (1 << 24) - 1;
@@ -121,7 +129,8 @@ impl Node {
     }
 }
 
-/// A parsed tree. The root is the last node.
+/// A parsed tree. The root is the last node. Only the first `node_count` nodes
+/// of `nodes` have been written.
 pub struct Ast {
     nodes: Buffer,
     node_count: u32,
@@ -130,7 +139,7 @@ pub struct Ast {
 impl Ast {
     pub(crate) fn new(nodes: Buffer, node_count: u32) -> Ast {
         check!(node_count > 0);
-        check!(node_count as usize <= nodes.as_slice::<Node>().len());
+        check!(node_count as usize <= nodes.size_bytes() / size_of::<Node>());
         Ast { nodes, node_count }
     }
 
@@ -140,7 +149,8 @@ impl Ast {
 
     pub fn node(&self, index: u32) -> Node {
         check!(index < self.node_count);
-        *at!(self.nodes.as_slice::<Node>(), index as usize)
+        // SAFETY: the first `node_count` nodes have been written.
+        unsafe { self.nodes.as_ptr::<Node>().add(index as usize).read() }
     }
 
     pub fn node_count(&self) -> u32 {
@@ -150,7 +160,10 @@ impl Ast {
 
 impl core::fmt::Debug for Ast {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let nodes = at!(self.nodes.as_slice::<Node>(), ..self.node_count as usize);
+        // SAFETY: the first `node_count` nodes have been written.
+        let nodes = unsafe {
+            core::slice::from_raw_parts(self.nodes.as_ptr::<Node>(), self.node_count as usize)
+        };
         f.debug_list().entries(nodes).finish()
     }
 }
