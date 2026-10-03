@@ -203,7 +203,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Not inlined, so `next_token` doesn't need its registers on every token.
     #[inline(never)]
     fn skip_comment(&mut self) {
         let rest = self.rest();
