@@ -124,7 +124,6 @@ impl Drop for Buffer {
     }
 }
 
-/// Frees a buffer made by `Buffer::allocate::<A>`.
 unsafe fn free<A: Allocator>(owner: NonNull<Owner>) {
     let header = owner.cast::<Header<A>>();
     // SAFETY: `owner` starts a `Header<A>`. Reading it moves the allocator
@@ -142,7 +141,6 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
 
-    /// The heap, counting live allocations.
     struct Counting(Rc<Cell<u32>>);
 
     // SAFETY: forwards to `Heap`.
