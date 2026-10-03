@@ -62,6 +62,14 @@ const _: () = assert!(size_of::<Node>() == 8);
 // `operator` check their values before converting.
 unsafe impl Primitive for Node {}
 
+/// The size of the block of memory that holds the tree's nodes.
+pub const BLOCK_BYTES: usize = 64 * 1024;
+
+/// How many nodes a block holds.
+pub const BLOCK_NODES: usize = BLOCK_BYTES / size_of::<Node>();
+
+const _: () = assert!(BLOCK_NODES.is_power_of_two());
+
 /// The longest token a leaf can hold, and the most children a `Call` can
 /// have, as both are stored in 24 bits.
 pub const DATA_MAX: u32 = (1 << 24) - 1;

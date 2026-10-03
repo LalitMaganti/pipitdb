@@ -6,7 +6,7 @@
 mod expression;
 
 use crate::allocator::Allocator;
-use crate::ast::{Ast, Node, Operator, Tag};
+use crate::ast::{Ast, BLOCK_BYTES, BLOCK_NODES, Node, Operator, Tag};
 use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
@@ -23,7 +23,7 @@ pub fn parse_expression<A: Allocator + 'static>(allocator: A, source: &[u8]) -> 
     if current.kind != TokenKind::End {
         return Err(Error::new(ErrorCode::UnexpectedToken, current.span));
     }
-    Ok(parser.finish(root))
+    parser.finish(root)
 }
 
 pub(crate) struct Parser<'a> {
@@ -41,14 +41,8 @@ impl<'a> Parser<'a> {
     ) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        // Each node takes a token of at least a byte, so there are at most
-        // as many nodes as bytes.
-        let first_byte = Span { start: 0, len: 1 };
-        let Some(size_bytes) = source.len().checked_mul(size_of::<Node>()) else {
-            return Err(Error::new(ErrorCode::QueryTooLarge, first_byte));
-        };
-        let nodes = Buffer::allocate(allocator, size_bytes)
-            .map_err(|_| Error::new(ErrorCode::OutOfMemory, first_byte))?;
+        let nodes = Buffer::allocate(allocator, BLOCK_BYTES)
+            .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
         Ok(Parser { source, lexer, current, nodes, node_count: 0 })
     }
 
@@ -79,18 +73,23 @@ impl<'a> Parser<'a> {
 
     /// Writes `children` to the tree, next to each other, and returns their
     /// parent, which is not in the tree yet.
-    pub(crate) fn operation(&mut self, tag: Tag, operator: Operator, children: &[Node]) -> Node {
-        Node::operation(tag, operator, self.write(children))
+    pub(crate) fn operation(
+        &mut self,
+        tag: Tag,
+        operator: Operator,
+        children: &[Node],
+    ) -> Result<Node, Error> {
+        Ok(Node::operation(tag, operator, self.write(children)?))
     }
 
     /// Writes `nodes` to the tree, next to each other, and returns the index
     /// of the first.
-    pub(crate) fn write(&mut self, nodes: &[Node]) -> u32 {
+    pub(crate) fn write(&mut self, nodes: &[Node]) -> Result<u32, Error> {
         let first = self.node_count;
         for &node in nodes {
-            self.push(node);
+            self.push(node)?;
         }
-        first
+        Ok(first)
     }
 
     pub(crate) fn node_count(&self) -> u32 {
@@ -98,16 +97,18 @@ impl<'a> Parser<'a> {
     }
 
     /// Writes `root` to the tree, last, and returns the tree.
-    pub(crate) fn finish(mut self, root: Node) -> Ast {
-        self.push(root);
-        Ast::new(self.nodes, self.node_count)
+    pub(crate) fn finish(mut self, root: Node) -> Result<Ast, Error> {
+        self.push(root)?;
+        Ok(Ast::new(self.nodes, self.node_count))
     }
 
-    fn push(&mut self, node: Node) {
-        let nodes = self.nodes.as_mut_slice::<Node>();
-        check!((self.node_count as usize) < nodes.len());
-        *at_mut!(nodes, self.node_count as usize) = node;
+    fn push(&mut self, node: Node) -> Result<(), Error> {
+        if self.node_count as usize == BLOCK_NODES {
+            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        }
+        *at_mut!(self.nodes.as_mut_slice::<Node>(), self.node_count as usize) = node;
         self.node_count += 1;
+        Ok(())
     }
 }
 
@@ -191,5 +192,7 @@ mod tests {
         assert_eq!(error("f(a,"), (ErrorCode::ExpectedExpression, 4));
         let many = format!("f({})", vec!["a"; NESTING_MAX + 1].join(","));
         assert_eq!(error(&many).0, ErrorCode::NestingTooDeep);
+        let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
+        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
     }
 }
