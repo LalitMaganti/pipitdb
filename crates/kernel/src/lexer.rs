@@ -122,7 +122,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a [u8]) -> Result<Lexer<'a>, Error> {
         if u32::try_from(source.len()).is_err() {
-            return Err(Error::new(ErrorCode::QueryTooLarge, Span { start: 0, len: 0 }));
+            return Err(Error::new(ErrorCode::QueryTooLarge, Span { start: 0, len: 1 }));
         }
         Ok(Lexer { source, position: 0 })
     }

@@ -1,5 +1,4 @@
-//! Parses expressions by Pratt parsing, with an explicit stack instead of
-//! recursion.
+//! Pratt parsing of expressions, with an explicit stack instead of recursion.
 //!
 //! Finished operands wait on the stack as nodes not yet in the tree. An
 //! operator's operands are written to the tree together, so they end up next
@@ -11,8 +10,17 @@ use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
 
-/// How deeply operators and parentheses can nest.
-pub const NESTING_MAX: usize = 64;
+use super::NESTING_MAX;
+
+pub(super) fn parse<A: Allocator + 'static>(allocator: A, source: &[u8]) -> Result<Ast, Error> {
+    let mut parser = Parser::new(allocator, source)?;
+    let root = parser.expression()?;
+    if parser.current.kind != TokenKind::End {
+        return Err(Error::new(ErrorCode::UnexpectedToken, parser.current.span));
+    }
+    parser.push(root);
+    Ok(Ast::new(parser.nodes, parser.node_count))
+}
 
 // Binding powers: higher binds tighter. A binary operator with power `p`
 // parses its right operand at `p + 1`, so equal operators group to the left.
@@ -43,17 +51,6 @@ const fn infix() -> [Option<(Operator, u8)>; TOKEN_KIND_COUNT] {
     infix[TokenKind::Star as usize] = Some((Operator::Multiply, PRODUCT));
     infix[TokenKind::Slash as usize] = Some((Operator::Divide, PRODUCT));
     infix
-}
-
-/// Parses `source` as a single expression.
-pub fn parse_expression<A: Allocator + 'static>(allocator: A, source: &[u8]) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
-    let root = parser.expression()?;
-    if parser.current.kind != TokenKind::End {
-        return Err(Error::new(ErrorCode::UnexpectedToken, parser.current.span));
-    }
-    parser.push(root);
-    Ok(Ast::new(parser.nodes, parser.node_count))
 }
 
 #[derive(Clone, Copy)]
@@ -93,12 +90,12 @@ impl<'a> Parser<'a> {
         let current = lexer.next_token()?;
         // Each node takes a token of at least a byte, so there are at most
         // as many nodes as bytes.
-        let nowhere = Span { start: 0, len: 0 };
+        let first_byte = Span { start: 0, len: 1 };
         let Some(size_bytes) = source.len().checked_mul(size_of::<Node>()) else {
-            return Err(Error::new(ErrorCode::QueryTooLarge, nowhere));
+            return Err(Error::new(ErrorCode::QueryTooLarge, first_byte));
         };
         let nodes = Buffer::allocate(allocator, size_bytes)
-            .map_err(|_| Error::new(ErrorCode::OutOfMemory, nowhere))?;
+            .map_err(|_| Error::new(ErrorCode::OutOfMemory, first_byte))?;
         Ok(Parser { source, lexer, current, nodes, node_count: 0 })
     }
 
@@ -239,64 +236,4 @@ fn leaf(token: Token) -> Result<Node, Error> {
         _ => Tag::Column,
     };
     Ok(Node::leaf(tag, token.span))
-}
-
-#[cfg(test)]
-mod tests {
-    use alloc::format;
-    use alloc::string::String;
-
-    use super::*;
-    use crate::allocator::Heap;
-
-    /// Renders the tree as an s-expression.
-    fn render(ast: &Ast, source: &str, index: u32) -> String {
-        let node = ast.node(index);
-        match node.tag() {
-            Tag::Unary => {
-                format!("({:?} {})", node.operator(), render(ast, source, node.first_child()))
-            }
-            Tag::Binary => format!(
-                "({:?} {} {})",
-                node.operator(),
-                render(ast, source, node.first_child()),
-                render(ast, source, node.first_child() + 1)
-            ),
-            _ => {
-                let span = node.span();
-                String::from(&source[span.start as usize..(span.start + span.len) as usize])
-            }
-        }
-    }
-
-    fn parse(source: &str) -> String {
-        let ast = parse_expression(Heap, source.as_bytes()).unwrap();
-        render(&ast, source, ast.root())
-    }
-
-    fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_expression(Heap, source.as_bytes()).err().unwrap();
-        (error.code, error.span.start)
-    }
-
-    #[test]
-    fn parses_with_precedence() {
-        assert_eq!(
-            parse("a + b * -c > 1 AND NOT d = 'x' or e"),
-            "(Or (And (Greater (Add a (Multiply b (Negate c))) 1) (Not (Equal d 'x'))) e)"
-        );
-        assert_eq!(
-            parse("(a - b) - c * (d / 2.5)"),
-            "(Subtract (Subtract a b) (Multiply c (Divide d 2.5)))"
-        );
-    }
-
-    #[test]
-    fn reports_errors() {
-        assert_eq!(error("a +"), (ErrorCode::ExpectedExpression, 3));
-        assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
-        assert_eq!(error("a b"), (ErrorCode::UnexpectedToken, 2));
-        assert_eq!(error("a AND"), (ErrorCode::ExpectedExpression, 5));
-        assert_eq!(error(&"(".repeat(NESTING_MAX + 1)), (ErrorCode::NestingTooDeep, 64));
-    }
 }
