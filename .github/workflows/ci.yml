@@ -20,3 +20,11 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo test
       - run: cargo build --release --target wasm32-unknown-unknown
+
+  # Runs the tests under Miri to catch undefined behavior in unsafe code.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: cargo +nightly miri test
