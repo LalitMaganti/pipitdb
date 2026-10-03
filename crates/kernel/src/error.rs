@@ -50,4 +50,9 @@ impl Error {
     pub fn new(code: ErrorCode, span: Span) -> Error {
         Error { code, detail: 0, span }
     }
+
+    /// `ExpectedToken`, where `kind` was expected.
+    pub(crate) fn expected(kind: crate::lexer::TokenKind, span: Span) -> Error {
+        Error { code: ErrorCode::ExpectedToken, detail: u16::from(kind as u8), span }
+    }
 }
