@@ -6,6 +6,7 @@
 - Only add a comment when the code isn't obvious. Keep it short and plain.
 - One small PR at a time.
 - Prefer a few smoke tests over testing every combination.
+- Use new APIs from `crates/size`, which CI checks against a size budget per architecture.
 - Commit titles are prefixed with the area, e.g. `kernel:`.
 
 Before sending a PR:

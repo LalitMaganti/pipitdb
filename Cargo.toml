@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/kernel"]
+members = ["crates/kernel", "crates/size"]
+default-members = ["crates/kernel"]
 
 [workspace.package]
 version = "0.0.0"
@@ -19,7 +20,6 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# Strict lints, per TigerStyle.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
