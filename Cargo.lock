@@ -352,6 +352,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pipitdb-diagnostics"
+version = "0.0.0"
+dependencies = [
+ "pipitdb-kernel",
+]
+
+[[package]]
 name = "pipitdb-kernel"
 version = "0.0.0"
 

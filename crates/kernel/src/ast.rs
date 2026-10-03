@@ -121,3 +121,10 @@ impl Ast {
         self.node_count
     }
 }
+
+impl core::fmt::Debug for Ast {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let nodes = at!(self.nodes.as_slice::<Node>(), ..self.node_count as usize);
+        f.debug_list().entries(nodes).finish()
+    }
+}
