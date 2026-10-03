@@ -2,7 +2,10 @@
 
 - Follow [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 - The kernel crate is `no_std` + `alloc`. No new dependencies without asking.
-- One small PR at a time; small, focused tests.
+- Keep code simple and easy to read.
+- Only add a comment when the code isn't obvious. Keep it short and plain.
+- One small PR at a time.
+- Prefer a few smoke tests over testing every combination.
 - Commit titles are prefixed with the area, e.g. `kernel:`.
 
 Before sending a PR:
