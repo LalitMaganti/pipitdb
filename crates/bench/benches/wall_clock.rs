@@ -3,7 +3,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use pipitdb_bench::{count_tokens, long_text, typical_queries};
+use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
 
 fn lexer(c: &mut Criterion) {
     let mut group = c.benchmark_group("lexer");
@@ -14,5 +14,13 @@ fn lexer(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, lexer);
+fn parser(c: &mut Criterion) {
+    let source = expression(10_000);
+    let mut group = c.benchmark_group("parser");
+    group.throughput(Throughput::Bytes(source.len() as u64));
+    group.bench_function("expression", |b| b.iter(|| count_nodes(black_box(source.as_bytes()))));
+    group.finish();
+}
+
+criterion_group!(benches, lexer, parser);
 criterion_main!(benches);
