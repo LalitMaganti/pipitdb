@@ -35,7 +35,7 @@ impl RowBatch {
         if self.column_count == BATCH_COLUMNS_MAX {
             return Err(column);
         }
-        self.columns[self.column_count as usize].write(column);
+        at_mut!(self.columns, self.column_count as usize).write(column);
         self.column_count += 1;
         Ok(())
     }
@@ -51,13 +51,13 @@ impl RowBatch {
     pub fn column(&self, index: u32) -> &ColumnView {
         check!(index < self.column_count);
         // SAFETY: columns below `column_count` are initialized.
-        unsafe { self.columns[index as usize].assume_init_ref() }
+        unsafe { at!(self.columns, index as usize).assume_init_ref() }
     }
 
     fn drop_columns(&mut self) {
         let count = self.column_count as usize;
         self.column_count = 0;
-        let columns = self.columns[..count].as_mut_ptr().cast::<ColumnView>();
+        let columns = at_mut!(self.columns, ..count).as_mut_ptr().cast::<ColumnView>();
         // SAFETY: the first `count` columns are initialized, and the count is
         // reset first, so each is dropped once.
         unsafe { core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(columns, count)) };

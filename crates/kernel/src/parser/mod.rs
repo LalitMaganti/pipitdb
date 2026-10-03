@@ -75,7 +75,7 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn text(&self, token: Token) -> &'a [u8] {
         let start = token.span.start as usize;
-        &self.source[start..start + token.span.len as usize]
+        at!(self.source, start..start + token.span.len as usize)
     }
 
     /// Writes `children` to the tree, next to each other, and returns their
@@ -97,7 +97,7 @@ impl<'a> Parser<'a> {
     fn push(&mut self, node: Node) {
         let nodes = self.nodes.as_mut_slice::<Node>();
         check!((self.node_count as usize) < nodes.len());
-        nodes[self.node_count as usize] = node;
+        *at_mut!(nodes, self.node_count as usize) = node;
         self.node_count += 1;
     }
 }
