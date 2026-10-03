@@ -1,4 +1,4 @@
 aarch64-apple-darwin 6200
-aarch64-unknown-linux-gnu 9400
-x86_64-unknown-linux-gnu 9200
+aarch64-unknown-linux-gnu 9650
+x86_64-unknown-linux-gnu 9700
 wasm32-unknown-unknown 7400
