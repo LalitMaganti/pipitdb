@@ -9,7 +9,7 @@ pub struct Span {
 }
 
 /// Codes are only ever added, never renumbered, so an error printed by one
-/// build can be explained by another.
+/// build can be explained by another. They start at 1 and have no gaps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u16)]
 pub enum ErrorCode {
@@ -31,6 +31,19 @@ pub struct Error {
     /// Depends on `code`.
     pub detail: u16,
     pub span: Span,
+}
+
+impl ErrorCode {
+    /// The highest code. Update it when adding one.
+    pub const LAST: ErrorCode = ErrorCode::OutOfMemory;
+
+    pub fn from_u16(value: u16) -> Option<ErrorCode> {
+        if !(1..=ErrorCode::LAST as u16).contains(&value) {
+            return None;
+        }
+        // SAFETY: `ErrorCode` is a `u16` with no gaps from 1 to `LAST`.
+        Some(unsafe { core::mem::transmute::<u16, ErrorCode>(value) })
+    }
 }
 
 impl Error {

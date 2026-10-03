@@ -9,44 +9,6 @@ use std::fmt::Write;
 use pipit_kernel::error::{Error, ErrorCode, Span};
 use pipit_kernel::lexer::TokenKind;
 
-/// Every code, in order: `ErrorCode` numbers start at 1 and have no gaps.
-const CODES: [ErrorCode; 9] = [
-    ErrorCode::QueryTooLarge,
-    ErrorCode::UnexpectedCharacter,
-    ErrorCode::UnterminatedString,
-    ErrorCode::TokenTooLong,
-    ErrorCode::ExpectedExpression,
-    ErrorCode::UnexpectedToken,
-    ErrorCode::ExpectedToken,
-    ErrorCode::NestingTooDeep,
-    ErrorCode::OutOfMemory,
-];
-
-/// Every token kind, in order.
-const TOKEN_KINDS: [TokenKind; 21] = [
-    TokenKind::Identifier,
-    TokenKind::Integer,
-    TokenKind::Float,
-    TokenKind::String,
-    TokenKind::Pipe,
-    TokenKind::LeftParen,
-    TokenKind::RightParen,
-    TokenKind::Comma,
-    TokenKind::Dot,
-    TokenKind::Semicolon,
-    TokenKind::Star,
-    TokenKind::Plus,
-    TokenKind::Minus,
-    TokenKind::Slash,
-    TokenKind::Equal,
-    TokenKind::NotEqual,
-    TokenKind::Less,
-    TokenKind::LessEqual,
-    TokenKind::Greater,
-    TokenKind::GreaterEqual,
-    TokenKind::End,
-];
-
 /// `error` in its compact form, `pipit:E0007:2+0:5`.
 pub fn compact(error: &Error) -> String {
     let Span { start, len } = error.span;
@@ -63,7 +25,7 @@ pub fn parse_compact(text: &str) -> Option<Error> {
     if parts.next().is_some() {
         return None;
     }
-    let code = *CODES.get(usize::from(code).checked_sub(1)?)?;
+    let code = ErrorCode::from_u16(code)?;
     let span = Span { start: start.parse().ok()?, len: len.parse().ok()? };
     Some(Error { code, detail, span })
 }
@@ -95,7 +57,8 @@ pub fn render(error: &Error, source: &str, name: &str) -> String {
 
 /// The title and the label under the source for `error`.
 fn describe(error: &Error, found: &str) -> (String, String) {
-    let expected = TOKEN_KINDS.get(usize::from(error.detail)).map_or("?", |&kind| token(kind));
+    let kind = u8::try_from(error.detail).ok().and_then(TokenKind::from_u8);
+    let expected = kind.map_or("?", token);
     match error.code {
         ErrorCode::QueryTooLarge => {
             ("the query is too large".into(), "queries are limited to 4 GiB".into())
@@ -182,18 +145,6 @@ mod tests {
     use pipit_kernel::parser::parse_expression;
 
     use super::*;
-
-    #[test]
-    fn lists_every_code_and_token_kind() {
-        assert_eq!(CODES.len(), ErrorCode::OutOfMemory as usize);
-        for (i, code) in CODES.iter().enumerate() {
-            assert_eq!(*code as usize, i + 1);
-        }
-        assert_eq!(TOKEN_KINDS.len(), TokenKind::End as usize + 1);
-        for (i, kind) in TOKEN_KINDS.iter().enumerate() {
-            assert_eq!(*kind as usize, i);
-        }
-    }
 
     #[test]
     fn renders_a_parse_error() {

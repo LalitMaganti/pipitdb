@@ -37,6 +37,16 @@ pub struct Token {
     pub span: Span,
 }
 
+impl TokenKind {
+    pub fn from_u8(value: u8) -> Option<TokenKind> {
+        if value > TokenKind::End as u8 {
+            return None;
+        }
+        // SAFETY: `TokenKind` is a `u8` with no gaps up to `End`, the last.
+        Some(unsafe { core::mem::transmute::<u8, TokenKind>(value) })
+    }
+}
+
 // Classes of bytes that aren't a token on their own.
 const SPACE: u8 = 32;
 // Identifiers continue with `DIGIT..=IDENTIFIER`.
