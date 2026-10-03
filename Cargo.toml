@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/kernel", "crates/size"]
-default-members = ["crates/kernel"]
+members = ["crates/bench", "crates/kernel", "crates/size"]
+default-members = ["crates/bench", "crates/kernel"]
 
 [workspace.package]
 version = "0.0.0"

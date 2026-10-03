@@ -8,6 +8,7 @@
 - In the kernel, use `check!` instead of `assert!`: it costs a few bytes in release builds.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
 - Prefer a few smoke tests over testing every combination.
+- Add benchmarks for hot code to `crates/bench`.
 - Use new APIs from `crates/size`, which CI checks against a size budget per architecture.
 - Commit titles are prefixed with the area, e.g. `kernel:`.
 
