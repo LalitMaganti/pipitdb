@@ -54,7 +54,6 @@ enum Pending {
     Unary(Operator),
     Binary(Operator, Node),
     Parenthesis,
-    /// A call's name. Its arguments wait in `Argument` frames above it.
     Call(Node),
     Argument(Node),
 }
