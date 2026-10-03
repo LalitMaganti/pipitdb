@@ -7,3 +7,4 @@ mod check;
 
 pub mod allocator;
 pub mod buffer;
+pub mod column;
