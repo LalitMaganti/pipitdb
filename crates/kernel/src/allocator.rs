@@ -3,7 +3,6 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
-/// An allocation was refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AllocError;
 
@@ -20,7 +19,6 @@ pub unsafe trait Allocator {
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
 }
 
-/// The global heap.
 #[derive(Clone, Copy)]
 pub struct Heap;
 

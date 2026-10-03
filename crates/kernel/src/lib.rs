@@ -1,5 +1,3 @@
-//! The pipitdb kernel.
-
 #![no_std]
 
 extern crate alloc;
