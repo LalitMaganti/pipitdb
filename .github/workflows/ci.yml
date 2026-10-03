@@ -14,14 +14,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rustup reads rust-toolchain.toml and installs the pinned toolchain.
       - run: rustup toolchain install
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
       - run: cargo build --release --target wasm32-unknown-unknown
 
-  # Runs the tests under Miri to catch undefined behavior in unsafe code.
+  size:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: ubuntu-latest, target: wasm32-unknown-unknown }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - run: cargo clippy -p pipitdb-size --target ${{ matrix.target }}
+      # `shell: bash` sets pipefail, so `tee` doesn't hide a failure.
+      - shell: bash
+        run: crates/size/check.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
+
   miri:
     runs-on: ubuntu-latest
     steps:
