@@ -25,7 +25,7 @@ pub struct Heap;
 // SAFETY: forwards to the global allocator.
 unsafe impl Allocator for Heap {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        assert!(layout.size() > 0);
+        check!(layout.size() > 0);
         // SAFETY: the size is non-zero.
         NonNull::new(unsafe { alloc::alloc::alloc(layout) }).ok_or(AllocError)
     }

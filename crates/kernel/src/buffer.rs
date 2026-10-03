@@ -68,7 +68,7 @@ impl Buffer {
             data.write_bytes(0, size_bytes);
             data
         };
-        assert!(data.addr().get().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
+        check!(data.addr().get().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
         Ok(Buffer { data, size_bytes, owner: header.cast() })
     }
 
@@ -77,7 +77,7 @@ impl Buffer {
     }
 
     pub fn as_slice<T: Primitive>(&self) -> &[T] {
-        assert!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
         // SAFETY: the bytes are aligned for any `Primitive`, any bit pattern
         // is a valid `T`, and the bytes live as long as any reference to them.
         unsafe { core::slice::from_raw_parts(self.data.as_ptr().cast(), self.len::<T>()) }
@@ -85,8 +85,8 @@ impl Buffer {
 
     /// Buffers are written before they are shared.
     pub fn as_mut_slice<T: Primitive>(&mut self) -> &mut [T] {
-        assert!(self.size_bytes.is_multiple_of(size_of::<T>()));
-        assert!(self.owner().references.get() == 1);
+        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.owner().references.get() == 1);
         // SAFETY: as in `as_slice`, and this is the only reference.
         unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len::<T>()) }
     }
@@ -105,7 +105,7 @@ impl Buffer {
 impl Clone for Buffer {
     fn clone(&self) -> Buffer {
         let references = &self.owner().references;
-        assert!(references.get() < u32::MAX);
+        check!(references.get() < u32::MAX);
         references.set(references.get() + 1);
         Buffer { data: self.data, size_bytes: self.size_bytes, owner: self.owner }
     }
