@@ -8,6 +8,7 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::lexer::{Lexer, TokenKind};
+use pipit_kernel::parser::parse_expression;
 use pipit_kernel::row_batch::RowBatch;
 
 #[unsafe(no_mangle)]
@@ -34,7 +35,7 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
 pub unsafe extern "C" fn token_count(source: *const u8, len: usize) -> u32 {
     // SAFETY: guaranteed by the caller.
     let source = unsafe { core::slice::from_raw_parts(source, len) };
-    let mut lexer = Lexer::new(source);
+    let Ok(mut lexer) = Lexer::new(source) else { return u32::MAX };
     let mut count = 0;
     loop {
         match lexer.next_token() {
@@ -42,6 +43,21 @@ pub unsafe extern "C" fn token_count(source: *const u8, len: usize) -> u32 {
             Ok(_) => count += 1,
             Err(_) => return u32::MAX,
         }
+    }
+}
+
+/// Returns the number of nodes, or the error code.
+///
+/// # Safety
+///
+/// `source` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn expression_node_count(source: *const u8, len: usize) -> u32 {
+    // SAFETY: guaranteed by the caller.
+    let source = unsafe { core::slice::from_raw_parts(source, len) };
+    match parse_expression(Heap, source) {
+        Ok(ast) => ast.node_count(),
+        Err(error) => u32::from(error.code as u16),
     }
 }
 

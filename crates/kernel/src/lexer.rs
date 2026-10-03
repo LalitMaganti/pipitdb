@@ -3,6 +3,8 @@
 //! Keywords come out as identifiers: the parser decides what they mean, so
 //! modules can add their own.
 
+use crate::error::{Error, ErrorCode, Span};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TokenKind {
@@ -29,18 +31,10 @@ pub enum TokenKind {
     End,
 }
 
-/// A token is the bytes `start..end` of the source.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Token {
     pub kind: TokenKind,
-    pub start: u32,
-    pub end: u32,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LexError {
-    UnexpectedCharacter { position: u32 },
-    UnterminatedString { position: u32 },
+    pub span: Span,
 }
 
 // Classes of bytes that aren't a token on their own.
@@ -126,24 +120,26 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    pub fn new(source: &'a [u8]) -> Lexer<'a> {
-        check!(u32::try_from(source.len()).is_ok());
-        Lexer { source, position: 0 }
+    pub fn new(source: &'a [u8]) -> Result<Lexer<'a>, Error> {
+        if u32::try_from(source.len()).is_err() {
+            return Err(Error::new(ErrorCode::QueryTooLarge, Span { start: 0, len: 1 }));
+        }
+        Ok(Lexer { source, position: 0 })
     }
 
     /// Returns `TokenKind::End` once the source is used up.
-    pub fn next_token(&mut self) -> Result<Token, LexError> {
+    pub fn next_token(&mut self) -> Result<Token, Error> {
         self.skip_whitespace_and_comments();
         let start = self.position;
         let Some(byte) = self.peek(0) else {
-            return Ok(Token { kind: TokenKind::End, start, end: start });
+            return Ok(self.token(TokenKind::End, start));
         };
         self.position += 1;
         let class = class(byte);
         if class < SPACE {
             // SAFETY: classes below `SPACE` are `TokenKind`s.
             let kind = unsafe { core::mem::transmute::<u8, TokenKind>(class) };
-            return Ok(Token { kind, start, end: self.position });
+            return Ok(self.token(kind, start));
         }
         let kind = match class {
             IDENTIFIER => {
@@ -159,9 +155,17 @@ impl<'a> Lexer<'a> {
             LESS => TokenKind::Less,
             GREATER if self.eat(b'=') => TokenKind::GreaterEqual,
             GREATER => TokenKind::Greater,
-            _ => return Err(LexError::UnexpectedCharacter { position: start }),
+            _ => return Err(self.error(ErrorCode::UnexpectedCharacter, start)),
         };
-        Ok(Token { kind, start, end: self.position })
+        Ok(self.token(kind, start))
+    }
+
+    fn token(&self, kind: TokenKind, start: u32) -> Token {
+        Token { kind, span: Span { start, len: self.position - start } }
+    }
+
+    fn error(&self, code: ErrorCode, start: u32) -> Error {
+        Error::new(code, Span { start, len: self.position - start })
     }
 
     fn number(&mut self) -> TokenKind {
@@ -176,10 +180,11 @@ impl<'a> Lexer<'a> {
     }
 
     /// Strings are in single quotes; `''` inside one is a quote.
-    fn string(&mut self, start: u32) -> Result<TokenKind, LexError> {
+    fn string(&mut self, start: u32) -> Result<TokenKind, Error> {
         loop {
             let Some(quote) = find_byte(self.rest(), b'\'') else {
-                return Err(LexError::UnterminatedString { position: start });
+                self.position = u32::try_from(self.source.len()).unwrap_or(u32::MAX);
+                return Err(self.error(ErrorCode::UnterminatedString, start));
             };
             self.advance(quote + 1);
             if !self.eat(b'\'') {
@@ -234,14 +239,15 @@ mod tests {
     use super::*;
 
     fn kinds_and_text(source: &str) -> alloc::vec::Vec<(TokenKind, &str)> {
-        let mut lexer = Lexer::new(source.as_bytes());
+        let mut lexer = Lexer::new(source.as_bytes()).unwrap();
         let mut tokens = alloc::vec::Vec::new();
         loop {
             let token = lexer.next_token().unwrap();
             if token.kind == TokenKind::End {
                 return tokens;
             }
-            tokens.push((token.kind, &source[token.start as usize..token.end as usize]));
+            let start = token.span.start as usize;
+            tokens.push((token.kind, &source[start..start + token.span.len as usize]));
         }
     }
 
@@ -289,13 +295,17 @@ mod tests {
 
     #[test]
     fn reports_errors() {
-        let mut lexer = Lexer::new(b"x = 'abc");
+        let mut lexer = Lexer::new(b"x = 'abc").unwrap();
         lexer.next_token().unwrap();
         lexer.next_token().unwrap();
-        assert_eq!(lexer.next_token(), Err(LexError::UnterminatedString { position: 4 }));
+        let error = lexer.next_token().unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnterminatedString);
+        assert_eq!(error.span, Span { start: 4, len: 4 });
 
-        let mut lexer = Lexer::new(b"x | y");
+        let mut lexer = Lexer::new(b"x | y").unwrap();
         lexer.next_token().unwrap();
-        assert_eq!(lexer.next_token(), Err(LexError::UnexpectedCharacter { position: 2 }));
+        let error = lexer.next_token().unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnexpectedCharacter);
+        assert_eq!(error.span, Span { start: 2, len: 1 });
     }
 }
