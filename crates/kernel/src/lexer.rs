@@ -58,7 +58,8 @@ const INVALID: u8 = 40;
 const _: () = assert!((TokenKind::End as u8) < SPACE);
 
 /// The class of each byte, as in SQLite's `aiClass`. A byte that is a token
-/// on its own maps to its `TokenKind`.
+/// on its own maps to its `TokenKind`. Rust always computes a `static` at
+/// compile time; a `classes()` that couldn't be would fail to build.
 static CLASSES: [u8; 256] = classes();
 
 const fn classes() -> [u8; 256] {
