@@ -5,38 +5,14 @@
 //! and a file mapping later. Releasing the last reference frees through the
 //! owner, so buffers from different allocators mix freely.
 
-use core::alloc::Layout;
-use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
+use crate::block::{BLOCK_ALIGNMENT_BYTES, Block, Owner};
 
 /// Alignment of every buffer's bytes: a cache line, the widest SIMD register
 /// (AVX-512), and what Arrow recommends.
-pub const BUFFER_ALIGNMENT_BYTES: usize = 64;
-
-const _: () = assert!(BUFFER_ALIGNMENT_BYTES.is_power_of_two());
-
-/// The part common to every kind of owner. It sits at the start of each
-/// owner, so a buffer can release an owner without knowing its type.
-///
-/// The count is not atomic: execution is single-threaded for now.
-#[repr(C)]
-struct Owner {
-    references: Cell<u32>,
-    release: unsafe fn(NonNull<Owner>),
-}
-
-/// The owner of a buffer allocated from `A`. The bytes follow it in the same
-/// block, so a buffer costs one allocation.
-#[repr(C, align(64))]
-struct AllocatedOwner<A: Allocator> {
-    // Must be the first field: buffers cast between the two types.
-    owner: Owner,
-    allocator: A,
-    // The whole block: this header followed by the bytes.
-    layout: Layout,
-}
+pub const BUFFER_ALIGNMENT_BYTES: usize = BLOCK_ALIGNMENT_BYTES;
 
 /// A refcounted, 64-byte aligned block of bytes.
 ///
@@ -60,41 +36,13 @@ impl Buffer {
         allocator: A,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
-        const { assert!(align_of::<AllocatedOwner<A>>() == BUFFER_ALIGNMENT_BYTES) };
-        let header_bytes = size_of::<AllocatedOwner<A>>();
-        let block_bytes = header_bytes.checked_add(size_bytes).ok_or(AllocError)?;
-        let layout =
-            Layout::from_size_align(block_bytes, BUFFER_ALIGNMENT_BYTES).map_err(|_| AllocError)?;
-
-        let block = allocator.allocate(layout)?;
-        assert!(block.as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
-
-        let header = block.cast::<AllocatedOwner<A>>();
-        let owner = Owner {
-            references: Cell::new(1),
-            release: release_allocated::<A>,
-        };
-        // SAFETY: the block is valid for `layout`, which starts with room for
-        // the header and is aligned for it.
-        unsafe {
-            header.write(AllocatedOwner {
-                owner,
-                allocator,
-                layout,
-            });
-        }
-
-        // SAFETY: `header_bytes <= block_bytes`, so this stays in the block.
-        let data = unsafe { block.add(header_bytes) };
-        assert!(data.as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
-        // SAFETY: `data` is valid for `size_bytes` writes, the rest of the
-        // block.
-        unsafe { data.write_bytes(0, size_bytes) };
-
+        let block = Block::allocate(allocator, (), size_bytes)?;
+        // SAFETY: the block was just allocated.
+        let data = unsafe { Block::trailing(block) };
         Ok(Buffer {
             data,
             size_bytes,
-            owner: header.cast(),
+            owner: Block::owner(block),
         })
     }
 
@@ -128,7 +76,7 @@ impl Buffer {
     /// Whether this is the only reference to the bytes.
     #[must_use]
     pub fn is_unique(&self) -> bool {
-        self.owner().references.get() == 1
+        self.owner().is_unique()
     }
 
     fn owner(&self) -> &Owner {
@@ -139,11 +87,7 @@ impl Buffer {
 
 impl Clone for Buffer {
     fn clone(&self) -> Buffer {
-        let references = &self.owner().references;
-        let count = references.get();
-        assert!(count > 0);
-        assert!(count < u32::MAX);
-        references.set(count + 1);
+        self.owner().retain();
         Buffer {
             data: self.data,
             size_bytes: self.size_bytes,
@@ -154,80 +98,19 @@ impl Clone for Buffer {
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        let owner = self.owner();
-        let count = owner.references.get();
-        assert!(count > 0);
-        owner.references.set(count - 1);
-        if count == 1 {
-            let release = owner.release;
-            // SAFETY: this was the last reference, and `release` matches the
-            // owner's type: both were set together when it was created.
-            unsafe { release(self.owner) };
-        }
+        // SAFETY: the owner is live and this buffer holds a reference.
+        unsafe { Owner::release(self.owner) };
     }
-}
-
-/// Frees a block made by `Buffer::allocate::<A>`.
-///
-/// # Safety
-///
-/// `owner` must be the start of an `AllocatedOwner<A>` with no references
-/// left.
-unsafe fn release_allocated<A: Allocator>(owner: NonNull<Owner>) {
-    let header = owner.cast::<AllocatedOwner<A>>();
-    // SAFETY: per the contract, the header is valid. Reading moves the
-    // allocator out, so it is dropped after the block is freed.
-    let AllocatedOwner {
-        owner,
-        allocator,
-        layout,
-    } = unsafe { header.read() };
-    assert!(owner.references.get() == 0);
-    assert!(layout.size() >= size_of::<AllocatedOwner<A>>());
-    // SAFETY: the block came from this allocator with this layout.
-    unsafe { allocator.deallocate(header.cast(), layout) };
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::rc::Rc;
+    use core::cell::Cell;
 
     use super::*;
     use crate::allocator::Heap;
-
-    /// The heap, counting live blocks so tests can see when one is freed.
-    #[derive(Clone)]
-    struct Counting {
-        live: Rc<Cell<u32>>,
-    }
-
-    // SAFETY: forwards to `Heap`.
-    unsafe impl Allocator for Counting {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-            self.live.set(self.live.get() + 1);
-            Heap.allocate(layout)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            self.live.set(self.live.get() - 1);
-            // SAFETY: forwarded from our caller.
-            unsafe { Heap.deallocate(ptr, layout) }
-        }
-    }
-
-    /// Refuses every allocation.
-    struct Refusing;
-
-    // SAFETY: never hands out memory.
-    unsafe impl Allocator for Refusing {
-        fn allocate(&self, _: Layout) -> Result<NonNull<u8>, AllocError> {
-            Err(AllocError)
-        }
-
-        unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {
-            unreachable!()
-        }
-    }
+    use crate::allocator::testing::{Counting, Refusing};
 
     #[test]
     fn allocate_is_zeroed_and_aligned() {

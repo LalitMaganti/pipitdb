@@ -57,3 +57,48 @@ unsafe impl Allocator for Heap {
         unsafe { alloc::alloc::dealloc(ptr.as_ptr(), layout) }
     }
 }
+
+/// Allocators for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use alloc::rc::Rc;
+    use core::alloc::Layout;
+    use core::cell::Cell;
+    use core::ptr::NonNull;
+
+    use super::{AllocError, Allocator, Heap};
+
+    /// The heap, counting live blocks so tests can see when one is freed.
+    #[derive(Clone)]
+    pub(crate) struct Counting {
+        pub(crate) live: Rc<Cell<u32>>,
+    }
+
+    // SAFETY: forwards to `Heap`.
+    unsafe impl Allocator for Counting {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+            self.live.set(self.live.get() + 1);
+            Heap.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.live.set(self.live.get() - 1);
+            // SAFETY: forwarded from our caller.
+            unsafe { Heap.deallocate(ptr, layout) }
+        }
+    }
+
+    /// Refuses every allocation.
+    pub(crate) struct Refusing;
+
+    // SAFETY: never hands out memory.
+    unsafe impl Allocator for Refusing {
+        fn allocate(&self, _: Layout) -> Result<NonNull<u8>, AllocError> {
+            Err(AllocError)
+        }
+
+        unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {
+            unreachable!()
+        }
+    }
+}
