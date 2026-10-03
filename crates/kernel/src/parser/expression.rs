@@ -4,23 +4,11 @@
 //! operator's operands are written to the tree together, so they end up next
 //! to each other, as the tree needs.
 
-use crate::allocator::Allocator;
-use crate::ast::{Ast, LEAF_LEN_MAX, Node, Operator, Tag};
-use crate::buffer::Buffer;
-use crate::error::{Error, ErrorCode, Span};
-use crate::lexer::{Lexer, Token, TokenKind};
+use crate::ast::{LEAF_LEN_MAX, Node, Operator, Tag};
+use crate::error::{Error, ErrorCode};
+use crate::lexer::{Token, TokenKind};
 
-use super::NESTING_MAX;
-
-pub(super) fn parse<A: Allocator + 'static>(allocator: A, source: &[u8]) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
-    let root = parser.expression()?;
-    if parser.current.kind != TokenKind::End {
-        return Err(Error::new(ErrorCode::UnexpectedToken, parser.current.span));
-    }
-    parser.push(root);
-    Ok(Ast::new(parser.nodes, parser.node_count))
-}
+use super::{NESTING_MAX, Parser};
 
 // Binding powers: higher binds tighter. A binary operator with power `p`
 // parses its right operand at `p + 1`, so equal operators group to the left.
@@ -76,32 +64,10 @@ struct Frame {
     min_power: u8,
 }
 
-struct Parser<'a> {
-    source: &'a [u8],
-    lexer: Lexer<'a>,
-    current: Token,
-    nodes: Buffer,
-    node_count: u32,
-}
-
-impl<'a> Parser<'a> {
-    fn new<A: Allocator + 'static>(allocator: A, source: &'a [u8]) -> Result<Parser<'a>, Error> {
-        let mut lexer = Lexer::new(source)?;
-        let current = lexer.next_token()?;
-        // Each node takes a token of at least a byte, so there are at most
-        // as many nodes as bytes.
-        let first_byte = Span { start: 0, len: 1 };
-        let Some(size_bytes) = source.len().checked_mul(size_of::<Node>()) else {
-            return Err(Error::new(ErrorCode::QueryTooLarge, first_byte));
-        };
-        let nodes = Buffer::allocate(allocator, size_bytes)
-            .map_err(|_| Error::new(ErrorCode::OutOfMemory, first_byte))?;
-        Ok(Parser { source, lexer, current, nodes, node_count: 0 })
-    }
-
+impl Parser<'_> {
     /// Parses an expression, stopping at the first token that can't continue
     /// it. Returns its root, which is not in the tree yet.
-    fn expression(&mut self) -> Result<Node, Error> {
+    pub(crate) fn expression(&mut self) -> Result<Node, Error> {
         let mut stack = [Frame { pending: Pending::Parenthesis, min_power: 0 }; NESTING_MAX];
         let mut depth = 0;
         let mut min_power = 0;
@@ -131,7 +97,7 @@ impl<'a> Parser<'a> {
             }
             let mut operand = leaf(token)?;
             loop {
-                if let Some((operator, power)) = self.infix(self.current)
+                if let Some((operator, power)) = self.infix(self.current())
                     && power > min_power
                 {
                     let token = self.advance()?;
@@ -184,44 +150,6 @@ impl<'a> Parser<'a> {
             _ => return Keyword::None,
         };
         if text.eq_ignore_ascii_case(keyword.1) { keyword.0 } else { Keyword::None }
-    }
-
-    fn text(&self, token: Token) -> &'a [u8] {
-        let start = token.span.start as usize;
-        &self.source[start..start + token.span.len as usize]
-    }
-
-    /// Writes `children` to the tree, next to each other, and returns their
-    /// parent.
-    fn operation(&mut self, tag: Tag, operator: Operator, children: &[Node]) -> Node {
-        let first_child = self.node_count;
-        for &child in children {
-            self.push(child);
-        }
-        Node::operation(tag, operator, first_child)
-    }
-
-    fn push(&mut self, node: Node) {
-        let nodes = self.nodes.as_mut_slice::<Node>();
-        check!((self.node_count as usize) < nodes.len());
-        nodes[self.node_count as usize] = node;
-        self.node_count += 1;
-    }
-
-    fn expect(&mut self, kind: TokenKind) -> Result<Token, Error> {
-        if self.current.kind != kind {
-            let mut error = Error::new(ErrorCode::ExpectedToken, self.current.span);
-            error.detail = u16::from(kind as u8);
-            return Err(error);
-        }
-        self.advance()
-    }
-
-    /// Moves to the next token and returns the one it was on.
-    fn advance(&mut self) -> Result<Token, Error> {
-        let token = self.current;
-        self.current = self.lexer.next_token()?;
-        Ok(token)
     }
 }
 
