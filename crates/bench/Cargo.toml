@@ -11,5 +11,17 @@ publish = false
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
 
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+gungraun = "0.20"
+
+[[bench]]
+name = "wall_clock"
+harness = false
+
+[[bench]]
+name = "instructions"
+harness = false
+
 [lints]
 workspace = true

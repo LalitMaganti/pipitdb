@@ -38,6 +38,33 @@ jobs:
       - shell: bash
         run: crates/size/check.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # Fails a PR whose benchmarks run more than 5% more instructions than its base.
+  instructions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: rustup toolchain install
+      # Must match the gungraun version in Cargo.lock.
+      - run: cargo install gungraun-runner --version 0.20.0 --locked
+      - name: Measure the base
+        run: |
+          git checkout ${{ github.event.pull_request.base.sha }}
+          if [ -f crates/bench/benches/instructions.rs ]; then
+            cargo bench -p pipitdb-bench --bench instructions -- --save-baseline=base
+          fi
+          git checkout ${{ github.event.pull_request.head.sha }}
+      - name: Compare against the base
+        run: |
+          if [ -d target/gungraun ]; then
+            cargo bench -p pipitdb-bench --bench instructions -- --baseline=base --callgrind-limits='ir=5%'
+          else
+            cargo bench -p pipitdb-bench --bench instructions
+          fi
+
   miri:
     runs-on: ubuntu-latest
     steps:
