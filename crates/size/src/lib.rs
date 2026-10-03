@@ -6,13 +6,19 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
+use pipit_kernel::column::{ColumnView, DataType};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn buffer_sum(count: usize, value: i64) -> i64 {
-    let Some(size_bytes) = count.checked_mul(size_of::<i64>()) else { return 0 };
-    let Ok(mut buffer) = Buffer::allocate(Heap, size_bytes) else { return 0 };
-    buffer.as_mut_slice::<i64>().fill(value);
-    buffer.clone().as_slice::<i64>().iter().sum()
+pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
+    let Ok(mut values) = Buffer::allocate(Heap, count as usize * size_of::<i64>()) else {
+        return 0;
+    };
+    values.as_mut_slice::<i64>().fill(value);
+    let column = ColumnView::new(DataType::Int64, values, None).slice(1, count - 1);
+    if column.is_null(0) {
+        return 0;
+    }
+    column.int64s().iter().sum()
 }
 
 #[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]
