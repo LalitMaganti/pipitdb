@@ -44,14 +44,12 @@ jobs:
       - shell: bash
         run: crates/size/check.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Fails a PR whose benchmarks run more than 5% more instructions than its base.
+  # Fails if a benchmark's instruction count is more than 5% off
+  # crates/bench/instructions.
   instructions:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
       - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: valgrind
@@ -60,20 +58,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Must match the gungraun version in Cargo.lock.
       - run: cargo install gungraun-runner --version 0.20.0 --locked
-      - name: Measure the base
-        run: |
-          git checkout ${{ github.event.pull_request.base.sha }}
-          if [ -f crates/bench/benches/instructions.rs ]; then
-            cargo bench -p pipitdb-bench --bench instructions -- --save-baseline=base
-          fi
-          git checkout ${{ github.event.pull_request.head.sha }}
-      - name: Compare against the base
-        run: |
-          if [ -d target/gungraun ]; then
-            cargo bench -p pipitdb-bench --bench instructions -- --baseline=base --callgrind-limits='ir=5%'
-          else
-            cargo bench -p pipitdb-bench --bench instructions
-          fi
+      # Clear summaries the cache may have restored from earlier runs.
+      - run: rm -rf target/gungraun && cargo bench -p pipitdb-bench --bench instructions -- --save-summary=json
+      - run: crates/bench/check_instructions.py | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: bash
 
   miri:
     runs-on: ubuntu-latest
