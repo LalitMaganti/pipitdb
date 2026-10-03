@@ -1,0 +1,18 @@
+[package]
+name = "pipitdb-diagnostics"
+description = "Turns pipitdb errors into readable messages."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pipitdb-kernel = { path = "../kernel" }
+
+[[bin]]
+name = "pipit-explain"
+path = "src/bin/explain.rs"
+
+[lints]
+workspace = true
