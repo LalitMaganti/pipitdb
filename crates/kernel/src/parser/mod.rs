@@ -16,7 +16,10 @@ use crate::lexer::{Lexer, Token, TokenKind};
 pub const NESTING_MAX: usize = 64;
 
 /// Parses `source` as a single expression.
-pub fn parse_expression<A: Allocator + 'static>(allocator: A, source: &[u8]) -> Result<Ast, Error> {
+pub fn parse_expression<A: Allocator + Clone + 'static>(
+    allocator: A,
+    source: &[u8],
+) -> Result<Ast, Error> {
     let mut parser = Parser::new(allocator, source)?;
     let root = parser.expression()?;
     let current = parser.current();
@@ -36,7 +39,7 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new<A: Allocator + 'static>(
+    pub(crate) fn new<A: Allocator + Clone + 'static>(
         allocator: A,
         source: &'a [u8],
     ) -> Result<Parser<'a>, Error> {

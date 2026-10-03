@@ -37,6 +37,7 @@ pub struct Buffer {
 struct Owner {
     references: Cell<u32>,
     free: unsafe fn(NonNull<Owner>),
+    allocate_like: unsafe fn(NonNull<Owner>, usize) -> Result<Buffer, AllocError>,
 }
 
 /// Sits in front of the bytes, in the same allocation.
@@ -49,7 +50,7 @@ struct Header<A> {
 
 impl Buffer {
     /// Allocates `size_bytes` zeroed bytes.
-    pub fn allocate<A: Allocator + 'static>(
+    pub fn allocate<A: Allocator + Clone + 'static>(
         allocator: A,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
@@ -66,7 +67,7 @@ impl Buffer {
     ///
     /// No byte may be read, through `as_slice` or otherwise, before it is
     /// written.
-    pub unsafe fn allocate_uninit<A: Allocator + 'static>(
+    pub unsafe fn allocate_uninit<A: Allocator + Clone + 'static>(
         allocator: A,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
@@ -76,7 +77,8 @@ impl Buffer {
         let layout =
             Layout::from_size_align(total_bytes, BUFFER_ALIGNMENT_BYTES).map_err(|_| AllocError)?;
         let header = allocator.allocate(layout)?.cast::<Header<A>>();
-        let owner = Owner { references: Cell::new(1), free: free::<A> };
+        let owner =
+            Owner { references: Cell::new(1), free: free::<A>, allocate_like: allocate_like::<A> };
 
         // SAFETY: `layout` fits a header followed by `size_bytes` bytes.
         let data = unsafe {
@@ -85,6 +87,19 @@ impl Buffer {
         };
         check!(data.addr().get().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
         Ok(Buffer { data, size_bytes, owner: header.cast() })
+    }
+
+    /// Allocates `size_bytes` bytes, without zeroing them, from the allocator
+    /// `self` came from.
+    ///
+    /// # Safety
+    ///
+    /// As for `allocate_uninit`.
+    pub unsafe fn allocate_uninit_like(&self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        let allocate_like = self.owner().allocate_like;
+        // SAFETY: `allocate_like` matches the owner's type: both were set
+        // together. The caller upholds the rest.
+        unsafe { allocate_like(self.owner, size_bytes) }
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -153,6 +168,22 @@ impl Drop for Buffer {
     }
 }
 
+/// Allocates from the allocator of a buffer made by `Buffer::allocate::<A>`.
+///
+/// # Safety
+///
+/// `owner` must start a live `Header<A>`, and the caller must uphold
+/// `allocate_uninit`'s contract.
+unsafe fn allocate_like<A: Allocator + Clone + 'static>(
+    owner: NonNull<Owner>,
+    size_bytes: usize,
+) -> Result<Buffer, AllocError> {
+    // SAFETY: `owner` starts a live `Header<A>`.
+    let allocator = unsafe { owner.cast::<Header<A>>().as_ref() }.allocator.clone();
+    // SAFETY: upheld by the caller.
+    unsafe { Buffer::allocate_uninit(allocator, size_bytes) }
+}
+
 unsafe fn free<A: Allocator>(owner: NonNull<Owner>) {
     let header = owner.cast::<Header<A>>();
     // SAFETY: `owner` starts a `Header<A>`. Reading it moves the allocator
@@ -170,6 +201,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
 
+    #[derive(Clone)]
     struct Counting(Rc<Cell<u32>>);
 
     // SAFETY: forwards to `Heap`.
@@ -186,6 +218,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct Refusing;
 
     // SAFETY: never hands out memory.
@@ -221,6 +254,19 @@ mod tests {
         drop(buffer);
         assert_eq!(live.get(), 1);
         drop(clone);
+        assert_eq!(live.get(), 0);
+    }
+
+    #[test]
+    fn allocates_like_another_buffer() {
+        let live = Rc::new(Cell::new(0));
+        let buffer = Buffer::allocate(Counting(live.clone()), 8).unwrap();
+        // SAFETY: the bytes aren't read.
+        let other = unsafe { buffer.allocate_uninit_like(16) }.unwrap();
+        assert_eq!(other.size_bytes(), 16);
+        assert_eq!(live.get(), 2);
+        drop(buffer);
+        drop(other);
         assert_eq!(live.get(), 0);
     }
 
