@@ -78,7 +78,7 @@ fn describe(error: &Error, found: &str) -> (String, String) {
             (format!("expected {expected}, found {found}"), format!("expected {expected}"))
         }
         ErrorCode::NestingTooDeep => (
-            "expression nests too deeply".into(),
+            "expression nests too deeply, or has too many arguments".into(),
             format!("nesting is limited to {} levels", pipit_kernel::parser::NESTING_MAX),
         ),
         ErrorCode::OutOfMemory => ("out of memory".into(), "while parsing this query".into()),

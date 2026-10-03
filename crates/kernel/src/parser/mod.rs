@@ -11,7 +11,8 @@ use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
 
-/// How deeply operators and parentheses can nest.
+/// How deeply operators, parentheses and calls can nest. Each waiting
+/// argument counts as a level.
 pub const NESTING_MAX: usize = 64;
 
 /// Parses `source` as a single expression.
@@ -66,9 +67,7 @@ impl<'a> Parser<'a> {
     /// Moves past the current token if it is `kind`, and fails otherwise.
     pub(crate) fn expect(&mut self, kind: TokenKind) -> Result<Token, Error> {
         if self.current.kind != kind {
-            let mut error = Error::new(ErrorCode::ExpectedToken, self.current.span);
-            error.detail = u16::from(kind as u8);
-            return Err(error);
+            return Err(Error::expected(kind, self.current.span));
         }
         self.advance()
     }
@@ -81,11 +80,21 @@ impl<'a> Parser<'a> {
     /// Writes `children` to the tree, next to each other, and returns their
     /// parent, which is not in the tree yet.
     pub(crate) fn operation(&mut self, tag: Tag, operator: Operator, children: &[Node]) -> Node {
-        let first_child = self.node_count;
-        for &child in children {
-            self.push(child);
+        Node::operation(tag, operator, self.write(children))
+    }
+
+    /// Writes `nodes` to the tree, next to each other, and returns the index
+    /// of the first.
+    pub(crate) fn write(&mut self, nodes: &[Node]) -> u32 {
+        let first = self.node_count;
+        for &node in nodes {
+            self.push(node);
         }
-        Node::operation(tag, operator, first_child)
+        first
+    }
+
+    pub(crate) fn node_count(&self) -> u32 {
+        self.node_count
     }
 
     /// Writes `root` to the tree, last, and returns the tree.
@@ -106,6 +115,7 @@ impl<'a> Parser<'a> {
 mod tests {
     use alloc::format;
     use alloc::string::String;
+    use alloc::vec;
 
     use super::*;
     use crate::allocator::Heap;
@@ -125,6 +135,12 @@ mod tests {
                 render(ast, source, node.first_child()),
                 render(ast, source, node.first_child() + 1)
             ),
+            Tag::Call => {
+                let children = (0..node.child_count())
+                    .map(|i| render(ast, source, node.first_child() + i))
+                    .collect::<alloc::vec::Vec<_>>();
+                format!("(Call {})", children.join(" "))
+            }
             _ => {
                 let span = node.span();
                 String::from(&source[span.start as usize..(span.start + span.len) as usize])
@@ -155,11 +171,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_calls() {
+        assert_eq!(parse("count(*)"), "(Call count *)");
+        assert_eq!(parse("now()"), "(Call now)");
+        assert_eq!(
+            parse("max(a + 1, f(g(x), y)) * 2"),
+            "(Multiply (Call max (Add a 1) (Call f (Call g x) y)) 2)"
+        );
+    }
+
+    #[test]
     fn reports_errors() {
         assert_eq!(error("a +"), (ErrorCode::ExpectedExpression, 3));
         assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
         assert_eq!(error("a b"), (ErrorCode::UnexpectedToken, 2));
         assert_eq!(error("a AND"), (ErrorCode::ExpectedExpression, 5));
         assert_eq!(error(&"(".repeat(NESTING_MAX + 1)), (ErrorCode::NestingTooDeep, 64));
+        assert_eq!(error("f(a b"), (ErrorCode::ExpectedToken, 4));
+        assert_eq!(error("f(a,"), (ErrorCode::ExpectedExpression, 4));
+        let many = format!("f({})", vec!["a"; NESTING_MAX + 1].join(","));
+        assert_eq!(error(&many).0, ErrorCode::NestingTooDeep);
     }
 }
