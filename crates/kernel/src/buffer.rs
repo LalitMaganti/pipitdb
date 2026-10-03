@@ -8,6 +8,22 @@ use crate::allocator::{AllocError, Allocator};
 
 pub const BUFFER_ALIGNMENT_BYTES: usize = 64;
 
+/// A number type where any bit pattern is a valid value.
+///
+/// # Safety
+///
+/// Only implement this for such types.
+pub unsafe trait Primitive: Copy {}
+
+// SAFETY: any bit pattern is a valid value of each of these.
+unsafe impl Primitive for u8 {}
+// SAFETY: as above.
+unsafe impl Primitive for u32 {}
+// SAFETY: as above.
+unsafe impl Primitive for i64 {}
+// SAFETY: as above.
+unsafe impl Primitive for f64 {}
+
 /// Cloning shares the bytes; the last drop frees them.
 pub struct Buffer {
     data: NonNull<u8>,
@@ -60,16 +76,24 @@ impl Buffer {
         self.size_bytes
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: the bytes live as long as any reference to them.
-        unsafe { core::slice::from_raw_parts(self.data.as_ptr(), self.size_bytes) }
+    pub fn as_slice<T: Primitive>(&self) -> &[T] {
+        assert!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        // SAFETY: the bytes are aligned for any `Primitive`, any bit pattern
+        // is a valid `T`, and the bytes live as long as any reference to them.
+        unsafe { core::slice::from_raw_parts(self.data.as_ptr().cast(), self.len::<T>()) }
     }
 
     /// Buffers are written before they are shared.
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+    pub fn as_mut_slice<T: Primitive>(&mut self) -> &mut [T] {
+        assert!(self.size_bytes.is_multiple_of(size_of::<T>()));
         assert!(self.owner().references.get() == 1);
-        // SAFETY: this is the only reference, so nothing else sees the write.
-        unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr(), self.size_bytes) }
+        // SAFETY: as in `as_slice`, and this is the only reference.
+        unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len::<T>()) }
+    }
+
+    fn len<T: Primitive>(&self) -> usize {
+        const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+        self.size_bytes / size_of::<T>()
     }
 
     fn owner(&self) -> &Owner {
@@ -149,17 +173,17 @@ mod tests {
     #[test]
     fn allocate_is_zeroed_and_aligned() {
         let buffer = Buffer::allocate(Heap, 100).unwrap();
-        assert_eq!(buffer.as_bytes(), [0; 100]);
-        assert!(buffer.as_bytes().as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
+        assert_eq!(buffer.as_slice::<u8>(), [0; 100]);
+        assert!(buffer.as_slice::<u8>().as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
     }
 
     #[test]
     fn clone_shares_bytes() {
         let mut buffer = Buffer::allocate(Heap, 8).unwrap();
-        buffer.as_bytes_mut()[0] = 7;
+        buffer.as_mut_slice::<i64>()[0] = -7;
         let clone = buffer.clone();
-        assert_eq!(clone.as_bytes().as_ptr(), buffer.as_bytes().as_ptr());
-        assert_eq!(clone.as_bytes()[0], 7);
+        assert_eq!(clone.as_slice::<i64>(), [-7]);
+        assert_eq!(clone.as_slice::<u8>().as_ptr(), buffer.as_slice::<u8>().as_ptr());
     }
 
     #[test]
@@ -188,6 +212,6 @@ mod tests {
     fn writing_shared_bytes_panics() {
         let mut buffer = Buffer::allocate(Heap, 8).unwrap();
         let _clone = buffer.clone();
-        buffer.as_bytes_mut();
+        buffer.as_mut_slice::<u8>();
     }
 }
