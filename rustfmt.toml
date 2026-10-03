@@ -1,0 +1,3 @@
+# TigerStyle: hard limit of 100 columns. This is rustfmt's default, stated
+# explicitly so it never drifts.
+max_width = 100

@@ -1,0 +1,13 @@
+[package]
+name = "pipitdb-kernel"
+description = "The pipitdb microkernel: data model, pipeline driver and module registry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_kernel"
+[lints]
+workspace = true
