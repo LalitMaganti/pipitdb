@@ -68,12 +68,12 @@ impl ColumnView {
         check!(row < self.row_count);
         let Some(validity) = &self.validity else { return false };
         let bit = (self.start + row) as usize;
-        validity.as_slice::<u8>()[bit / 8] & (1 << (bit % 8)) == 0
+        at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
     }
 
     fn values<T: Primitive>(&self) -> &[T] {
         let start = self.start as usize;
-        &self.values.as_slice::<T>()[start..start + self.row_count as usize]
+        at!(self.values.as_slice::<T>(), start..start + self.row_count as usize)
     }
 }
 

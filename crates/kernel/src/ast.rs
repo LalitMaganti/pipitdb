@@ -114,7 +114,7 @@ impl Ast {
 
     pub fn node(&self, index: u32) -> Node {
         check!(index < self.node_count);
-        self.nodes.as_slice::<Node>()[index as usize]
+        *at!(self.nodes.as_slice::<Node>(), index as usize)
     }
 
     pub fn node_count(&self) -> u32 {

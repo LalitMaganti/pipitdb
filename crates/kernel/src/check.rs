@@ -1,4 +1,5 @@
-//! `check!`: an assertion that costs a few bytes in release builds.
+//! `check!`: an assertion that costs a few bytes in release builds, and
+//! `at!`, indexing that does the same.
 //!
 //! Debug builds use `assert!`. Release builds drop the message and location
 //! and call `check_failed(line!())`. To find a failed check, symbolize the
@@ -11,6 +12,35 @@ macro_rules! check {
             assert!($condition);
         } else if !$condition {
             $crate::check::check_failed(line!());
+        }
+    };
+}
+
+/// `slice[index]`, for an index or a range, without a panic location in
+/// release builds: the same trade as `check!`.
+macro_rules! at {
+    ($slice:expr, $index:expr) => {
+        if cfg!(debug_assertions) {
+            &$slice[$index]
+        } else {
+            match $slice.get($index) {
+                Some(item) => item,
+                None => $crate::check::check_failed(line!()),
+            }
+        }
+    };
+}
+
+/// `&mut slice[index]`, as `at!`.
+macro_rules! at_mut {
+    ($slice:expr, $index:expr) => {
+        if cfg!(debug_assertions) {
+            &mut $slice[$index]
+        } else {
+            match $slice.get_mut($index) {
+                Some(item) => item,
+                None => $crate::check::check_failed(line!()),
+            }
         }
     };
 }

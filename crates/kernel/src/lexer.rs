@@ -212,7 +212,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn rest(&self) -> &'a [u8] {
-        &self.source[self.position as usize..]
+        at!(self.source, self.position as usize..)
     }
 
     fn advance(&mut self, count: usize) {

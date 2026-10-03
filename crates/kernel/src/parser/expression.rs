@@ -90,7 +90,7 @@ impl Parser<'_> {
                 if depth == NESTING_MAX {
                     return Err(Error::new(ErrorCode::NestingTooDeep, token.span));
                 }
-                stack[depth] = Frame { pending, min_power };
+                *at_mut!(stack, depth) = Frame { pending, min_power };
                 depth += 1;
                 min_power = power;
                 continue;
@@ -104,7 +104,8 @@ impl Parser<'_> {
                     if depth == NESTING_MAX {
                         return Err(Error::new(ErrorCode::NestingTooDeep, token.span));
                     }
-                    stack[depth] = Frame { pending: Pending::Binary(operator, operand), min_power };
+                    *at_mut!(stack, depth) =
+                        Frame { pending: Pending::Binary(operator, operand), min_power };
                     depth += 1;
                     min_power = power + 1;
                     continue 'operand;
@@ -113,7 +114,7 @@ impl Parser<'_> {
                     return Ok(operand);
                 }
                 depth -= 1;
-                let frame = stack[depth];
+                let frame = *at!(stack, depth);
                 min_power = frame.min_power;
                 operand = match frame.pending {
                     Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand]),
@@ -131,7 +132,7 @@ impl Parser<'_> {
 
     fn infix(&self, token: Token) -> Option<(Operator, u8)> {
         if token.kind != TokenKind::Identifier {
-            return INFIX[token.kind as usize];
+            return *at!(INFIX, token.kind as usize);
         }
         match self.keyword(token) {
             Keyword::And => Some((Operator::And, AND)),
