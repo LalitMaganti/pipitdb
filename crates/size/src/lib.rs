@@ -7,6 +7,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::lexer::{Lexer, TokenKind};
 use pipit_kernel::row_batch::RowBatch;
 
 #[unsafe(no_mangle)]
@@ -22,6 +23,26 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
         return 0;
     }
     batch.column(0).int64s().iter().sum()
+}
+
+/// Returns the number of tokens, or `u32::MAX` on an error.
+///
+/// # Safety
+///
+/// `source` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn token_count(source: *const u8, len: usize) -> u32 {
+    // SAFETY: guaranteed by the caller.
+    let source = unsafe { core::slice::from_raw_parts(source, len) };
+    let mut lexer = Lexer::new(source);
+    let mut count = 0;
+    loop {
+        match lexer.next_token() {
+            Ok(token) if token.kind == TokenKind::End => return count,
+            Ok(_) => count += 1,
+            Err(_) => return u32::MAX,
+        }
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]
