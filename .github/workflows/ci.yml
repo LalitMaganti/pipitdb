@@ -8,13 +8,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Pinned so Miri's standard library build can be cached.
+  MIRI_NIGHTLY: nightly-2026-09-27
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        # The profiles live in the root Cargo.toml, which rust-cache doesn't hash.
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
@@ -31,16 +37,52 @@ jobs:
           - { os: ubuntu-latest, target: wasm32-unknown-unknown }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
       - run: cargo clippy -p pipitdb-size --target ${{ matrix.target }}
       # `shell: bash` sets pipefail, so `tee` doesn't hide a failure.
       - shell: bash
         run: crates/size/check.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # Fails if a benchmark's instruction count is more than 5% off
+  # crates/bench/instructions.
+  instructions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: valgrind
+      - uses: ./.github/actions/setup-rust
+      # Also caches the gungraun-runner binary, so installing it is quick.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        # The profiles live in the root Cargo.toml, which rust-cache doesn't hash.
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      # Must match the gungraun version in Cargo.lock.
+      - run: cargo install gungraun-runner --version 0.20.0 --locked
+      # Clear summaries the cache may have restored from earlier runs.
+      - run: rm -rf target/gungraun && cargo bench -p pipitdb-bench --bench instructions -- --save-summary=json
+      - run: crates/bench/check_instructions.py | tee -a "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
   miri:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
-      - run: cargo +nightly miri test
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ env.MIRI_NIGHTLY }}
+          components: miri,rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        # The profiles live in the root Cargo.toml, which rust-cache doesn't hash.
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/miri
+          key: miri-${{ env.MIRI_NIGHTLY }}
+      - run: cargo +$MIRI_NIGHTLY miri test
