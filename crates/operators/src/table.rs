@@ -4,6 +4,7 @@
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
+use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::slow_vec::SlowVec;
@@ -97,7 +98,7 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
-    fn new_state(&self, _: &mut Context) -> Result<ScanState, AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<ScanState, Error> {
         Ok(ScanState { row_group: 0 })
     }
 
@@ -107,7 +108,7 @@ impl Scannable for Table {
         _: &mut Context,
         at: &mut ScanState,
         batch: &mut RowBatch,
-    ) -> Result<bool, AllocError> {
+    ) -> Result<bool, Error> {
         loop {
             let Some(row_group) = self.row_groups.get(at.row_group) else { return Ok(false) };
             at.row_group += 1;

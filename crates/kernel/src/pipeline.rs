@@ -13,6 +13,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
+use crate::error::Error;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, Progress, Step};
@@ -32,7 +33,7 @@ impl<'a> Pipeline<'a> {
 
     /// Creates the state of a run, in one allocation from `allocator`, which
     /// steps' states also allocate from.
-    pub fn start<'r>(&'r self, allocator: &'r dyn Allocator) -> Result<Execution<'r>, AllocError> {
+    pub fn start<'r>(&'r self, allocator: &'r dyn Allocator) -> Result<Execution<'r>, Error> {
         let size_bytes = self.layout(|_, _| {})?.0.size();
         // SAFETY: `Execution::new` writes every byte it reads.
         let memory = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
@@ -115,9 +116,9 @@ struct Run<'p> {
     source_state: usize,
     /// How many states are made: the source's, then each step's, in order.
     made: usize,
-    /// Whether a step has failed. Its segment then reports that it ended,
-    /// so the loop pays for failures only where segments end.
-    failed: Cell<bool>,
+    /// Why a step failed, if one has. Its segment then reports that it
+    /// ended, so the loop pays for failures only where segments end.
+    failed: Cell<Option<Error>>,
     // Frees `memory`.
     _buffer: Buffer,
 }
@@ -128,7 +129,7 @@ impl<'p> Execution<'p> {
         pipeline: &'p Pipeline<'p>,
         allocator: &'p dyn Allocator,
         mut buffer: Buffer,
-    ) -> Result<Execution<'p>, AllocError> {
+    ) -> Result<Execution<'p>, Error> {
         let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
             crate::check::check_failed(line!());
         };
@@ -136,22 +137,22 @@ impl<'p> Execution<'p> {
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
             crate::check::check_failed(line!());
         };
-        let failed = Cell::new(false);
+        let failed = Cell::new(None);
         let mut run =
             Run { pipeline, memory, slots, source_state: 0, made: 0, failed, _buffer: buffer };
-        let mut failed = false;
+        let mut failed = None;
         // SAFETY: the memory was allocated with this layout, so it has room
         // for each state at its offset, and for the slots.
         let layout = pipeline.layout(|i, state| unsafe {
-            if failed {
+            if failed.is_some() {
                 return;
             }
             let made = match i {
                 None => pipeline.source.new_state(&mut context, memory.add(state)),
                 Some(i) => at!(pipeline.steps, i).new_state(&mut context, memory.add(state)),
             };
-            if made.is_err() {
-                failed = true;
+            if let Err(error) = made {
+                failed = Some(error);
                 return;
             }
             match i {
@@ -166,9 +167,9 @@ impl<'p> Execution<'p> {
             run.made += 1;
         });
         check!(layout.is_ok());
-        if failed {
+        if let Some(error) = failed {
             // Dropping it drops the states made.
-            return Err(AllocError);
+            return Err(error);
         }
 
         let steps = &pipeline.steps;
@@ -190,11 +191,11 @@ impl<'p> Execution<'p> {
     }
 
     /// Fills `output` with the next batch, or returns false when there are
-    /// none left. Fails if a step can't allocate what it needs; the run
-    /// can't go on after that, so later calls fail too.
-    pub fn next(&mut self, output: &mut RowBatch) -> Result<bool, AllocError> {
-        if self.run.failed.get() {
-            return Err(AllocError);
+    /// none left. Fails if a step does, such as if it can't allocate what it
+    /// needs; the run can't go on after that, so later calls fail too.
+    pub fn next(&mut self, output: &mut RowBatch) -> Result<bool, Error> {
+        if let Some(error) = self.run.failed.get() {
+            return Err(error);
         }
         self.run.next(&mut self.context, output)
     }
@@ -206,14 +207,14 @@ impl Run<'_> {
     /// Starting from the last segment, it moves to the one before when a
     /// segment's operator needs input, and to the one after when a segment
     /// makes a batch or ends.
-    fn next(&mut self, context: &mut Context, output: &mut RowBatch) -> Result<bool, AllocError> {
+    fn next(&mut self, context: &mut Context, output: &mut RowBatch) -> Result<bool, Error> {
         let last = self.pipeline.segment_count - 1;
         let mut k = self.ready(last);
         loop {
             match self.make(context, k, output) {
                 Made::Nothing => k = self.ready(k),
                 Made::Batch if k == last => return Ok(true),
-                Made::End if self.failed.get() => return Err(AllocError),
+                Made::End if let Some(error) = self.failed.get() => return Err(error),
                 Made::End if k == last => return Ok(false),
                 made => {
                     k += 1;
@@ -273,8 +274,8 @@ impl Run<'_> {
                 crate::check::check_failed(line!());
             };
             // SAFETY: the transform's state was made by `Execution::new`.
-            if unsafe { transform.process(context, self.state(Some(i)), batch) }.is_err() {
-                return self.fail();
+            if let Err(error) = unsafe { transform.process(context, self.state(Some(i)), batch) } {
+                return self.fail(error);
             }
             i += 1;
         }
@@ -287,14 +288,14 @@ impl Run<'_> {
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Ok(true) => Made::Batch,
             Ok(false) => Made::End,
-            Err(AllocError) => self.fail(),
+            Err(error) => self.fail(error),
         }
     }
 
     /// Records that a step failed, and ends its segment.
     #[cold]
-    fn fail(&self) -> Made {
-        self.failed.set(true);
+    fn fail(&self, error: Error) -> Made {
+        self.failed.set(Some(error));
         Made::End
     }
 
@@ -322,7 +323,10 @@ impl Run<'_> {
                 Status::Waiting => crate::check::check_failed(line!()),
             }
         };
-        let Ok(progress) = progress else { return self.fail() };
+        let progress = match progress {
+            Ok(progress) => progress,
+            Err(error) => return self.fail(error),
+        };
         if progress == Progress::NeedInput {
             segment.status =
                 if segment.status == Status::Ready { Status::Waiting } else { Status::Done };
@@ -397,16 +401,11 @@ mod tests {
     impl Source for Numbers {
         type State = i64;
 
-        fn new_state(&self, _: &mut Context) -> Result<i64, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
             Ok(0)
         }
 
-        fn next(
-            &self,
-            _: &mut Context,
-            i: &mut i64,
-            batch: &mut RowBatch,
-        ) -> Result<bool, AllocError> {
+        fn next(&self, _: &mut Context, i: &mut i64, batch: &mut RowBatch) -> Result<bool, Error> {
             if *i == self.batches {
                 return Ok(false);
             }
@@ -424,16 +423,11 @@ mod tests {
     impl Transform for Reverse {
         type State = ();
 
-        fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
             Ok(())
         }
 
-        fn process(
-            &self,
-            _: &mut Context,
-            (): &mut (),
-            batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
             batch.columns_mut().reverse();
             Ok(())
         }
@@ -448,7 +442,7 @@ mod tests {
     impl Transform for Position {
         type State = (i64, Rc<()>);
 
-        fn new_state(&self, _: &mut Context) -> Result<(i64, Rc<()>), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(i64, Rc<()>), Error> {
             Ok((0, self.live.clone()))
         }
 
@@ -457,7 +451,7 @@ mod tests {
             _: &mut Context,
             (position, _): &mut (i64, Rc<()>),
             batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        ) -> Result<(), Error> {
             let column = int64s(&alloc::vec![*position; batch.row_count() as usize]);
             assert!(batch.push_column(column).is_ok());
             *position += 1;
@@ -471,7 +465,7 @@ mod tests {
     impl Transform for SkipOdd {
         type State = bool;
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
             Ok(false)
         }
 
@@ -480,7 +474,7 @@ mod tests {
             _: &mut Context,
             odd: &mut bool,
             batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        ) -> Result<(), Error> {
             if *odd {
                 batch.reset(0);
             }
@@ -495,16 +489,11 @@ mod tests {
     impl Transform for KeepEven {
         type State = ();
 
-        fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
             Ok(())
         }
 
-        fn process(
-            &self,
-            _: &mut Context,
-            (): &mut (),
-            batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
             let column = batch.column(0).clone();
             batch.selection_mut().retain(|row| column.int64s()[row as usize] % 2 == 0);
             Ok(())
@@ -517,16 +506,11 @@ mod tests {
     impl Transform for KeepNone {
         type State = ();
 
-        fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
             Ok(())
         }
 
-        fn process(
-            &self,
-            _: &mut Context,
-            (): &mut (),
-            batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
             batch.selection_mut().retain(|_| false);
             Ok(())
         }
@@ -538,7 +522,7 @@ mod tests {
     impl Operator for Split {
         type State = u32;
 
-        fn new_state(&self, _: &mut Context) -> Result<u32, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<u32, Error> {
             Ok(0)
         }
 
@@ -548,7 +532,7 @@ mod tests {
             row: &mut u32,
             input: &RowBatch,
             output: &mut RowBatch,
-        ) -> Result<Progress, AllocError> {
+        ) -> Result<Progress, Error> {
             output.reset(1);
             for column in 0..input.column_count() {
                 assert!(output.push_column(input.column(column).slice(*row, 1)).is_ok());
@@ -569,7 +553,7 @@ mod tests {
     impl Operator for Sum {
         type State = i64;
 
-        fn new_state(&self, _: &mut Context) -> Result<i64, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
             Ok(0)
         }
 
@@ -579,7 +563,7 @@ mod tests {
             sum: &mut i64,
             input: &RowBatch,
             _: &mut RowBatch,
-        ) -> Result<Progress, AllocError> {
+        ) -> Result<Progress, Error> {
             *sum += input.column(0).int64s().iter().sum::<i64>();
             Ok(Progress::NeedInput)
         }
@@ -589,7 +573,7 @@ mod tests {
             _: &mut Context,
             sum: &mut i64,
             output: &mut RowBatch,
-        ) -> Result<Progress, AllocError> {
+        ) -> Result<Progress, Error> {
             output.reset(1);
             assert!(output.push_column(int64s(&[*sum])).is_ok());
             Ok(Progress::NeedInput)
@@ -605,11 +589,11 @@ mod tests {
     impl Transform for Boxed {
         type State = crate::boxed::Box<i64>;
 
-        fn new_state(&self, context: &mut Context) -> Result<Self::State, AllocError> {
+        fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
             if self.fail {
-                return Err(AllocError);
+                return Err(Error::OutOfMemory);
             }
-            crate::boxed::Box::new(context.allocator(), 7)
+            Ok(crate::boxed::Box::new(context.allocator(), 7)?)
         }
 
         fn process(
@@ -617,31 +601,26 @@ mod tests {
             _: &mut Context,
             number: &mut Self::State,
             batch: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        ) -> Result<(), Error> {
             let column = int64s(&alloc::vec![**number; batch.row_count() as usize]);
             assert!(batch.push_column(column).is_ok());
             Ok(())
         }
     }
 
-    /// Fails on its second batch, as a step that can't allocate would.
+    /// Fails on its second batch, as a step reading damaged data would.
     struct FailSecond;
 
     impl Transform for FailSecond {
         type State = bool;
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
             Ok(false)
         }
 
-        fn process(
-            &self,
-            _: &mut Context,
-            seen: &mut bool,
-            _: &mut RowBatch,
-        ) -> Result<(), AllocError> {
+        fn process(&self, _: &mut Context, seen: &mut bool, _: &mut RowBatch) -> Result<(), Error> {
             if *seen {
-                return Err(AllocError);
+                return Err(Error::Corrupt);
             }
             *seen = true;
             Ok(())
@@ -764,9 +743,9 @@ mod tests {
         let mut execution = failing.start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         assert_eq!(execution.next(&mut batch), Ok(true));
-        assert_eq!(execution.next(&mut batch), Err(AllocError));
+        assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
         // Rows aren't skipped: the run stays failed.
-        assert_eq!(execution.next(&mut batch), Err(AllocError));
+        assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
     }
 
     #[test]
@@ -775,6 +754,6 @@ mod tests {
         let mut execution = failing.start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         // A sum of the first batch alone would be wrong.
-        assert_eq!(execution.next(&mut batch), Err(AllocError));
+        assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
     }
 }

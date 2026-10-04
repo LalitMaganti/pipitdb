@@ -8,6 +8,7 @@
 use crate::allocator::{AllocError, Allocator};
 use crate::column::ColumnView;
 use crate::context::Context;
+use crate::error::Error;
 use crate::filter::{self, Comparison, Value};
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
@@ -210,8 +211,8 @@ pub struct Filter {
 impl Transform for Filter {
     type State = ();
 
-    fn new_state(&self, context: &mut Context) -> Result<(), AllocError> {
-        context.reserve_selections(self.predicate.depth() as usize)
+    fn new_state(&self, context: &mut Context) -> Result<(), Error> {
+        Ok(context.reserve_selections(self.predicate.depth() as usize)?)
     }
 
     fn process(
@@ -219,7 +220,7 @@ impl Transform for Filter {
         context: &mut Context,
         (): &mut (),
         batch: &mut RowBatch,
-    ) -> Result<(), AllocError> {
+    ) -> Result<(), Error> {
         self.predicate.select(context.selections(), batch);
         Ok(())
     }

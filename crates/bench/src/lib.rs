@@ -1,9 +1,10 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
-use pipit_kernel::allocator::{AllocError, Heap};
+use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
+use pipit_kernel::error::Error;
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
@@ -93,16 +94,11 @@ impl Repeat {
 impl Source for Repeat {
     type State = u32;
 
-    fn new_state(&self, _: &mut Context) -> Result<u32, AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<u32, Error> {
         Ok(0)
     }
 
-    fn next(
-        &self,
-        _: &mut Context,
-        made: &mut u32,
-        batch: &mut RowBatch,
-    ) -> Result<bool, AllocError> {
+    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> Result<bool, Error> {
         if *made == self.batches {
             return Ok(false);
         }
@@ -118,11 +114,11 @@ pub struct PassTransform;
 impl Transform for PassTransform {
     type State = ();
 
-    fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<(), Error> {
         Ok(())
     }
 
-    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<(), AllocError> {
+    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<(), Error> {
         Ok(())
     }
 }
@@ -133,7 +129,7 @@ pub struct PassOperator;
 impl Operator for PassOperator {
     type State = ();
 
-    fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<(), Error> {
         Ok(())
     }
 
@@ -143,7 +139,7 @@ impl Operator for PassOperator {
         (): &mut (),
         input: &RowBatch,
         output: &mut RowBatch,
-    ) -> Result<Progress, AllocError> {
+    ) -> Result<Progress, Error> {
         output.reset(input.row_count());
         for i in 0..input.column_count() {
             let _ = output.push_column(input.column(i).clone());
