@@ -17,5 +17,6 @@ pub mod pipeline;
 pub mod plan;
 pub mod row_batch;
 pub mod scannable;
+pub mod selection;
 pub mod step;
 pub mod vec;

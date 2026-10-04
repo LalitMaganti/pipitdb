@@ -127,6 +127,7 @@ impl Operator for PassOperator {
         for i in 0..input.column_count() {
             let _ = output.push_column(input.column(i).clone());
         }
+        output.selection_mut().clone_from(input.selection());
         Progress::NeedInput
     }
 }
@@ -137,7 +138,7 @@ pub fn run(pipeline: &Pipeline) -> u64 {
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while execution.next(&mut batch) {
-        rows += u64::from(batch.row_count());
+        rows += u64::from(batch.selection().len());
     }
     rows
 }
