@@ -3,6 +3,8 @@
 
 #![no_std]
 
+pub mod table;
+
 use pipit_kernel::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule =
