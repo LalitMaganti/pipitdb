@@ -9,7 +9,8 @@ use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 
 /// Every `Vec` has a most values it can hold, `max`. It grows towards it as
 /// needed, doubling, so one made with room for `max` never grows. `max` is a
-/// power of two, and so is the room for values, unless it is 0.
+/// power of two, and the room for values is rounded up to one, unless it is
+/// 0.
 ///
 /// Its values live in a `Buffer`, which also remembers the allocator, so a
 /// `Vec` isn't generic over it.
@@ -30,7 +31,8 @@ impl<T> Vec<T> {
         Vec::with_capacity(allocator, 0, max)
     }
 
-    /// An empty `Vec` with room for `capacity` values, that can grow to `max`.
+    /// An empty `Vec` with room for at least `capacity` values, that can grow
+    /// to `max`.
     pub fn with_capacity<A: Allocator + Clone + 'static>(
         allocator: A,
         capacity: usize,
@@ -38,7 +40,7 @@ impl<T> Vec<T> {
     ) -> Result<Vec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
-        check!(capacity == 0 || capacity.is_power_of_two());
+        let capacity = if capacity == 0 { 0 } else { capacity.next_power_of_two() };
         check!(capacity <= max);
         max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
         let size_bytes = capacity * size_of::<T>();
@@ -218,5 +220,11 @@ mod tests {
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
         let _ = Vec::<u64>::new(Heap, 100);
+    }
+
+    #[test]
+    fn rounds_its_room_up() {
+        let values = Vec::<u64>::with_capacity(Heap, 5, 8).unwrap();
+        assert_eq!(values.capacity(), 8);
     }
 }
