@@ -1,6 +1,7 @@
 //! Wall-clock benchmarks. Run with `cargo bench -p pipitdb-bench --bench wall_clock`.
 
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
@@ -49,5 +50,13 @@ fn pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, lexer, parser, query, pipeline);
+// Each iteration takes well under a millisecond, so short runs still give
+// thousands of samples.
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .warm_up_time(Duration::from_secs(1))
+        .measurement_time(Duration::from_secs(2));
+    targets = lexer, parser, query, pipeline
+}
 criterion_main!(benches);
