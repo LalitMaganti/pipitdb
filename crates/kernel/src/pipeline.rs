@@ -1,8 +1,10 @@
 //! `Pipeline`: a source and the steps its batches go through. `Execution`: one
 //! run of it.
 //!
-//! Transforms run in place on the batch from the source or operator before
-//! them. An operator's input is the batches out of the steps before it.
+//! The steps are cut into segments at each operator. The first segment is the
+//! source and the transforms after it; each other is an operator and the
+//! transforms after it. A segment's transforms run in place on the batches its
+//! head makes, and each segment's batches are the next operator's input.
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
@@ -16,11 +18,13 @@ use crate::step::{DynSource, Progress, Step};
 pub struct Pipeline<'a> {
     source: DynSource<'a>,
     steps: &'a [Step<'a>],
+    segment_count: usize,
 }
 
 impl<'a> Pipeline<'a> {
     pub fn new(source: DynSource<'a>, steps: &'a [Step<'a>]) -> Pipeline<'a> {
-        Pipeline { source, steps }
+        let operators = steps.iter().filter(|step| matches!(step, Step::Operator(_))).count();
+        Pipeline { source, steps, segment_count: operators + 1 }
     }
 
     /// Creates the state of a run, in one allocation from `allocator`.
@@ -28,19 +32,24 @@ impl<'a> Pipeline<'a> {
         &self,
         allocator: A,
     ) -> Result<Execution<'_>, AllocError> {
-        let size_bytes = self.layout(|_, _| {})?.size();
+        let size_bytes = self.layout(|_, _| {})?.0.size();
         // SAFETY: `Execution::new` writes every byte it reads.
         let memory = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
         Ok(Execution::new(self, memory))
     }
 
-    /// A `Slot` per step, then the source's state, then each step's. Calls
-    /// `state` with each state's step, or `None` for the source, and its
-    /// offset.
-    fn layout(&self, mut state: impl FnMut(Option<usize>, usize)) -> Result<Layout, AllocError> {
+    /// A `Segment` per segment, a `Slot` per step, then the source's state,
+    /// then each step's. Calls `state` with each state's step, or `None` for
+    /// the source, and its offset. Returns the slots' offset too.
+    fn layout(
+        &self,
+        mut state: impl FnMut(Option<usize>, usize),
+    ) -> Result<(Layout, usize), AllocError> {
+        let segments = Layout::array::<Segment>(self.segment_count).map_err(|_| AllocError)?;
         let slots = Layout::array::<Slot>(self.steps.len()).map_err(|_| AllocError)?;
+        let (layout, slots) = segments.extend(slots).map_err(|_| AllocError)?;
         let (mut layout, offset) =
-            slots.extend(self.source.state_layout).map_err(|_| AllocError)?;
+            layout.extend(self.source.state_layout).map_err(|_| AllocError)?;
         state(None, offset);
         for (i, step) in self.steps.iter().enumerate() {
             let offset;
@@ -48,33 +57,39 @@ impl<'a> Pipeline<'a> {
             state(Some(i), offset);
         }
         check!(layout.align() <= BUFFER_ALIGNMENT_BYTES);
-        Ok(layout)
+        Ok((layout, slots))
     }
 }
 
-/// What a run keeps for a step.
-struct Slot {
-    /// Where the step's state is in the run's memory.
-    state: usize,
-    /// For operators: their input, and where they are with it.
-    input: RowBatch,
-    status: Status,
-    /// For operators: where their segment ends, and the operator heading the
-    /// segment before, or `None` for the source.
+/// Where a run is with a segment. Kept together, apart from the slots, so
+/// moving between segments touches little memory.
+struct Segment {
+    /// The operator heading it; unused for the source's.
+    head: usize,
+    /// Where its transforms end: the next operator, or the number of steps.
     end: usize,
-    before: Option<usize>,
+    /// For an operator's segment: where the operator is with its input.
+    status: Status,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// Needs another input batch.
     Waiting,
-    /// `input` holds a batch to execute.
+    /// Its input holds a batch to execute.
     Ready,
     /// There's no more input; the operator is finishing.
     Ended,
     /// The operator has nothing left to output.
     Done,
+}
+
+/// What a run keeps for a step.
+struct Slot {
+    /// Where the step's state is in the run's memory.
+    state: usize,
+    /// For operators: their input.
+    input: RowBatch,
 }
 
 /// What a segment did when run.
@@ -83,19 +98,14 @@ enum Made {
     Batch,
     /// A batch with no rows, which is dropped.
     Nothing,
-    /// Its operator needs a batch from the segment before.
-    NeedsInput,
     End,
 }
 
 pub struct Execution<'p> {
     pipeline: &'p Pipeline<'p>,
     memory: NonNull<u8>,
+    slots: usize,
     source_state: usize,
-    /// Where the source's segment ends.
-    source_end: usize,
-    /// The operator heading the last segment, or `None` for the source.
-    last: Option<usize>,
     // Frees `memory`.
     _buffer: Buffer,
 }
@@ -106,8 +116,11 @@ impl<'p> Execution<'p> {
             crate::check::check_failed(line!());
         };
         let mut source_state = 0;
+        let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
+            crate::check::check_failed(line!());
+        };
         // SAFETY: the memory was allocated with this layout, so it has room
-        // for each state at its offset, and for the slots at the start.
+        // for each state at its offset, and for the slots.
         let layout = pipeline.layout(|i, state| unsafe {
             let Some(i) = i else {
                 source_state = state;
@@ -115,78 +128,95 @@ impl<'p> Execution<'p> {
                 return;
             };
             at!(pipeline.steps, i).new_state(memory.add(state));
-            let input = RowBatch::new();
-            let slot = Slot { state, input, status: Status::Waiting, end: 0, before: None };
-            memory.cast::<Slot>().add(i).write(slot);
+            let slot = Slot { state, input: RowBatch::new() };
+            memory.add(slots).cast::<Slot>().add(i).write(slot);
         });
         check!(layout.is_ok());
-        let mut execution = Execution {
-            pipeline,
-            memory,
-            source_state,
-            source_end: 0,
-            last: None,
-            _buffer: buffer,
-        };
-        for (i, step) in pipeline.steps.iter().enumerate() {
+        let execution = Execution { pipeline, memory, slots, source_state, _buffer: buffer };
+
+        let steps = pipeline.steps;
+        let mut k = 0;
+        let mut segment = Segment { head: 0, end: 0, status: Status::Ready };
+        for (i, step) in steps.iter().enumerate() {
             if let Step::Operator(_) = step {
-                execution.set_end(execution.last, i);
-                // SAFETY: the slots were written above.
-                unsafe { (*execution.slot(i)).before = execution.last };
-                execution.last = Some(i);
+                segment.end = i;
+                // SAFETY: there is a segment per operator, and one more.
+                unsafe { execution.segment(k).write(segment) };
+                k += 1;
+                segment = Segment { head: i, end: 0, status: Status::Waiting };
             }
         }
-        execution.set_end(execution.last, pipeline.steps.len());
+        segment.end = steps.len();
+        // SAFETY: as above.
+        unsafe { execution.segment(k).write(segment) };
         execution
-    }
-
-    fn set_end(&mut self, head: Option<usize>, end: usize) {
-        match head {
-            None => self.source_end = end,
-            // SAFETY: the slots were written by `Execution::new`.
-            Some(op) => unsafe { (*self.slot(op)).end = end },
-        }
     }
 
     /// Fills `output` with the next batch, or returns false when there are
     /// none left.
     ///
-    /// Each segment is a head, the source or an operator, and the transforms
-    /// after it. Starting from the last, it moves to the segment before when
-    /// a segment's operator needs input, and to the one after when a segment
+    /// Starting from the last segment, it moves to the one before when a
+    /// segment's operator needs input, and to the one after when a segment
     /// makes a batch or ends.
     pub fn next(&mut self, output: &mut RowBatch) -> bool {
-        let last = self.pipeline.steps.len();
-        let mut head = self.last;
+        let last = self.pipeline.segment_count - 1;
+        let mut k = self.ready(last);
         loop {
-            let end = match head {
-                None => self.source_end,
-                // SAFETY: the slots were written by `Execution::new`.
-                Some(op) => unsafe { (*self.slot(op)).end },
-            };
-            match self.make(head, end, output) {
-                // SAFETY: as above.
-                Made::NeedsInput => head = head.and_then(|op| unsafe { (*self.slot(op)).before }),
-                Made::Nothing => {}
-                Made::Batch if end == last => return true,
-                Made::End if end == last => return false,
-                Made::Batch | Made::End => head = Some(end),
+            match self.make(k, output) {
+                Made::Nothing => k = self.ready(k),
+                Made::Batch if k == last => return true,
+                Made::End if k == last => return false,
+                made => {
+                    k += 1;
+                    let status = if made == Made::Batch { Status::Ready } else { Status::Ended };
+                    // SAFETY: `k` is at most `last`.
+                    unsafe { (*self.segment(k)).status = status };
+                }
             }
         }
     }
 
-    /// Runs the segment from `head` to `end` once. Its batch goes to the
-    /// operator at `end`, or to `output` if `end` is past the last step.
-    fn make(&self, head: Option<usize>, end: usize, output: &mut RowBatch) -> Made {
-        let next = (end < self.pipeline.steps.len()).then(|| self.slot(end));
-        // SAFETY: a different slot from `head`'s.
-        let batch = next.map_or(output, |next| unsafe { &mut (*next).input });
-        let made = match head {
-            None => self.read_source(batch),
-            Some(op) => self.execute(op, batch),
+    /// The nearest segment from `k` back whose head can run: the first whose
+    /// operator isn't waiting for input, or the source's.
+    #[inline]
+    fn ready(&self, k: usize) -> usize {
+        if k > 0 && self.waiting(k) { self.ready_before(k) } else { k }
+    }
+
+    /// As `ready`, for segment `k`, which is waiting.
+    #[inline(never)]
+    fn ready_before(&self, mut k: usize) -> usize {
+        k -= 1;
+        while k > 0 && self.waiting(k) {
+            k -= 1;
+        }
+        k
+    }
+
+    fn waiting(&self, k: usize) -> bool {
+        // SAFETY: the segments were written by `Execution::new`.
+        unsafe { (*self.segment(k)).status == Status::Waiting }
+    }
+
+    /// Runs segment `k` once. Its batch goes to the next operator's input, or
+    /// to `output` if it is the last segment.
+    fn make(&self, k: usize, output: &mut RowBatch) -> Made {
+        // SAFETY: the segments were written by `Execution::new`.
+        let segment = unsafe { &mut *self.segment(k) };
+        let end = segment.end;
+        let batch = if end == self.pipeline.steps.len() {
+            output
+        } else {
+            // SAFETY: the next operator's slot, which nothing else borrows.
+            unsafe { &mut (*self.slot(end)).input }
+        };
+        let (made, first) = if k == 0 {
+            (self.read_source(batch), 0)
+        } else {
+            (self.execute(segment, batch), segment.head + 1)
         };
         if made == Made::Batch {
-            for i in head.map_or(0, |op| op + 1)..end {
+            for i in first..end {
                 let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
                     crate::check::check_failed(line!());
                 };
@@ -194,17 +224,7 @@ impl<'p> Execution<'p> {
                 unsafe { transform.process(batch, self.state(Some(i))) };
             }
         }
-        let status = match made {
-            Made::Batch if batch.row_count() == 0 => return Made::Nothing,
-            Made::Batch => Status::Ready,
-            Made::End => Status::Ended,
-            Made::NeedsInput | Made::Nothing => return made,
-        };
-        if let Some(next) = next {
-            // SAFETY: as above.
-            unsafe { (*next).status = status };
-        }
-        made
+        if made == Made::Batch && batch.row_count() == 0 { Made::Nothing } else { made }
     }
 
     fn read_source(&self, batch: &mut RowBatch) -> Made {
@@ -217,39 +237,47 @@ impl<'p> Execution<'p> {
         }
     }
 
-    /// Runs operator `op` once.
-    fn execute(&self, op: usize, output: &mut RowBatch) -> Made {
+    /// Runs the operator heading `segment` once.
+    fn execute(&self, segment: &mut Segment, output: &mut RowBatch) -> Made {
+        let op = segment.head;
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
             crate::check::check_failed(line!());
         };
-        // SAFETY: `make` doesn't touch `op`'s slot otherwise.
-        let slot = unsafe { &mut *self.slot(op) };
+        // SAFETY: the operator's slot, which nothing else borrows.
+        let input = unsafe { &(*self.slot(op)).input };
         let state = self.state(Some(op));
         // SAFETY: the operator's state was made by `Execution::new`.
         let progress = unsafe {
-            match slot.status {
-                Status::Waiting => return Made::NeedsInput,
+            match segment.status {
                 Status::Done => return Made::End,
                 Status::Ready => {
                     output.reset(0);
-                    operator.execute(&slot.input, output, state)
+                    operator.execute(input, output, state)
                 }
                 Status::Ended => {
                     output.reset(0);
                     operator.finish(output, state)
                 }
+                Status::Waiting => crate::check::check_failed(line!()),
             }
         };
         if progress == Progress::NeedInput {
-            slot.status = if slot.status == Status::Ready { Status::Waiting } else { Status::Done };
+            segment.status =
+                if segment.status == Status::Ready { Status::Waiting } else { Status::Done };
         }
         Made::Batch
     }
 
+    fn segment(&self, k: usize) -> *mut Segment {
+        check!(k < self.pipeline.segment_count);
+        // SAFETY: the segments start the run's memory.
+        unsafe { self.memory.cast::<Segment>().as_ptr().add(k) }
+    }
+
     fn slot(&self, i: usize) -> *mut Slot {
         check!(i < self.pipeline.steps.len());
-        // SAFETY: the slots start the run's memory.
-        unsafe { self.memory.cast::<Slot>().as_ptr().add(i) }
+        // SAFETY: the slots are at `self.slots`.
+        unsafe { self.memory.add(self.slots).cast::<Slot>().as_ptr().add(i) }
     }
 
     /// The state of step `i`, or of the source.
