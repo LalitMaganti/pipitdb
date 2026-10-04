@@ -24,6 +24,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
       - run: cargo test
+      # Small blocks, so the tests also cover growing and running out of them.
+      - run: cargo test -p pipitdb-kernel
+        env:
+          PIPIT_AST_BLOCK_BYTES: 4096
+          PIPIT_AST_BLOCK_SLOTS: 4
       - run: cargo build --release --target wasm32-unknown-unknown
 
   size:

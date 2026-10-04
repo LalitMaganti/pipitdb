@@ -197,6 +197,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
+    fn reports_running_out_of_blocks() {
+        let nodes_max = crate::ast::BLOCK_NODES * crate::ast::BLOCK_SLOTS;
+        if nodes_max > 1 << 16 {
+            // Too slow at the default settings. CI runs it with small blocks.
+            return;
+        }
+        let long = vec!["a"; nodes_max / 2 + 1].join("+");
+        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
+    }
+
+    #[test]
     fn reports_errors() {
         assert_eq!(error("a +"), (ErrorCode::ExpectedExpression, 3));
         assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
