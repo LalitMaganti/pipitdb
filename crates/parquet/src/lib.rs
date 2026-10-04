@@ -9,6 +9,7 @@ extern crate pipit_kernel;
 pub mod chunk;
 pub mod footer;
 mod hybrid;
+pub mod table;
 mod thrift;
 
 pub use pipit_kernel::error::Error;

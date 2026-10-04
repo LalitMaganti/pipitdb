@@ -11,15 +11,15 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
-use pipit_parquet::chunk::ChunkReader;
-use pipit_parquet::footer::ParquetFile;
+use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 use pipit_kernel::error::Error;
-use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::scannable::Scannable;
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::spill::{Block, LogId, SpillStore, read_column, write_column};
 
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
 }
 
 /// How many rows the first column of the Parquet file in `len` bytes from
-/// `data` has, read a page at a time, or 0 if it can't be read.
+/// `data` has, scanned as a table, or 0 if it can't be read.
 ///
 /// # Safety
 ///
@@ -157,21 +157,13 @@ pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
 pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     // SAFETY: guaranteed by the caller.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
-    let Ok(file) = ParquetFile::open(&Heap, &bytes) else { return 0 };
-    let Some(&column) = file.columns().first() else { return 0 };
+    let Ok(table) = ParquetTable::open(&Heap, &[&bytes]) else { return 0 };
     let mut context = Context::new(&Heap);
+    let Ok(mut state) = table.new_state(&mut context) else { return 0 };
+    let mut batch = RowBatch::new();
     let mut rows = 0;
-    for group in 0..file.row_groups() {
-        let Ok(mut reader) = ChunkReader::new(&bytes, column, file.chunk(group, 0)) else {
-            return 0;
-        };
-        while let Ok(left) = reader.page_left(&mut context) {
-            let batch = left.min(BATCH_ROWS_MAX as usize);
-            if batch == 0 || reader.read(&mut context, batch).is_err() {
-                break;
-            }
-            rows += batch;
-        }
+    while let Ok(true) = table.next(&[0], &mut context, &mut state, &mut batch) {
+        rows += batch.row_count() as usize;
     }
     rows
 }
