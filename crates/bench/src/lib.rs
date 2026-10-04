@@ -97,13 +97,18 @@ impl Source for Repeat {
         Ok(0)
     }
 
-    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> bool {
+    fn next(
+        &self,
+        _: &mut Context,
+        made: &mut u32,
+        batch: &mut RowBatch,
+    ) -> Result<bool, AllocError> {
         if *made == self.batches {
-            return false;
+            return Ok(false);
         }
         *made += 1;
         batch.reset(BATCH_ROWS_MAX);
-        batch.push_column(self.column.clone()).is_ok()
+        Ok(batch.push_column(self.column.clone()).is_ok())
     }
 }
 
@@ -117,7 +122,9 @@ impl Transform for PassTransform {
         Ok(())
     }
 
-    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) {}
+    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<(), AllocError> {
+        Ok(())
+    }
 }
 
 /// Outputs its input, to measure what an operator costs the pipeline.
@@ -136,22 +143,23 @@ impl Operator for PassOperator {
         (): &mut (),
         input: &RowBatch,
         output: &mut RowBatch,
-    ) -> Progress {
+    ) -> Result<Progress, AllocError> {
         output.reset(input.row_count());
         for i in 0..input.column_count() {
             let _ = output.push_column(input.column(i).clone());
         }
         output.selection_mut().clone_from(input.selection());
-        Progress::NeedInput
+        Ok(Progress::NeedInput)
     }
 }
 
-/// Runs `pipeline` once, returning the rows out.
+/// Runs `pipeline` once, returning the rows out, or as many as it made
+/// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
     let Ok(mut execution) = pipeline.start(Heap) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
-    while execution.next(&mut batch) {
+    while execution.next(&mut batch) == Ok(true) {
         rows += u64::from(batch.selection().len());
     }
     rows

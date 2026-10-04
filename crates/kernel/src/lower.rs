@@ -185,9 +185,9 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> bool {
+        ) -> Result<bool, AllocError> {
             if *done {
-                return false;
+                return Ok(false);
             }
             batch.reset(2);
             for &column in columns {
@@ -197,7 +197,7 @@ mod tests {
                 assert!(batch.push_column(ColumnView::new(DataType::Int64, values, None)).is_ok());
             }
             *done = true;
-            true
+            Ok(true)
         }
     }
 
@@ -221,11 +221,11 @@ mod tests {
 
         let mut execution = physical.pipeline().start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
+        assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
             physical.columns().iter().map(|c| batch.column(c.position).int64s()).collect();
         assert_eq!(rows, [[10, 20], [1, 2]]);
-        assert!(!execution.next(&mut batch));
+        assert!(!execution.next(&mut batch).unwrap());
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -249,7 +249,7 @@ mod tests {
         let physical = lower(Heap, &plan).unwrap();
         let mut execution = physical.pipeline().start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
+        assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
     }
 
@@ -290,9 +290,9 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> bool {
+        ) -> Result<bool, AllocError> {
             if *done {
-                return false;
+                return Ok(false);
             }
             batch.reset(4);
             for &column in columns {
@@ -308,7 +308,7 @@ mod tests {
                 assert!(batch.push_column(column).is_ok());
             }
             *done = true;
-            true
+            Ok(true)
         }
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let physical = lower(Heap, &plan).unwrap();
         let mut execution = physical.pipeline().start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
+        assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);
         let Kept::Select(rows) = batch.selection().kept() else { panic!("not narrowed") };
         let kept: StdVec<(bool, i64)> = rows
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(kept, [(false, 20), (true, 0)]);
         // `a` is read by the filter, so it isn't pruned.
         assert_eq!(batch.column_count(), 2);
-        assert!(!execution.next(&mut batch));
+        assert!(!execution.next(&mut batch).unwrap());
     }
 
     /// As many columns as it holds, with no rows.
@@ -377,8 +377,14 @@ mod tests {
             Ok(())
         }
 
-        fn next(&self, _: &[u32], _: &mut Context, (): &mut (), _: &mut RowBatch) -> bool {
-            false
+        fn next(
+            &self,
+            _: &[u32],
+            _: &mut Context,
+            (): &mut (),
+            _: &mut RowBatch,
+        ) -> Result<bool, AllocError> {
+            Ok(false)
         }
     }
 

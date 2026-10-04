@@ -149,7 +149,7 @@ mod tests {
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
-        while execution.next(&mut batch) {
+        while execution.next(&mut batch).unwrap() {
             let rows: StdVec<usize> = match batch.selection().kept() {
                 Kept::All => (0..batch.row_count() as usize).collect(),
                 Kept::None => StdVec::new(),
@@ -228,7 +228,7 @@ mod tests {
         let physical = lower(Heap, &plan).unwrap();
         let mut execution = physical.pipeline().start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
+        assert!(execution.next(&mut batch).unwrap());
         assert_eq!(batch.column_count(), 1);
         assert_eq!(batch.column(physical.columns()[0].position).int64s(), [10, 20]);
     }

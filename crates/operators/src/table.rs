@@ -107,9 +107,9 @@ impl Scannable for Table {
         _: &mut Context,
         at: &mut ScanState,
         batch: &mut RowBatch,
-    ) -> bool {
+    ) -> Result<bool, AllocError> {
         loop {
-            let Some(row_group) = self.row_groups.get(at.row_group) else { return false };
+            let Some(row_group) = self.row_groups.get(at.row_group) else { return Ok(false) };
             at.row_group += 1;
             // A batch with no rows would be dropped anyway.
             if row_group.row_count == 0 {
@@ -119,7 +119,7 @@ impl Scannable for Table {
             for &i in columns {
                 check!(batch.push_column(at!(row_group.columns, i as usize).clone()).is_ok());
             }
-            return true;
+            return Ok(true);
         }
     }
 }
@@ -149,7 +149,7 @@ mod tests {
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while table.next(columns, &mut context, &mut state, &mut batch) {
+        while table.next(columns, &mut context, &mut state, &mut batch).unwrap() {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }

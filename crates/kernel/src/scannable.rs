@@ -41,7 +41,7 @@ pub trait Scannable {
         context: &mut Context,
         state: &mut Self::State,
         batch: &mut RowBatch,
-    ) -> bool;
+    ) -> Result<bool, AllocError>;
 }
 
 /// The tables a frontend can read, provided by the embedder.
@@ -50,8 +50,13 @@ pub trait Catalog {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
 
-type ScannableNext =
-    unsafe fn(NonNull<()>, &[u32], &mut Context, NonNull<u8>, &mut RowBatch) -> bool;
+type ScannableNext = unsafe fn(
+    NonNull<()>,
+    &[u32],
+    &mut Context,
+    NonNull<u8>,
+    &mut RowBatch,
+) -> Result<bool, AllocError>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
 /// allocator, and functions that know its type.
@@ -163,7 +168,7 @@ unsafe fn scan_next(
     context: &mut Context,
     state: NonNull<u8>,
     batch: &mut RowBatch,
-) -> bool {
+) -> Result<bool, AllocError> {
     // SAFETY: as in `scan_new_state`.
     let scan = unsafe { step.cast::<Scan>().as_ref() };
     // SAFETY: as in `scan_new_state`.
@@ -211,9 +216,9 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> bool {
+        ) -> Result<bool, AllocError> {
             if *done {
-                return false;
+                return Ok(false);
             }
             batch.reset(2);
             for &column in columns {
@@ -223,7 +228,7 @@ mod tests {
                 assert!(batch.push_column(ColumnView::new(DataType::Int64, values, None)).is_ok());
             }
             *done = true;
-            true
+            Ok(true)
         }
     }
 
@@ -243,9 +248,9 @@ mod tests {
             Pipeline::new(scannable.scan(Heap, columns).unwrap(), Vec::new(Heap, 1).unwrap());
         let mut execution = pipeline.start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
+        assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();
         assert_eq!(rows, [[2, 12], [0, 10]]);
-        assert!(!execution.next(&mut batch));
+        assert!(!execution.next(&mut batch).unwrap());
     }
 }
