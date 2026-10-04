@@ -68,13 +68,32 @@ fn describe(found: &str, error: &Error) -> Message {
         ),
         ErrorCode::UnknownTable => (format!("no table {found}"), "not in the catalog".into()),
         ErrorCode::UnknownColumn => (format!("no column {found}"), "not a column here".into()),
+        ErrorCode::NumberTooLarge => {
+            (format!("{found} is too large"), "doesn't fit in 64 bits".into())
+        }
+        ErrorCode::ConditionTooLarge => (
+            "the condition is too large".into(),
+            format!(
+                "conditions are limited to {} parts",
+                pipit_kernel::predicate::PREDICATE_NODES_MAX
+            ),
+        ),
         ErrorCode::Unsupported => match error.detail {
             what if what == Unsupported::SelectExpression as u16 => {
                 ("only column names can be selected yet".into(), "not a column's name".into())
             }
-            what if what == Unsupported::Where as u16 => {
-                ("`WHERE` isn't supported yet".into(), "can't filter on this yet".into())
-            }
+            what if what == Unsupported::Where as u16 => (
+                "only comparisons of a column with a number can filter yet".into(),
+                "can't filter on this yet".into(),
+            ),
+            what if what == Unsupported::NumberType as u16 => (
+                format!("{found} can't be compared with this column yet"),
+                "a float can't hold this integer exactly".into(),
+            ),
+            what if what == Unsupported::Decimal as u16 => (
+                "numbers with a decimal point can't be compared yet".into(),
+                "not an integer".into(),
+            ),
             _ => ("not supported yet".into(), "this can't be run yet".into()),
         },
     };

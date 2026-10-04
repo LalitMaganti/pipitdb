@@ -13,7 +13,9 @@ use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
+use crate::predicate::{Filter, Predicate};
 use crate::scannable::DynScannable;
+use crate::step::{DynTransform, Step};
 use crate::vec::Vec;
 
 /// The most columns a plan can have.
@@ -195,6 +197,35 @@ impl<'c> Op<'c> for ScanOp<'c> {
             first = false;
             keep
         });
+        Pruned::Keep
+    }
+}
+
+/// Keeps the rows of its one child that `predicate` is true for, as `WHERE`
+/// does. The predicate reads columns by `ColumnId`, and each comparison's
+/// value has its column's type.
+pub struct FilterOp {
+    pub predicate: Predicate,
+}
+
+impl<'c> Op<'c> for FilterOp {
+    fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
+        check!(node.children.len() == 1);
+        lowering.lower(*at!(node.children, 0))?;
+        let allocator = lowering.allocator();
+        let predicate = self.predicate.renumbered(allocator.clone(), |id| lowering.position(id))?;
+        lowering.add_step(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
+    }
+
+    /// Makes no columns, and reads its predicate's.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        for column in self.predicate.columns() {
+            needed.need(column);
+        }
         Pruned::Keep
     }
 }

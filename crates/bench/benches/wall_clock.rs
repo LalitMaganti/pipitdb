@@ -68,6 +68,13 @@ fn slices(c: &mut Criterion) {
         ("all", "FROM slice"),
         ("two", "FROM slice |> SELECT ts, dur"),
         ("four", "FROM slice |> SELECT ts, dur, name, depth"),
+        // 3% of rows, 43%, and 3% through an `OR`.
+        ("where", "FROM slice |> WHERE dur > 1000000 |> SELECT ts, dur"),
+        ("where_half", "FROM slice |> WHERE depth = 0 |> SELECT ts, dur"),
+        (
+            "where_or",
+            "FROM slice |> WHERE depth = 0 AND (dur > 1000000 OR dur < 1000) |> SELECT ts, dur",
+        ),
     ];
     for (name, query) in queries {
         let Some(plan) = pipitdb_bench::real::slice_query(slices, query) else { continue };

@@ -8,7 +8,7 @@ use pipit_kernel::scannable::Catalog;
 use pipit_kernel::vec::Vec;
 
 use crate::ast::{Ast, Node};
-use crate::error::{Error, Span};
+use crate::error::{Error, ErrorCode, Span};
 use crate::parser::parse_query;
 use crate::registry::Registry;
 
@@ -45,6 +45,13 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// What to make plan nodes with.
     pub fn allocator(&self) -> DynAllocator {
         self.allocator.clone()
+    }
+
+    /// The column in scope that `name`, a `Name` node, names.
+    pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
+        let text = self.text(name.span());
+        let found = self.scope.iter().find(|column| self.plan.names.get(column.name) == text);
+        found.copied().ok_or_else(|| Error::new(ErrorCode::UnknownColumn, name.span()))
     }
 
     /// Where `node` starts, for errors about it: its leftmost leaf.
@@ -88,6 +95,7 @@ pub fn compile<'c, A: Allocator + Clone + 'static>(
 mod tests {
     extern crate std;
 
+    use std::format;
     use std::vec::Vec as StdVec;
 
     use pipit_kernel::allocator::Heap;
@@ -96,6 +104,7 @@ mod tests {
     use pipit_kernel::lower::lower;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
+    use pipit_kernel::selection::Kept;
     use pipit_operators::table::Table;
 
     use super::*;
@@ -104,7 +113,7 @@ mod tests {
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
 
-    /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20.
+    /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5.
     struct OneTable(DynScannable<'static>);
 
     impl Catalog for OneTable {
@@ -114,29 +123,53 @@ mod tests {
     }
 
     fn catalog() -> OneTable {
-        let column = |values: [i64; 2]| {
+        let column = |data_type, values: [i64; 2]| {
             let mut buffer = Buffer::allocate(Heap, 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-            ColumnView::new(DataType::Int64, buffer, None)
+            ColumnView::new(data_type, buffer, None)
         };
-        let columns = [column([1, 2]), column([10, 20])];
-        let schema = [("a", DataType::Int64), ("b", DataType::Int64)];
+        let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
+        let columns = [
+            column(DataType::Int64, [1, 2]),
+            column(DataType::Int64, [10, 20]),
+            column(DataType::Float64, floats),
+        ];
+        let schema = [("a", DataType::Int64), ("b", DataType::Int64), ("f", DataType::Float64)];
         let table = Table::new(Heap, &schema, &[&columns]).unwrap();
         OneTable(DynScannable::new(Heap, table).unwrap())
     }
 
-    /// Runs `query`, returning each result column's name and values.
-    fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<i64>)> {
+    /// Runs `query`, returning each result column's name and the values of
+    /// the rows kept, as floats.
+    fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
         let plan = compile(Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
         let physical = lower(Heap, &plan).unwrap();
         let mut execution = physical.pipeline().start(Heap).unwrap();
         let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch));
-        let columns = physical.columns().iter();
+        let mut columns: StdVec<_> =
+            physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
+        while execution.next(&mut batch) {
+            let rows: StdVec<usize> = match batch.selection().kept() {
+                Kept::All => (0..batch.row_count() as usize).collect(),
+                Kept::None => StdVec::new(),
+                Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
+            };
+            for (&c, (_, values)) in physical.columns().iter().zip(&mut columns) {
+                let column = batch.column(c.position);
+                values.extend(rows.iter().map(|&row| match column.data_type() {
+                    #[expect(clippy::cast_precision_loss, reason = "small test values")]
+                    DataType::Int64 => column.int64s()[row] as f64,
+                    DataType::Float64 => column.float64s()[row],
+                }));
+            }
+        }
         columns
-            .map(|&c| (physical.name(c).into(), batch.column(c.position).int64s().into()))
-            .collect()
+    }
+
+    /// `query`'s values of its one result column.
+    fn kept(query: &str) -> StdVec<f64> {
+        run(query).remove(0).1
     }
 
     fn error(query: &str) -> (ErrorCode, u32) {
@@ -147,11 +180,23 @@ mod tests {
 
     #[test]
     fn runs_from_and_select() {
-        let a = (b"a".to_vec(), [1, 2].to_vec());
-        let b = (b"b".to_vec(), [10, 20].to_vec());
-        assert_eq!(run("FROM t"), [a.clone(), b.clone()]);
+        let a = (b"a".to_vec(), [1.0, 2.0].to_vec());
+        let b = (b"b".to_vec(), [10.0, 20.0].to_vec());
+        let f = (b"f".to_vec(), [0.5, 2.5].to_vec());
+        assert_eq!(run("FROM t"), [a.clone(), b.clone(), f]);
         assert_eq!(run("FROM t |> SELECT b, a"), [b.clone(), a.clone()]);
         assert_eq!(run("FROM t |> SELECT b |> SELECT b"), [b]);
+    }
+
+    #[test]
+    fn filters_with_where() {
+        assert_eq!(kept("FROM t |> WHERE a > 1 |> SELECT b"), [20.0]);
+        assert_eq!(kept("FROM t |> WHERE 15 < b AND NOT a = 1 |> SELECT b"), [20.0]);
+        assert_eq!(kept("FROM t |> WHERE (a = 1 OR b >= 20) |> SELECT a"), [1.0, 2.0]);
+        assert_eq!(kept("FROM t |> WHERE a > -9223372036854775808 |> SELECT a"), [1.0, 2.0]);
+        assert_eq!(kept("FROM t |> WHERE a > 5 |> SELECT a"), []);
+        // An integer compared with a float column, which holds it exactly.
+        assert_eq!(kept("FROM t |> WHERE f > 1 AND f < 3 |> SELECT f"), [2.5]);
     }
 
     #[test]
@@ -160,7 +205,19 @@ mod tests {
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));
-        assert_eq!(error("FROM t |> WHERE a > 1"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
+        assert_eq!(error("FROM t |> WHERE a > b"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE a + 1 > 2"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> WHERE a"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> WHERE f > 1.5"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 20));
+        assert_eq!(
+            error("FROM t |> WHERE a > 9223372036854775808"),
+            (ErrorCode::NumberTooLarge, 20)
+        );
+        let wide = (0..40).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
+        let wide = format!("FROM t |> WHERE {wide}");
+        assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
     }
 
     #[test]

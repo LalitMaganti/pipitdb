@@ -38,6 +38,10 @@ pub enum ErrorCode {
     UnknownColumn = 15,
     /// Parsed, but not compiled yet. `detail` is the `Unsupported` it is.
     Unsupported = 16,
+    /// An integer doesn't fit in 64 bits.
+    NumberTooLarge = 17,
+    /// A condition has more than `PREDICATE_NODES_MAX` parts.
+    ConditionTooLarge = 18,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -46,7 +50,13 @@ pub enum ErrorCode {
 pub enum Unsupported {
     /// Anything but a column's name in `SELECT`.
     SelectExpression = 1,
+    /// A condition that isn't comparisons of a column with a number,
+    /// combined with `AND`, `OR` and `NOT`.
     Where = 2,
+    /// An integer compared with a float column that can't hold it exactly.
+    NumberType = 3,
+    /// A number with a decimal point, which conditions can't compare yet.
+    Decimal = 4,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,7 +86,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::Unsupported;
+    pub const LAST: ErrorCode = ErrorCode::ConditionTooLarge;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

@@ -6,5 +6,4 @@
 #[macro_use]
 extern crate pipit_kernel;
 
-pub mod filter;
 pub mod table;
