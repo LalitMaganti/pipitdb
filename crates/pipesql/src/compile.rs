@@ -28,14 +28,12 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.ast.node(index)
     }
 
-    /// The text of a name, such as a table's or a column's. Names are ASCII
-    /// for now: any other is empty, so matches nothing.
+    /// The text of a name, such as a table's or a column's. Names are ASCII:
+    /// the lexer allows no other bytes in them.
     pub fn text(&self, span: Span) -> &'q str {
         let start = span.start as usize;
         let bytes = at!(self.source, start..start + span.len as usize);
-        if !bytes.is_ascii() {
-            return "";
-        }
+        check!(bytes.is_ascii());
         // SAFETY: ASCII is UTF-8.
         unsafe { core::str::from_utf8_unchecked(bytes) }
     }

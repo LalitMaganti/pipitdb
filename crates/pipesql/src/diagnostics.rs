@@ -5,7 +5,7 @@ use alloc::string::String;
 
 use pipitdb_diagnostics::{Compact, Message, found};
 
-use crate::error::{Error, ErrorCode, Span};
+use crate::error::{Error, ErrorCode, Span, Unsupported};
 use crate::lexer::TokenKind;
 
 /// `error` in its compact form, `pipit:E0007:2+0:5`.
@@ -68,7 +68,15 @@ fn describe(error: &Error, found: &str) -> Message {
         ),
         ErrorCode::UnknownTable => (format!("no table {found}"), "not in the catalog".into()),
         ErrorCode::UnknownColumn => (format!("no column {found}"), "not a column here".into()),
-        ErrorCode::Unsupported => ("not supported yet".into(), "this can't be run yet".into()),
+        ErrorCode::Unsupported => match error.detail {
+            what if what == Unsupported::SelectExpression as u16 => {
+                ("only column names can be selected yet".into(), "not a column's name".into())
+            }
+            what if what == Unsupported::Where as u16 => {
+                ("`WHERE` isn't supported yet".into(), "can't filter on this yet".into())
+            }
+            _ => ("not supported yet".into(), "this can't be run yet".into()),
+        },
     };
     Message { title, label }
 }
