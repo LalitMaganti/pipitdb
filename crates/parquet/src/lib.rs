@@ -6,7 +6,9 @@
 #[macro_use]
 extern crate pipit_kernel;
 
+pub mod chunk;
 pub mod footer;
+mod hybrid;
 mod thrift;
 
 use pipit_kernel::allocator::AllocError;

@@ -2,6 +2,7 @@
 //! they share can grow without changing every step's functions.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::buffer::Buffer;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -24,6 +25,14 @@ impl<'a> Context<'a> {
     /// What the run's memory comes from, for states to allocate with.
     pub fn allocator(&self) -> &'a dyn Allocator {
         self.allocator
+    }
+
+    /// Memory for filling a batch's column. Steps get all their columns'
+    /// memory here, so how it's found, such as from a pool, can change in one
+    /// place. What it holds is unspecified: whoever fills it writes every byte
+    /// that's read.
+    pub fn column_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        Buffer::allocate(self.allocator, size_bytes)
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
