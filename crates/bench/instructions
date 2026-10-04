@@ -1,3 +1,4 @@
 lexer.long_text 103516
 lexer.typical 286202
-parser.expression 458288
+parser.expression 457068
+query.typical 992029
