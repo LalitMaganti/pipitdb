@@ -102,6 +102,8 @@ enum Made {
     /// A batch with no rows, which is dropped.
     Nothing,
     End,
+    /// A step couldn't allocate, which ends the run.
+    Failed,
 }
 
 pub struct Execution<'p> {
@@ -192,7 +194,9 @@ impl<'p> Execution<'p> {
             return Err(AllocError);
         }
         let next = self.run.next(&mut self.context, output);
-        self.failed = next.is_err();
+        if next.is_err() {
+            self.failed = true;
+        }
         next
     }
 }
@@ -207,7 +211,8 @@ impl Run<'_> {
         let last = self.pipeline.segment_count - 1;
         let mut k = self.ready(last);
         loop {
-            match self.make(context, k, output)? {
+            match self.make(context, k, output) {
+                Made::Failed => return Err(AllocError),
                 Made::Nothing => k = self.ready(k),
                 Made::Batch if k == last => return Ok(true),
                 Made::End if k == last => return Ok(false),
@@ -245,12 +250,7 @@ impl Run<'_> {
 
     /// Runs segment `k` once. Its batch goes to the next operator's input, or
     /// to `output` if it is the last segment.
-    fn make(
-        &self,
-        context: &mut Context,
-        k: usize,
-        output: &mut RowBatch,
-    ) -> Result<Made, AllocError> {
+    fn make(&self, context: &mut Context, k: usize, output: &mut RowBatch) -> Made {
         // SAFETY: the segments were written by `Execution::new`.
         let segment = unsafe { &mut *self.segment(k) };
         let end = segment.end;
@@ -261,36 +261,39 @@ impl Run<'_> {
             unsafe { &mut (*self.slot(end)).input }
         };
         let (made, first) = if k == 0 {
-            (self.read_source(context, batch)?, 0)
+            (self.read_source(context, batch), 0)
         } else {
-            (self.execute(context, segment, batch)?, segment.head + 1)
+            (self.execute(context, segment, batch), segment.head + 1)
         };
-        if made == Made::Batch {
-            for i in first..end {
-                let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
-                    crate::check::check_failed(line!());
-                };
-                // SAFETY: the transform's state was made by `Execution::new`.
-                unsafe { transform.process(context, self.state(Some(i)), batch)? };
-            }
+        if made != Made::Batch {
+            return made;
         }
-        Ok(if made == Made::Batch && batch.selection().is_empty() { Made::Nothing } else { made })
+        let mut i = first;
+        while i < end {
+            let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
+                crate::check::check_failed(line!());
+            };
+            // SAFETY: the transform's state was made by `Execution::new`.
+            if unsafe { transform.process(context, self.state(Some(i)), batch) }.is_err() {
+                return Made::Failed;
+            }
+            i += 1;
+        }
+        if batch.selection().is_empty() { Made::Nothing } else { Made::Batch }
     }
 
-    fn read_source(&self, context: &mut Context, batch: &mut RowBatch) -> Result<Made, AllocError> {
+    fn read_source(&self, context: &mut Context, batch: &mut RowBatch) -> Made {
         batch.reset(0);
         // SAFETY: the source's state was made by `Execution::new`.
-        let more = unsafe { self.pipeline.source.next(context, self.state(None), batch)? };
-        Ok(if more { Made::Batch } else { Made::End })
+        match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
+            Ok(true) => Made::Batch,
+            Ok(false) => Made::End,
+            Err(AllocError) => Made::Failed,
+        }
     }
 
     /// Runs the operator heading `segment` once.
-    fn execute(
-        &self,
-        context: &mut Context,
-        segment: &mut Segment,
-        output: &mut RowBatch,
-    ) -> Result<Made, AllocError> {
+    fn execute(&self, context: &mut Context, segment: &mut Segment, output: &mut RowBatch) -> Made {
         let op = segment.head;
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
             crate::check::check_failed(line!());
@@ -301,7 +304,7 @@ impl Run<'_> {
         // SAFETY: the operator's state was made by `Execution::new`.
         let progress = unsafe {
             match segment.status {
-                Status::Done => return Ok(Made::End),
+                Status::Done => return Made::End,
                 Status::Ready => {
                     output.reset(0);
                     operator.execute(context, state, input, output)
@@ -312,12 +315,13 @@ impl Run<'_> {
                 }
                 Status::Waiting => crate::check::check_failed(line!()),
             }
-        }?;
+        };
+        let Ok(progress) = progress else { return Made::Failed };
         if progress == Progress::NeedInput {
             segment.status =
                 if segment.status == Status::Ready { Status::Waiting } else { Status::Done };
         }
-        Ok(Made::Batch)
+        Made::Batch
     }
 
     fn segment(&self, k: usize) -> *mut Segment {
