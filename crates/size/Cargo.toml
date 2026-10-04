@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
+pipitdb-std = { path = "../std" }
 
 [lints]
 workspace = true

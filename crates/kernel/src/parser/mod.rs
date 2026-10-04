@@ -1,19 +1,40 @@
 //! Parses query text into an `Ast`.
 //!
 //! `Parser` is the cursor over tokens that every part of the grammar uses, and
-//! writes the tree. Expressions are parsed in `expression.rs`.
+//! writes the tree. Expressions are parsed in `expression.rs`, and queries in
+//! `query.rs`.
 
 mod expression;
+mod query;
 
 use crate::allocator::Allocator;
 use crate::ast::{Ast, BLOCK_BYTES, Node, Nodes, Operator, Tag};
 use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
+use crate::registry::Registry;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
 pub const NESTING_MAX: usize = 64;
+
+/// How many stages a query, or items a list, can have.
+pub const LIST_MAX: usize = 64;
+
+/// Parses `source` as a query, with the stages in `registry`.
+pub fn parse_query<A: Allocator + Clone + 'static>(
+    allocator: A,
+    registry: &Registry,
+    source: &[u8],
+) -> Result<Ast, Error> {
+    let mut parser = Parser::new(allocator, source)?;
+    let root = parser.query(registry)?;
+    let current = parser.current();
+    if current.kind != TokenKind::End {
+        return Err(Error::new(ErrorCode::UnexpectedToken, current.span));
+    }
+    parser.finish(root)
+}
 
 /// Parses `source` as a single expression.
 pub fn parse_expression<A: Allocator + Clone + 'static>(

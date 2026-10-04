@@ -23,6 +23,12 @@ pub enum ErrorCode {
     ExpectedToken = 7,
     NestingTooDeep = 8,
     OutOfMemory = 9,
+    UnknownStage = 10,
+    /// A query must start with a source, like `FROM`.
+    ExpectedSource = 11,
+    /// A source, like `FROM`, can only start a query.
+    UnexpectedSource = 12,
+    ListTooLong = 13,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,7 +44,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::OutOfMemory;
+    pub const LAST: ErrorCode = ErrorCode::ListTooLong;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

@@ -2,7 +2,10 @@
 
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::lexer::{Lexer, TokenKind};
-use pipit_kernel::parser::parse_expression;
+use pipit_kernel::parser::{parse_expression, parse_query};
+use pipit_kernel::registry::Registry;
+
+static REGISTRY: Registry = Registry::new(&[pipit_std::RELATIONAL]);
 
 /// Queries shaped like real ones, repeated `count` times.
 pub fn typical_queries(count: usize) -> String {
@@ -26,6 +29,23 @@ pub fn expression(terms: usize) -> String {
 
 pub fn count_nodes(source: &[u8]) -> u32 {
     parse_expression(Heap, source).map_or(0, |ast| ast.node_count())
+}
+
+/// Three-stage queries, one per line.
+pub fn queries(count: usize) -> String {
+    "FROM slice |> WHERE dur > 1000 AND name != 'binder transaction' \
+     |> SELECT ts, dur / 1000, name, count(*)\n"
+        .repeat(count)
+}
+
+/// Parses each line as a query, as an embedder would.
+pub fn count_query_nodes(source: &str) -> u32 {
+    source
+        .lines()
+        .map(|query| {
+            parse_query(Heap, &REGISTRY, query.as_bytes()).map_or(0, |ast| ast.node_count())
+        })
+        .sum()
 }
 
 pub fn count_tokens(source: &[u8]) -> u32 {

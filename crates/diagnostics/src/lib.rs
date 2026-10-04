@@ -82,6 +82,18 @@ fn describe(error: &Error, found: &str) -> (String, String) {
             format!("nesting is limited to {} levels", pipit_kernel::parser::NESTING_MAX),
         ),
         ErrorCode::OutOfMemory => ("out of memory".into(), "while parsing this query".into()),
+        ErrorCode::UnknownStage => (format!("unknown stage {found}"), "not a stage".into()),
+        ErrorCode::ExpectedSource => (
+            format!("a query must start with a source, found {found}"),
+            "expected a source, such as `FROM`".into(),
+        ),
+        ErrorCode::UnexpectedSource => {
+            (format!("{found} can only start a query"), "a source can't follow `|>`".into())
+        }
+        ErrorCode::ListTooLong => (
+            "the list is too long".into(),
+            format!("lists are limited to {} items", pipit_kernel::parser::LIST_MAX),
+        ),
     }
 }
 
