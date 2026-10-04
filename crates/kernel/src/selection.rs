@@ -1,5 +1,7 @@
 //! `Selection`: which rows of a batch are kept.
 
+use core::mem::MaybeUninit;
+
 use crate::row_batch::BATCH_ROWS_MAX;
 
 /// The rows a batch keeps: all of them, none, or a selection of them by
@@ -8,9 +10,10 @@ pub struct Selection {
     /// How many rows are kept: all of them, if `all`.
     len: u32,
     all: bool,
-    // Unless `all`, the first `len` are the kept rows, in increasing order.
-    // Kept whatever the state, so narrowing never sets it up again.
-    indices: [u16; BATCH_ROWS_MAX as usize],
+    // Unless `all`, the first `len` are the kept rows, in increasing order;
+    // only those are written. Kept whatever the state, so narrowing never
+    // sets it up again.
+    indices: [MaybeUninit<u16>; BATCH_ROWS_MAX as usize],
 }
 
 /// What a `Selection` keeps.
@@ -26,14 +29,22 @@ impl Selection {
     /// All of `rows` rows.
     pub fn all(rows: u32) -> Selection {
         check!(rows <= BATCH_ROWS_MAX);
-        Selection { len: rows, all: true, indices: [0; BATCH_ROWS_MAX as usize] }
+        Selection {
+            len: rows,
+            all: true,
+            indices: [MaybeUninit::uninit(); BATCH_ROWS_MAX as usize],
+        }
     }
 
     pub fn kept(&self) -> Kept<'_> {
         match (self.len, self.all) {
             (0, _) => Kept::None,
             (_, true) => Kept::All,
-            (len, false) => Kept::Select(at!(self.indices, ..len as usize)),
+            (len, false) => {
+                let indices = at!(self.indices, ..len as usize);
+                // SAFETY: unless `all`, the first `len` indices were written.
+                Kept::Select(unsafe { &*(core::ptr::from_ref(indices) as *const [u16]) })
+            }
         }
     }
 
@@ -52,8 +63,13 @@ impl Selection {
     pub fn retain(&mut self, mut keep: impl FnMut(u16) -> bool) {
         let mut kept = 0;
         for i in 0..self.len as usize {
-            let row = if self.all { i as u16 } else { *at!(self.indices, i) };
-            *at_mut!(self.indices, kept) = row;
+            let row = if self.all {
+                i as u16
+            } else {
+                // SAFETY: unless `all`, the first `len` indices were written.
+                unsafe { at!(self.indices, i).assume_init() }
+            };
+            at_mut!(self.indices, kept).write(row);
             kept += usize::from(keep(row));
         }
         // Every row still kept stays `all`, which needs no indices.
