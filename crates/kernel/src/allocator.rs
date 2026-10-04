@@ -117,10 +117,32 @@ mod tests {
         assert_eq!((budget.used(), budget.peak()), (0, two));
     }
 
+    /// Hands out one static block, so what's allocated from it can be
+    /// leaked without leaking heap memory.
+    struct Static;
+
+    #[repr(align(64))]
+    struct Block {
+        _bytes: [u8; 128],
+    }
+
+    static mut BLOCK: Block = Block { _bytes: [0; 128] };
+
+    // SAFETY: the block is valid for the life of the program; each test
+    // allocates from it once.
+    unsafe impl Allocator for Static {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+            check!(layout.size() <= 128 && layout.align() <= 64);
+            NonNull::new((&raw mut BLOCK).cast::<u8>()).ok_or(AllocError)
+        }
+
+        unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
+    }
+
     #[test]
     #[should_panic(expected = "used")]
     fn budgets_check_nothing_outlives_them() {
-        let budget = Budget::new(&Heap, 1000);
+        let budget = Budget::new(&Static, 1000);
         // Leaked, so it's never freed through the dropped budget.
         core::mem::forget(Box::new(&budget, 7_u64).unwrap());
     }
