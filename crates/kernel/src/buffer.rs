@@ -38,6 +38,8 @@ struct Owner {
     references: Cell<u32>,
     free: unsafe fn(NonNull<Owner>),
     allocate_like: unsafe fn(NonNull<Owner>, usize) -> Result<Buffer, AllocError>,
+    allocate_raw: unsafe fn(NonNull<Owner>, Layout) -> Result<NonNull<u8>, AllocError>,
+    deallocate_raw: unsafe fn(NonNull<Owner>, NonNull<u8>, Layout),
 }
 
 /// Sits in front of the bytes, in the same allocation.
@@ -92,6 +94,14 @@ impl Buffer {
             allocate_like: |owner, size_bytes| unsafe {
                 let allocator = owner.cast::<Header<A>>().as_ref().allocator.clone();
                 Buffer::allocate_uninit(allocator, size_bytes)
+            },
+            // SAFETY: as above.
+            allocate_raw: |owner, layout| unsafe {
+                owner.cast::<Header<A>>().as_ref().allocator.allocate(layout)
+            },
+            // SAFETY: as above; the caller passes what `allocate_raw` gave.
+            deallocate_raw: |owner, ptr, layout| unsafe {
+                owner.cast::<Header<A>>().as_ref().allocator.deallocate(ptr, layout);
             },
         };
 
@@ -160,6 +170,24 @@ impl Buffer {
     fn len<T: Primitive>(&self) -> usize {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         self.size_bytes / size_of::<T>()
+    }
+
+    /// Allocates `layout` from the allocator `self` came from.
+    pub(crate) fn allocate_raw_like(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        // SAFETY: the function matches the owner's type.
+        unsafe { (self.owner().allocate_raw)(self.owner, layout) }
+    }
+
+    /// Frees what `allocate_raw_like` gave, through the same allocator.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` and `layout` must come from `allocate_raw_like` on a buffer from
+    /// the same allocator.
+    pub(crate) unsafe fn deallocate_raw_like(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the function matches the owner's type; the caller upholds
+        // the rest.
+        unsafe { (self.owner().deallocate_raw)(self.owner, ptr, layout) }
     }
 
     fn owner(&self) -> &Owner {
