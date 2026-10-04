@@ -26,16 +26,18 @@ unsafe impl Primitive for f64 {}
 
 /// Cloning shares the bytes; the last drop frees them, through the allocator
 /// they came from, which must outlive them.
+///
+/// It's one pointer, to the bytes: what else it needs is in a header right
+/// in front of them, so columns, which hold a few, stay small.
 pub struct Buffer {
     data: NonNull<u8>,
-    size_bytes: usize,
-    header: NonNull<Header>,
 }
 
 /// Sits in front of the bytes, in the same allocation.
 #[repr(C, align(64))]
 struct Header {
     references: Cell<u32>,
+    size_bytes: usize,
     allocator: NonNull<dyn Allocator>,
 }
 
@@ -48,7 +50,7 @@ impl Buffer {
         // SAFETY: the bytes are zeroed before anything can read them.
         let buffer = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
         // SAFETY: the buffer holds `size_bytes` bytes.
-        unsafe { buffer.data.write_bytes(0, buffer.size_bytes) };
+        unsafe { buffer.data.write_bytes(0, size_bytes) };
         Ok(buffer)
     }
 
@@ -74,10 +76,10 @@ impl Buffer {
         };
         // SAFETY: the allocation fits a header followed by `size_bytes` bytes.
         let data = unsafe {
-            header.write(Header { references: Cell::new(1), allocator });
+            header.write(Header { references: Cell::new(1), size_bytes, allocator });
             header.cast::<u8>().add(HEADER_BYTES)
         };
-        Ok(Buffer { data, size_bytes, header })
+        Ok(Buffer { data })
     }
 
     /// Allocates `size_bytes` bytes, without zeroing them, from the allocator
@@ -98,11 +100,11 @@ impl Buffer {
     }
 
     pub fn size_bytes(&self) -> usize {
-        self.size_bytes
+        self.header().size_bytes
     }
 
     pub fn as_slice<T: Primitive>(&self) -> &[T] {
-        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.size_bytes().is_multiple_of(size_of::<T>()));
         // SAFETY: the bytes are aligned for any `Primitive`, any bit pattern
         // is a valid `T`, and the bytes live as long as any reference to them.
         unsafe { core::slice::from_raw_parts(self.data.as_ptr().cast(), self.len::<T>()) }
@@ -110,7 +112,7 @@ impl Buffer {
 
     /// Buffers are written before they are shared.
     pub fn as_mut_slice<T: Primitive>(&mut self) -> &mut [T] {
-        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.size_bytes().is_multiple_of(size_of::<T>()));
         check!(self.header().references.get() == 1);
         // SAFETY: as in `as_slice`, and this is the only reference.
         unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), self.len::<T>()) }
@@ -119,7 +121,7 @@ impl Buffer {
     /// The first byte, for buffers whose bytes are tracked as written by the
     /// caller, which `as_slice` can't read.
     pub fn as_ptr<T: Primitive>(&self) -> *const T {
-        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.size_bytes().is_multiple_of(size_of::<T>()));
         self.data.as_ptr().cast()
     }
 
@@ -132,19 +134,20 @@ impl Buffer {
 
     /// As `as_ptr`, for writing.
     pub fn as_mut_ptr<T: Primitive>(&mut self) -> *mut T {
-        check!(self.size_bytes.is_multiple_of(size_of::<T>()));
+        check!(self.size_bytes().is_multiple_of(size_of::<T>()));
         check!(self.header().references.get() == 1);
         self.data.as_ptr().cast()
     }
 
     fn len<T: Primitive>(&self) -> usize {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        self.size_bytes / size_of::<T>()
+        self.size_bytes() / size_of::<T>()
     }
 
     fn header(&self) -> &Header {
-        // SAFETY: the header lives as long as any reference to it.
-        unsafe { self.header.as_ref() }
+        // SAFETY: the header is right in front of the bytes, and lives as
+        // long as any reference to it.
+        unsafe { self.data.sub(HEADER_BYTES).cast::<Header>().as_ref() }
     }
 }
 
@@ -159,7 +162,7 @@ impl Clone for Buffer {
         let references = &self.header().references;
         check!(references.get() < u32::MAX);
         references.set(references.get() + 1);
-        Buffer { data: self.data, size_bytes: self.size_bytes, header: self.header }
+        Buffer { data: self.data }
     }
 }
 
@@ -169,10 +172,10 @@ impl Drop for Buffer {
         let references = header.references.get() - 1;
         header.references.set(references);
         if references == 0 {
-            let Ok(layout) = layout(self.size_bytes) else { crate::check::check_failed(line!()) };
+            let Ok(layout) = layout(header.size_bytes) else { crate::check::check_failed(line!()) };
             // SAFETY: that was the last reference, and the header and bytes
             // were allocated together with this layout, from this allocator.
-            unsafe { self.allocator().deallocate(self.header.cast(), layout) };
+            unsafe { self.allocator().deallocate(self.data.sub(HEADER_BYTES), layout) };
         }
     }
 }
@@ -211,6 +214,13 @@ mod tests {
         }
 
         unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
+    }
+
+    #[test]
+    fn is_one_pointer() {
+        // Columns hold a few, and are moved for every batch.
+        assert_eq!(size_of::<Buffer>(), size_of::<usize>());
+        assert_eq!(size_of::<Option<Buffer>>(), size_of::<usize>());
     }
 
     #[test]
