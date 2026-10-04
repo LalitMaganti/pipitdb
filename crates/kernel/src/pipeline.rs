@@ -7,6 +7,7 @@
 //! head makes, and each segment's batches are the next operator's input.
 
 use core::alloc::Layout;
+use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator, DynAllocator};
@@ -102,15 +103,11 @@ enum Made {
     /// A batch with no rows, which is dropped.
     Nothing,
     End,
-    /// A step couldn't allocate, which ends the run.
-    Failed,
 }
 
 pub struct Execution<'p> {
     run: Run<'p>,
     context: Context,
-    /// Whether a step has failed, which ends the run.
-    failed: bool,
 }
 
 /// A run's memory, and where it is in it.
@@ -121,6 +118,9 @@ struct Run<'p> {
     source_state: usize,
     /// How many states are made: the source's, then each step's, in order.
     made: usize,
+    /// Whether a step has failed. Its segment then reports that it ended,
+    /// so the loop pays for failures only where segments end.
+    failed: Cell<bool>,
     // Frees `memory`.
     _buffer: Buffer,
 }
@@ -135,7 +135,9 @@ impl<'p> Execution<'p> {
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
             crate::check::check_failed(line!());
         };
-        let mut run = Run { pipeline, memory, slots, source_state: 0, made: 0, _buffer: buffer };
+        let failed = Cell::new(false);
+        let mut run =
+            Run { pipeline, memory, slots, source_state: 0, made: 0, failed, _buffer: buffer };
         let mut failed = false;
         // SAFETY: the memory was allocated with this layout, so it has room
         // for each state at its offset, and for the slots.
@@ -183,21 +185,17 @@ impl<'p> Execution<'p> {
         segment.end = steps.len();
         // SAFETY: as above.
         unsafe { run.segment(k).write(segment) };
-        Ok(Execution { run, context, failed: false })
+        Ok(Execution { run, context })
     }
 
     /// Fills `output` with the next batch, or returns false when there are
     /// none left. Fails if a step can't allocate what it needs; the run
     /// can't go on after that, so later calls fail too.
     pub fn next(&mut self, output: &mut RowBatch) -> Result<bool, AllocError> {
-        if self.failed {
+        if self.run.failed.get() {
             return Err(AllocError);
         }
-        let next = self.run.next(&mut self.context, output);
-        if next.is_err() {
-            self.failed = true;
-        }
-        next
+        self.run.next(&mut self.context, output)
     }
 }
 
@@ -212,9 +210,9 @@ impl Run<'_> {
         let mut k = self.ready(last);
         loop {
             match self.make(context, k, output) {
-                Made::Failed => return Err(AllocError),
                 Made::Nothing => k = self.ready(k),
                 Made::Batch if k == last => return Ok(true),
+                Made::End if self.failed.get() => return Err(AllocError),
                 Made::End if k == last => return Ok(false),
                 made => {
                     k += 1;
@@ -275,7 +273,7 @@ impl Run<'_> {
             };
             // SAFETY: the transform's state was made by `Execution::new`.
             if unsafe { transform.process(context, self.state(Some(i)), batch) }.is_err() {
-                return Made::Failed;
+                return self.fail();
             }
             i += 1;
         }
@@ -288,8 +286,15 @@ impl Run<'_> {
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Ok(true) => Made::Batch,
             Ok(false) => Made::End,
-            Err(AllocError) => Made::Failed,
+            Err(AllocError) => self.fail(),
         }
+    }
+
+    /// Records that a step failed, and ends its segment.
+    #[cold]
+    fn fail(&self) -> Made {
+        self.failed.set(true);
+        Made::End
     }
 
     /// Runs the operator heading `segment` once.
@@ -316,7 +321,7 @@ impl Run<'_> {
                 Status::Waiting => crate::check::check_failed(line!()),
             }
         };
-        let Ok(progress) = progress else { return Made::Failed };
+        let Ok(progress) = progress else { return self.fail() };
         if progress == Progress::NeedInput {
             segment.status =
                 if segment.status == Status::Ready { Status::Waiting } else { Status::Done };
@@ -760,6 +765,15 @@ mod tests {
         assert_eq!(execution.next(&mut batch), Ok(true));
         assert_eq!(execution.next(&mut batch), Err(AllocError));
         // Rows aren't skipped: the run stays failed.
+        assert_eq!(execution.next(&mut batch), Err(AllocError));
+    }
+
+    #[test]
+    fn operators_dont_finish_after_a_failure_before_them() {
+        let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond), operator(Sum)]);
+        let mut execution = failing.start(Heap).unwrap();
+        let mut batch = RowBatch::new();
+        // A sum of the first batch alone would be wrong.
         assert_eq!(execution.next(&mut batch), Err(AllocError));
     }
 }
