@@ -10,7 +10,7 @@
 - Avoid work: design for laziness first. Skip what statistics and dictionaries rule out, and don't read, decode or copy values until something needs them.
 - One hard memory budget per query: every allocation counts against it. Over budget, operators spill; with nothing left to spill, the query fails with an error. Parallelism is sized from the budget, never the other way round.
 - Design for spilling to remote storage from the start: state that grows with the data is partitioned and appended in blocks to a spill log, which can be local disk or object storage (staged locally, uploaded in large parts, sealed before it's read).
-- Make clear where brute-force work is (loops over every row, with no shared state): that's where threads will go, as a bonus on a single thread that's already competitive.
+- Threads are the executor's job, a bonus on a single thread that's already competitive: it runs copies of the work between pipeline breakers, so operators aren't written for threads. Breakers, such as sorts and aggregations, build small local results in each copy and then merge them.
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
 - Prefer a few smoke tests over testing every combination.
