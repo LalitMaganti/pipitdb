@@ -11,7 +11,17 @@ rust-version.workspace = true
 name = "pipit_pipesql"
 
 [dependencies]
+pipitdb-diagnostics = { path = "../diagnostics", optional = true }
 pipitdb-kernel = { path = "../kernel" }
+
+[features]
+# Error messages, and `pipit-explain` to print them.
+diagnostics = ["dep:pipitdb-diagnostics"]
+
+[[bin]]
+name = "pipit-explain"
+path = "src/bin/explain.rs"
+required-features = ["diagnostics"]
 
 [lints]
 workspace = true

@@ -355,10 +355,6 @@ dependencies = [
 [[package]]
 name = "pipitdb-diagnostics"
 version = "0.0.0"
-dependencies = [
- "pipitdb-kernel",
- "pipitdb-pipesql",
-]
 
 [[package]]
 name = "pipitdb-kernel"
@@ -368,6 +364,7 @@ version = "0.0.0"
 name = "pipitdb-pipesql"
 version = "0.0.0"
 dependencies = [
+ "pipitdb-diagnostics",
  "pipitdb-kernel",
 ]
 
