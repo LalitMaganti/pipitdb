@@ -1,6 +1,6 @@
 [package]
-name = "pipitdb-kernel"
-description = "The pipitdb microkernel: data model, pipeline driver and module registry."
+name = "pipitdb-std"
+description = "pipitdb's standard stages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "pipit_kernel"
+name = "pipit_std"
+
 [dependencies]
-pipitdb-keywords = { path = "../keywords" }
+pipitdb-kernel = { path = "../kernel" }
 
 [lints]
 workspace = true

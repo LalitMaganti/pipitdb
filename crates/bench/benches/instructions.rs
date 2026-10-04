@@ -20,5 +20,11 @@ fn parser(source: String) -> u32 {
 }
 
 library_benchmark_group!(name = lexer_group, benchmarks = [lexer]);
-library_benchmark_group!(name = parser_group, benchmarks = [parser]);
+#[library_benchmark]
+#[bench::typical(pipitdb_bench::queries(100))]
+fn query(source: String) -> u32 {
+    black_box(pipitdb_bench::count_query_nodes(black_box(&source)))
+}
+
+library_benchmark_group!(name = parser_group, benchmarks = [parser, query]);
 main!(library_benchmark_groups = lexer_group, parser_group);

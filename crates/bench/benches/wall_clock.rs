@@ -22,5 +22,15 @@ fn parser(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, lexer, parser);
+fn query(c: &mut Criterion) {
+    let source = pipitdb_bench::queries(1000);
+    let mut group = c.benchmark_group("query");
+    group.throughput(Throughput::Bytes(source.len() as u64));
+    group.bench_function("typical", |b| {
+        b.iter(|| pipitdb_bench::count_query_nodes(black_box(&source)));
+    });
+    group.finish();
+}
+
+criterion_group!(benches, lexer, parser, query);
 criterion_main!(benches);

@@ -349,6 +349,7 @@ dependencies = [
  "criterion",
  "gungraun",
  "pipitdb-kernel",
+ "pipitdb-std",
 ]
 
 [[package]]
@@ -361,6 +362,9 @@ dependencies = [
 [[package]]
 name = "pipitdb-kernel"
 version = "0.0.0"
+dependencies = [
+ "pipitdb-keywords",
+]
 
 [[package]]
 name = "pipitdb-keywords"
@@ -368,6 +372,14 @@ version = "0.0.0"
 
 [[package]]
 name = "pipitdb-size"
+version = "0.0.0"
+dependencies = [
+ "pipitdb-kernel",
+ "pipitdb-std",
+]
+
+[[package]]
+name = "pipitdb-std"
 version = "0.0.0"
 dependencies = [
  "pipitdb-kernel",

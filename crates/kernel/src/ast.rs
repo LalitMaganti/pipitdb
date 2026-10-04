@@ -6,8 +6,10 @@
 
 use crate::buffer::{Buffer, Primitive};
 use crate::error::{ErrorCode, Span};
+use crate::settings::build_setting;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Leaves come first, so `tag < Unary` tells them apart.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(u8)]
 pub enum Tag {
     /// A column or function name. A leaf.
@@ -24,6 +26,13 @@ pub enum Tag {
     /// A function call: `child_count` children from `first_child`, the name and
     /// then the arguments.
     Call,
+    /// `child_count` items from `first_child`, as in `SELECT a, b`.
+    List,
+    /// A stage of a query: one child per item of its rule, from
+    /// `first_child`. Its rule is `rule()`, an id in the parser's registry.
+    Stage,
+    /// A query: `child_count` stages from `first_child`.
+    Query,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,22 +93,6 @@ const _: () = assert!(
 const BLOCK_SHIFT: u32 = BLOCK_NODES.trailing_zeros();
 const BLOCK_MASK: usize = BLOCK_NODES - 1;
 
-/// `value`, a decimal number set at build time, or `default` if it isn't set.
-/// Fails the build if it isn't a number.
-const fn build_setting(value: Option<&str>, default: usize) -> usize {
-    let Some(value) = value else { return default };
-    let digits = value.as_bytes();
-    assert!(!digits.is_empty(), "build settings must be decimal numbers");
-    let mut number: usize = 0;
-    let mut i = 0;
-    while i < digits.len() {
-        assert!(digits[i].is_ascii_digit(), "build settings must be decimal numbers");
-        number = number * 10 + (digits[i] - b'0') as usize;
-        i += 1;
-    }
-    number
-}
-
 /// The longest token a leaf can hold, and the most children a `Call` can
 /// have, as both are stored in 24 bits.
 pub const DATA_MAX: u32 = (1 << 24) - 1;
@@ -109,6 +102,16 @@ impl Node {
         check!(span.len <= DATA_MAX);
         let [a, b, c, _] = span.len.to_le_bytes();
         Node { tag: tag as u8, data: [a, b, c], payload: span.start }
+    }
+
+    /// A placeholder, for array slots not yet filled.
+    pub(crate) const fn empty() -> Node {
+        Node { tag: 0, data: [0; 3], payload: 0 }
+    }
+
+    pub(crate) fn stage(rule: u16, first_child: u32) -> Node {
+        let [a, b] = rule.to_le_bytes();
+        Node { tag: Tag::Stage as u8, data: [a, b, 0], payload: first_child }
     }
 
     pub(crate) fn list(tag: Tag, child_count: u32, first_child: u32) -> Node {
@@ -122,7 +125,7 @@ impl Node {
     }
 
     pub fn tag(self) -> Tag {
-        check!(self.tag <= Tag::Call as u8);
+        check!(self.tag <= Tag::Query as u8);
         // SAFETY: `Tag` is a `u8` and the value is in range, checked above.
         unsafe { core::mem::transmute::<u8, Tag>(self.tag) }
     }
@@ -135,7 +138,7 @@ impl Node {
     }
 
     pub fn is_leaf(self) -> bool {
-        !matches!(self.tag(), Tag::Unary | Tag::Binary | Tag::Call)
+        self.tag() < Tag::Unary
     }
 
     pub fn first_child(self) -> u32 {
@@ -143,9 +146,18 @@ impl Node {
         self.payload
     }
 
+    /// For `Call`, `List` and `Query`. A `Stage` has one child per item of
+    /// its rule.
     pub fn child_count(self) -> u32 {
-        check!(self.tag() == Tag::Call);
+        check!(matches!(self.tag(), Tag::Call | Tag::List | Tag::Query));
         self.data_u24()
+    }
+
+    /// For `Stage`: its rule's id in the registry it was parsed with.
+    pub fn rule(self) -> u16 {
+        check!(self.tag() == Tag::Stage);
+        let [a, b, _] = self.data;
+        u16::from_le_bytes([a, b])
     }
 
     pub fn span(self) -> Span {
