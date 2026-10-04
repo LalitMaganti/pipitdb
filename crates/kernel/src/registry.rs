@@ -4,8 +4,7 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
-use pipitdb_keywords::KeywordTable;
-
+use crate::keywords::KeywordTable;
 use crate::settings::build_setting;
 
 /// How many keywords a registry has room for. Set at build time with

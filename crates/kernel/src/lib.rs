@@ -10,6 +10,7 @@ pub mod ast;
 pub mod buffer;
 pub mod column;
 pub mod error;
+pub mod keywords;
 pub mod lexer;
 pub mod parser;
 pub mod pipeline;

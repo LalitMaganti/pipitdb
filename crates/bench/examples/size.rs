@@ -1,4 +1,5 @@
-//! Uses the kernel so CI can measure its size.
+//! Uses the kernel so CI can measure its size. Built as a library, as
+//! `crates/bench/check_size.sh` does.
 
 #![no_std]
 
