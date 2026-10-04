@@ -1,5 +1,5 @@
-//! The steps of a pipeline: `Source` and `Transform`, and `DynSource` and
-//! `DynTransform`, the forms a pipeline stores.
+//! The steps of a pipeline: `Source`, `Transform` and `Operator`, and
+//! `DynSource`, `DynTransform` and `DynOperator`, the forms a pipeline stores.
 //!
 //! A step is a plan node: read-only while it runs. What changes lives in its
 //! `State`, which each run creates.
@@ -31,9 +31,42 @@ pub trait Transform {
     fn process(&self, batch: &mut RowBatch, state: &mut Self::State);
 }
 
+/// Turns input batches into output batches, for steps that hold rows back or
+/// output more than one batch for an input.
+pub trait Operator {
+    type State;
+
+    fn new_state(&self) -> Self::State;
+
+    /// `output` is empty when called.
+    fn execute(&self, input: &RowBatch, output: &mut RowBatch, state: &mut Self::State)
+    -> Progress;
+
+    /// Called after the last input, for operators that hold rows back.
+    fn finish(&self, output: &mut RowBatch, state: &mut Self::State) -> Progress {
+        let _ = (output, state);
+        Progress::NeedInput
+    }
+}
+
+/// What an operator did with its input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Progress {
+    /// The output holds everything left for this input, maybe nothing.
+    NeedInput,
+    /// The output holds some of it. Call again with the same input.
+    MoreOutput,
+}
+
+/// A step after a pipeline's source.
+pub enum Step<'a> {
+    Transform(DynTransform<'a>),
+    Operator(DynOperator<'a>),
+}
+
 /// A step of any type, borrowed for `'a`: a pointer to it, and functions that
 /// know its type. `F` is the function a pipeline calls for each batch.
-pub struct DynStep<'a, F> {
+pub struct Erased<'a, F> {
     step: NonNull<()>,
     pub(crate) state_layout: Layout,
     new_state: unsafe fn(NonNull<()>, NonNull<u8>),
@@ -42,13 +75,19 @@ pub struct DynStep<'a, F> {
     lifetime: PhantomData<&'a ()>,
 }
 
-pub type DynSource<'a> = DynStep<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool>;
-pub type DynTransform<'a> = DynStep<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>)>;
+pub type DynSource<'a> = Erased<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool>;
+pub type DynTransform<'a> = Erased<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>)>;
+pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
+
+pub struct OperatorFunctions {
+    execute: unsafe fn(NonNull<()>, &RowBatch, &mut RowBatch, NonNull<u8>) -> Progress,
+    finish: unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> Progress,
+}
 
 impl<'a> DynSource<'a> {
     pub fn new<T: Source>(source: &'a T) -> DynSource<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        DynStep {
+        Erased {
             step: NonNull::from(source).cast(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_source_state::<T>,
@@ -71,7 +110,7 @@ impl<'a> DynSource<'a> {
 impl<'a> DynTransform<'a> {
     pub fn new<T: Transform>(transform: &'a T) -> DynTransform<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        DynStep {
+        Erased {
             step: NonNull::from(transform).cast(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_transform_state::<T>,
@@ -90,7 +129,42 @@ impl<'a> DynTransform<'a> {
     }
 }
 
-impl<F> DynStep<'_, F> {
+impl<'a> DynOperator<'a> {
+    pub fn new<T: Operator>(operator: &'a T) -> DynOperator<'a> {
+        const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        Erased {
+            step: NonNull::from(operator).cast(),
+            state_layout: Layout::new::<T::State>(),
+            new_state: new_operator_state::<T>,
+            drop_state: drop_state::<T::State>,
+            run: OperatorFunctions { execute: execute::<T>, finish: finish::<T> },
+            lifetime: PhantomData,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// As for `DynSource::next`.
+    pub(crate) unsafe fn execute(
+        &self,
+        input: &RowBatch,
+        output: &mut RowBatch,
+        state: NonNull<u8>,
+    ) -> Progress {
+        // SAFETY: as in `DynSource::next`.
+        unsafe { (self.run.execute)(self.step, input, output, state) }
+    }
+
+    /// # Safety
+    ///
+    /// As for `DynSource::next`.
+    pub(crate) unsafe fn finish(&self, output: &mut RowBatch, state: NonNull<u8>) -> Progress {
+        // SAFETY: as in `DynSource::next`.
+        unsafe { (self.run.finish)(self.step, output, state) }
+    }
+}
+
+impl<F> Erased<'_, F> {
     /// # Safety
     ///
     /// `state` must be valid for writes of this step's state.
@@ -114,6 +188,11 @@ unsafe fn new_transform_state<T: Transform>(transform: NonNull<()>, state: NonNu
     unsafe { state.cast().write(transform.cast::<T>().as_ref().new_state()) }
 }
 
+unsafe fn new_operator_state<T: Operator>(operator: NonNull<()>, state: NonNull<u8>) {
+    // SAFETY: see above.
+    unsafe { state.cast().write(operator.cast::<T>().as_ref().new_state()) }
+}
+
 unsafe fn drop_state<S>(state: NonNull<u8>) {
     // SAFETY: see above.
     unsafe { state.cast::<S>().drop_in_place() }
@@ -127,4 +206,23 @@ unsafe fn next<T: Source>(source: NonNull<()>, batch: &mut RowBatch, state: NonN
 unsafe fn process<T: Transform>(transform: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>) {
     // SAFETY: see above.
     unsafe { transform.cast::<T>().as_ref().process(batch, state.cast().as_mut()) }
+}
+
+unsafe fn execute<T: Operator>(
+    operator: NonNull<()>,
+    input: &RowBatch,
+    output: &mut RowBatch,
+    state: NonNull<u8>,
+) -> Progress {
+    // SAFETY: see above.
+    unsafe { operator.cast::<T>().as_ref().execute(input, output, state.cast().as_mut()) }
+}
+
+unsafe fn finish<T: Operator>(
+    operator: NonNull<()>,
+    output: &mut RowBatch,
+    state: NonNull<u8>,
+) -> Progress {
+    // SAFETY: see above.
+    unsafe { operator.cast::<T>().as_ref().finish(output, state.cast().as_mut()) }
 }
