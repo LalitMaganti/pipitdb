@@ -3,29 +3,48 @@
 use core::mem::MaybeUninit;
 
 use crate::column::ColumnView;
+use crate::selection::Selection;
 
 pub const BATCH_ROWS_MAX: u32 = 2048;
 pub const BATCH_COLUMNS_MAX: u32 = 64;
 
 /// The row count is set separately from the columns, so a batch can have
-/// rows but no columns, e.g. for `COUNT(*)`.
+/// rows but no columns, e.g. for `COUNT(*)`. Its selection says which of the
+/// rows are kept: whoever reads a batch reads only those.
 pub struct RowBatch {
     row_count: u32,
     column_count: u32,
     // The first `column_count` are initialized.
     columns: [MaybeUninit<ColumnView>; BATCH_COLUMNS_MAX as usize],
+    selection: Selection,
 }
 
 impl RowBatch {
     pub fn new() -> RowBatch {
-        RowBatch { row_count: 0, column_count: 0, columns: [const { MaybeUninit::uninit() }; _] }
+        RowBatch {
+            row_count: 0,
+            column_count: 0,
+            selection: Selection::all(0),
+            columns: [const { MaybeUninit::uninit() }; _],
+        }
     }
 
-    /// Empties the batch so it can be refilled with `row_count` rows.
+    /// Empties the batch so it can be refilled with `row_count` rows, all
+    /// kept.
     pub fn reset(&mut self, row_count: u32) {
         check!(row_count <= BATCH_ROWS_MAX);
         self.drop_columns();
         self.row_count = row_count;
+        self.selection.reset(row_count);
+    }
+
+    /// Which rows are kept.
+    pub fn selection(&self) -> &Selection {
+        &self.selection
+    }
+
+    pub fn selection_mut(&mut self) -> &mut Selection {
+        &mut self.selection
     }
 
     /// Fails, giving `column` back, if the batch has `BATCH_COLUMNS_MAX`

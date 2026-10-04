@@ -225,7 +225,7 @@ impl<'p> Execution<'p> {
                 unsafe { transform.process(batch, self.state(Some(i))) };
             }
         }
-        if made == Made::Batch && batch.row_count() == 0 { Made::Nothing } else { made }
+        if made == Made::Batch && batch.selection().is_empty() { Made::Nothing } else { made }
     }
 
     fn read_source(&self, batch: &mut RowBatch) -> Made {
@@ -315,6 +315,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::column::{ColumnView, DataType};
+    use crate::selection::Kept;
     use crate::step::{DynOperator, DynTransform, Operator, Source, Transform};
 
     fn int64s(values: &[i64]) -> ColumnView {
@@ -396,6 +397,33 @@ mod tests {
                 batch.reset(0);
             }
             *odd = !*odd;
+        }
+    }
+
+    /// Keeps the rows whose first column is even.
+    struct KeepEven;
+
+    impl Transform for KeepEven {
+        type State = ();
+
+        fn new_state(&self) {}
+
+        fn process(&self, batch: &mut RowBatch, (): &mut ()) {
+            let column = batch.column(0).clone();
+            batch.selection_mut().retain(|row| column.int64s()[row as usize] % 2 == 0);
+        }
+    }
+
+    /// Keeps no rows.
+    struct KeepNone;
+
+    impl Transform for KeepNone {
+        type State = ();
+
+        fn new_state(&self) {}
+
+        fn process(&self, batch: &mut RowBatch, (): &mut ()) {
+            batch.selection_mut().retain(|_| false);
         }
     }
 
@@ -523,5 +551,22 @@ mod tests {
         assert_eq!(Rc::strong_count(&live), 2);
         drop(pipeline);
         assert_eq!(Rc::strong_count(&live), 1);
+    }
+
+    #[test]
+    fn passes_selections_on_and_skips_batches_with_none() {
+        let even = pipeline(Numbers { batches: 3 }, [transform(KeepEven), transform(KeepEven)]);
+        let mut execution = even.start(Heap).unwrap();
+        let mut batch = RowBatch::new();
+        let mut kept = alloc::vec::Vec::new();
+        while execution.next(&mut batch) {
+            let Kept::Select(rows) = batch.selection().kept() else { panic!("not narrowed") };
+            kept.extend(rows.iter().map(|&row| batch.column(0).int64s()[row as usize]));
+        }
+        // Each batch has 2i and 2i + 1, so one row of each is kept.
+        assert_eq!(kept, [0, 2, 4]);
+
+        let none = pipeline(Numbers { batches: 3 }, [transform(KeepNone)]);
+        assert!(!none.start(Heap).unwrap().next(&mut batch));
     }
 }
