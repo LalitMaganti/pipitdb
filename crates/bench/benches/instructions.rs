@@ -38,7 +38,7 @@ fn pipeline(pipeline: Pipeline<'static>) -> u64 {
 }
 
 #[library_benchmark]
-#[bench::table(pipitdb_bench::scan_pipeline(pipitdb_bench::table(100, 20_480)))]
+#[bench::table(pipitdb_bench::scan_pipeline(pipitdb_bench::table(1000)))]
 fn scan(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }

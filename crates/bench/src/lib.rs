@@ -173,11 +173,11 @@ pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'s
     Pipeline::new(DynSource::new(Heap, Repeat::new(batches)).expect("allocates"), owned)
 }
 
-/// `row_groups` row groups of `rows` rows, with four columns. Kept for the
-/// rest of the run, so pipelines can borrow it.
+/// `row_groups` full row groups, with four columns. Kept for the rest of the
+/// run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn table(row_groups: usize, rows: u32) -> &'static DynScannable<'static> {
-    let values = Buffer::allocate(Heap, rows as usize * 8).expect("allocates");
+pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
+    let values = Buffer::allocate(Heap, BATCH_ROWS_MAX as usize * 8).expect("allocates");
     let column = ColumnView::new(DataType::Int64, values, None);
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];

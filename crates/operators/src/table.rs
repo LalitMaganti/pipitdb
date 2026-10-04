@@ -16,7 +16,8 @@ pub struct Table {
     row_groups: Vec<RowGroup>,
 }
 
-/// Rows stored together: a column of each of the table's types.
+/// Rows stored together, at most a batch's: a column of each of the
+/// table's types. A scan reads each as one batch.
 pub struct RowGroup {
     row_count: u32,
     columns: Vec<ColumnView>,
@@ -24,8 +25,8 @@ pub struct RowGroup {
 
 impl Table {
     /// A table with a column for each of `columns`' names and types, in
-    /// `row_groups` of a column each, with the same number of rows. The
-    /// columns' buffers are shared, not copied.
+    /// `row_groups` of a column each, with the same number of rows, at most
+    /// `BATCH_ROWS_MAX`. The columns' buffers are shared, not copied.
     pub fn new<A: Allocator + Clone + 'static>(
         allocator: A,
         columns: &[(&str, DataType)],
@@ -36,6 +37,7 @@ impl Table {
         for &views in row_groups {
             check!(views.len() == columns.len());
             let row_count = views.first().map_or(0, ColumnView::row_count);
+            check!(row_count <= BATCH_ROWS_MAX);
             for (view, &(_, data_type)) in views.iter().zip(columns) {
                 check!(view.data_type() == data_type && view.row_count() == row_count);
             }
@@ -73,14 +75,12 @@ impl RowGroup {
     }
 }
 
-/// Where a scan of a table is: a row group, and a row in it.
+/// Where a scan of a table is: the next row group.
 pub struct ScanState {
     row_group: usize,
-    row: u32,
 }
 
-/// Reads a row group at a time, in batches of up to `BATCH_ROWS_MAX` rows.
-/// Nothing is copied.
+/// Reads each row group as one batch. Nothing is copied.
 impl Scannable for Table {
     type State = ScanState;
 
@@ -98,7 +98,7 @@ impl Scannable for Table {
     }
 
     fn new_state(&self, _: &mut Context) -> Result<ScanState, AllocError> {
-        Ok(ScanState { row_group: 0, row: 0 })
+        Ok(ScanState { row_group: 0 })
     }
 
     fn next(
@@ -110,17 +110,15 @@ impl Scannable for Table {
     ) -> bool {
         loop {
             let Some(row_group) = self.row_groups.get(at.row_group) else { return false };
-            let rows = (row_group.row_count - at.row).min(BATCH_ROWS_MAX);
-            if rows == 0 {
-                *at = ScanState { row_group: at.row_group + 1, row: 0 };
+            at.row_group += 1;
+            // A batch with no rows would be dropped anyway.
+            if row_group.row_count == 0 {
                 continue;
             }
-            batch.reset(rows);
+            batch.reset(row_group.row_count);
             for &i in columns {
-                let column = at!(row_group.columns, i as usize).slice(at.row, rows);
-                check!(batch.push_column(column).is_ok());
+                check!(batch.push_column(at!(row_group.columns, i as usize).clone()).is_ok());
             }
-            at.row += rows;
             return true;
         }
     }
@@ -159,23 +157,30 @@ mod tests {
     }
 
     #[test]
-    fn reads_row_groups_in_batches() {
-        let first = [int64s(0..3000), int64s((0..3000).map(|i| -i))];
+    fn reads_each_row_group_as_a_batch() {
+        let first = [int64s(0..2048), int64s((0..2048).map(|i| -i))];
         let empty = [int64s(0..0), int64s(0..0)];
-        let second = [int64s(3000..3500), int64s((3000..3500).map(|i| -i))];
+        let second = [int64s(2048..2548), int64s((2048..2548).map(|i| -i))];
         let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
         let table = Table::new(Heap, &columns, &[&first, &empty, &second]).unwrap();
 
-        let expected = [(2048, vec![0, 0]), (952, vec![-2048, 2048]), (500, vec![-3000, 3000])];
+        let expected = [(2048, vec![0, 0]), (500, vec![-2048, 2048])];
         assert_eq!(scan(&table, &[1, 0]), expected);
     }
 
     #[test]
     fn counts_rows_without_columns() {
-        let columns = [int64s(0..5000)];
-        let table = Table::new(Heap, &[("a", DataType::Int64)], &[&columns]).unwrap();
+        let (first, second) = ([int64s(0..2048)], [int64s(0..904)]);
+        let table = Table::new(Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
         let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
-        assert_eq!(counts, [2048, 2048, 904]);
+        assert_eq!(counts, [2048, 904]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BATCH_ROWS_MAX")]
+    fn checks_row_groups_fit_in_a_batch() {
+        let columns = [int64s(0..2049)];
+        let _ = Table::new(Heap, &[("a", DataType::Int64)], &[&columns]);
     }
 
     #[test]
