@@ -1,8 +1,11 @@
+filter.greater 1853071
+filter.greater_nulls 3493357
+filter.in_eight 13434471
 lexer.long_text 103516
 lexer.typical 286202
-parser.expression 457068
-pipeline.operators 1203305
-pipeline.source 207601
-pipeline.transforms 275712
-query.typical 992029
-scan.table 399765
+parser.expression 457072
+pipeline.operators 1276333
+pipeline.source 212610
+pipeline.transforms 281736
+query.typical 995453
+scan.table 409856
