@@ -1,9 +1,16 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
 use pipit_kernel::allocator::Heap;
+use pipit_kernel::buffer::Buffer;
+use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::lexer::{Lexer, TokenKind};
 use pipit_kernel::parser::{parse_expression, parse_query};
+use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::registry::Registry;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::step::{
+    DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
+};
 
 static REGISTRY: Registry = Registry::new(&[pipit_std::RELATIONAL]);
 
@@ -58,4 +65,88 @@ pub fn count_tokens(source: &[u8]) -> u32 {
         count += 1;
     }
     count
+}
+
+/// Batches of `BATCH_ROWS_MAX` rows, all sharing one column.
+pub struct Repeat {
+    column: ColumnView,
+    batches: u32,
+}
+
+impl Repeat {
+    #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+    pub fn new(batches: u32) -> Repeat {
+        let size_bytes = BATCH_ROWS_MAX as usize * 8;
+        let values = Buffer::allocate(Heap, size_bytes).expect("allocates");
+        Repeat { column: ColumnView::new(DataType::Int64, values, None), batches }
+    }
+}
+
+impl Source for Repeat {
+    type State = u32;
+
+    fn new_state(&self) -> u32 {
+        0
+    }
+
+    fn next(&self, batch: &mut RowBatch, made: &mut u32) -> bool {
+        if *made == self.batches {
+            return false;
+        }
+        *made += 1;
+        batch.reset(BATCH_ROWS_MAX);
+        batch.push_column(self.column.clone()).is_ok()
+    }
+}
+
+/// Does nothing, to measure what a transform costs the pipeline.
+pub struct PassTransform;
+
+impl Transform for PassTransform {
+    type State = ();
+
+    fn new_state(&self) {}
+
+    fn process(&self, _: &mut RowBatch, (): &mut ()) {}
+}
+
+/// Outputs its input, to measure what an operator costs the pipeline.
+pub struct PassOperator;
+
+impl Operator for PassOperator {
+    type State = ();
+
+    fn new_state(&self) {}
+
+    fn execute(&self, input: &RowBatch, output: &mut RowBatch, (): &mut ()) -> Progress {
+        output.reset(input.row_count());
+        for i in 0..input.column_count() {
+            let _ = output.push_column(input.column(i).clone());
+        }
+        Progress::NeedInput
+    }
+}
+
+/// Runs `source` through `steps`, returning the rows out.
+pub fn run_pipeline(source: &Repeat, steps: &[Step]) -> u64 {
+    let pipeline = Pipeline::new(DynSource::new(source), steps);
+    let Ok(mut execution) = pipeline.start(Heap) else { return 0 };
+    let mut batch = RowBatch::new();
+    let mut rows = 0;
+    while execution.next(&mut batch) {
+        rows += u64::from(batch.row_count());
+    }
+    rows
+}
+
+/// `count` pass-through transforms, or operators.
+pub fn pass_steps(count: usize, operators: bool) -> Vec<Step<'static>> {
+    let step = || {
+        if operators {
+            Step::Operator(DynOperator::new(&PassOperator))
+        } else {
+            Step::Transform(DynTransform::new(&PassTransform))
+        }
+    };
+    (0..count).map(|_| step()).collect()
 }
