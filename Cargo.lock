@@ -776,6 +776,7 @@ dependencies = [
  "gungraun",
  "pipitdb-kernel",
  "pipitdb-operators",
+ "pipitdb-parquet",
  "pipitdb-pipesql",
 ]
 
@@ -798,6 +799,14 @@ version = "0.0.0"
 name = "pipitdb-operators"
 version = "0.0.0"
 dependencies = [
+ "pipitdb-kernel",
+]
+
+[[package]]
+name = "pipitdb-parquet"
+version = "0.0.0"
+dependencies = [
+ "pipitdb-file",
  "pipitdb-kernel",
 ]
 

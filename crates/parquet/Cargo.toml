@@ -1,0 +1,20 @@
+[package]
+name = "pipitdb-parquet"
+description = "A small Parquet reader for pipitdb."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_parquet"
+
+[dependencies]
+pipitdb-kernel = { path = "../kernel" }
+
+[dev-dependencies]
+pipitdb-file = { path = "../file" }
+
+[lints]
+workspace = true
