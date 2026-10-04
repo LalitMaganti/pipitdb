@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     };
     match read_query(args.next()) {
         Ok((source, name)) => {
-            print!("{}", pipit_pipesql::diagnostics::render(&error, &source, &name));
+            print!("{}", pipit_pipesql::diagnostics::render(&source, &name, &error));
             ExitCode::SUCCESS
         }
         Err(message) => {

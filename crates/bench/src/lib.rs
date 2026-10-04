@@ -3,6 +3,7 @@
 use pipit_kernel::allocator::{AllocError, DynAllocator, Heap};
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::context::Context;
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
@@ -92,11 +93,11 @@ impl Repeat {
 impl Source for Repeat {
     type State = u32;
 
-    fn new_state(&self, _: &DynAllocator) -> Result<u32, AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<u32, AllocError> {
         Ok(0)
     }
 
-    fn next(&self, batch: &mut RowBatch, made: &mut u32) -> bool {
+    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> bool {
         if *made == self.batches {
             return false;
         }
@@ -112,11 +113,11 @@ pub struct PassTransform;
 impl Transform for PassTransform {
     type State = ();
 
-    fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
         Ok(())
     }
 
-    fn process(&self, _: &mut RowBatch, (): &mut ()) {}
+    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) {}
 }
 
 /// Outputs its input, to measure what an operator costs the pipeline.
@@ -125,11 +126,17 @@ pub struct PassOperator;
 impl Operator for PassOperator {
     type State = ();
 
-    fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
         Ok(())
     }
 
-    fn execute(&self, input: &RowBatch, output: &mut RowBatch, (): &mut ()) -> Progress {
+    fn execute(
+        &self,
+        _: &mut Context,
+        (): &mut (),
+        input: &RowBatch,
+        output: &mut RowBatch,
+    ) -> Progress {
         output.reset(input.row_count());
         for i in 0..input.column_count() {
             let _ = output.push_column(input.column(i).clone());
@@ -257,13 +264,14 @@ pub fn predicate(shape: &str) -> Predicate {
 /// Runs `predicate` over `batches` batches of `column`, returning the rows kept.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -> u64 {
-    let mut scratch = predicate.scratch(Heap).expect("allocates");
+    let mut context = Context::new(DynAllocator::new(Heap).expect("allocates"));
+    context.reserve_selections(predicate.depth() as usize).expect("allocates");
     let mut batch = RowBatch::new();
     let mut kept = 0;
     for _ in 0..batches {
         batch.reset(column.row_count());
         let _ = batch.push_column(column.clone());
-        predicate.select(&mut batch, &mut scratch);
+        predicate.select(context.selections(), &mut batch);
         kept += u64::from(batch.selection().len());
     }
     kept

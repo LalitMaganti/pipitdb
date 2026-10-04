@@ -9,6 +9,7 @@ pub mod allocator;
 pub mod boxed;
 pub mod buffer;
 pub mod column;
+pub mod context;
 mod erase;
 pub mod filter;
 pub mod lower;

@@ -102,7 +102,7 @@ mod tests {
     static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
 
     /// Renders the tree as an s-expression.
-    fn render(ast: &Ast, source: &str, index: u32) -> String {
+    fn render(source: &str, ast: &Ast, index: u32) -> String {
         let node = ast.node(index);
         let (head, count) = match node.tag() {
             Tag::Query => ("Query".to_string(), node.child_count()),
@@ -120,13 +120,13 @@ mod tests {
             }
         };
         let children: Vec<String> =
-            (0..count).map(|i| render(ast, source, node.first_child() + i)).collect();
+            (0..count).map(|i| render(source, ast, node.first_child() + i)).collect();
         format!("({head} {})", children.join(" "))
     }
 
     fn parse(source: &str) -> String {
         let ast = parse_query(Heap, &REGISTRY, source.as_bytes()).unwrap();
-        render(&ast, source, ast.root())
+        render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
