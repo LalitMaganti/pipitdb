@@ -2,13 +2,13 @@
 //! `DynSource`, `DynTransform` and `DynOperator`, the forms a pipeline stores.
 //!
 //! A step is a plan node: read-only while it runs. What changes lives in its
-//! `State`, which each run creates.
+//! `State`, which each run creates, with memory from the run's allocator.
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::{AllocError, Allocator, DynAllocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::erase::{drop_state, state_of, value_of, write_state};
@@ -18,7 +18,7 @@ use crate::row_batch::RowBatch;
 pub trait Source {
     type State;
 
-    fn new_state(&self) -> Self::State;
+    fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError>;
 
     /// Fills `batch`, which is empty when called, or returns false when no
     /// batches are left.
@@ -29,7 +29,7 @@ pub trait Source {
 pub trait Transform {
     type State;
 
-    fn new_state(&self) -> Self::State;
+    fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError>;
 
     fn process(&self, batch: &mut RowBatch, state: &mut Self::State);
 }
@@ -39,7 +39,7 @@ pub trait Transform {
 pub trait Operator {
     type State;
 
-    fn new_state(&self) -> Self::State;
+    fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError>;
 
     /// `output` is empty when called.
     fn execute(&self, input: &RowBatch, output: &mut RowBatch, state: &mut Self::State)
@@ -78,12 +78,16 @@ impl Step<'_> {
     /// # Safety
     ///
     /// As for `Erased::new_state`.
-    pub(crate) unsafe fn new_state(&self, state: NonNull<u8>) {
+    pub(crate) unsafe fn new_state(
+        &self,
+        state: NonNull<u8>,
+        allocator: &DynAllocator,
+    ) -> Result<(), AllocError> {
         // SAFETY: upheld by the caller.
         unsafe {
             match self {
-                Step::Transform(transform) => transform.new_state(state),
-                Step::Operator(operator) => operator.new_state(state),
+                Step::Transform(transform) => transform.new_state(state, allocator),
+                Step::Operator(operator) => operator.new_state(state, allocator),
             }
         }
     }
@@ -107,11 +111,15 @@ impl Step<'_> {
 pub struct Erased<'a, F> {
     step: ErasedBox,
     pub(crate) state_layout: Layout,
-    new_state: unsafe fn(NonNull<()>, NonNull<u8>),
+    new_state: NewState,
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
     run: F,
     lifetime: PhantomData<&'a ()>,
 }
+
+/// Makes a step's state at the given place, or fails without making it.
+pub(crate) type NewState =
+    unsafe fn(NonNull<()>, NonNull<u8>, &DynAllocator) -> Result<(), AllocError>;
 
 pub type DynSource<'a> = Erased<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool>;
 pub type DynTransform<'a> = Erased<'a, unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>)>;
@@ -132,7 +140,7 @@ impl<'a> DynSource<'a> {
     pub(crate) unsafe fn from_parts(
         step: ErasedBox,
         state_layout: Layout,
-        new_state: unsafe fn(NonNull<()>, NonNull<u8>),
+        new_state: NewState,
         drop_state: unsafe fn(NonNull<u8>),
         next: unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool,
     ) -> DynSource<'a> {
@@ -148,8 +156,10 @@ impl<'a> DynSource<'a> {
             step: Box::new(allocator, source)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this source and its state, as is each below.
-            new_state: |source, state| unsafe {
-                write_state(state, value_of::<T>(source).new_state());
+            new_state: |source, state, allocator| unsafe {
+                let made = value_of::<T>(source).new_state(allocator)?;
+                write_state(state, made);
+                Ok(())
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
@@ -180,8 +190,10 @@ impl<'a> DynTransform<'a> {
             step: Box::new(allocator, transform)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this transform and its state, as is each below.
-            new_state: |transform, state| unsafe {
-                write_state(state, value_of::<T>(transform).new_state());
+            new_state: |transform, state, allocator| unsafe {
+                let made = value_of::<T>(transform).new_state(allocator)?;
+                write_state(state, made);
+                Ok(())
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
@@ -211,8 +223,10 @@ impl<'a> DynOperator<'a> {
             step: Box::new(allocator, operator)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this operator and its state, as is each below.
-            new_state: |operator, state| unsafe {
-                write_state(state, value_of::<T>(operator).new_state());
+            new_state: |operator, state, allocator| unsafe {
+                let made = value_of::<T>(operator).new_state(allocator)?;
+                write_state(state, made);
+                Ok(())
             },
             drop_state: drop_state::<T::State>,
             run: OperatorFunctions {
@@ -252,12 +266,18 @@ impl<'a> DynOperator<'a> {
 }
 
 impl<F> Erased<'_, F> {
+    /// Makes this step's state at `state`, unless it fails.
+    ///
     /// # Safety
     ///
     /// `state` must be valid for writes of this step's state.
-    pub(crate) unsafe fn new_state(&self, state: NonNull<u8>) {
+    pub(crate) unsafe fn new_state(
+        &self,
+        state: NonNull<u8>,
+        allocator: &DynAllocator,
+    ) -> Result<(), AllocError> {
         // SAFETY: `new_state` matches `step`'s type, and the caller upholds
         // the rest.
-        unsafe { (self.new_state)(self.step.as_ptr(), state) }
+        unsafe { (self.new_state)(self.step.as_ptr(), state, allocator) }
     }
 }

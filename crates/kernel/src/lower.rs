@@ -171,8 +171,8 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self) -> bool {
-            false
+        fn new_state(&self, _: &DynAllocator) -> Result<bool, AllocError> {
+            Ok(false)
         }
 
         fn next(&self, columns: &[u32], batch: &mut RowBatch, done: &mut bool) -> bool {
@@ -269,7 +269,9 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self) {}
+        fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+            Ok(())
+        }
 
         fn next(&self, _: &[u32], _: &mut RowBatch, (): &mut ()) -> bool {
             false
