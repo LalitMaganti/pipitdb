@@ -111,7 +111,7 @@ impl<'s> ChunkReader<'s> {
                 for (row, word) in out.as_mut_slice::<i64>().iter_mut().enumerate() {
                     if valid(row) {
                         let bytes = values.get(at..at + width).ok_or(Error::Corrupt)?;
-                        *word = plain(physical, bytes);
+                        *word = plain(physical, bytes).ok_or(Error::Corrupt)?;
                         at += width;
                     }
                 }
@@ -194,21 +194,14 @@ impl<'s> ChunkReader<'s> {
 
 /// A plain value of `physical` from its bytes, as a word: an integer, or a
 /// float's bits.
-fn plain(physical: Physical, bytes: &[u8]) -> i64 {
-    match physical {
-        Physical::Int32 => i64::from(i32::from_le_bytes(array(bytes))),
-        Physical::Float => f64::from(f32::from_le_bytes(array(bytes))).to_bits().cast_signed(),
-        _ => i64::from_le_bytes(array(bytes)),
-    }
-}
-
-/// The first `N` of `bytes`, which has at least that many.
-fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
-    let mut array = [0; N];
-    for (to, &from) in array.iter_mut().zip(at!(bytes, ..N)) {
-        *to = from;
-    }
-    array
+fn plain(physical: Physical, bytes: &[u8]) -> Option<i64> {
+    Some(match physical {
+        Physical::Int32 => i64::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+        Physical::Float => {
+            f64::from(f32::from_le_bytes(bytes.try_into().ok()?)).to_bits().cast_signed()
+        }
+        _ => i64::from_le_bytes(bytes.try_into().ok()?),
+    })
 }
 
 struct PageHeader {
