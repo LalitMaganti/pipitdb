@@ -8,6 +8,8 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use crate::allocator::{AllocError, Allocator};
+use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::row_batch::RowBatch;
 
@@ -98,10 +100,11 @@ impl Step<'_> {
     }
 }
 
-/// A step of any type, borrowed for `'a`: a pointer to it, and functions that
-/// know its type. `F` is the function a pipeline calls for each batch.
+/// A step of any type that lives for `'a`, owned in memory from an allocator:
+/// a pointer to it, and functions that know its type. `F` is the function a
+/// pipeline calls for each batch.
 pub struct Erased<'a, F> {
-    step: NonNull<()>,
+    step: ErasedBox,
     pub(crate) state_layout: Layout,
     new_state: unsafe fn(NonNull<()>, NonNull<u8>),
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
@@ -119,16 +122,19 @@ pub struct OperatorFunctions {
 }
 
 impl<'a> DynSource<'a> {
-    pub fn new<T: Source>(source: &'a T) -> DynSource<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Source + 'a>(
+        allocator: A,
+        source: T,
+    ) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(source).cast(),
+        Ok(Erased {
+            step: Box::new(allocator, source)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_source_state::<T>,
             drop_state: drop_state::<T::State>,
             run: next::<T>,
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -137,21 +143,24 @@ impl<'a> DynSource<'a> {
     pub(crate) unsafe fn next(&self, batch: &mut RowBatch, state: NonNull<u8>) -> bool {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
-        unsafe { (self.run)(self.step, batch, state) }
+        unsafe { (self.run)(self.step.as_ptr(), batch, state) }
     }
 }
 
 impl<'a> DynTransform<'a> {
-    pub fn new<T: Transform>(transform: &'a T) -> DynTransform<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Transform + 'a>(
+        allocator: A,
+        transform: T,
+    ) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(transform).cast(),
+        Ok(Erased {
+            step: Box::new(allocator, transform)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_transform_state::<T>,
             drop_state: drop_state::<T::State>,
             run: process::<T>,
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -159,21 +168,24 @@ impl<'a> DynTransform<'a> {
     /// As for `DynSource::next`.
     pub(crate) unsafe fn process(&self, batch: &mut RowBatch, state: NonNull<u8>) {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run)(self.step, batch, state) }
+        unsafe { (self.run)(self.step.as_ptr(), batch, state) }
     }
 }
 
 impl<'a> DynOperator<'a> {
-    pub fn new<T: Operator>(operator: &'a T) -> DynOperator<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Operator + 'a>(
+        allocator: A,
+        operator: T,
+    ) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(operator).cast(),
+        Ok(Erased {
+            step: Box::new(allocator, operator)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_operator_state::<T>,
             drop_state: drop_state::<T::State>,
             run: OperatorFunctions { execute: execute::<T>, finish: finish::<T> },
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -186,7 +198,7 @@ impl<'a> DynOperator<'a> {
         state: NonNull<u8>,
     ) -> Progress {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.execute)(self.step, input, output, state) }
+        unsafe { (self.run.execute)(self.step.as_ptr(), input, output, state) }
     }
 
     /// # Safety
@@ -194,7 +206,7 @@ impl<'a> DynOperator<'a> {
     /// As for `DynSource::next`.
     pub(crate) unsafe fn finish(&self, output: &mut RowBatch, state: NonNull<u8>) -> Progress {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.finish)(self.step, output, state) }
+        unsafe { (self.run.finish)(self.step.as_ptr(), output, state) }
     }
 }
 
@@ -205,7 +217,7 @@ impl<F> Erased<'_, F> {
     pub(crate) unsafe fn new_state(&self, state: NonNull<u8>) {
         // SAFETY: `new_state` matches `step`'s type, and the caller upholds
         // the rest.
-        unsafe { (self.new_state)(self.step, state) }
+        unsafe { (self.new_state)(self.step.as_ptr(), state) }
     }
 }
 

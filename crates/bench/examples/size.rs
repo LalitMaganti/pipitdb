@@ -6,6 +6,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 
 use pipit_kernel::allocator::Heap;
+use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_pipesql::lexer::{Lexer, TokenKind};
@@ -29,6 +30,14 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
         return 0;
     }
     batch.column(0).int64s().iter().sum()
+}
+
+/// `value` doubled, through a `Box`.
+#[unsafe(no_mangle)]
+pub extern "C" fn box_double(value: u64) -> u64 {
+    let Ok(mut boxed) = Box::new(Heap, value) else { return 0 };
+    *boxed *= 2;
+    *boxed
 }
 
 /// Pushes `0..count` to a `Vec`, and returns the last.

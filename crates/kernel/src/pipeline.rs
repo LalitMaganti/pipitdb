@@ -13,16 +13,17 @@ use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::row_batch::RowBatch;
 use crate::step::{DynSource, Progress, Step};
+use crate::vec::Vec;
 
-/// Read-only, so it can be run any number of times.
+/// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
     source: DynSource<'a>,
-    steps: &'a [Step<'a>],
+    steps: Vec<Step<'a>>,
     segment_count: usize,
 }
 
 impl<'a> Pipeline<'a> {
-    pub fn new(source: DynSource<'a>, steps: &'a [Step<'a>]) -> Pipeline<'a> {
+    pub fn new(source: DynSource<'a>, steps: Vec<Step<'a>>) -> Pipeline<'a> {
         let operators = steps.iter().filter(|step| matches!(step, Step::Operator(_))).count();
         Pipeline { source, steps, segment_count: operators + 1 }
     }
@@ -134,7 +135,7 @@ impl<'p> Execution<'p> {
         check!(layout.is_ok());
         let execution = Execution { pipeline, memory, slots, source_state, _buffer: buffer };
 
-        let steps = pipeline.steps;
+        let steps = &pipeline.steps;
         let mut k = 0;
         let mut segment = Segment { head: 0, end: 0, status: Status::Ready };
         for (i, step) in steps.iter().enumerate() {
@@ -458,67 +459,69 @@ mod tests {
         batches
     }
 
+    fn transform<'a>(transform: impl Transform + 'a) -> Step<'a> {
+        Step::Transform(DynTransform::new(Heap, transform).unwrap())
+    }
+
+    fn operator<'a>(operator: impl Operator + 'a) -> Step<'a> {
+        Step::Operator(DynOperator::new(Heap, operator).unwrap())
+    }
+
+    fn pipeline<'a>(
+        source: impl Source + 'a,
+        steps: impl IntoIterator<Item = Step<'a>>,
+    ) -> Pipeline<'a> {
+        let mut owned = crate::vec::Vec::new(Heap, 8).unwrap();
+        for step in steps {
+            assert!(owned.push(step).is_ok());
+        }
+        Pipeline::new(DynSource::new(Heap, source).unwrap(), owned)
+    }
+
     #[test]
     fn runs_a_source_alone() {
-        let source = Numbers { batches: 2 };
-        let pipeline = Pipeline::new(DynSource::new(&source), &[]);
+        let pipeline = pipeline(Numbers { batches: 2 }, []);
         let expected = [[[0, 0], [1, -1]], [[2, -2], [3, -3]]];
         assert_eq!(batches(&mut pipeline.start(Heap).unwrap()), expected);
     }
 
     #[test]
     fn transforms_each_batch_in_order() {
-        let source = Numbers { batches: 2 };
         let position = Position { live: Rc::new(()) };
-        let steps = [
-            Step::Transform(DynTransform::new(&Reverse)),
-            Step::Transform(DynTransform::new(&position)),
-        ];
-        let pipeline = Pipeline::new(DynSource::new(&source), &steps);
+        let pipeline = pipeline(Numbers { batches: 2 }, [transform(Reverse), transform(position)]);
         let expected = [[[0, 0, 0], [-1, 1, 0]], [[-2, 2, 1], [-3, 3, 1]]];
         assert_eq!(batches(&mut pipeline.start(Heap).unwrap()), expected);
     }
 
     #[test]
     fn operators_output_more_than_once_for_an_input() {
-        let source = Numbers { batches: 2 };
         let position = Position { live: Rc::new(()) };
-        let steps = [
-            Step::Operator(DynOperator::new(&Split)),
-            Step::Transform(DynTransform::new(&position)),
-        ];
-        let pipeline = Pipeline::new(DynSource::new(&source), &steps);
+        let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
         let expected = [[[0, 0, 0]], [[1, -1, 1]], [[2, -2, 2]], [[3, -3, 3]]];
         assert_eq!(batches(&mut pipeline.start(Heap).unwrap()), expected);
     }
 
     #[test]
     fn operators_finish_after_their_input_ends() {
-        let source = Numbers { batches: 3 };
-        let steps = [
-            Step::Operator(DynOperator::new(&Split)),
-            Step::Transform(DynTransform::new(&SkipOdd)),
-            Step::Operator(DynOperator::new(&Sum)),
-        ];
-        let pipeline = Pipeline::new(DynSource::new(&source), &steps);
+        let steps = [operator(Split), transform(SkipOdd), operator(Sum)];
+        let pipeline = pipeline(Numbers { batches: 3 }, steps);
         assert_eq!(batches(&mut pipeline.start(Heap).unwrap()), [[[2 + 4]]]);
     }
 
     #[test]
     fn each_run_has_its_own_state() {
-        let source = Numbers { batches: 2 };
-        let position = Position { live: Rc::new(()) };
-        let steps = [
-            Step::Operator(DynOperator::new(&Split)),
-            Step::Transform(DynTransform::new(&position)),
-        ];
-        let pipeline = Pipeline::new(DynSource::new(&source), &steps);
+        let live = Rc::new(());
+        let position = Position { live: live.clone() };
+        let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
 
         let mut first = pipeline.start(Heap).unwrap();
         let mut second = pipeline.start(Heap).unwrap();
         assert_eq!(batches(&mut first), batches(&mut second));
-        assert_eq!(Rc::strong_count(&position.live), 3);
+        // Ours, the pipeline's step, and a state for each run.
+        assert_eq!(Rc::strong_count(&live), 4);
         drop((first, second));
-        assert_eq!(Rc::strong_count(&position.live), 1);
+        assert_eq!(Rc::strong_count(&live), 2);
+        drop(pipeline);
+        assert_eq!(Rc::strong_count(&live), 1);
     }
 }

@@ -1,8 +1,8 @@
 lexer.long_text 103516
 lexer.typical 286202
 parser.expression 457068
-pipeline.operators 1248554
-pipeline.source 217435
-pipeline.transforms 284965
+pipeline.operators 1203305
+pipeline.source 207601
+pipeline.transforms 275712
 query.typical 992029
-scan.table 434087
+scan.table 399765

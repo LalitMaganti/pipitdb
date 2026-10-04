@@ -128,9 +128,8 @@ impl Operator for PassOperator {
     }
 }
 
-/// Runs `source` through `steps`, returning the rows out.
-pub fn run_pipeline<S: Source>(source: &S, steps: &[Step]) -> u64 {
-    let pipeline = Pipeline::new(DynSource::new(source), steps);
+/// Runs `pipeline` once, returning the rows out.
+pub fn run(pipeline: &Pipeline) -> u64 {
     let Ok(mut execution) = pipeline.start(Heap) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
@@ -140,29 +139,36 @@ pub fn run_pipeline<S: Source>(source: &S, steps: &[Step]) -> u64 {
     rows
 }
 
-/// `count` pass-through transforms, or operators.
-pub fn pass_steps(count: usize, operators: bool) -> Vec<Step<'static>> {
-    let step = || {
-        if operators {
-            Step::Operator(DynOperator::new(&PassOperator))
+/// `batches` full batches through `steps` pass-through transforms, or
+/// operators.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
+    let mut owned = pipit_kernel::vec::Vec::fixed(Heap, steps).expect("allocates");
+    for _ in 0..steps {
+        let step = if operators {
+            Step::Operator(DynOperator::new(Heap, PassOperator).expect("allocates"))
         } else {
-            Step::Transform(DynTransform::new(&PassTransform))
-        }
-    };
-    (0..count).map(|_| step()).collect()
+            Step::Transform(DynTransform::new(Heap, PassTransform).expect("allocates"))
+        };
+        assert!(owned.push(step).is_ok(), "fixed for `steps`");
+    }
+    Pipeline::new(DynSource::new(Heap, Repeat::new(batches)).expect("allocates"), owned)
 }
 
-/// `row_groups` row groups of `rows` rows, with four columns.
+/// `row_groups` row groups of `rows` rows, with four columns. Kept for the
+/// rest of the run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn table(row_groups: usize, rows: u32) -> Table {
+pub fn table(row_groups: usize, rows: u32) -> &'static Table {
     let values = Buffer::allocate(Heap, rows as usize * 8).expect("allocates");
     let column = ColumnView::new(DataType::Int64, values, None);
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
-    Table::new(Heap, &[DataType::Int64; 4], &row_groups).expect("allocates")
+    Box::leak(Box::new(Table::new(Heap, &[DataType::Int64; 4], &row_groups).expect("allocates")))
 }
 
-/// Scans two of `table`'s columns, returning the rows read.
-pub fn scan_table(table: &Table) -> u64 {
-    run_pipeline(&TableScan::new(table, &[3, 1]), &[])
+/// Scans two of `table`'s columns.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn scan_pipeline(table: &'static Table) -> Pipeline<'static> {
+    let source = DynSource::new(Heap, TableScan::new(table, &[3, 1])).expect("allocates");
+    Pipeline::new(source, pipit_kernel::vec::Vec::fixed(Heap, 0).expect("allocates"))
 }

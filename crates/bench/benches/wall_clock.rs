@@ -36,26 +36,23 @@ fn query(c: &mut Criterion) {
 /// What the pipeline costs per batch, with steps that do nothing.
 fn pipeline(c: &mut Criterion) {
     let batches = 10_000;
-    let source = pipitdb_bench::Repeat::new(batches);
     let mut group = c.benchmark_group("pipeline");
     group.throughput(Throughput::Elements(u64::from(batches)));
     for (name, steps, operators) in
         [("source", 0, false), ("transforms", 4, false), ("operators", 4, true)]
     {
-        let steps = pipitdb_bench::pass_steps(steps, operators);
-        group.bench_function(name, |b| {
-            b.iter(|| pipitdb_bench::run_pipeline(black_box(&source), black_box(&steps)));
-        });
+        let pipeline = pipitdb_bench::pass_pipeline(batches, steps, operators);
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
     }
     group.finish();
 }
 
 /// Scanning a table's row groups.
 fn scan(c: &mut Criterion) {
-    let table = pipitdb_bench::table(100, 20_480);
+    let pipeline = pipitdb_bench::scan_pipeline(pipitdb_bench::table(100, 20_480));
     let mut group = c.benchmark_group("scan");
     group.throughput(Throughput::Elements(100 * 20_480));
-    group.bench_function("table", |b| b.iter(|| pipitdb_bench::scan_table(black_box(&table))));
+    group.bench_function("table", |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
     group.finish();
 }
 
