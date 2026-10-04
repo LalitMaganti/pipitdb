@@ -5,6 +5,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
+use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::selection::Selection;
@@ -225,5 +226,41 @@ pub fn run_filter(
 
 /// Keeps values over 500: about half.
 pub fn greater(column: &ColumnView, selection: &mut Selection) {
-    filter::compare(column, Comparison::Greater, Value::Int64(500), selection);
+    filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
+}
+
+/// `x > 500 AND x < 900`, `x < 100 OR x > 900`, or `NOT (x > 500)`, over the
+/// first column.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn predicate(shape: &str) -> Predicate {
+    let compare = |comparison, value| {
+        Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
+    };
+    let nodes: &[Node] = match shape {
+        "and" => {
+            &[compare(Comparison::Greater, 500), compare(Comparison::Less, 900), Node::And(0, 1)]
+        }
+        "or" => {
+            &[compare(Comparison::Less, 100), compare(Comparison::Greater, 900), Node::Or(0, 1)]
+        }
+        _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
+    };
+    Predicate::new(
+        pipit_kernel::vec::Vec::fixed_from(Heap, nodes.iter().copied()).expect("allocates"),
+    )
+}
+
+/// Runs `predicate` over `batches` batches of `column`, returning the rows kept.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -> u64 {
+    let mut scratch = predicate.scratch(Heap).expect("allocates");
+    let mut batch = RowBatch::new();
+    let mut kept = 0;
+    for _ in 0..batches {
+        batch.reset(column.row_count());
+        let _ = batch.push_column(column.clone());
+        predicate.select(&mut batch, &mut scratch);
+        kept += u64::from(batch.selection().len());
+    }
+    kept
 }
