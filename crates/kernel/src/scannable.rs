@@ -9,6 +9,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::DataType;
+use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::step::DynSource;
 use crate::vec::Vec;
@@ -16,14 +17,19 @@ use crate::vec::Vec;
 /// Named, typed columns, read into batches. Where a read is lives in
 /// `State`, which each run creates, as for a step.
 pub trait Scannable {
+    /// Where a read is, such as a row group and a row in it.
     type State;
 
+    /// How many columns there are, numbered from 0.
     fn column_count(&self) -> u32;
 
+    /// What frontends call `column`, such as in `SELECT`.
     fn column_name(&self, column: u32) -> &str;
 
+    /// What `column` holds. Every batch's `column` has this type.
     fn column_type(&self, column: u32) -> DataType;
 
+    /// The state of a read from the first row.
     fn new_state(&self) -> Self::State;
 
     /// Fills `batch`, which is empty when called, with the next rows of
@@ -59,13 +65,26 @@ impl<'a> DynScannable<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(DynScannable {
             scannable: Box::new(allocator, scannable)?.erase(),
-            column_count: column_count::<T>,
-            column_name: column_name::<T>,
-            column_type: column_type::<T>,
+            // SAFETY: only called with this scannable and its state, as is each below.
+            column_count: |scannable| unsafe { value_of::<T>(scannable).column_count() },
+            // SAFETY: as above.
+            column_name: |scannable, column| unsafe {
+                value_of::<T>(scannable).column_name(column)
+            },
+            // SAFETY: as above.
+            column_type: |scannable, column| unsafe {
+                value_of::<T>(scannable).column_type(column)
+            },
             state_layout: Layout::new::<T::State>(),
-            new_state: new_state::<T>,
+            // SAFETY: as above.
+            new_state: |scannable, state| unsafe {
+                write_state(state, value_of::<T>(scannable).new_state());
+            },
             drop_state: drop_state::<T::State>,
-            next: next::<T>,
+            // SAFETY: as above.
+            next: |scannable, columns, batch, state| unsafe {
+                value_of::<T>(scannable).next(columns, batch, state_of::<T::State>(state))
+            },
             lifetime: PhantomData,
         })
     }
@@ -130,44 +149,6 @@ unsafe fn scan_next(step: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>)
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
     unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, batch, state) }
-}
-
-// These undo the erasure. Each is only stored next to a pointer to a `T`, and
-// only called with a state of `T`'s type.
-
-unsafe fn column_count<T: Scannable>(scannable: NonNull<()>) -> u32 {
-    // SAFETY: see above.
-    unsafe { scannable.cast::<T>().as_ref().column_count() }
-}
-
-unsafe fn column_name<T: Scannable>(scannable: NonNull<()>, column: u32) -> *const str {
-    // SAFETY: see above.
-    unsafe { scannable.cast::<T>().as_ref().column_name(column) }
-}
-
-unsafe fn column_type<T: Scannable>(scannable: NonNull<()>, column: u32) -> DataType {
-    // SAFETY: see above.
-    unsafe { scannable.cast::<T>().as_ref().column_type(column) }
-}
-
-unsafe fn new_state<T: Scannable>(scannable: NonNull<()>, state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast().write(scannable.cast::<T>().as_ref().new_state()) }
-}
-
-unsafe fn drop_state<S>(state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast::<S>().drop_in_place() }
-}
-
-unsafe fn next<T: Scannable>(
-    scannable: NonNull<()>,
-    columns: &[u32],
-    batch: &mut RowBatch,
-    state: NonNull<u8>,
-) -> bool {
-    // SAFETY: see above.
-    unsafe { scannable.cast::<T>().as_ref().next(columns, batch, state.cast().as_mut()) }
 }
 
 #[cfg(test)]

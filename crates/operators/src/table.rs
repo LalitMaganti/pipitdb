@@ -9,9 +9,6 @@ use pipit_kernel::vec::Vec;
 
 use crate::names::{Name, Names};
 
-/// The most bytes a table's column names take.
-pub const TABLE_NAME_BYTES_MAX: usize = 1 << 12;
-
 pub struct Table {
     names: Names,
     columns: Vec<(Name, DataType)>,
@@ -44,7 +41,8 @@ impl Table {
             let views = Vec::fixed_from(allocator.clone(), views.iter().cloned())?;
             groups.push(RowGroup { row_count, columns: views })?;
         }
-        let mut names = Names::new(allocator.clone(), TABLE_NAME_BYTES_MAX)?;
+        let name_bytes = columns.iter().map(|(name, _)| name.len()).sum();
+        let mut names = Names::fixed(allocator.clone(), name_bytes)?;
         let mut schema = Vec::fixed(allocator, columns.len())?;
         for &(name, data_type) in columns {
             schema.push((names.add(name)?, data_type))?;

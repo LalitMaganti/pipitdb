@@ -9,6 +9,7 @@ pub mod allocator;
 pub mod boxed;
 pub mod buffer;
 pub mod column;
+mod erase;
 pub mod pipeline;
 pub mod row_batch;
 pub mod scannable;

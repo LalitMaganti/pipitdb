@@ -23,6 +23,14 @@ impl Names {
         Ok(Names { bytes: Vec::new(allocator, max_bytes)? })
     }
 
+    /// Room for exactly `bytes` of names, which never grows.
+    pub fn fixed<A: Allocator + Clone + 'static>(
+        allocator: A,
+        bytes: usize,
+    ) -> Result<Names, AllocError> {
+        Ok(Names { bytes: Vec::fixed(allocator, bytes)? })
+    }
+
     /// Copies `name` in.
     pub fn add(&mut self, name: &str) -> Result<Name, AllocError> {
         let (Ok(start), Ok(len)) = (u32::try_from(self.bytes.len()), u32::try_from(name.len()))

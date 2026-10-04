@@ -23,10 +23,7 @@ impl<T> Box<T> {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         // SAFETY: the value is written before anything reads it.
         let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
-        let Some(data) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
-            crate::check::check_failed(line!());
-        };
-        let value_ptr = data.cast::<T>();
+        let value_ptr = buffer.as_mut_non_null().cast::<T>();
         // SAFETY: the buffer has room for a `T`, aligned for it.
         unsafe { value_ptr.write(value) };
         Ok(Box { buffer, value: value_ptr })
@@ -38,7 +35,9 @@ impl<T> Box<T> {
         // SAFETY: `this` is never used or dropped again, so the buffer moves
         // out once.
         let buffer = unsafe { core::ptr::read(&raw const this.buffer) };
-        ErasedBox { _buffer: buffer, value: this.value.cast(), drop: drop_value::<T> }
+        // SAFETY: only called with this value, once.
+        let drop = |value: NonNull<()>| unsafe { value.cast::<T>().drop_in_place() };
+        ErasedBox { _buffer: buffer, value: this.value.cast(), drop }
     }
 }
 
@@ -86,11 +85,6 @@ impl Drop for ErasedBox {
         // SAFETY: `drop` was made for the value's type, and runs once.
         unsafe { (self.drop)(self.value) }
     }
-}
-
-unsafe fn drop_value<T>(value: NonNull<()>) {
-    // SAFETY: only called on a `T`, by `ErasedBox::drop`.
-    unsafe { value.cast::<T>().drop_in_place() }
 }
 
 #[cfg(test)]
