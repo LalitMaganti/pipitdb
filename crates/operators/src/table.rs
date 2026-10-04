@@ -26,17 +26,17 @@ impl Table {
         types: &[DataType],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
-        let mut groups = sized(allocator.clone(), row_groups.len())?;
+        let mut groups = Vec::fixed(allocator.clone(), row_groups.len())?;
         for &columns in row_groups {
             check!(columns.len() == types.len());
             let row_count = columns.first().map_or(0, ColumnView::row_count);
             for (column, &data_type) in columns.iter().zip(types) {
                 check!(column.data_type() == data_type && column.row_count() == row_count);
             }
-            let columns = filled(allocator.clone(), columns.iter().cloned())?;
-            push(&mut groups, RowGroup { row_count, columns })?;
+            let columns = Vec::fixed_from(allocator.clone(), columns.iter().cloned())?;
+            groups.push(RowGroup { row_count, columns })?;
         }
-        Ok(Table { types: filled(allocator, types.iter().copied())?, row_groups: groups })
+        Ok(Table { types: Vec::fixed_from(allocator, types.iter().copied())?, row_groups: groups })
     }
 
     pub fn types(&self) -> &[DataType] {
@@ -56,29 +56,6 @@ impl RowGroup {
     pub fn columns(&self) -> &[ColumnView] {
         &self.columns
     }
-}
-
-/// An empty `Vec` with room for exactly `len` values, rounded up.
-fn sized<A: Allocator + Clone + 'static, T>(
-    allocator: A,
-    len: usize,
-) -> Result<Vec<T>, AllocError> {
-    Vec::with_capacity(allocator, len, len.next_power_of_two())
-}
-
-fn filled<A: Allocator + Clone + 'static, T>(
-    allocator: A,
-    values: impl ExactSizeIterator<Item = T>,
-) -> Result<Vec<T>, AllocError> {
-    let mut vec = sized(allocator, values.len())?;
-    for value in values {
-        push(&mut vec, value)?;
-    }
-    Ok(vec)
-}
-
-fn push<T>(vec: &mut Vec<T>, value: T) -> Result<(), AllocError> {
-    vec.push(value).map_err(|_| AllocError)
 }
 
 /// Reads the selected columns of a table, in selection order, a row group at
