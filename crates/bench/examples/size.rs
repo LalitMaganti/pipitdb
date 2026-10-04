@@ -5,7 +5,7 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use pipit_kernel::allocator::Heap;
+use pipit_kernel::allocator::{Budget, Heap};
 use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
@@ -38,6 +38,16 @@ pub extern "C" fn box_double(value: u64) -> u64 {
     let Ok(mut boxed) = Box::new(&Heap, value) else { return 0 };
     *boxed *= 2;
     *boxed
+}
+
+/// The most bytes a `Box` of `value` takes from a budget of `limit` bytes,
+/// or 0 if it doesn't fit.
+#[unsafe(no_mangle)]
+pub extern "C" fn budget_peak(value: u64, limit: usize) -> usize {
+    let budget = Budget::new(&Heap, limit);
+    let Ok(boxed) = Box::new(&budget, value) else { return 0 };
+    drop(boxed);
+    budget.peak()
 }
 
 /// Pushes `0..count` to a `Vec`, and returns the last.
