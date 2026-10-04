@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pipit_file::spill::FileSpill;
-use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore};
+use pipit_kernel::error::Error;
+use pipit_kernel::spill::{Block, LogId, SpillStore};
 use rusty_s3::actions::{CreateMultipartUpload, S3Action};
 use rusty_s3::{Bucket, Credentials};
 
@@ -80,15 +81,15 @@ impl S3Spill {
     fn with<T>(
         &self,
         log: LogId,
-        f: impl FnOnce(&mut Log) -> Result<T, SpillError>,
-    ) -> Result<T, SpillError> {
-        let mut logs = self.logs.lock().map_err(|_| SpillError::Io)?;
-        let index = usize::try_from(log.0).map_err(|_| SpillError::Io)?;
-        f(logs.get_mut(index).and_then(Option::as_mut).ok_or(SpillError::Io)?)
+        f: impl FnOnce(&mut Log) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut logs = self.logs.lock().map_err(|_| Error::Io)?;
+        let index = usize::try_from(log.0).map_err(|_| Error::Io)?;
+        f(logs.get_mut(index).and_then(Option::as_mut).ok_or(Error::Io)?)
     }
 
     /// Uploads the part being staged, maybe empty, as the log's next part.
-    fn upload(&self, log: &mut Log) -> Result<(), SpillError> {
+    fn upload(&self, log: &mut Log) -> Result<(), Error> {
         let (staged, len) = match log.staged.take() {
             Some(staged) => staged,
             None => (self.staging.create()?, 0),
@@ -99,9 +100,9 @@ impl S3Spill {
         Ok(())
     }
 
-    fn upload_staged(&self, log: &Log, staged: LogId, len: u64) -> Result<String, SpillError> {
+    fn upload_staged(&self, log: &Log, staged: LogId, len: u64) -> Result<String, Error> {
         self.staging.seal(staged)?;
-        let number = u16::try_from(log.etags.len() + 1).map_err(|_| SpillError::Io)?;
+        let number = u16::try_from(log.etags.len() + 1).map_err(|_| Error::Io)?;
         let action =
             self.bucket.upload_part(Some(&self.credentials), &log.key, number, &log.upload_id);
         let mut reader = Staged { store: &self.staging, log: staged, offset: 0, len };
@@ -110,12 +111,12 @@ impl S3Spill {
             .put(action.sign(SIGNED_FOR).as_str())
             .header("content-length", len)
             .send(ureq::SendBody::from_reader(&mut reader))
-            .map_err(|_| SpillError::Io)?;
-        let etag = response.headers().get("etag").ok_or(SpillError::Io)?;
-        Ok(etag.to_str().map_err(|_| SpillError::Io)?.to_owned())
+            .map_err(|_| Error::Io)?;
+        let etag = response.headers().get("etag").ok_or(Error::Io)?;
+        Ok(etag.to_str().map_err(|_| Error::Io)?.to_owned())
     }
 
-    fn complete(&self, log: &Log) -> Result<(), SpillError> {
+    fn complete(&self, log: &Log) -> Result<(), Error> {
         let action = self.bucket.complete_multipart_upload(
             Some(&self.credentials),
             &log.key,
@@ -123,22 +124,22 @@ impl S3Spill {
             log.etags.iter().map(String::as_str),
         );
         let url = action.sign(SIGNED_FOR);
-        self.agent.post(url.as_str()).send(action.body()).map_err(|_| SpillError::Io)?;
+        self.agent.post(url.as_str()).send(action.body()).map_err(|_| Error::Io)?;
         Ok(())
     }
 }
 
 impl SpillStore for S3Spill {
-    fn create(&self) -> Result<LogId, SpillError> {
+    fn create(&self) -> Result<LogId, Error> {
         let key = format!("{}{}", self.prefix, self.next.fetch_add(1, Ordering::Relaxed));
         let action = self.bucket.create_multipart_upload(Some(&self.credentials), &key);
         let mut response = self
             .agent
             .post(action.sign(SIGNED_FOR).as_str())
             .send_empty()
-            .map_err(|_| SpillError::Io)?;
-        let body = response.body_mut().read_to_string().map_err(|_| SpillError::Io)?;
-        let created = CreateMultipartUpload::parse_response(&body).map_err(|_| SpillError::Io)?;
+            .map_err(|_| Error::Io)?;
+        let body = response.body_mut().read_to_string().map_err(|_| Error::Io)?;
+        let created = CreateMultipartUpload::parse_response(&body).map_err(|_| Error::Io)?;
         let log = Log {
             key,
             upload_id: created.upload_id().to_owned(),
@@ -147,15 +148,15 @@ impl SpillStore for S3Spill {
             len: 0,
             sealed: false,
         };
-        let mut logs = self.logs.lock().map_err(|_| SpillError::Io)?;
+        let mut logs = self.logs.lock().map_err(|_| Error::Io)?;
         logs.push(Some(log));
         Ok(LogId(logs.len() as u64 - 1))
     }
 
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, SpillError> {
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
         self.with(log, |log| {
             if log.sealed {
-                return Err(SpillError::Io);
+                return Err(Error::Io);
             }
             let (staged, len) = match log.staged {
                 Some(staged) => staged,
@@ -172,7 +173,7 @@ impl SpillStore for S3Spill {
         })
     }
 
-    fn seal(&self, log: LogId) -> Result<(), SpillError> {
+    fn seal(&self, log: LogId) -> Result<(), Error> {
         self.with(log, |log| {
             // S3 needs a part, even an empty one.
             if log.staged.is_some() || log.etags.is_empty() {
@@ -184,11 +185,11 @@ impl SpillStore for S3Spill {
         })
     }
 
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
+    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
         self.with(log, |log| {
             let fits = block.offset.checked_add(block.len).is_some_and(|end| end <= log.len);
             if !log.sealed || !fits || block.len != into.len() as u64 {
-                return Err(SpillError::Io);
+                return Err(Error::Io);
             }
             if into.is_empty() {
                 return Ok(());
@@ -200,8 +201,8 @@ impl SpillStore for S3Spill {
                 .get(action.sign(SIGNED_FOR).as_str())
                 .header("range", format!("bytes={}-{last}", block.offset))
                 .call()
-                .map_err(|_| SpillError::Io)?;
-            response.body_mut().as_reader().read_exact(into).map_err(|_| SpillError::Io)
+                .map_err(|_| Error::Io)?;
+            response.body_mut().as_reader().read_exact(into).map_err(|_| Error::Io)
         })
     }
 
@@ -319,7 +320,7 @@ mod tests {
         let Some(store) = store(PART_BYTES_MIN) else { return };
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(10)).unwrap();
-        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(SpillError::Io));
+        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(Error::Io));
         store.seal(log).unwrap();
         assert!(read_column(&Heap, &store, log, &spilled).is_ok());
         store.delete(log);
@@ -345,7 +346,7 @@ mod tests {
         for _ in 0..3 {
             store.append(log, &[0; 1024]).unwrap();
         }
-        assert_eq!(store.seal(log).err(), Some(SpillError::Io));
+        assert_eq!(store.seal(log).err(), Some(Error::Io));
         store.delete(log);
     }
 }

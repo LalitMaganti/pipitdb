@@ -149,6 +149,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
     use crate::context::Context;
+    use crate::error::Error;
     use crate::filter::{Comparison, Value};
     use crate::plan::{DynOp, FilterOp, ScanColumn, ScanOp};
     use crate::predicate::{Leaf, Node, Predicate};
@@ -174,7 +175,7 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
             Ok(false)
         }
 
@@ -184,7 +185,7 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> Result<bool, AllocError> {
+        ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }
@@ -279,7 +280,7 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
             Ok(false)
         }
 
@@ -289,7 +290,7 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> Result<bool, AllocError> {
+        ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }
@@ -372,7 +373,7 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
             Ok(())
         }
 
@@ -382,7 +383,7 @@ mod tests {
             _: &mut Context,
             (): &mut (),
             _: &mut RowBatch,
-        ) -> Result<bool, AllocError> {
+        ) -> Result<bool, Error> {
             Ok(false)
         }
     }

@@ -4,6 +4,7 @@
 - The kernel and pipesql crates are `no_std` + `alloc`. No new dependencies without asking.
 - Keep code simple and easy to read.
 - Don't implement something poorly: leave it out until it can be done well.
+- Refactor early and often. When a change shows the code should be shaped differently, such as two types that are really one, reshape it now rather than leaving it: later means migrating more code.
 - Only add a comment when the code isn't obvious. Keep it short and plain.
 - Order parameters from longest-lived to shortest, e.g. `context, state, batch`.
 - One small PR at a time.

@@ -12,6 +12,7 @@ pub mod bytes;
 pub mod column;
 pub mod context;
 mod erase;
+pub mod error;
 pub mod filter;
 pub mod lower;
 pub mod names;

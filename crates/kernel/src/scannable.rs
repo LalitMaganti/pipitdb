@@ -11,6 +11,7 @@ use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::DataType;
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
+use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, NewState};
@@ -31,7 +32,7 @@ pub trait Scannable {
     fn column_type(&self, column: u32) -> DataType;
 
     /// The state of a read from the first row.
-    fn new_state(&self, context: &mut Context) -> Result<Self::State, AllocError>;
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
 
     /// Fills `batch`, which is empty when called, with the next rows of
     /// `columns`, in that order, or returns false when no rows are left.
@@ -41,7 +42,7 @@ pub trait Scannable {
         context: &mut Context,
         state: &mut Self::State,
         batch: &mut RowBatch,
-    ) -> Result<bool, AllocError>;
+    ) -> Result<bool, Error>;
 }
 
 /// The tables a frontend can read, provided by the embedder.
@@ -50,13 +51,8 @@ pub trait Catalog {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
 
-type ScannableNext = unsafe fn(
-    NonNull<()>,
-    &[u32],
-    &mut Context,
-    NonNull<u8>,
-    &mut RowBatch,
-) -> Result<bool, AllocError>;
+type ScannableNext =
+    unsafe fn(NonNull<()>, &[u32], &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
 /// allocator, and functions that know its type.
@@ -156,7 +152,7 @@ unsafe fn scan_new_state(
     step: NonNull<()>,
     context: &mut Context,
     state: NonNull<u8>,
-) -> Result<(), AllocError> {
+) -> Result<(), Error> {
     // SAFETY: `step` is a `Scan`, whose scannable outlives it.
     let scannable = unsafe { step.cast::<Scan>().as_ref().scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
@@ -168,7 +164,7 @@ unsafe fn scan_next(
     context: &mut Context,
     state: NonNull<u8>,
     batch: &mut RowBatch,
-) -> Result<bool, AllocError> {
+) -> Result<bool, Error> {
     // SAFETY: as in `scan_new_state`.
     let scan = unsafe { step.cast::<Scan>().as_ref() };
     // SAFETY: as in `scan_new_state`.
@@ -206,7 +202,7 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
             Ok(false)
         }
 
@@ -216,7 +212,7 @@ mod tests {
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
-        ) -> Result<bool, AllocError> {
+        ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }

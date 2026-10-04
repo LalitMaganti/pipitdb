@@ -18,9 +18,10 @@ use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
+use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::slow_vec::SlowVec;
-use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore, read_column, write_column};
+use pipit_kernel::spill::{Block, LogId, SpillStore, read_column, write_column};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
@@ -63,9 +64,9 @@ struct Fixed {
 
 impl Fixed {
     /// Bytes `start..start + len` of the log, if it has room.
-    fn range(&self, start: usize, len: usize) -> Result<*mut u8, SpillError> {
+    fn range(&self, start: usize, len: usize) -> Result<*mut u8, Error> {
         if start.checked_add(len).is_none_or(|end| end > 256) {
-            return Err(SpillError::Io);
+            return Err(Error::Io);
         }
         // SAFETY: `start` is within the array.
         Ok(unsafe { self.bytes.get().cast::<u8>().add(start) })
@@ -73,11 +74,11 @@ impl Fixed {
 }
 
 impl SpillStore for Fixed {
-    fn create(&self) -> Result<LogId, SpillError> {
+    fn create(&self) -> Result<LogId, Error> {
         Ok(LogId(0))
     }
 
-    fn append(&self, _: LogId, bytes: &[u8]) -> Result<Block, SpillError> {
+    fn append(&self, _: LogId, bytes: &[u8]) -> Result<Block, Error> {
         let offset = self.len.get();
         let to = self.range(offset, bytes.len())?;
         // SAFETY: `to` has room for `bytes`, which don't overlap the array.
@@ -86,12 +87,12 @@ impl SpillStore for Fixed {
         Ok(Block { offset: offset as u64, len: bytes.len() as u64 })
     }
 
-    fn seal(&self, _: LogId) -> Result<(), SpillError> {
+    fn seal(&self, _: LogId) -> Result<(), Error> {
         Ok(())
     }
 
-    fn read(&self, _: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
-        let offset = usize::try_from(block.offset).map_err(|_| SpillError::Io)?;
+    fn read(&self, _: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+        let offset = usize::try_from(block.offset).map_err(|_| Error::Io)?;
         let from = self.range(offset, into.len())?;
         // SAFETY: as in `append`.
         unsafe { into.as_mut_ptr().copy_from_nonoverlapping(from, into.len()) };

@@ -6,24 +6,10 @@
 //! Calls block. A store that's remote does its uploads and fetches on its
 //! own threads, behind them.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::Allocator;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType};
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpillError {
-    /// The store couldn't write or read, such as from a disk or network
-    /// failure.
-    Io,
-    /// There was no memory to read into.
-    OutOfMemory,
-}
-
-impl From<AllocError> for SpillError {
-    fn from(_: AllocError) -> SpillError {
-        SpillError::OutOfMemory
-    }
-}
+use crate::error::Error;
 
 /// A log in a store, which the store names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,14 +24,14 @@ pub struct Block {
 
 pub trait SpillStore {
     /// A new, empty log.
-    fn create(&self) -> Result<LogId, SpillError>;
+    fn create(&self) -> Result<LogId, Error>;
 
     /// Appends `bytes` to `log`, which isn't sealed. Each block starts where
     /// the one before ended.
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, SpillError>;
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error>;
 
     /// Ends writing to `log`. Only a sealed log can be read.
-    fn seal(&self, log: LogId) -> Result<(), SpillError>;
+    fn seal(&self, log: LogId) -> Result<(), Error>;
 
     /// Says `blocks` of `log` will be read soon, so a remote store can fetch
     /// them together. By default, nothing is done.
@@ -55,7 +41,7 @@ pub trait SpillStore {
 
     /// Reads `block` of `log`, which is sealed, into `into`, which is its
     /// length.
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError>;
+    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error>;
 
     /// Deletes `log`, sealed or not.
     fn delete(&self, log: LogId);
@@ -83,7 +69,7 @@ pub fn write_column(
     store: &dyn SpillStore,
     log: LogId,
     column: &ColumnView,
-) -> Result<SpilledColumn, SpillError> {
+) -> Result<SpilledColumn, Error> {
     let (values, bytes) = if column.data_type().has_offsets() {
         let strings = column.string_values();
         (write_offsets(store, log, strings.offsets())?, Some(store.append(log, strings.bytes())?))
@@ -122,7 +108,7 @@ pub fn write_column(
 
 /// Appends `offsets`, less the first, so they start at 0, a chunk at a time,
 /// as one block.
-fn write_offsets(store: &dyn SpillStore, log: LogId, offsets: &[u32]) -> Result<Block, SpillError> {
+fn write_offsets(store: &dyn SpillStore, log: LogId, offsets: &[u32]) -> Result<Block, Error> {
     let first = *at!(offsets, 0);
     let mut chunk = [0_u8; CHUNK_ROWS as usize * 4];
     let mut block: Option<Block> = None;
@@ -137,7 +123,7 @@ fn write_offsets(store: &dyn SpillStore, log: LogId, offsets: &[u32]) -> Result<
             Some(block) => Block { offset: block.offset, len: block.len + appended.len },
         });
     }
-    block.ok_or(SpillError::Io)
+    block.ok_or(Error::Io)
 }
 
 /// Reads a column `write_column` wrote, into memory from `allocator`.
@@ -146,7 +132,7 @@ pub fn read_column(
     store: &dyn SpillStore,
     log: LogId,
     spilled: &SpilledColumn,
-) -> Result<ColumnView, SpillError> {
+) -> Result<ColumnView, Error> {
     let has_offsets = spilled.data_type.has_offsets();
     let size_bytes =
         (spilled.row_count as usize + usize::from(has_offsets)) * spilled.data_type.width_bytes();
@@ -172,7 +158,7 @@ pub fn read_column(
     let Some(block) = spilled.bytes.filter(|_| has_offsets) else {
         return Ok(ColumnView::new(spilled.data_type, values, validity));
     };
-    let len = usize::try_from(block.len).map_err(|_| SpillError::OutOfMemory)?;
+    let len = usize::try_from(block.len).map_err(|_| Error::OutOfMemory)?;
     let mut bytes = Buffer::allocate(allocator, len)?;
     store.read(log, block, bytes.as_mut_slice::<u8>())?;
     Ok(ColumnView::strings(values, bytes, validity))
@@ -216,15 +202,15 @@ mod tests {
     }
 
     impl SpillStore for Strict {
-        fn create(&self) -> Result<LogId, SpillError> {
+        fn create(&self) -> Result<LogId, Error> {
             let mut logs = self.logs.borrow_mut();
             logs.push(Some(Log::default()));
             Ok(LogId(logs.len() as u64 - 1))
         }
 
-        fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, SpillError> {
+        fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
             let mut logs = self.logs.borrow_mut();
-            let log = logs[index(log)].as_mut().ok_or(SpillError::Io)?;
+            let log = logs[index(log)].as_mut().ok_or(Error::Io)?;
             assert!(!log.sealed);
             let offset = (log.uploaded.len() + log.pending.len()) as u64;
             log.pending.extend_from_slice(bytes);
@@ -234,9 +220,9 @@ mod tests {
             Ok(Block { offset, len: bytes.len() as u64 })
         }
 
-        fn seal(&self, log: LogId) -> Result<(), SpillError> {
+        fn seal(&self, log: LogId) -> Result<(), Error> {
             let mut logs = self.logs.borrow_mut();
-            let log = logs[index(log)].as_mut().ok_or(SpillError::Io)?;
+            let log = logs[index(log)].as_mut().ok_or(Error::Io)?;
             if !log.pending.is_empty() {
                 self.upload(log);
             }
@@ -244,11 +230,11 @@ mod tests {
             Ok(())
         }
 
-        fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
+        fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
             let logs = self.logs.borrow();
-            let log = logs[index(log)].as_ref().ok_or(SpillError::Io)?;
+            let log = logs[index(log)].as_ref().ok_or(Error::Io)?;
             if !log.sealed {
-                return Err(SpillError::Io);
+                return Err(Error::Io);
             }
             self.requests.set(self.requests.get() + 1);
             let start = usize::try_from(block.offset).unwrap();
@@ -337,7 +323,7 @@ mod tests {
         let store = Strict::default();
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(&[1, 2, 3], &[1])).unwrap();
-        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(SpillError::Io));
+        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(Error::Io));
         store.seal(log).unwrap();
         assert!(read_column(&Heap, &store, log, &spilled).is_ok());
     }
