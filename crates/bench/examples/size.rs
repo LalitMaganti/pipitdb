@@ -87,7 +87,8 @@ impl SpillStore for Fixed {
     }
 
     fn read(&self, _: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
-        let from = self.range(block.offset as usize, into.len())?;
+        let offset = usize::try_from(block.offset).map_err(|_| SpillError::Io)?;
+        let from = self.range(offset, into.len())?;
         // SAFETY: as in `append`.
         unsafe { into.as_mut_ptr().copy_from_nonoverlapping(from, into.len()) };
         Ok(())
