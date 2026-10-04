@@ -5,3 +5,4 @@ pipeline.operators 1248554
 pipeline.source 217435
 pipeline.transforms 284965
 query.typical 992029
+scan.table 434087

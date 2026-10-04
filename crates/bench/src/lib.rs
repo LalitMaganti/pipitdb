@@ -8,6 +8,7 @@ use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
+use pipit_operators::table::{Table, TableScan};
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -128,7 +129,7 @@ impl Operator for PassOperator {
 }
 
 /// Runs `source` through `steps`, returning the rows out.
-pub fn run_pipeline(source: &Repeat, steps: &[Step]) -> u64 {
+pub fn run_pipeline<S: Source>(source: &S, steps: &[Step]) -> u64 {
     let pipeline = Pipeline::new(DynSource::new(source), steps);
     let Ok(mut execution) = pipeline.start(Heap) else { return 0 };
     let mut batch = RowBatch::new();
@@ -149,4 +150,19 @@ pub fn pass_steps(count: usize, operators: bool) -> Vec<Step<'static>> {
         }
     };
     (0..count).map(|_| step()).collect()
+}
+
+/// `row_groups` row groups of `rows` rows, with four columns.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn table(row_groups: usize, rows: u32) -> Table {
+    let values = Buffer::allocate(Heap, rows as usize * 8).expect("allocates");
+    let column = ColumnView::new(DataType::Int64, values, None);
+    let columns = [column.clone(), column.clone(), column.clone(), column];
+    let row_groups = vec![columns.as_slice(); row_groups];
+    Table::new(Heap, &[DataType::Int64; 4], &row_groups).expect("allocates")
+}
+
+/// Scans two of `table`'s columns, returning the rows read.
+pub fn scan_table(table: &Table) -> u64 {
+    run_pipeline(&TableScan::new(table, &[3, 1]), &[])
 }

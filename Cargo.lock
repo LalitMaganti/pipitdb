@@ -349,6 +349,7 @@ dependencies = [
  "criterion",
  "gungraun",
  "pipitdb-kernel",
+ "pipitdb-operators",
  "pipitdb-pipesql",
 ]
 
@@ -359,6 +360,13 @@ version = "0.0.0"
 [[package]]
 name = "pipitdb-kernel"
 version = "0.0.0"
+
+[[package]]
+name = "pipitdb-operators"
+version = "0.0.0"
+dependencies = [
+ "pipitdb-kernel",
+]
 
 [[package]]
 name = "pipitdb-pipesql"

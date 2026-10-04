@@ -50,6 +50,15 @@ fn pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Scanning a table's row groups.
+fn scan(c: &mut Criterion) {
+    let table = pipitdb_bench::table(100, 20_480);
+    let mut group = c.benchmark_group("scan");
+    group.throughput(Throughput::Elements(100 * 20_480));
+    group.bench_function("table", |b| b.iter(|| pipitdb_bench::scan_table(black_box(&table))));
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -57,6 +66,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, pipeline
+    targets = lexer, parser, query, pipeline, scan
 }
 criterion_main!(benches);
