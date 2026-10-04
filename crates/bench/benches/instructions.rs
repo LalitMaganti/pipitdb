@@ -46,7 +46,6 @@ fn scan(pipeline: Pipeline<'static>) -> u64 {
 #[library_benchmark]
 #[bench::greater(pipitdb_bench::filter_column(false), pipitdb_bench::greater)]
 #[bench::greater_nulls(pipitdb_bench::filter_column(true), pipitdb_bench::greater)]
-#[bench::in_eight(pipitdb_bench::filter_column(false), pipitdb_bench::in_eight)]
 fn filter(
     column: pipit_kernel::column::ColumnView,
     filter: fn(&pipit_kernel::column::ColumnView, &mut pipit_kernel::selection::Selection),

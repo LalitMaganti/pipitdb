@@ -1,6 +1,5 @@
 filter.greater 1853071
 filter.greater_nulls 3493357
-filter.in_eight 13434471
 lexer.long_text 103516
 lexer.typical 286202
 parser.expression 457072

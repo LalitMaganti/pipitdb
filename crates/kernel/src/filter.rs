@@ -1,9 +1,7 @@
 //! Filters on one column: each narrows a `Selection` to the rows it keeps.
 //! Shared by sources that filter as they read and by filters in a pipeline,
-//! so both keep the same rows. A null row is never kept by a comparison or
-//! `is_in`, as in SQL.
-
-use core::cmp::Ordering;
+//! so both keep the same rows. A null row is never kept by a comparison, as
+//! in SQL.
 
 use crate::column::{ColumnView, DataType};
 use crate::selection::Selection;
@@ -23,18 +21,6 @@ pub enum Comparison {
 pub enum Value {
     Int64(i64),
     Float64(f64),
-}
-
-/// Values of one type order as their numbers do; of different types, not at
-/// all.
-impl PartialOrd for Value {
-    fn partial_cmp(&self, other: &Value) -> Option<Ordering> {
-        match (self, other) {
-            (Value::Int64(a), Value::Int64(b)) => a.partial_cmp(b),
-            (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
-            _ => None,
-        }
-    }
 }
 
 /// Keeps the rows where `column <comparison> value`.
@@ -66,27 +52,6 @@ pub fn is_null(column: &ColumnView, nulls: bool, selection: &mut Selection) {
     };
     // SAFETY: `covering` checked every kept row is a row of `column`.
     selection.retain(|row| unsafe { validity.is_valid_unchecked(u32::from(row)) } != nulls);
-}
-
-/// Keeps the rows whose value is one of `values`, which are sorted, of the
-/// column's type.
-pub fn is_in(column: &ColumnView, values: &[Value], selection: &mut Selection) {
-    check!(values.windows(2).all(|pair| pair[0].partial_cmp(&pair[1]) == Some(Ordering::Less)));
-    let found = |cell: Value| {
-        values.binary_search_by(|value| value.partial_cmp(&cell).unwrap_or(Ordering::Less)).is_ok()
-    };
-    match column.data_type() {
-        DataType::Int64 => {
-            let cells = covering(column, selection).int64s();
-            // SAFETY: `covering` checked every kept row is a row of `column`.
-            keep(column, selection, |row| found(Value::Int64(unsafe { cell(cells, row) })));
-        }
-        DataType::Float64 => {
-            let cells = covering(column, selection).float64s();
-            // SAFETY: as above.
-            keep(column, selection, |row| found(Value::Float64(unsafe { cell(cells, row) })));
-        }
-    }
 }
 
 /// One loop per comparison, so the loop has no branch on it.
@@ -208,7 +173,6 @@ mod tests {
             kept(|s| compare(&column, Comparison::NotEqual, Value::Int64(5), s)),
             [0, 1, 3, 4, 6, 8, 9]
         );
-        assert_eq!(kept(|s| is_in(&column, &[Value::Int64(2), Value::Int64(3)], s)), [3]);
         assert_eq!(kept(|s| is_null(&column, true, s)), [2, 7]);
         assert_eq!(kept(|s| is_null(&column, false, s)).len(), 8);
         assert_eq!(kept(|s| is_null(&int64s(&[]), true, s)), []);
@@ -219,8 +183,8 @@ mod tests {
         let column = int64s(&[]);
         let rows = kept(|s| {
             compare(&column, Comparison::Greater, Value::Int64(2), s);
-            is_in(&column, &[Value::Int64(1), Value::Int64(4), Value::Int64(9)], s);
+            compare(&column, Comparison::NotEqual, Value::Int64(5), s);
         });
-        assert_eq!(rows, [4, 9]);
+        assert_eq!(rows, [3, 4, 6, 7, 8, 9]);
     }
 }

@@ -227,9 +227,3 @@ pub fn run_filter(
 pub fn greater(column: &ColumnView, selection: &mut Selection) {
     filter::compare(column, Comparison::Greater, Value::Int64(500), selection);
 }
-
-/// Keeps eight values of the thousand.
-pub fn in_eight(column: &ColumnView, selection: &mut Selection) {
-    let values = [3, 99, 211, 400, 517, 640, 777, 901].map(Value::Int64);
-    filter::is_in(column, &values, selection);
-}
