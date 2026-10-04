@@ -37,9 +37,7 @@ impl Names {
         else {
             return Err(AllocError);
         };
-        for &byte in name.as_bytes() {
-            self.bytes.push(byte)?;
-        }
+        self.bytes.extend_from_slice(name.as_bytes())?;
         Ok(Name { start, len })
     }
 
