@@ -5,7 +5,7 @@
 //! <https://jhwlr.io/super-flat-ast/>.
 
 use crate::buffer::{Buffer, Primitive};
-use crate::error::Span;
+use crate::error::{ErrorCode, Span};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -68,7 +68,12 @@ pub const BLOCK_BYTES: usize = 64 * 1024;
 /// How many nodes a block holds.
 pub const BLOCK_NODES: usize = BLOCK_BYTES / size_of::<Node>();
 
+/// How many blocks a tree can use.
+pub const BLOCK_SLOTS: usize = 256;
+
 const _: () = assert!(BLOCK_NODES.is_power_of_two());
+const BLOCK_SHIFT: u32 = BLOCK_NODES.trailing_zeros();
+const BLOCK_MASK: usize = BLOCK_NODES - 1;
 
 /// The longest token a leaf can hold, and the most children a `Call` can
 /// have, as both are stored in 24 bits.
@@ -129,41 +134,153 @@ impl Node {
     }
 }
 
-/// A parsed tree. The root is the last node. Only the first `node_count` nodes
-/// of `nodes` have been written.
+/// A parsed tree. The root is the last node.
 pub struct Ast {
-    nodes: Buffer,
-    node_count: u32,
+    nodes: Nodes,
 }
 
 impl Ast {
-    pub(crate) fn new(nodes: Buffer, node_count: u32) -> Ast {
-        check!(node_count > 0);
-        check!(node_count as usize <= nodes.size_bytes() / size_of::<Node>());
-        Ast { nodes, node_count }
+    pub(crate) fn new(nodes: Nodes) -> Ast {
+        check!(nodes.len() > 0);
+        Ast { nodes }
     }
 
     pub fn root(&self) -> u32 {
-        self.node_count - 1
+        self.nodes.len() - 1
     }
 
     pub fn node(&self, index: u32) -> Node {
-        check!(index < self.node_count);
-        // SAFETY: the first `node_count` nodes have been written.
-        unsafe { self.nodes.as_ptr::<Node>().add(index as usize).read() }
+        self.nodes.get(index)
     }
 
     pub fn node_count(&self) -> u32 {
-        self.node_count
+        self.nodes.len()
     }
 }
 
 impl core::fmt::Debug for Ast {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // SAFETY: the first `node_count` nodes have been written.
-        let nodes = unsafe {
-            core::slice::from_raw_parts(self.nodes.as_ptr::<Node>(), self.node_count as usize)
-        };
-        f.debug_list().entries(nodes).finish()
+        f.debug_list().entries((0..self.nodes.len()).map(|i| self.nodes.get(i))).finish()
+    }
+}
+
+/// The tree's nodes, in equal-sized blocks. Block 0 is held directly, so
+/// reading it is the fast path. Later blocks are `Buffer`s kept in `rest`, a
+/// slot table allocated with the second block. Only nodes below `count`, and
+/// slots below `rest_count`, have been written.
+pub(crate) struct Nodes {
+    first: Buffer,
+    rest: Option<Buffer>,
+    rest_count: usize,
+    /// The block being filled. Always a whole block, so writes through it
+    /// stay in bounds even if `grow` fails.
+    current: *mut Node,
+    count: u32,
+}
+
+impl Nodes {
+    /// `first` must come from `Buffer::allocate_uninit` with `BLOCK_BYTES`.
+    pub(crate) fn new(mut first: Buffer) -> Nodes {
+        check!(first.size_bytes() == BLOCK_BYTES);
+        let current = first.as_mut_ptr::<Node>();
+        Nodes { first, rest: None, rest_count: 0, current, count: 0 }
+    }
+
+    pub(crate) fn len(&self) -> u32 {
+        self.count
+    }
+
+    pub(crate) fn push(&mut self, node: Node) {
+        // SAFETY: the offset is masked to within the block.
+        unsafe { self.current.add(self.count as usize & BLOCK_MASK).write(node) };
+        self.count += 1;
+    }
+
+    /// Whether the block being filled just became full, so `grow` must come
+    /// before the next `push`.
+    pub(crate) fn needs_block(&self) -> bool {
+        self.count as usize & BLOCK_MASK == 0
+    }
+
+    /// Allocates the next block, and the slot table with the second block,
+    /// from the allocator the first block came from.
+    #[cold]
+    pub(crate) fn grow(&mut self) -> Result<(), ErrorCode> {
+        if self.rest_count == BLOCK_SLOTS - 1 {
+            return Err(ErrorCode::QueryTooLarge);
+        }
+        if self.rest.is_none() {
+            let size_bytes = (BLOCK_SLOTS - 1) * size_of::<Buffer>();
+            // SAFETY: slots are read only once written.
+            let table = unsafe { self.first.allocate_uninit_like(size_bytes) };
+            self.rest = Some(table.map_err(|_| ErrorCode::OutOfMemory)?);
+        }
+        // SAFETY: nodes are read only once written.
+        let mut block = unsafe { self.first.allocate_uninit_like(BLOCK_BYTES) }
+            .map_err(|_| ErrorCode::OutOfMemory)?;
+        self.current = block.as_mut_ptr::<Node>();
+        let Some(table) = &self.rest else { crate::check::check_failed(line!()) };
+        // SAFETY: `rest_count` is below the table's length, this slot hasn't
+        // been written, and the table is only reachable through `self`.
+        unsafe { slots(table).cast_mut().add(self.rest_count).write(block) };
+        self.rest_count += 1;
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, index: u32) -> Node {
+        check!(index < self.count);
+        let index = index as usize;
+        if index < BLOCK_NODES {
+            // SAFETY: nodes below `count` have been written.
+            return unsafe { self.first.as_ptr::<Node>().add(index).read() };
+        }
+        let slot = (index >> BLOCK_SHIFT) - 1;
+        check!(slot < self.rest_count);
+        let Some(table) = &self.rest else { crate::check::check_failed(line!()) };
+        // SAFETY: slots below `rest_count`, and nodes below `count`, have been
+        // written.
+        unsafe {
+            let block = &*slots(table).add(slot);
+            block.as_ptr::<Node>().add(index & BLOCK_MASK).read()
+        }
+    }
+}
+
+impl Drop for Nodes {
+    fn drop(&mut self) {
+        let Some(table) = &self.rest else { return };
+        let blocks = core::ptr::slice_from_raw_parts_mut(slots(table).cast_mut(), self.rest_count);
+        // SAFETY: the first `rest_count` slots hold blocks, dropped once here.
+        unsafe { core::ptr::drop_in_place(blocks) };
+    }
+}
+
+/// The slot table's slots, which hold `Buffer`s. Read through `i64`, which is
+/// aligned at least as `Buffer` is.
+fn slots(table: &Buffer) -> *const Buffer {
+    const { assert!(align_of::<Buffer>() <= align_of::<i64>()) };
+    table.as_ptr::<i64>().cast()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::Heap;
+
+    #[test]
+    fn nodes_span_blocks() {
+        // SAFETY: nodes are read only once written.
+        let first = unsafe { Buffer::allocate_uninit(Heap, BLOCK_BYTES) }.unwrap();
+        let mut nodes = Nodes::new(first);
+        let count = u32::try_from(2 * BLOCK_NODES + 1).unwrap();
+        for i in 0..count {
+            nodes.push(Node::leaf(Tag::Name, Span { start: i, len: 1 }));
+            if nodes.needs_block() {
+                nodes.grow().unwrap();
+            }
+        }
+        for i in 0..count {
+            assert_eq!(nodes.get(i).span().start, i);
+        }
     }
 }
