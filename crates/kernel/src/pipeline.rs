@@ -59,6 +59,10 @@ struct Slot {
     /// For operators: their input, and where they are with it.
     input: RowBatch,
     status: Status,
+    /// For operators: where their segment ends, and the operator heading the
+    /// segment before, or `None` for the source.
+    end: usize,
+    before: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,10 +77,25 @@ enum Status {
     Done,
 }
 
+/// What a segment did when run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Made {
+    Batch,
+    /// A batch with no rows, which is dropped.
+    Nothing,
+    /// Its operator needs a batch from the segment before.
+    NeedsInput,
+    End,
+}
+
 pub struct Execution<'p> {
     pipeline: &'p Pipeline<'p>,
     memory: NonNull<u8>,
     source_state: usize,
+    /// Where the source's segment ends.
+    source_end: usize,
+    /// The operator heading the last segment, or `None` for the source.
+    last: Option<usize>,
     // Frees `memory`.
     _buffer: Buffer,
 }
@@ -96,72 +115,135 @@ impl<'p> Execution<'p> {
                 return;
             };
             at!(pipeline.steps, i).new_state(memory.add(state));
-            let slot = Slot { state, input: RowBatch::new(), status: Status::Waiting };
+            let input = RowBatch::new();
+            let slot = Slot { state, input, status: Status::Waiting, end: 0, before: None };
             memory.cast::<Slot>().add(i).write(slot);
         });
         check!(layout.is_ok());
-        Execution { pipeline, memory, source_state, _buffer: buffer }
+        let mut execution = Execution {
+            pipeline,
+            memory,
+            source_state,
+            source_end: 0,
+            last: None,
+            _buffer: buffer,
+        };
+        for (i, step) in pipeline.steps.iter().enumerate() {
+            if let Step::Operator(_) = step {
+                execution.set_end(execution.last, i);
+                // SAFETY: the slots were written above.
+                unsafe { (*execution.slot(i)).before = execution.last };
+                execution.last = Some(i);
+            }
+        }
+        execution.set_end(execution.last, pipeline.steps.len());
+        execution
+    }
+
+    fn set_end(&mut self, head: Option<usize>, end: usize) {
+        match head {
+            None => self.source_end = end,
+            // SAFETY: the slots were written by `Execution::new`.
+            Some(op) => unsafe { (*self.slot(op)).end = end },
+        }
     }
 
     /// Fills `output` with the next batch, or returns false when there are
     /// none left.
+    ///
+    /// Each segment is a head, the source or an operator, and the transforms
+    /// after it. Starting from the last, it moves to the segment before when
+    /// a segment's operator needs input, and to the one after when a segment
+    /// makes a batch or ends.
     pub fn next(&mut self, output: &mut RowBatch) -> bool {
-        self.pull(self.pipeline.steps.len(), output)
+        let last = self.pipeline.steps.len();
+        let mut head = self.last;
+        loop {
+            let end = match head {
+                None => self.source_end,
+                // SAFETY: the slots were written by `Execution::new`.
+                Some(op) => unsafe { (*self.slot(op)).end },
+            };
+            match self.make(head, end, output) {
+                // SAFETY: as above.
+                Made::NeedsInput => head = head.and_then(|op| unsafe { (*self.slot(op)).before }),
+                Made::Nothing => {}
+                Made::Batch if end == last => return true,
+                Made::End if end == last => return false,
+                Made::Batch | Made::End => head = Some(end),
+            }
+        }
     }
 
-    /// Fills `batch` with the next non-empty batch out of the steps before
-    /// `end`. Recurses once per operator.
-    fn pull(&self, end: usize, batch: &mut RowBatch) -> bool {
-        let steps = at!(self.pipeline.steps, ..end);
-        let operator = steps.iter().rposition(|step| matches!(step, Step::Operator(_)));
-        let first_transform = operator.map_or(0, |op| op + 1);
-        loop {
-            batch.reset(0);
-            let more = match operator {
-                // SAFETY: the source's state was made by `Execution::new`.
-                None => unsafe { self.pipeline.source.next(batch, self.state(None)) },
-                Some(op) => self.execute(op, batch),
-            };
-            if !more {
-                return false;
-            }
-            for i in first_transform..end {
-                let Step::Transform(transform) = at!(steps, i) else {
+    /// Runs the segment from `head` to `end` once. Its batch goes to the
+    /// operator at `end`, or to `output` if `end` is past the last step.
+    fn make(&self, head: Option<usize>, end: usize, output: &mut RowBatch) -> Made {
+        let next = (end < self.pipeline.steps.len()).then(|| self.slot(end));
+        // SAFETY: a different slot from `head`'s.
+        let batch = next.map_or(output, |next| unsafe { &mut (*next).input });
+        let made = match head {
+            None => self.read_source(batch),
+            Some(op) => self.execute(op, batch),
+        };
+        if made == Made::Batch {
+            for i in head.map_or(0, |op| op + 1)..end {
+                let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
                     crate::check::check_failed(line!());
                 };
                 // SAFETY: the transform's state was made by `Execution::new`.
                 unsafe { transform.process(batch, self.state(Some(i))) };
             }
-            if batch.row_count() > 0 {
-                return true;
-            }
+        }
+        let status = match made {
+            Made::Batch if batch.row_count() == 0 => return Made::Nothing,
+            Made::Batch => Status::Ready,
+            Made::End => Status::Ended,
+            Made::NeedsInput | Made::Nothing => return made,
+        };
+        if let Some(next) = next {
+            // SAFETY: as above.
+            unsafe { (*next).status = status };
+        }
+        made
+    }
+
+    fn read_source(&self, batch: &mut RowBatch) -> Made {
+        batch.reset(0);
+        // SAFETY: the source's state was made by `Execution::new`.
+        if unsafe { self.pipeline.source.next(batch, self.state(None)) } {
+            Made::Batch
+        } else {
+            Made::End
         }
     }
 
-    /// Runs operator `op` once, or returns false if it has nothing left.
-    fn execute(&self, op: usize, output: &mut RowBatch) -> bool {
+    /// Runs operator `op` once.
+    fn execute(&self, op: usize, output: &mut RowBatch) -> Made {
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
             crate::check::check_failed(line!());
         };
-        // SAFETY: `pull` only reaches the slots of steps before `op`.
+        // SAFETY: `make` doesn't touch `op`'s slot otherwise.
         let slot = unsafe { &mut *self.slot(op) };
-        if slot.status == Status::Waiting {
-            let more = self.pull(op, &mut slot.input);
-            slot.status = if more { Status::Ready } else { Status::Ended };
-        }
         let state = self.state(Some(op));
         // SAFETY: the operator's state was made by `Execution::new`.
         let progress = unsafe {
             match slot.status {
-                Status::Ready => operator.execute(&slot.input, output, state),
-                Status::Ended => operator.finish(output, state),
-                Status::Waiting | Status::Done => return false,
+                Status::Waiting => return Made::NeedsInput,
+                Status::Done => return Made::End,
+                Status::Ready => {
+                    output.reset(0);
+                    operator.execute(&slot.input, output, state)
+                }
+                Status::Ended => {
+                    output.reset(0);
+                    operator.finish(output, state)
+                }
             }
         };
         if progress == Progress::NeedInput {
             slot.status = if slot.status == Status::Ready { Status::Waiting } else { Status::Done };
         }
-        true
+        Made::Batch
     }
 
     fn slot(&self, i: usize) -> *mut Slot {
