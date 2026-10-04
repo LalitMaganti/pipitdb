@@ -5,13 +5,13 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::{AllocError, Allocator, DynAllocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::DataType;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
-use crate::step::DynSource;
+use crate::step::{DynSource, NewState};
 use crate::vec::Vec;
 
 /// Named, typed columns, read into batches. Where a read is lives in
@@ -29,8 +29,8 @@ pub trait Scannable {
     /// What `column` holds. Every batch's `column` has this type.
     fn column_type(&self, column: u32) -> DataType;
 
-    /// The state of a read from the first row.
-    fn new_state(&self) -> Self::State;
+    /// The state of a read from the first row, with memory from `allocator`.
+    fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError>;
 
     /// Fills `batch`, which is empty when called, with the next rows of
     /// `columns`, in that order, or returns false when no rows are left.
@@ -51,7 +51,7 @@ pub struct DynScannable<'a> {
     column_name: unsafe fn(NonNull<()>, u32) -> *const str,
     column_type: unsafe fn(NonNull<()>, u32) -> DataType,
     state_layout: Layout,
-    new_state: unsafe fn(NonNull<()>, NonNull<u8>),
+    new_state: NewState,
     drop_state: unsafe fn(NonNull<u8>),
     next: unsafe fn(NonNull<()>, &[u32], &mut RowBatch, NonNull<u8>) -> bool,
     lifetime: PhantomData<&'a ()>,
@@ -77,8 +77,10 @@ impl<'a> DynScannable<'a> {
             },
             state_layout: Layout::new::<T::State>(),
             // SAFETY: as above.
-            new_state: |scannable, state| unsafe {
-                write_state(state, value_of::<T>(scannable).new_state());
+            new_state: |scannable, state, allocator| unsafe {
+                let made = value_of::<T>(scannable).new_state(allocator)?;
+                write_state(state, made);
+                Ok(())
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
@@ -134,11 +136,15 @@ struct Scan {
     columns: Vec<u32>,
 }
 
-unsafe fn scan_new_state(step: NonNull<()>, state: NonNull<u8>) {
+unsafe fn scan_new_state(
+    step: NonNull<()>,
+    state: NonNull<u8>,
+    allocator: &DynAllocator,
+) -> Result<(), AllocError> {
     // SAFETY: `step` is a `Scan`, whose scannable outlives it.
     let scannable = unsafe { step.cast::<Scan>().as_ref().scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), state) }
+    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), state, allocator) }
 }
 
 unsafe fn scan_next(step: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>) -> bool {
@@ -179,8 +185,8 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self) -> bool {
-            false
+        fn new_state(&self, _: &DynAllocator) -> Result<bool, AllocError> {
+            Ok(false)
         }
 
         fn next(&self, columns: &[u32], batch: &mut RowBatch, done: &mut bool) -> bool {

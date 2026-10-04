@@ -9,7 +9,7 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::{AllocError, Allocator, DynAllocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::row_batch::RowBatch;
 use crate::step::{DynSource, Progress, Step};
@@ -28,7 +28,8 @@ impl<'a> Pipeline<'a> {
         Pipeline { source, steps, segment_count: operators + 1 }
     }
 
-    /// Creates the state of a run, in one allocation from `allocator`.
+    /// Creates the state of a run, in one allocation from `allocator`, which
+    /// steps' states also allocate from.
     pub fn start<A: Allocator + Clone + 'static>(
         &self,
         allocator: A,
@@ -36,7 +37,7 @@ impl<'a> Pipeline<'a> {
         let size_bytes = self.layout(|_, _| {})?.0.size();
         // SAFETY: `Execution::new` writes every byte it reads.
         let memory = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
-        Ok(Execution::new(self, memory))
+        Execution::new(self, memory)
     }
 
     /// A `Segment` per segment, a `Slot` per step, then the source's state,
@@ -107,35 +108,55 @@ pub struct Execution<'p> {
     memory: NonNull<u8>,
     slots: usize,
     source_state: usize,
+    /// How many states are made: the source's, then each step's, in order.
+    made: usize,
     // Frees `memory`.
     _buffer: Buffer,
 }
 
 impl<'p> Execution<'p> {
-    fn new(pipeline: &'p Pipeline<'p>, mut buffer: Buffer) -> Execution<'p> {
+    /// Makes every state, or, if one fails, drops those made.
+    fn new(pipeline: &'p Pipeline<'p>, mut buffer: Buffer) -> Result<Execution<'p>, AllocError> {
         let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
             crate::check::check_failed(line!());
         };
-        let mut source_state = 0;
+        let allocator = DynAllocator::of(&buffer);
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
             crate::check::check_failed(line!());
         };
+        let mut execution =
+            Execution { pipeline, memory, slots, source_state: 0, made: 0, _buffer: buffer };
+        let mut failed = false;
         // SAFETY: the memory was allocated with this layout, so it has room
         // for each state at its offset, and for the slots.
         let layout = pipeline.layout(|i, state| unsafe {
-            let Some(i) = i else {
-                source_state = state;
-                pipeline.source.new_state(memory.add(state));
+            if failed {
                 return;
+            }
+            let made = match i {
+                None => pipeline.source.new_state(memory.add(state), &allocator),
+                Some(i) => at!(pipeline.steps, i).new_state(memory.add(state), &allocator),
             };
-            at!(pipeline.steps, i).new_state(memory.add(state));
-            // Built in place: a batch is too big to build and then copy.
-            let slot = memory.add(slots).cast::<Slot>().add(i).as_ptr();
-            (&raw mut (*slot).state).write(state);
-            RowBatch::init(&raw mut (*slot).input);
+            if made.is_err() {
+                failed = true;
+                return;
+            }
+            match i {
+                None => execution.source_state = state,
+                Some(i) => {
+                    // Built in place: a batch is too big to build and then copy.
+                    let slot = memory.add(slots).cast::<Slot>().add(i).as_ptr();
+                    (&raw mut (*slot).state).write(state);
+                    RowBatch::init(&raw mut (*slot).input);
+                }
+            }
+            execution.made += 1;
         });
         check!(layout.is_ok());
-        let execution = Execution { pipeline, memory, slots, source_state, _buffer: buffer };
+        if failed {
+            // Dropping it drops the states made.
+            return Err(AllocError);
+        }
 
         let steps = &pipeline.steps;
         let mut k = 0;
@@ -152,7 +173,7 @@ impl<'p> Execution<'p> {
         segment.end = steps.len();
         // SAFETY: as above.
         unsafe { execution.segment(k).write(segment) };
-        execution
+        Ok(execution)
     }
 
     /// Fills `output` with the next batch, or returns false when there are
@@ -298,10 +319,13 @@ impl<'p> Execution<'p> {
 impl Drop for Execution<'_> {
     fn drop(&mut self) {
         let pipeline = self.pipeline;
+        if self.made == 0 {
+            return;
+        }
         // SAFETY: each was made by `Execution::new`, and is dropped once.
         unsafe {
             (pipeline.source.drop_state)(self.state(None));
-            for (i, step) in pipeline.steps.iter().enumerate() {
+            for (i, step) in pipeline.steps.iter().enumerate().take(self.made - 1) {
                 step.drop_state(self.state(Some(i)));
                 self.slot(i).drop_in_place();
             }
@@ -335,8 +359,8 @@ mod tests {
     impl Source for Numbers {
         type State = i64;
 
-        fn new_state(&self) -> i64 {
-            0
+        fn new_state(&self, _: &DynAllocator) -> Result<i64, AllocError> {
+            Ok(0)
         }
 
         fn next(&self, batch: &mut RowBatch, i: &mut i64) -> bool {
@@ -357,7 +381,9 @@ mod tests {
     impl Transform for Reverse {
         type State = ();
 
-        fn new_state(&self) {}
+        fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+            Ok(())
+        }
 
         fn process(&self, batch: &mut RowBatch, (): &mut ()) {
             batch.columns_mut().reverse();
@@ -373,8 +399,8 @@ mod tests {
     impl Transform for Position {
         type State = (i64, Rc<()>);
 
-        fn new_state(&self) -> (i64, Rc<()>) {
-            (0, self.live.clone())
+        fn new_state(&self, _: &DynAllocator) -> Result<(i64, Rc<()>), AllocError> {
+            Ok((0, self.live.clone()))
         }
 
         fn process(&self, batch: &mut RowBatch, (position, _): &mut (i64, Rc<()>)) {
@@ -390,8 +416,8 @@ mod tests {
     impl Transform for SkipOdd {
         type State = bool;
 
-        fn new_state(&self) -> bool {
-            false
+        fn new_state(&self, _: &DynAllocator) -> Result<bool, AllocError> {
+            Ok(false)
         }
 
         fn process(&self, batch: &mut RowBatch, odd: &mut bool) {
@@ -408,7 +434,9 @@ mod tests {
     impl Transform for KeepEven {
         type State = ();
 
-        fn new_state(&self) {}
+        fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+            Ok(())
+        }
 
         fn process(&self, batch: &mut RowBatch, (): &mut ()) {
             let column = batch.column(0).clone();
@@ -422,7 +450,9 @@ mod tests {
     impl Transform for KeepNone {
         type State = ();
 
-        fn new_state(&self) {}
+        fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+            Ok(())
+        }
 
         fn process(&self, batch: &mut RowBatch, (): &mut ()) {
             batch.selection_mut().retain(|_| false);
@@ -435,8 +465,8 @@ mod tests {
     impl Operator for Split {
         type State = u32;
 
-        fn new_state(&self) -> u32 {
-            0
+        fn new_state(&self, _: &DynAllocator) -> Result<u32, AllocError> {
+            Ok(0)
         }
 
         fn execute(&self, input: &RowBatch, output: &mut RowBatch, row: &mut u32) -> Progress {
@@ -460,8 +490,8 @@ mod tests {
     impl Operator for Sum {
         type State = i64;
 
-        fn new_state(&self) -> i64 {
-            0
+        fn new_state(&self, _: &DynAllocator) -> Result<i64, AllocError> {
+            Ok(0)
         }
 
         fn execute(&self, input: &RowBatch, _: &mut RowBatch, sum: &mut i64) -> Progress {
@@ -473,6 +503,28 @@ mod tests {
             output.reset(1);
             assert!(output.push_column(int64s(&[*sum])).is_ok());
             Progress::NeedInput
+        }
+    }
+
+    /// Allocates its state, a number, from the run's allocator, or fails to
+    /// if `fail`.
+    struct Boxed {
+        fail: bool,
+    }
+
+    impl Transform for Boxed {
+        type State = crate::boxed::Box<i64>;
+
+        fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError> {
+            if self.fail {
+                return Err(AllocError);
+            }
+            crate::boxed::Box::new(allocator.clone(), 7)
+        }
+
+        fn process(&self, batch: &mut RowBatch, number: &mut Self::State) {
+            let column = int64s(&alloc::vec![**number; batch.row_count() as usize]);
+            assert!(batch.push_column(column).is_ok());
         }
     }
 
@@ -553,6 +605,20 @@ mod tests {
         assert_eq!(Rc::strong_count(&live), 2);
         drop(pipeline);
         assert_eq!(Rc::strong_count(&live), 1);
+    }
+
+    #[test]
+    fn states_allocate_and_can_fail() {
+        let boxed = pipeline(Numbers { batches: 1 }, [transform(Boxed { fail: false })]);
+        assert_eq!(batches(&mut boxed.start(Heap).unwrap()), [[[0, 0, 7], [1, -1, 7]]]);
+
+        // The states made before the one that fails are dropped.
+        let live = Rc::new(());
+        let position = Position { live: live.clone() };
+        let steps = [transform(position), transform(Boxed { fail: true })];
+        let failing = pipeline(Numbers { batches: 1 }, steps);
+        assert!(failing.start(Heap).is_err());
+        assert_eq!(Rc::strong_count(&live), 2);
     }
 
     #[test]

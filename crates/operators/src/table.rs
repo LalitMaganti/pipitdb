@@ -1,7 +1,7 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
 //! footer, which pipelines can scan.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
+use pipit_kernel::allocator::{AllocError, Allocator, DynAllocator};
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
@@ -96,8 +96,8 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
-    fn new_state(&self) -> ScanState {
-        ScanState { row_group: 0, row: 0 }
+    fn new_state(&self, _: &DynAllocator) -> Result<ScanState, AllocError> {
+        Ok(ScanState { row_group: 0, row: 0 })
     }
 
     fn next(&self, columns: &[u32], batch: &mut RowBatch, at: &mut ScanState) -> bool {
@@ -140,7 +140,8 @@ mod tests {
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let mut state = table.new_state();
+        let allocator = DynAllocator::new(Heap).unwrap();
+        let mut state = table.new_state(&allocator).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
         while table.next(columns, &mut batch, &mut state) {

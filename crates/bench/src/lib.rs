@@ -1,6 +1,6 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
-use pipit_kernel::allocator::Heap;
+use pipit_kernel::allocator::{AllocError, DynAllocator, Heap};
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::filter::{self, Comparison, Value};
@@ -92,8 +92,8 @@ impl Repeat {
 impl Source for Repeat {
     type State = u32;
 
-    fn new_state(&self) -> u32 {
-        0
+    fn new_state(&self, _: &DynAllocator) -> Result<u32, AllocError> {
+        Ok(0)
     }
 
     fn next(&self, batch: &mut RowBatch, made: &mut u32) -> bool {
@@ -112,7 +112,9 @@ pub struct PassTransform;
 impl Transform for PassTransform {
     type State = ();
 
-    fn new_state(&self) {}
+    fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+        Ok(())
+    }
 
     fn process(&self, _: &mut RowBatch, (): &mut ()) {}
 }
@@ -123,7 +125,9 @@ pub struct PassOperator;
 impl Operator for PassOperator {
     type State = ();
 
-    fn new_state(&self) {}
+    fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+        Ok(())
+    }
 
     fn execute(&self, input: &RowBatch, output: &mut RowBatch, (): &mut ()) -> Progress {
         output.reset(input.row_count());

@@ -34,6 +34,12 @@ impl DynAllocator {
     pub fn new<A: Allocator + Clone + 'static>(allocator: A) -> Result<DynAllocator, AllocError> {
         Ok(DynAllocator { header: Buffer::allocate(allocator, 0)? })
     }
+
+    /// The allocator `buffer` came from, sharing its header, so making it
+    /// allocates nothing.
+    pub(crate) fn of(buffer: &Buffer) -> DynAllocator {
+        DynAllocator { header: buffer.clone() }
+    }
 }
 
 // SAFETY: forwards to the allocator in the header.
