@@ -62,18 +62,43 @@ const _: () = assert!(size_of::<Node>() == 8);
 // `operator` check their values before converting.
 unsafe impl Primitive for Node {}
 
-/// The size of the block of memory that holds the tree's nodes.
-pub const BLOCK_BYTES: usize = 64 * 1024;
+/// The size of each block of memory holding the tree's nodes. Set at build
+/// time with `PIPIT_AST_BLOCK_BYTES`.
+pub const BLOCK_BYTES: usize = build_setting(option_env!("PIPIT_AST_BLOCK_BYTES"), 64 * 1024);
 
 /// How many nodes a block holds.
 pub const BLOCK_NODES: usize = BLOCK_BYTES / size_of::<Node>();
 
-/// How many blocks a tree can use.
-pub const BLOCK_SLOTS: usize = 256;
+/// How many blocks a tree can use. Set at build time with
+/// `PIPIT_AST_BLOCK_SLOTS`.
+pub const BLOCK_SLOTS: usize = build_setting(option_env!("PIPIT_AST_BLOCK_SLOTS"), 256);
 
-const _: () = assert!(BLOCK_NODES.is_power_of_two());
+const _: () =
+    assert!(BLOCK_BYTES.is_power_of_two(), "PIPIT_AST_BLOCK_BYTES must be a power of two");
+const _: () = assert!(BLOCK_NODES >= 2, "PIPIT_AST_BLOCK_BYTES is too small");
+const _: () = assert!(BLOCK_SLOTS >= 1, "PIPIT_AST_BLOCK_SLOTS must be at least 1");
+const _: () = assert!(
+    BLOCK_SLOTS <= u32::MAX as usize / BLOCK_NODES,
+    "a tree can't have more than u32::MAX nodes"
+);
 const BLOCK_SHIFT: u32 = BLOCK_NODES.trailing_zeros();
 const BLOCK_MASK: usize = BLOCK_NODES - 1;
+
+/// `value`, a decimal number set at build time, or `default` if it isn't set.
+/// Fails the build if it isn't a number.
+const fn build_setting(value: Option<&str>, default: usize) -> usize {
+    let Some(value) = value else { return default };
+    let digits = value.as_bytes();
+    assert!(!digits.is_empty(), "build settings must be decimal numbers");
+    let mut number: usize = 0;
+    let mut i = 0;
+    while i < digits.len() {
+        assert!(digits[i].is_ascii_digit(), "build settings must be decimal numbers");
+        number = number * 10 + (digits[i] - b'0') as usize;
+        i += 1;
+    }
+    number
+}
 
 /// The longest token a leaf can hold, and the most children a `Call` can
 /// have, as both are stored in 24 bits.
