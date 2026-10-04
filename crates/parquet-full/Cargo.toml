@@ -1,0 +1,22 @@
+[package]
+name = "pipitdb-parquet-full"
+description = "What pipitdb's small Parquet reader leaves out, such as compression."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_parquet_full"
+
+[dependencies]
+pipitdb-parquet = { path = "../parquet" }
+snap = "1"
+
+[dev-dependencies]
+pipitdb-file = { path = "../file" }
+pipitdb-kernel = { path = "../kernel" }
+
+[lints]
+workspace = true

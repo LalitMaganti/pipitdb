@@ -8,15 +8,16 @@ use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::slow_vec::SlowVec;
 
-use crate::Error;
 use crate::chunk::ChunkReader;
 use crate::footer::ParquetFile;
+use crate::{Codec, Error};
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
 
 pub struct ParquetTable<'a> {
     files: SlowVec<File<'a>>,
+    codecs: &'a dyn Codec,
 }
 
 struct File<'a> {
@@ -36,9 +37,11 @@ pub struct ScanState<'a> {
 
 impl<'a> ParquetTable<'a> {
     /// The files in `sources`, which must have the same columns, in the same
-    /// order, of types the kernel has.
+    /// order, of types the kernel has. Their pages are decompressed with
+    /// `codecs`.
     pub fn open(
         allocator: &dyn Allocator,
+        codecs: &'a dyn Codec,
         sources: &[&'a dyn ByteSource],
     ) -> Result<ParquetTable<'a>, Error> {
         let mut files: SlowVec<File<'a>> = SlowVec::new(allocator, FILES_MAX)?;
@@ -54,7 +57,7 @@ impl<'a> ParquetTable<'a> {
         if files.is_empty() {
             return Err(Error::Unsupported);
         }
-        Ok(ParquetTable { files })
+        Ok(ParquetTable { files, codecs })
     }
 
     fn first(&self) -> &ParquetFile {
@@ -117,7 +120,7 @@ impl<'a> Scannable for ParquetTable<'a> {
                     let c = column as usize;
                     let chunk = file.footer.chunk(state.group, c);
                     let column = *at!(file.footer.columns(), c);
-                    let reader = ChunkReader::new(file.source, column, chunk)?;
+                    let reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
                     state.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
                 }
                 (state.started, state.left) = (true, file.footer.group_rows(state.group));
@@ -157,6 +160,7 @@ mod tests {
     use pipit_kernel::allocator::Heap;
 
     use super::*;
+    use crate::Uncompressed;
 
     const SMALL: &[u8] = include_bytes!("../tests/data/small.parquet");
     const NULLS: &[u8] = include_bytes!("../tests/data/nulls.parquet");
@@ -182,7 +186,7 @@ mod tests {
 
     #[test]
     fn scans_files_as_one_table() {
-        let table = ParquetTable::open(&Heap, &[&NULLS, &NULLS]).unwrap();
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
         assert_eq!(table.column_count(), 3);
         assert_eq!(table.column_name(2), "name");
         assert!(table.column_type(2) == DataType::String);
@@ -196,7 +200,7 @@ mod tests {
 
     #[test]
     fn files_must_have_the_same_columns() {
-        let opened = ParquetTable::open(&Heap, &[&NULLS, &SMALL]);
+        let opened = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &SMALL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 }

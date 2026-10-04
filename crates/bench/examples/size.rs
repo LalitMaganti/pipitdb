@@ -11,6 +11,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
+use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
@@ -157,7 +158,7 @@ pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
 pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     // SAFETY: guaranteed by the caller.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
-    let Ok(table) = ParquetTable::open(&Heap, &[&bytes]) else { return 0 };
+    let Ok(table) = ParquetTable::open(&Heap, &Uncompressed, &[&bytes]) else { return 0 };
     let mut context = Context::new(&Heap);
     let Ok(mut state) = table.new_state(&mut context) else { return 0 };
     let mut batch = RowBatch::new();
