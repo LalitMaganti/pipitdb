@@ -1,7 +1,7 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
-use pipit_kernel::vec::Vec;
+use crate::allocator::{AllocError, Allocator};
+use crate::vec::Vec;
 
 pub struct Names {
     bytes: Vec<u8>,
@@ -51,7 +51,7 @@ impl Names {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
+    use crate::allocator::Heap;
 
     use super::*;
 

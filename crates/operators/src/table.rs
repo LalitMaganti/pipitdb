@@ -7,7 +7,7 @@ use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::vec::Vec;
 
-use crate::names::{Name, Names};
+use pipit_kernel::names::{Name, Names};
 
 pub struct Table {
     names: Names,
