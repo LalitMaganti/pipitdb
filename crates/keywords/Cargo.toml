@@ -1,0 +1,11 @@
+[package]
+name = "pipitdb-keywords"
+description = "A case-insensitive keyword table that can be built at compile time."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
