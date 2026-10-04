@@ -56,6 +56,26 @@ fn scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// Queries over Perfetto's benchmark slices, compiled and lowered once, then
+/// run. Skipped without a Perfetto checkout.
+fn slices(c: &mut Criterion) {
+    let Some(slices) = pipitdb_bench::real::slices() else {
+        eprintln!("No Perfetto checkout at $PIPIT_PERFETTO or ~/perfetto: skipping `slices`.");
+        return;
+    };
+    let mut group = c.benchmark_group("slices");
+    let queries = [
+        ("all", "FROM slice"),
+        ("two", "FROM slice |> SELECT ts, dur"),
+        ("four", "FROM slice |> SELECT ts, dur, name, depth"),
+    ];
+    for (name, query) in queries {
+        let Some(plan) = pipitdb_bench::real::slice_query(slices, query) else { continue };
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run(black_box(plan.pipeline()))));
+    }
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -63,6 +83,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, pipeline, scan
+    targets = lexer, parser, query, pipeline, scan, slices
 }
 criterion_main!(benches);

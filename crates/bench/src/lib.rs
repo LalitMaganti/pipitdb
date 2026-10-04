@@ -14,6 +14,8 @@ use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
 
+pub mod real;
+
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 
 /// Queries shaped like real ones, repeated `count` times.
