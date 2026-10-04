@@ -10,4 +10,4 @@ predicate.and 2656230
 predicate.not 1716570
 predicate.or 5648730
 query.typical 995453
-scan.table 409856
+scan.table 372876
