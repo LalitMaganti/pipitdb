@@ -32,5 +32,22 @@ fn query(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, lexer, parser, query);
+/// What the pipeline costs per batch, with steps that do nothing.
+fn pipeline(c: &mut Criterion) {
+    let batches = 10_000;
+    let source = pipitdb_bench::Repeat::new(batches);
+    let mut group = c.benchmark_group("pipeline");
+    group.throughput(Throughput::Elements(u64::from(batches)));
+    for (name, steps, operators) in
+        [("source", 0, false), ("transforms", 4, false), ("operators", 4, true)]
+    {
+        let steps = pipitdb_bench::pass_steps(steps, operators);
+        group.bench_function(name, |b| {
+            b.iter(|| pipitdb_bench::run_pipeline(black_box(&source), black_box(&steps)));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, lexer, parser, query, pipeline);
 criterion_main!(benches);
