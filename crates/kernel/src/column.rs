@@ -82,6 +82,13 @@ impl ColumnView {
         at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
     }
 
+    /// The view's values, as bytes.
+    pub(crate) fn value_bytes(&self) -> &[u8] {
+        let width = self.data_type.width_bytes();
+        let start = self.start as usize * width;
+        at!(self.values.as_slice::<u8>(), start..start + self.row_count as usize * width)
+    }
+
     fn values<T: Primitive>(&self) -> &[T] {
         let start = self.start as usize;
         at!(self.values.as_slice::<T>(), start..start + self.row_count as usize)
