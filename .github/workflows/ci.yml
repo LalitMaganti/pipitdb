@@ -33,6 +33,18 @@ jobs:
           PIPIT_AST_BLOCK_SLOTS: 4
       - run: cargo build --release --target wasm32-unknown-unknown
 
+  # The engine on Windows, where files work differently. The benchmarks are
+  # left out: one of their dependencies needs a C compiler there.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      - run: cargo test -p pipitdb-kernel -p pipitdb-file -p pipitdb-operators -p pipitdb-pipesql -p pipitdb-diagnostics
+
   size:
     strategy:
       fail-fast: false
