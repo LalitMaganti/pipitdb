@@ -8,7 +8,8 @@ use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 
 /// Every `Vec` has a most values it can hold, `max`. It grows towards it as
-/// needed, so one made with room for `max` never grows.
+/// needed, doubling, so one made with room for `max` never grows. `max` is a
+/// power of two, and so is the room for values, unless it is 0.
 ///
 /// Its values live in a `Buffer`, which also remembers the allocator, so a
 /// `Vec` isn't generic over it.
@@ -36,8 +37,11 @@ impl<T> Vec<T> {
         max: usize,
     ) -> Result<Vec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+        check!(max.is_power_of_two());
+        check!(capacity == 0 || capacity.is_power_of_two());
         check!(capacity <= max);
-        let size_bytes = capacity.checked_mul(size_of::<T>()).ok_or(AllocError)?;
+        max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
+        let size_bytes = capacity * size_of::<T>();
         // SAFETY: only the first `len` values are read, and each is written
         // first.
         let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
@@ -56,12 +60,14 @@ impl<T> Vec<T> {
             if self.len == self.max {
                 return Err(value);
             }
+            // Powers of two below `max` double to at most `max`.
+            let capacity = if self.capacity == 0 { self.max.min(4) } else { self.capacity * 2 };
             let item = size_of::<T>();
-            match grow(&mut self.buffer, self.len * item, item, self.max * item) {
+            match grow(&mut self.buffer, self.len * item, capacity * item) {
                 Ok(values) => self.values = values.cast(),
                 Err(AllocError) => return Err(value),
             }
-            self.capacity = self.buffer.size_bytes() / size_of::<T>();
+            self.capacity = capacity;
         }
         // SAFETY: there is room for a value at `len`.
         unsafe { self.values.add(self.len).write(value) };
@@ -70,18 +76,15 @@ impl<T> Vec<T> {
     }
 }
 
-/// Moves the first `used_bytes` of `buffer` to one about twice as big, from
-/// the same allocator: room for at least four `item_bytes`, and at most
-/// `max_bytes`. Shared by every `Vec<T>`, so it isn't copied for each `T`.
+/// Moves the first `used_bytes` of `buffer` to one of `size_bytes`, from the
+/// same allocator. Shared by every `Vec<T>`, so it isn't copied for each `T`.
 #[cold]
 #[inline(never)]
 fn grow(
     buffer: &mut Buffer,
     used_bytes: usize,
-    item_bytes: usize,
-    max_bytes: usize,
+    size_bytes: usize,
 ) -> Result<NonNull<u8>, AllocError> {
-    let size_bytes = used_bytes.saturating_mul(2).max(4 * item_bytes).min(max_bytes);
     // SAFETY: as in `Vec::with_capacity`.
     let mut grown = unsafe { buffer.allocate_uninit_like(size_bytes)? };
     let to = data(&mut grown);
@@ -163,7 +166,7 @@ mod tests {
     fn grows_from_its_allocator() {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-        let mut values = Vec::new(allocator, 100).unwrap();
+        let mut values = Vec::new(allocator, 128).unwrap();
         for i in 0..100 {
             assert!(values.push(i).is_ok());
         }
@@ -176,7 +179,7 @@ mod tests {
     #[test]
     fn drops_its_values() {
         let value = Rc::new(());
-        let mut values = Vec::new(Heap, 10).unwrap();
+        let mut values = Vec::new(Heap, 16).unwrap();
         for _ in 0..10 {
             assert!(values.push(value.clone()).is_ok());
         }
@@ -189,7 +192,7 @@ mod tests {
     fn gives_the_value_back_if_it_cant_grow() {
         let left = Rc::new(Cell::new(2));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-        let mut values = Vec::new(allocator, 100).unwrap();
+        let mut values = Vec::new(allocator, 128).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -201,13 +204,19 @@ mod tests {
     fn stops_at_its_max() {
         let left = Rc::new(Cell::new(1));
         let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
-        let mut values = Vec::with_capacity(allocator, 3, 3).unwrap();
-        for i in 0..3 {
+        let mut values = Vec::with_capacity(allocator, 4, 4).unwrap();
+        for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
-        assert_eq!(values.push(3), Err(3));
+        assert_eq!(values.push(4), Err(4));
         // Made with room for its max, it never grew.
         assert_eq!(left.get(), 0);
-        assert_eq!(values.capacity(), 3);
+        assert_eq!(values.capacity(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "power_of_two")]
+    fn max_is_a_power_of_two() {
+        let _ = Vec::<u64>::new(Heap, 100);
     }
 }

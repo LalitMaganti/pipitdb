@@ -34,7 +34,7 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
 /// Pushes `0..count` to a `Vec`, and returns the last.
 #[unsafe(no_mangle)]
 pub extern "C" fn vec_sum(count: u32) -> u64 {
-    let Ok(mut values) = Vec::new(Heap, count as usize) else { return 0 };
+    let Ok(mut values) = Vec::new(Heap, (count as usize).next_power_of_two()) else { return 0 };
     for i in 0..count {
         if values.push(u64::from(i)).is_err() {
             return 0;
