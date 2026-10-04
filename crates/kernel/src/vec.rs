@@ -58,22 +58,27 @@ impl<T> Vec<T> {
     /// Adds `value` at the end, growing if full. Fails, giving `value` back,
     /// if the `Vec` holds `max` values or can't grow.
     pub fn push(&mut self, value: T) -> Result<(), T> {
-        if self.len == self.capacity {
-            if self.len == self.max {
-                return Err(value);
-            }
-            // Powers of two below `max` double to at most `max`.
-            let capacity = if self.capacity == 0 { self.max.min(4) } else { self.capacity * 2 };
-            let item = size_of::<T>();
-            match grow(&mut self.buffer, self.len * item, capacity * item) {
-                Ok(values) => self.values = values.cast(),
-                Err(AllocError) => return Err(value),
-            }
-            self.capacity = capacity;
+        if self.len == self.capacity && self.make_room().is_err() {
+            return Err(value);
         }
         // SAFETY: there is room for a value at `len`.
         unsafe { self.values.add(self.len).write(value) };
         self.len += 1;
+        Ok(())
+    }
+
+    /// Grows a full `Vec`, unless it is at `max`.
+    #[cold]
+    #[inline(never)]
+    fn make_room(&mut self) -> Result<(), AllocError> {
+        if self.len == self.max {
+            return Err(AllocError);
+        }
+        // Powers of two below `max` double to at most `max`.
+        let capacity = if self.capacity == 0 { self.max.min(4) } else { self.capacity * 2 };
+        let item = size_of::<T>();
+        self.values = grow(&mut self.buffer, self.len * item, capacity * item)?.cast();
+        self.capacity = capacity;
         Ok(())
     }
 }
