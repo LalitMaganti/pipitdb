@@ -6,19 +6,21 @@ use crate::buffer::{Buffer, Primitive};
 pub enum DataType {
     Int64,
     Float64,
-    /// Bytes of any length, as Arrow's `Binary`: offsets into a buffer of
-    /// them.
     String,
 }
 
 impl DataType {
-    /// How wide each value is in a column's values buffer: for strings, an
-    /// offset.
     pub fn width_bytes(self) -> usize {
         match self {
             DataType::Int64 | DataType::Float64 => 8,
             DataType::String => 4,
         }
+    }
+
+    /// Whether a column's values are offsets into a buffer of bytes, with one
+    /// more offset than there are rows.
+    pub fn has_offsets(self) -> bool {
+        matches!(self, DataType::String)
     }
 }
 
@@ -27,7 +29,6 @@ impl DataType {
 #[derive(Clone)]
 pub struct ColumnView {
     data_type: DataType,
-    /// For strings, offsets into `bytes`, one more than there are rows.
     values: Buffer,
     bytes: Option<Buffer>,
     validity: Option<Buffer>,
@@ -38,7 +39,7 @@ pub struct ColumnView {
 impl ColumnView {
     /// A view of every row in `values`.
     pub fn new(data_type: DataType, values: Buffer, validity: Option<Buffer>) -> ColumnView {
-        check!(data_type != DataType::String);
+        check!(!data_type.has_offsets());
         check!(values.size_bytes().is_multiple_of(data_type.width_bytes()));
         let Ok(row_count) = u32::try_from(values.size_bytes() / data_type.width_bytes()) else {
             crate::check::check_failed(line!());
@@ -73,7 +74,6 @@ impl ColumnView {
         }
     }
 
-    /// A string column's values.
     pub fn string_values(&self) -> Strings<'_> {
         check!(self.data_type == DataType::String);
         let start = self.start as usize;
@@ -153,7 +153,6 @@ impl<'a> Strings<'a> {
         self.len() == 0
     }
 
-    /// Row `row`'s bytes.
     pub fn get(self, row: usize) -> &'a [u8] {
         let (start, end) = (*at!(self.offsets, row), *at!(self.offsets, row + 1));
         at!(self.bytes, start as usize..end as usize)
@@ -228,7 +227,6 @@ mod tests {
         ColumnView::new(DataType::Float64, values, None).int64s();
     }
 
-    /// `values` as a string column.
     fn strings(values: &[&str]) -> ColumnView {
         let mut offsets = Buffer::allocate(&Heap, (values.len() + 1) * 4).unwrap();
         let total: usize = values.iter().map(|v| v.len()).sum();
@@ -258,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "String")]
+    #[should_panic(expected = "has_offsets")]
     fn strings_need_their_bytes() {
         let _ = ColumnView::new(DataType::String, Buffer::allocate(&Heap, 8).unwrap(), None);
     }

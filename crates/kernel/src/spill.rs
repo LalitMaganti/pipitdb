@@ -66,9 +66,9 @@ pub trait SpillStore {
 pub struct SpilledColumn {
     pub data_type: DataType,
     pub row_count: u32,
-    /// Its values, or for strings, their offsets, starting at 0.
+    /// Its values, or if its type has offsets, them, starting at 0.
     pub values: Block,
-    /// For strings, their bytes.
+    /// If its type has offsets, the bytes they're into.
     pub bytes: Option<Block>,
     /// Its null bitmap, if it may have nulls.
     pub validity: Option<Block>,
@@ -77,14 +77,14 @@ pub struct SpilledColumn {
 /// How many rows' null bits `write_column` appends at once.
 const CHUNK_ROWS: u32 = 512;
 
-/// Appends `column` to `log`: its values, or a string column's offsets and
-/// then bytes, then its null bitmap, if any.
+/// Appends `column` to `log`: its values, or its offsets and then bytes,
+/// then its null bitmap, if any.
 pub fn write_column(
     store: &dyn SpillStore,
     log: LogId,
     column: &ColumnView,
 ) -> Result<SpilledColumn, SpillError> {
-    let (values, bytes) = if column.data_type() == DataType::String {
+    let (values, bytes) = if column.data_type().has_offsets() {
         let strings = column.string_values();
         (write_offsets(store, log, strings.offsets())?, Some(store.append(log, strings.bytes())?))
     } else {
@@ -147,14 +147,13 @@ pub fn read_column(
     log: LogId,
     spilled: &SpilledColumn,
 ) -> Result<ColumnView, SpillError> {
-    // Strings have an offset more than they have rows.
-    let is_string = spilled.data_type == DataType::String;
+    let has_offsets = spilled.data_type.has_offsets();
     let size_bytes =
-        (spilled.row_count as usize + usize::from(is_string)) * spilled.data_type.width_bytes();
+        (spilled.row_count as usize + usize::from(has_offsets)) * spilled.data_type.width_bytes();
     check!(spilled.values.len == size_bytes as u64);
     let mut values = Buffer::allocate(allocator, size_bytes)?;
     store.read(log, spilled.values, values.as_mut_slice::<u8>())?;
-    if is_string {
+    if has_offsets {
         // Offsets were written little-endian.
         for offset in values.as_mut_slice::<u32>() {
             *offset = u32::from_le(*offset);
@@ -170,7 +169,7 @@ pub fn read_column(
             Some(bits)
         }
     };
-    let Some(block) = spilled.bytes.filter(|_| is_string) else {
+    let Some(block) = spilled.bytes.filter(|_| has_offsets) else {
         return Ok(ColumnView::new(spilled.data_type, values, validity));
     };
     let len = usize::try_from(block.len).map_err(|_| SpillError::OutOfMemory)?;
@@ -316,7 +315,6 @@ mod tests {
         let mut validity = Buffer::allocate(&Heap, words.len().div_ceil(8)).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1110_1111);
         let whole = ColumnView::strings(offsets, bytes, Some(validity));
-        // A slice's offsets don't start at 0, and are rebased when written.
         let columns = [whole.clone(), whole.slice(3, 600)];
 
         let log = store.create().unwrap();
