@@ -1,6 +1,7 @@
 //! `Vec`: a growable list of values, in memory from the allocator it was made
 //! with.
 
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
@@ -17,15 +18,23 @@ impl<T> From<Full<T>> for AllocError {
     }
 }
 
+/// A list for building things now and then, such as plans and footers. It
+/// stays small rather than fast: what doesn't depend on its values' type is
+/// shared by every `Vec`, not copied for each type. Hot loops work on
+/// buffers directly.
+///
 /// Every `Vec` has a most values it can hold, `max`, a power of two. One made
 /// by `new` grows towards it as needed, doubling; one made by `fixed` has room
 /// for `max` from the start, and never grows.
-///
-/// Its values live in a `Buffer`, which also remembers the allocator, so a
-/// `Vec` isn't generic over it.
 pub struct Vec<T> {
+    raw: RawVec,
+    values: PhantomData<T>,
+}
+
+/// A `Vec`'s memory and counts, which don't depend on its values' type.
+struct RawVec {
     buffer: Buffer,
-    values: NonNull<T>,
+    values: NonNull<u8>,
     len: usize,
     capacity: usize,
     max: usize,
@@ -52,36 +61,39 @@ impl<T> Vec<T> {
     ) -> Result<Vec<T>, AllocError> {
         let mut vec = Vec::fixed(allocator, values.len())?;
         // An iterator can claim a wrong length, so it can't overrun.
-        for value in values.take(vec.capacity) {
+        for value in values.take(vec.raw.capacity) {
             // SAFETY: `len` is below the capacity.
-            unsafe { vec.values.add(vec.len).write(value) };
-            vec.len += 1;
+            unsafe { vec.slot(vec.raw.len).write(value) };
+            vec.raw.len += 1;
         }
         Ok(vec)
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.raw.capacity
     }
 
     /// An empty `Vec` with room for `capacity` values, 0 or `max`.
     fn empty(allocator: &dyn Allocator, capacity: usize, max: usize) -> Result<Vec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
-        let mut buffer = allocate(allocator, capacity * size_of::<T>())?;
-        let values = buffer.as_mut_non_null().cast();
-        Ok(Vec { buffer, values, len: 0, capacity, max })
+        Ok(Vec { raw: RawVec::new(allocator, size_of::<T>(), capacity, max)?, values: PhantomData })
+    }
+
+    /// Where value `i` goes.
+    fn slot(&self, i: usize) -> NonNull<T> {
+        // SAFETY: callers only ask for places within the capacity.
+        unsafe { self.raw.values.cast::<T>().add(i) }
     }
 
     /// Adds `value` at the end, growing if full. Fails, giving `value` back,
     /// if the `Vec` holds `max` values or can't grow.
     pub fn push(&mut self, value: T) -> Result<(), Full<T>> {
-        if self.len == self.capacity && self.make_room(1).is_err() {
+        if self.raw.len == self.raw.capacity && self.raw.make_room(size_of::<T>(), 1).is_err() {
             return Err(Full(value));
         }
         // SAFETY: there is room for a value at `len`.
-        unsafe { self.values.add(self.len).write(value) };
-        self.len += 1;
+        unsafe { self.slot(self.raw.len).write(value) };
+        self.raw.len += 1;
         Ok(())
     }
 
@@ -92,43 +104,42 @@ impl<T> Vec<T> {
     where
         T: Copy,
     {
-        if values.len() > self.capacity - self.len {
-            self.make_room(values.len())?;
+        if values.len() > self.raw.capacity - self.raw.len {
+            self.raw.make_room(size_of::<T>(), values.len())?;
         }
         // SAFETY: there is room for `values` from `len`, and they can't
         // overlap the `Vec`, which `values` doesn't borrow.
         unsafe {
-            self.values
-                .add(self.len)
+            self.slot(self.raw.len)
                 .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
         };
-        self.len += values.len();
+        self.raw.len += values.len();
         Ok(())
     }
 
     /// Removes the last value, if any.
     pub fn pop(&mut self) -> Option<T> {
-        self.len = self.len.checked_sub(1)?;
+        self.raw.len = self.raw.len.checked_sub(1)?;
         // SAFETY: the value at the old last place was written, and is no
         // longer counted, so it's moved out once.
-        Some(unsafe { self.values.add(self.len).read() })
+        Some(unsafe { self.slot(self.raw.len).read() })
     }
 
     /// Keeps the values `keep` says to, in order, dropping the rest.
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
-        let len = self.len;
+        let len = self.raw.len;
         // Counted as empty while values move, so a panic in `keep` leaks
         // rather than drops twice.
-        self.len = 0;
+        self.raw.len = 0;
         let mut kept = 0;
         for i in 0..len {
             // SAFETY: values below `len` were written, and each is read or
             // dropped once here; `kept` never passes `i`.
             unsafe {
-                let value = self.values.add(i);
+                let value = self.slot(i);
                 if keep(value.as_ref()) {
                     if kept != i {
-                        self.values.add(kept).write(value.read());
+                        self.slot(kept).write(value.read());
                     }
                     kept += 1;
                 } else {
@@ -136,13 +147,31 @@ impl<T> Vec<T> {
                 }
             }
         }
-        self.len = kept;
+        self.raw.len = kept;
+    }
+}
+
+impl RawVec {
+    #[inline(never)]
+    fn new(
+        allocator: &dyn Allocator,
+        item: usize,
+        capacity: usize,
+        max: usize,
+    ) -> Result<RawVec, AllocError> {
+        max.checked_mul(item).ok_or(AllocError)?;
+        // SAFETY: only the first `len` values are read, and each is written
+        // first.
+        let mut buffer = unsafe { Buffer::allocate_uninit(allocator, capacity * item)? };
+        let values = buffer.as_mut_non_null();
+        Ok(RawVec { buffer, values, len: 0, capacity, max })
     }
 
-    /// Grows so `additional` more values fit, unless that's past `max`.
+    /// Grows so `additional` more values of `item` bytes fit, unless that's
+    /// past `max`.
     #[cold]
     #[inline(never)]
-    fn make_room(&mut self, additional: usize) -> Result<(), AllocError> {
+    fn make_room(&mut self, item: usize, additional: usize) -> Result<(), AllocError> {
         let needed = self.len.checked_add(additional).ok_or(AllocError)?;
         if needed > self.max {
             return Err(AllocError);
@@ -150,38 +179,17 @@ impl<T> Vec<T> {
         // Powers of two up to `max` stay powers of two up to `max`.
         let doubled = if self.capacity == 0 { 4 } else { self.capacity * 2 };
         let capacity = doubled.max(needed.next_power_of_two()).min(self.max);
-        let item = size_of::<T>();
-        self.values = grow(&mut self.buffer, self.len * item, capacity * item)?.cast();
+        // SAFETY: as in `new`.
+        let mut grown = unsafe { self.buffer.allocate_uninit_like(capacity * item)? };
+        let to = grown.as_mut_non_null();
+        // SAFETY: both hold at least `len` values. They're moved, not
+        // dropped: freeing a `Buffer` doesn't drop what's in it.
+        unsafe { to.copy_from_nonoverlapping(self.values, self.len * item) };
+        self.buffer = grown;
+        self.values = to;
         self.capacity = capacity;
         Ok(())
     }
-}
-
-/// Memory for a `Vec`'s values. Shared by every `Vec<T>` with an `A`, so it
-/// isn't copied for each `T`.
-#[inline(never)]
-fn allocate(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
-    // SAFETY: only the first `len` values are read, and each is written first.
-    unsafe { Buffer::allocate_uninit(allocator, size_bytes) }
-}
-
-/// Moves the first `used_bytes` of `buffer` to one of `size_bytes`, from the
-/// same allocator. Shared by every `Vec<T>`, so it isn't copied for each `T`.
-#[cold]
-#[inline(never)]
-fn grow(
-    buffer: &mut Buffer,
-    used_bytes: usize,
-    size_bytes: usize,
-) -> Result<NonNull<u8>, AllocError> {
-    // SAFETY: as in `Vec::empty`.
-    let mut grown = unsafe { buffer.allocate_uninit_like(size_bytes)? };
-    let to = grown.as_mut_non_null();
-    // SAFETY: both hold at least `used_bytes`. Values are moved, not dropped:
-    // freeing a `Buffer` doesn't drop what's in it.
-    unsafe { to.copy_from_nonoverlapping(buffer.as_mut_non_null(), used_bytes) };
-    *buffer = grown;
-    Ok(to)
 }
 
 impl<T> Deref for Vec<T> {
@@ -189,20 +197,20 @@ impl<T> Deref for Vec<T> {
 
     fn deref(&self) -> &[T] {
         // SAFETY: the first `len` values were written by `push`.
-        unsafe { core::slice::from_raw_parts(self.values.as_ptr(), self.len) }
+        unsafe { core::slice::from_raw_parts(self.slot(0).as_ptr(), self.raw.len) }
     }
 }
 
 impl<T> DerefMut for Vec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: as in `deref`, and this is the only reference.
-        unsafe { core::slice::from_raw_parts_mut(self.values.as_ptr(), self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len) }
     }
 }
 
 impl<T> Drop for Vec<T> {
     fn drop(&mut self) {
-        let values = core::ptr::slice_from_raw_parts_mut(self.values.as_ptr(), self.len);
+        let values = core::ptr::slice_from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len);
         // SAFETY: the first `len` values were written by `push`, and are
         // dropped once: freeing the buffer doesn't drop them.
         unsafe { values.drop_in_place() };
