@@ -57,8 +57,11 @@ impl<T> Vec<T> {
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<Vec<T>, AllocError> {
         let mut vec = Vec::fixed(allocator, values.len())?;
-        for value in values {
-            vec.push(value)?;
+        // An iterator can claim a wrong length, so it can't overrun.
+        for value in values.take(vec.capacity) {
+            // SAFETY: `len` is below the capacity.
+            unsafe { vec.values.add(vec.len).write(value) };
+            vec.len += 1;
         }
         Ok(vec)
     }
@@ -85,7 +88,7 @@ impl<T> Vec<T> {
     /// Adds `value` at the end, growing if full. Fails, giving `value` back,
     /// if the `Vec` holds `max` values or can't grow.
     pub fn push(&mut self, value: T) -> Result<(), Full<T>> {
-        if self.len == self.capacity && self.make_room().is_err() {
+        if self.len == self.capacity && self.make_room(1).is_err() {
             return Err(Full(value));
         }
         // SAFETY: there is room for a value at `len`.
@@ -94,15 +97,38 @@ impl<T> Vec<T> {
         Ok(())
     }
 
-    /// Grows a full `Vec`, unless it is at `max`.
+    /// Adds copies of `values` at the end, in one go, growing if there isn't
+    /// room. Fails, adding none, if that would take it past `max` or it
+    /// can't grow.
+    pub fn extend_from_slice(&mut self, values: &[T]) -> Result<(), AllocError>
+    where
+        T: Copy,
+    {
+        if values.len() > self.capacity - self.len {
+            self.make_room(values.len())?;
+        }
+        // SAFETY: there is room for `values` from `len`, and they can't
+        // overlap the `Vec`, which `values` doesn't borrow.
+        unsafe {
+            self.values
+                .add(self.len)
+                .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
+        };
+        self.len += values.len();
+        Ok(())
+    }
+
+    /// Grows so `additional` more values fit, unless that's past `max`.
     #[cold]
     #[inline(never)]
-    fn make_room(&mut self) -> Result<(), AllocError> {
-        if self.len == self.max {
+    fn make_room(&mut self, additional: usize) -> Result<(), AllocError> {
+        let needed = self.len.checked_add(additional).ok_or(AllocError)?;
+        if needed > self.max {
             return Err(AllocError);
         }
-        // Powers of two below `max` double to at most `max`.
-        let capacity = if self.capacity == 0 { self.max.min(4) } else { self.capacity * 2 };
+        // Powers of two up to `max` stay powers of two up to `max`.
+        let doubled = if self.capacity == 0 { 4 } else { self.capacity * 2 };
+        let capacity = doubled.max(needed.next_power_of_two()).min(self.max);
         let item = size_of::<T>();
         self.values = grow(&mut self.buffer, self.len * item, capacity * item)?.cast();
         self.capacity = capacity;
@@ -245,6 +271,20 @@ mod tests {
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
         let _ = Vec::<u64>::new(Heap, 100);
+    }
+
+    #[test]
+    fn extends_in_one_go() {
+        let left = Rc::new(Cell::new(u32::MAX));
+        let live = Rc::new(Cell::new(0));
+        let mut values = Vec::new(Limited { left: left.clone(), live }, 16).unwrap();
+        assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
+        assert!(values.extend_from_slice(&[6]).is_ok());
+        assert_eq!(*values, [1, 2, 3, 4, 5, 6]);
+        // One buffer to start, and one grown to fit five.
+        assert_eq!(u32::MAX - left.get(), 2);
+        assert_eq!(values.extend_from_slice(&[0; 11]), Err(AllocError));
+        assert_eq!(values.len(), 6);
     }
 
     #[test]
