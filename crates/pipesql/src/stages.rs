@@ -3,9 +3,11 @@
 
 use pipit_kernel::plan::{DynOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
 use pipit_kernel::vec::Vec;
+use pipit_operators::filter::FilterOp;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;
+use crate::condition::compile_condition;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::registry::{Item, Point, Rule, Shared};
 
@@ -55,10 +57,14 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     Ok(())
 }
 
-/// `WHERE`: needs expressions, which can't be compiled yet.
+/// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let span = compiler.span(compiler.node(stage.first_child()));
-    Err(Error::unsupported(Unsupported::Where, span))
+    let predicate = compile_condition(compiler, compiler.node(stage.first_child()))?;
+    let allocator = compiler.allocator();
+    let filter = DynOp::new(allocator.clone(), FilterOp { predicate })?;
+    let children = Vec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(filter, children)?;
+    Ok(())
 }
 
 /// `SELECT a, b`: the named columns, in that order, are the new scope. Only
@@ -71,13 +77,7 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
         if item.tag() != Tag::Name {
             return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(item)));
         }
-        let name = compiler.text(item.span());
-        let plan = &compiler.plan;
-        let found = compiler.scope.iter().find(|column| plan.names.get(column.name) == name);
-        let Some(&column) = found else {
-            return Err(Error::new(ErrorCode::UnknownColumn, item.span()));
-        };
-        scope.push(column)?;
+        scope.push(compiler.find_column(item)?)?;
     }
     compiler.scope = scope;
     Ok(())
