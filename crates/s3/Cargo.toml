@@ -16,6 +16,7 @@ pipitdb-kernel = { path = "../kernel" }
 rusty-s3 = { version = "0.10", default-features = false, features = ["rustcrypto", "xml"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true

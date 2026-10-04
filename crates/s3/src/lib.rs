@@ -3,6 +3,13 @@
 //! Each log is a multipart upload. Appends are staged in a local file until
 //! there's a part's worth, then streamed up from it, so parts never sit in
 //! memory. Sealing completes the upload; reads are ranged gets.
+//!
+//! Logs are deleted when they're done with. If a process ends first, what
+//! it left is cleaned up by the bucket's lifecycle rules, which the bucket's
+//! owner sets on the store's prefix: `AbortIncompleteMultipartUpload` for
+//! logs that weren't sealed, and `Expiration` for those that were, each
+//! after a day. The store doesn't set them, as setting a bucket's rules
+//! replaces all of them.
 
 use std::io::Read;
 use std::sync::Mutex;
@@ -24,8 +31,11 @@ pub struct S3Spill {
     agent: ureq::Agent,
     bucket: Bucket,
     credentials: Credentials,
-    /// What each log's key starts with.
+    /// What each log's key starts with: the prefix given, and a UUID made
+    /// for this store, so no other store, on any machine, uses its keys.
     prefix: String,
+    /// The next log's number.
+    next: AtomicU64,
     /// Where parts are staged before they're uploaded.
     staging: FileSpill,
     part_bytes: u64,
@@ -43,11 +53,8 @@ struct Log {
     sealed: bool,
 }
 
-/// Names logs uniquely, across stores in this process.
-static NEXT_LOG: AtomicU64 = AtomicU64::new(0);
-
 impl S3Spill {
-    /// Logs in `bucket`, as `prefix` and a number, uploaded in parts of
+    /// Logs in `bucket`, as `prefix`, a UUID and a number, uploaded in parts of
     /// `part_bytes`, staged in `staging`. S3 needs parts of at least
     /// `PART_BYTES_MIN`; a store that allows less can be given less.
     pub fn new(
@@ -61,7 +68,8 @@ impl S3Spill {
             agent: ureq::Agent::new_with_defaults(),
             bucket,
             credentials,
-            prefix: prefix.into(),
+            prefix: format!("{}{}-", prefix.into(), uuid::Uuid::new_v4()),
+            next: AtomicU64::new(0),
             staging,
             part_bytes,
             logs: Mutex::new(Vec::new()),
@@ -122,8 +130,7 @@ impl S3Spill {
 
 impl SpillStore for S3Spill {
     fn create(&self) -> Result<LogId, SpillError> {
-        let n = NEXT_LOG.fetch_add(1, Ordering::Relaxed);
-        let key = format!("{}{}-{n}", self.prefix, std::process::id());
+        let key = format!("{}{}", self.prefix, self.next.fetch_add(1, Ordering::Relaxed));
         let action = self.bucket.create_multipart_upload(Some(&self.credentials), &key);
         let mut response = self
             .agent
@@ -275,6 +282,20 @@ mod tests {
             *o = v * 3;
         }
         ColumnView::new(DataType::Int64, buffer, None)
+    }
+
+    #[test]
+    fn stores_use_their_own_keys() {
+        let new = || {
+            let url = "http://127.0.0.1:9000".parse().unwrap();
+            let bucket = Bucket::new(url, UrlStyle::Path, "b", "us-east-1").unwrap();
+            let credentials = Credentials::new("key", "secret");
+            let staging = FileSpill::new(std::env::temp_dir());
+            S3Spill::new(bucket, credentials, "spill-", staging, PART_BYTES_MIN)
+        };
+        let (a, b) = (new(), new());
+        assert!(a.prefix.starts_with("spill-") && b.prefix.starts_with("spill-"));
+        assert_ne!(a.prefix, b.prefix);
     }
 
     #[test]
