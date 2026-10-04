@@ -10,6 +10,7 @@ use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_parquet::chunk::ChunkReader;
 use pipit_parquet::footer::ParquetFile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
@@ -144,17 +145,31 @@ pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
     }
 }
 
-/// How many row groups the Parquet file in `len` bytes from `data` has, or
-/// 0 if it can't be read.
+/// How many rows the first column of the Parquet file in `len` bytes from
+/// `data` has, read a page at a time, or 0 if it can't be read.
 ///
 /// # Safety
 ///
 /// `data` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn parquet_row_groups(data: *const u8, len: usize) -> usize {
+pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     // SAFETY: guaranteed by the caller.
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
-    ParquetFile::open(&Heap, &bytes).map_or(0, |file| file.row_groups())
+    let Ok(file) = ParquetFile::open(&Heap, &bytes) else { return 0 };
+    let Some(&column) = file.columns().first() else { return 0 };
+    let mut rows = 0;
+    for group in 0..file.row_groups() {
+        let Ok(mut reader) = ChunkReader::new(&bytes, column, file.chunk(group, 0)) else {
+            return 0;
+        };
+        while let Ok(left) = reader.page_left(&Heap) {
+            if left == 0 || reader.read(&Heap, left).is_err() {
+                break;
+            }
+            rows += left;
+        }
+    }
+    rows
 }
 
 /// Pushes `0..count` to a `SlowVec`, and returns the last.
