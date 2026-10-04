@@ -10,14 +10,12 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
+use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_operators::table::Table;
 use pipit_pipesql::compile::compile;
 
 use crate::REGISTRY;
-
-/// Rows per row group, as a Parquet writer might use.
-const ROW_GROUP_ROWS: u32 = 1 << 14;
 
 fn data_dir() -> PathBuf {
     let perfetto = std::env::var_os("PIPIT_PERFETTO").map_or_else(
@@ -71,9 +69,9 @@ fn csv_table(text: &str) -> Option<Table> {
     let schema: Vec<(&str, DataType)> =
         names.iter().map(|name| (name.as_str(), DataType::Int64)).collect();
     let groups: Vec<Vec<ColumnView>> = (0..rows)
-        .step_by(ROW_GROUP_ROWS as usize)
+        .step_by(BATCH_ROWS_MAX as usize)
         .map(|start| {
-            let len = ROW_GROUP_ROWS.min(rows - start);
+            let len = BATCH_ROWS_MAX.min(rows - start);
             views.iter().map(|view| view.slice(start, len)).collect()
         })
         .collect();

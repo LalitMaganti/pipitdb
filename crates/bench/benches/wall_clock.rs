@@ -49,7 +49,7 @@ fn pipeline(c: &mut Criterion) {
 
 /// Scanning a table's row groups.
 fn scan(c: &mut Criterion) {
-    let pipeline = pipitdb_bench::scan_pipeline(pipitdb_bench::table(100, 20_480));
+    let pipeline = pipitdb_bench::scan_pipeline(pipitdb_bench::table(1000));
     let mut group = c.benchmark_group("scan");
     group.throughput(Throughput::Elements(100 * 20_480));
     group.bench_function("table", |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
