@@ -4,6 +4,9 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
+use crate::ast::Node;
+use crate::compile::Compiler;
+use crate::error::Error;
 use crate::keywords::KeywordTable;
 use crate::settings::build_setting;
 
@@ -42,6 +45,8 @@ pub struct Rule {
     pub keyword: &'static str,
     pub point: Point,
     pub items: &'static [Item],
+    /// Adds the stage, whose node is passed, to the plan being compiled.
+    pub compile: fn(&mut Compiler<'_, '_>, Node) -> Result<(), Error>,
 }
 
 /// Rules, found by keyword. A rule's id is `set << 8 | index in set`.
