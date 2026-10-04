@@ -14,18 +14,18 @@ use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
 use crate::row_batch::RowBatch;
+use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, Progress, Step};
-use crate::vec::Vec;
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
     source: DynSource<'a>,
-    steps: Vec<Step<'a>>,
+    steps: SlowVec<Step<'a>>,
     segment_count: usize,
 }
 
 impl<'a> Pipeline<'a> {
-    pub fn new(source: DynSource<'a>, steps: Vec<Step<'a>>) -> Pipeline<'a> {
+    pub fn new(source: DynSource<'a>, steps: SlowVec<Step<'a>>) -> Pipeline<'a> {
         let operators = steps.iter().filter(|step| matches!(step, Step::Operator(_))).count();
         Pipeline { source, steps, segment_count: operators + 1 }
     }
@@ -673,7 +673,7 @@ mod tests {
         source: impl Source + 'a,
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
-        let mut owned = crate::vec::Vec::new(&Heap, 8).unwrap();
+        let mut owned = crate::slow_vec::SlowVec::new(&Heap, 8).unwrap();
         for step in steps {
             assert!(owned.push(step).is_ok());
         }

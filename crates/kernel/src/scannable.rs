@@ -12,8 +12,8 @@ use crate::column::DataType;
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
+use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, NewState};
-use crate::vec::Vec;
 
 /// Named, typed columns, read into batches. Where a read is lives in
 /// `State`, which each run creates, as for a step.
@@ -126,7 +126,7 @@ impl<'a> DynScannable<'a> {
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
-        columns: Vec<u32>,
+        columns: SlowVec<u32>,
     ) -> Result<DynSource<'_>, AllocError> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&column| column < self.column_count()));
@@ -149,7 +149,7 @@ impl<'a> DynScannable<'a> {
 /// A source's step that reads a `DynScannable`.
 struct Scan {
     scannable: NonNull<DynScannable<'static>>,
-    columns: Vec<u32>,
+    columns: SlowVec<u32>,
 }
 
 unsafe fn scan_new_state(
@@ -243,9 +243,9 @@ mod tests {
     #[test]
     fn scans_chosen_columns_through_a_pipeline() {
         let scannable = DynScannable::new(&Heap, Columns).unwrap();
-        let columns = Vec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
+        let columns = SlowVec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
         let pipeline =
-            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), Vec::new(&Heap, 1).unwrap());
+            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), SlowVec::new(&Heap, 1).unwrap());
         let mut execution = pipeline.start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());

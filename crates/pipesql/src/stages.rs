@@ -2,7 +2,7 @@
 //! API as any extension.
 
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
-use pipit_kernel::vec::Vec;
+use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;
@@ -42,15 +42,15 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     };
     let allocator = compiler.allocator();
     let count = table.column_count();
-    let mut columns = Vec::fixed(allocator, count as usize)?;
-    let mut scope = Vec::new(allocator, PLAN_COLUMNS_MAX)?;
+    let mut columns = SlowVec::fixed(allocator, count as usize)?;
+    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..count {
         let binding = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
         columns.push(ScanColumn { column: i, binding })?;
         scope.push(binding)?;
     }
     let scan = DynOp::new(allocator, ScanOp { scannable: table, columns })?;
-    let children = Vec::fixed(allocator, 0)?;
+    let children = SlowVec::fixed(allocator, 0)?;
     compiler.plan.add_node(scan, children)?;
     compiler.scope = scope;
     Ok(())
@@ -61,7 +61,7 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     let predicate = compile_condition(compiler, compiler.node(stage.first_child()))?;
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
-    let children = Vec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(filter, children)?;
     Ok(())
 }
@@ -70,7 +70,7 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
 /// names, for now.
 fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = Vec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
     for i in 0..list.child_count() {
         let item = compiler.node(list.first_child() + i);
         if item.tag() != Tag::Name {

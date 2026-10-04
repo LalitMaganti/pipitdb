@@ -11,8 +11,8 @@ use crate::context::Context;
 use crate::filter::{self, Comparison, Value};
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
+use crate::slow_vec::SlowVec;
 use crate::step::Transform;
-use crate::vec::Vec;
 
 /// The most nodes a predicate can have.
 pub const PREDICATE_NODES_MAX: usize = 1 << 6;
@@ -42,13 +42,13 @@ pub enum Leaf {
 
 /// Its root is its last node.
 pub struct Predicate {
-    nodes: Vec<Node>,
+    nodes: SlowVec<Node>,
     depth: u32,
 }
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
-    pub fn new(nodes: Vec<Node>) -> Predicate {
+    pub fn new(nodes: SlowVec<Node>) -> Predicate {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
         // Each node's depth: how many selections it holds at once, at most.
         let mut depths = [0_u32; PREDICATE_NODES_MAX];
@@ -100,7 +100,7 @@ impl Predicate {
             }
             node => node,
         });
-        let nodes = Vec::fixed_from(allocator, nodes)?;
+        let nodes = SlowVec::fixed_from(allocator, nodes)?;
         Ok(Predicate { nodes, depth: self.depth })
     }
 
@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// Adds `expr`'s nodes to `nodes`, children first, returning its own.
-    fn build(expr: &Expr, nodes: &mut Vec<Node>) -> u32 {
+    fn build(expr: &Expr, nodes: &mut SlowVec<Node>) -> u32 {
         let node = match *expr {
             Expr::Greater(column, value) => Node::Leaf(Leaf::Compare {
                 column,
@@ -296,7 +296,7 @@ mod tests {
     }
 
     fn kept(expr: &Expr) -> StdVec<usize> {
-        let mut nodes = Vec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+        let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         let predicate = Predicate::new(nodes);
         let mut scratch: StdVec<Selection> =
@@ -332,7 +332,7 @@ mod tests {
         ];
         // One scratch selection per `AND` or `OR` nested in another.
         let depth = |expr: &Expr| {
-            let mut nodes = Vec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+            let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
             build(expr, &mut nodes);
             Predicate::new(nodes).depth()
         };

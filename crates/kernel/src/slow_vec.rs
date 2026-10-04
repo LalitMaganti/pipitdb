@@ -1,4 +1,4 @@
-//! `Vec`: a growable list of values, in memory from the allocator it was made
+//! `SlowVec`: a growable list of values, in memory from the allocator it was made
 //! with.
 
 use core::marker::PhantomData;
@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 
-/// A value that didn't fit in a `Vec`. With `?`, it becomes an `AllocError`.
+/// A value that didn't fit in a `SlowVec`. With `?`, it becomes an `AllocError`.
 #[derive(PartialEq, Eq, Debug)]
 pub struct Full<T>(pub T);
 
@@ -20,18 +20,18 @@ impl<T> From<Full<T>> for AllocError {
 
 /// A list for building things now and then, such as plans and footers. It
 /// stays small rather than fast: what doesn't depend on its values' type is
-/// shared by every `Vec`, not copied for each type. Hot loops work on
+/// shared by every `SlowVec`, not copied for each type. Hot loops work on
 /// buffers directly.
 ///
-/// Every `Vec` has a most values it can hold, `max`, a power of two. One made
+/// Every `SlowVec` has a most values it can hold, `max`, a power of two. One made
 /// by `new` grows towards it as needed, doubling; one made by `fixed` has room
 /// for `max` from the start, and never grows.
-pub struct Vec<T> {
+pub struct SlowVec<T> {
     raw: RawVec,
     values: PhantomData<T>,
 }
 
-/// A `Vec`'s memory and counts, which don't depend on its values' type.
+/// A `SlowVec`'s memory and counts, which don't depend on its values' type.
 struct RawVec {
     buffer: Buffer,
     values: NonNull<u8>,
@@ -40,26 +40,26 @@ struct RawVec {
     max: usize,
 }
 
-impl<T> Vec<T> {
-    /// An empty `Vec` that can grow to `max` values.
-    pub fn new(allocator: &dyn Allocator, max: usize) -> Result<Vec<T>, AllocError> {
+impl<T> SlowVec<T> {
+    /// An empty `SlowVec` that can grow to `max` values.
+    pub fn new(allocator: &dyn Allocator, max: usize) -> Result<SlowVec<T>, AllocError> {
         check!(max.is_power_of_two());
-        Vec::empty(allocator, 0, max)
+        SlowVec::empty(allocator, 0, max)
     }
 
-    /// An empty `Vec` with room for `len` values, rounded up, that never
+    /// An empty `SlowVec` with room for `len` values, rounded up, that never
     /// grows: for lists whose length is known.
-    pub fn fixed(allocator: &dyn Allocator, len: usize) -> Result<Vec<T>, AllocError> {
+    pub fn fixed(allocator: &dyn Allocator, len: usize) -> Result<SlowVec<T>, AllocError> {
         let max = len.next_power_of_two();
-        Vec::empty(allocator, max, max)
+        SlowVec::empty(allocator, max, max)
     }
 
-    /// `values`, in a `Vec` that never grows.
+    /// `values`, in a `SlowVec` that never grows.
     pub fn fixed_from(
         allocator: &dyn Allocator,
         values: impl ExactSizeIterator<Item = T>,
-    ) -> Result<Vec<T>, AllocError> {
-        let mut vec = Vec::fixed(allocator, values.len())?;
+    ) -> Result<SlowVec<T>, AllocError> {
+        let mut vec = SlowVec::fixed(allocator, values.len())?;
         // An iterator can claim a wrong length, so it can't overrun.
         for value in values.take(vec.raw.capacity) {
             // SAFETY: `len` is below the capacity.
@@ -73,10 +73,17 @@ impl<T> Vec<T> {
         self.raw.capacity
     }
 
-    /// An empty `Vec` with room for `capacity` values, 0 or `max`.
-    fn empty(allocator: &dyn Allocator, capacity: usize, max: usize) -> Result<Vec<T>, AllocError> {
+    /// An empty `SlowVec` with room for `capacity` values, 0 or `max`.
+    fn empty(
+        allocator: &dyn Allocator,
+        capacity: usize,
+        max: usize,
+    ) -> Result<SlowVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        Ok(Vec { raw: RawVec::new(allocator, size_of::<T>(), capacity, max)?, values: PhantomData })
+        Ok(SlowVec {
+            raw: RawVec::new(allocator, size_of::<T>(), capacity, max)?,
+            values: PhantomData,
+        })
     }
 
     /// Where value `i` goes.
@@ -86,7 +93,7 @@ impl<T> Vec<T> {
     }
 
     /// Adds `value` at the end, growing if full. Fails, giving `value` back,
-    /// if the `Vec` holds `max` values or can't grow.
+    /// if the `SlowVec` holds `max` values or can't grow.
     pub fn push(&mut self, value: T) -> Result<(), Full<T>> {
         if self.raw.len == self.raw.capacity && self.raw.make_room(size_of::<T>(), 1).is_err() {
             return Err(Full(value));
@@ -108,7 +115,7 @@ impl<T> Vec<T> {
             self.raw.make_room(size_of::<T>(), values.len())?;
         }
         // SAFETY: there is room for `values` from `len`, and they can't
-        // overlap the `Vec`, which `values` doesn't borrow.
+        // overlap the `SlowVec`, which `values` doesn't borrow.
         unsafe {
             self.slot(self.raw.len)
                 .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
@@ -192,7 +199,7 @@ impl RawVec {
     }
 }
 
-impl<T> Deref for Vec<T> {
+impl<T> Deref for SlowVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -201,14 +208,14 @@ impl<T> Deref for Vec<T> {
     }
 }
 
-impl<T> DerefMut for Vec<T> {
+impl<T> DerefMut for SlowVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: as in `deref`, and this is the only reference.
         unsafe { core::slice::from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len) }
     }
 }
 
-impl<T> Drop for Vec<T> {
+impl<T> Drop for SlowVec<T> {
     fn drop(&mut self) {
         let values = core::ptr::slice_from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len);
         // SAFETY: the first `len` values were written by `push`, and are
@@ -256,7 +263,7 @@ mod tests {
     fn grows_from_its_allocator() {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-        let mut values = Vec::new(&allocator, 128).unwrap();
+        let mut values = SlowVec::new(&allocator, 128).unwrap();
         for i in 0..100 {
             assert!(values.push(i).is_ok());
         }
@@ -269,7 +276,7 @@ mod tests {
     #[test]
     fn drops_its_values() {
         let value = Rc::new(());
-        let mut values = Vec::new(&Heap, 16).unwrap();
+        let mut values = SlowVec::new(&Heap, 16).unwrap();
         for _ in 0..10 {
             assert!(values.push(value.clone()).is_ok());
         }
@@ -282,7 +289,7 @@ mod tests {
     fn gives_the_value_back_if_it_cant_grow() {
         let left = Rc::new(Cell::new(2));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-        let mut values = Vec::new(&allocator, 128).unwrap();
+        let mut values = SlowVec::new(&allocator, 128).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -294,7 +301,7 @@ mod tests {
     fn stops_at_its_max() {
         let left = Rc::new(Cell::new(1));
         let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
-        let mut values = Vec::fixed(&allocator, 3).unwrap();
+        let mut values = SlowVec::fixed(&allocator, 3).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -307,7 +314,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
-        let _ = Vec::<u64>::new(&Heap, 100);
+        let _ = SlowVec::<u64>::new(&Heap, 100);
     }
 
     #[test]
@@ -315,7 +322,7 @@ mod tests {
         let left = Rc::new(Cell::new(u32::MAX));
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: left.clone(), live };
-        let mut values = Vec::new(&allocator, 16).unwrap();
+        let mut values = SlowVec::new(&allocator, 16).unwrap();
         assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
         assert!(values.extend_from_slice(&[6]).is_ok());
         assert_eq!(*values, [1, 2, 3, 4, 5, 6]);
@@ -328,7 +335,7 @@ mod tests {
     #[test]
     fn retains_and_pops() {
         let value = Rc::new(());
-        let mut values = Vec::new(&Heap, 8).unwrap();
+        let mut values = SlowVec::new(&Heap, 8).unwrap();
         for i in 0..6 {
             assert!(values.push((i, value.clone())).is_ok());
         }
@@ -341,7 +348,7 @@ mod tests {
 
     #[test]
     fn rounds_its_room_up() {
-        let values = Vec::<u64>::fixed(&Heap, 5).unwrap();
+        let values = SlowVec::<u64>::fixed(&Heap, 5).unwrap();
         assert_eq!(values.capacity(), 8);
     }
 }

@@ -2,7 +2,7 @@
 //! The `diagnostics` feature turns them into messages.
 
 use pipit_kernel::allocator::AllocError;
-use pipit_kernel::vec::Full;
+use pipit_kernel::slow_vec::Full;
 
 /// The bytes `start..start + len` of the query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

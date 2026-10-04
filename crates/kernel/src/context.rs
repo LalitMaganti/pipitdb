@@ -3,7 +3,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::selection::Selection;
-use crate::vec::Vec;
+use crate::slow_vec::SlowVec;
 
 /// The most scratch selections a run can have.
 pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
@@ -11,7 +11,7 @@ pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
 pub struct Context<'a> {
     allocator: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
-    selections: Option<Vec<Selection>>,
+    selections: Option<SlowVec<Selection>>,
 }
 
 impl<'a> Context<'a> {
@@ -36,7 +36,7 @@ impl<'a> Context<'a> {
         }
         let selections = match &mut self.selections {
             Some(selections) => selections,
-            None => self.selections.insert(Vec::new(self.allocator, SCRATCH_SELECTIONS_MAX)?),
+            None => self.selections.insert(SlowVec::new(self.allocator, SCRATCH_SELECTIONS_MAX)?),
         };
         while selections.len() < count {
             selections.push(Selection::all(0))?;

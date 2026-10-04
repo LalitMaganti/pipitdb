@@ -6,7 +6,7 @@
 use pipit_kernel::column::DataType;
 use pipit_kernel::filter::{Comparison, Value};
 use pipit_kernel::predicate::{Leaf, Node as PredicateNode, PREDICATE_NODES_MAX, Predicate};
-use pipit_kernel::vec::Vec;
+use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
@@ -14,7 +14,7 @@ use crate::error::{Error, ErrorCode, Unsupported};
 
 /// `node`, a condition, as a predicate over the plan's columns.
 pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Predicate, Error> {
-    let mut nodes = Vec::new(compiler.allocator(), PREDICATE_NODES_MAX)?;
+    let mut nodes = SlowVec::new(compiler.allocator(), PREDICATE_NODES_MAX)?;
     add(compiler, &mut nodes, node)?;
     Ok(Predicate::new(nodes))
 }
@@ -23,7 +23,7 @@ pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Pred
 /// its own. The parser limits how deep this recurses.
 fn add(
     compiler: &Compiler<'_, '_>,
-    nodes: &mut Vec<PredicateNode>,
+    nodes: &mut SlowVec<PredicateNode>,
     node: Node,
 ) -> Result<u32, Error> {
     let child = |i: u32| compiler.node(node.first_child() + i);

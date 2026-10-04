@@ -15,8 +15,8 @@ use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::predicate::{Filter, Predicate};
 use crate::scannable::DynScannable;
+use crate::slow_vec::SlowVec;
 use crate::step::{DynTransform, Step};
-use crate::vec::Vec;
 
 /// The most columns a plan can have.
 pub const PLAN_COLUMNS_MAX: usize = 1 << 10;
@@ -103,29 +103,29 @@ impl<'c> DynOp<'c> {
 /// An operation, and the nodes whose rows it reads.
 pub struct PlanNode<'c> {
     pub op: DynOp<'c>,
-    pub children: Vec<PlanNodeId>,
+    pub children: SlowVec<PlanNodeId>,
 }
 
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
     pub names: Names,
     /// Indexed by `ColumnId`.
-    pub columns: Vec<ColumnSchema>,
-    pub nodes: Vec<PlanNode<'c>>,
+    pub columns: SlowVec<ColumnSchema>,
+    pub nodes: SlowVec<PlanNode<'c>>,
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
     /// The columns of the result, in order.
-    pub output: Vec<NamedColumn>,
+    pub output: SlowVec<NamedColumn>,
 }
 
 impl<'c> LogicalPlan<'c> {
     pub fn new(allocator: &dyn Allocator) -> Result<LogicalPlan<'c>, AllocError> {
         Ok(LogicalPlan {
             names: Names::new(allocator, PLAN_NAME_BYTES_MAX)?,
-            columns: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
-            nodes: Vec::new(allocator, PLAN_NODES_MAX)?,
+            columns: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            nodes: SlowVec::new(allocator, PLAN_NODES_MAX)?,
             root: 0,
-            output: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
+            output: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
         })
     }
 
@@ -148,7 +148,7 @@ impl<'c> LogicalPlan<'c> {
     pub fn add_node(
         &mut self,
         op: DynOp<'c>,
-        children: Vec<PlanNodeId>,
+        children: SlowVec<PlanNodeId>,
     ) -> Result<PlanNodeId, AllocError> {
         let id = self.nodes.len() as PlanNodeId;
         self.nodes.push(PlanNode { op, children })?;
@@ -160,7 +160,7 @@ impl<'c> LogicalPlan<'c> {
 /// Reads all the rows of a scannable, binding the columns in `columns`.
 pub struct ScanOp<'c> {
     pub scannable: &'c DynScannable<'c>,
-    pub columns: Vec<ScanColumn>,
+    pub columns: SlowVec<ScanColumn>,
 }
 
 /// A column a scan reads, and what it's bound to in the plan.
@@ -177,7 +177,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
             lowering.define(column.binding.id)?;
         }
         let read = self.columns.iter().map(|column| column.column);
-        let read = Vec::fixed_from(lowering.allocator(), read)?;
+        let read = SlowVec::fixed_from(lowering.allocator(), read)?;
         lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
         Ok(())
     }
