@@ -160,6 +160,8 @@ mod tests {
                     #[expect(clippy::cast_precision_loss, reason = "small test values")]
                     DataType::Int64 => column.int64s()[row] as f64,
                     DataType::Float64 => column.float64s()[row],
+                    // These tests have no strings.
+                    DataType::String => f64::NAN,
                 }));
             }
         }

@@ -112,6 +112,9 @@ fn value(
                     let exact = float as i128 == i128::from(value);
                     if exact { Ok(Value::Float64(float)) } else { Err(inexact) }
                 }
+                DataType::String => {
+                    Err(Error::unsupported(Unsupported::Where, compiler.span(node)))
+                }
             }
         }
         Tag::Float => Err(Error::unsupported(Unsupported::Decimal, compiler.span(node))),
