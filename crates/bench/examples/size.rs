@@ -14,6 +14,7 @@ use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::vec::Vec;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
@@ -28,6 +29,18 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
         return 0;
     }
     batch.column(0).int64s().iter().sum()
+}
+
+/// Pushes `0..count` to a `Vec`, and returns the last.
+#[unsafe(no_mangle)]
+pub extern "C" fn vec_sum(count: u32) -> u64 {
+    let Ok(mut values) = Vec::new(Heap) else { return 0 };
+    for i in 0..count {
+        if values.push(u64::from(i)).is_err() {
+            return 0;
+        }
+    }
+    values.last().copied().unwrap_or(0)
 }
 
 /// Returns the number of tokens, or `u32::MAX` on an error.

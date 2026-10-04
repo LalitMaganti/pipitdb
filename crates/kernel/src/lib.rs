@@ -11,3 +11,4 @@ pub mod column;
 pub mod pipeline;
 pub mod row_batch;
 pub mod step;
+pub mod vec;
