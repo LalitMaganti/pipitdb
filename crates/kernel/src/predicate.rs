@@ -214,8 +214,14 @@ impl Transform for Filter {
         context.reserve_selections(self.predicate.depth() as usize)
     }
 
-    fn process(&self, context: &mut Context, (): &mut (), batch: &mut RowBatch) {
+    fn process(
+        &self,
+        context: &mut Context,
+        (): &mut (),
+        batch: &mut RowBatch,
+    ) -> Result<(), AllocError> {
         self.predicate.select(context.selections(), batch);
+        Ok(())
     }
 }
 

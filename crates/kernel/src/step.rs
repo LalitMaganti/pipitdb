@@ -4,6 +4,9 @@
 //! A step is a plan node: read-only while it runs. What changes lives in its
 //! `State`, which each run creates. What a run's steps share is its
 //! `Context`, passed to each.
+//!
+//! A step fails if it can't allocate what it needs, which ends the run.
+//! Steps never drop rows instead.
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
@@ -24,7 +27,12 @@ pub trait Source {
 
     /// Fills `batch`, which is empty when called, or returns false when no
     /// batches are left.
-    fn next(&self, context: &mut Context, state: &mut Self::State, batch: &mut RowBatch) -> bool;
+    fn next(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        batch: &mut RowBatch,
+    ) -> Result<bool, AllocError>;
 }
 
 /// Changes each batch in place, such as by keeping some of its columns.
@@ -33,7 +41,12 @@ pub trait Transform {
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, AllocError>;
 
-    fn process(&self, context: &mut Context, state: &mut Self::State, batch: &mut RowBatch);
+    fn process(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        batch: &mut RowBatch,
+    ) -> Result<(), AllocError>;
 }
 
 /// Turns input batches into output batches, for steps that hold rows back or
@@ -50,7 +63,7 @@ pub trait Operator {
         state: &mut Self::State,
         input: &RowBatch,
         output: &mut RowBatch,
-    ) -> Progress;
+    ) -> Result<Progress, AllocError>;
 
     /// Called after the last input, for operators that hold rows back.
     fn finish(
@@ -58,9 +71,9 @@ pub trait Operator {
         context: &mut Context,
         state: &mut Self::State,
         output: &mut RowBatch,
-    ) -> Progress {
+    ) -> Result<Progress, AllocError> {
         let _ = (context, state, output);
-        Progress::NeedInput
+        Ok(Progress::NeedInput)
     }
 }
 
@@ -134,17 +147,21 @@ pub(crate) type NewState =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>) -> Result<(), AllocError>;
 
 pub type DynSource<'a> = Erased<'a, SourceNext>;
-pub type DynTransform<'a> =
-    Erased<'a, unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch)>;
+pub type DynTransform<'a> = Erased<
+    'a,
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), AllocError>,
+>;
 pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
 
 pub(crate) type SourceNext =
-    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> bool;
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, AllocError>;
+
+type Executed = Result<Progress, AllocError>;
 
 pub struct OperatorFunctions {
     execute:
-        unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &RowBatch, &mut RowBatch) -> Progress,
-    finish: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Progress,
+        unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &RowBatch, &mut RowBatch) -> Executed,
+    finish: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Executed,
 }
 
 impl<'a> DynSource<'a> {
@@ -195,7 +212,7 @@ impl<'a> DynSource<'a> {
         context: &mut Context,
         state: NonNull<u8>,
         batch: &mut RowBatch,
-    ) -> bool {
+    ) -> Result<bool, AllocError> {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
         unsafe { (self.run)(self.step.as_ptr(), context, state, batch) }
@@ -220,7 +237,7 @@ impl<'a> DynTransform<'a> {
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
             run: |transform, context, state, batch| unsafe {
-                value_of::<T>(transform).process(context, state_of::<T::State>(state), batch);
+                value_of::<T>(transform).process(context, state_of::<T::State>(state), batch)
             },
             lifetime: PhantomData,
         })
@@ -234,7 +251,7 @@ impl<'a> DynTransform<'a> {
         context: &mut Context,
         state: NonNull<u8>,
         batch: &mut RowBatch,
-    ) {
+    ) -> Result<(), AllocError> {
         // SAFETY: as in `DynSource::next`.
         unsafe { (self.run)(self.step.as_ptr(), context, state, batch) }
     }
@@ -280,7 +297,7 @@ impl<'a> DynOperator<'a> {
         state: NonNull<u8>,
         input: &RowBatch,
         output: &mut RowBatch,
-    ) -> Progress {
+    ) -> Executed {
         // SAFETY: as in `DynSource::next`.
         unsafe { (self.run.execute)(self.step.as_ptr(), context, state, input, output) }
     }
@@ -293,7 +310,7 @@ impl<'a> DynOperator<'a> {
         context: &mut Context,
         state: NonNull<u8>,
         output: &mut RowBatch,
-    ) -> Progress {
+    ) -> Executed {
         // SAFETY: as in `DynSource::next`.
         unsafe { (self.run.finish)(self.step.as_ptr(), context, state, output) }
     }

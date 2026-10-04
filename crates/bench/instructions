@@ -3,11 +3,11 @@ filter.greater_nulls 3904857
 lexer.long_text 103516
 lexer.typical 286202
 parser.expression 457072
-pipeline.operators 1276333
-pipeline.source 212610
-pipeline.transforms 281736
+pipeline.operators 1303532
+pipeline.source 222751
+pipeline.transforms 311902
 predicate.and 2656230
 predicate.not 1716570
 predicate.or 5648730
 query.typical 995453
-scan.table 372876
+scan.table 350888
