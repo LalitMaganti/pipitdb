@@ -1,7 +1,10 @@
-//! Filters on one column: each narrows a `Selection` to the rows it keeps.
-//! Shared by sources that filter as they read and by filters in a pipeline,
-//! so both keep the same rows. A null row is never kept by a comparison, as
-//! in SQL.
+//! Filters on one column, such as `x > 5` or `x IS NULL`.
+//!
+//! Each narrows a `Selection` to the rows its condition is true for. It
+//! drops the rest: those it's false for, and for a comparison the null rows,
+//! for which SQL's condition is neither true nor false. Given a second
+//! selection, `dropped`, a filter also writes the rows it drops there, in the
+//! same pass, so an `OR` can test its next condition on only those.
 
 use crate::column::{ColumnView, DataType};
 use crate::selection::Selection;
@@ -23,113 +26,73 @@ pub enum Value {
     Float64(f64),
 }
 
-/// Keeps the rows where `column <comparison> value`.
+/// Narrows `selection` to the rows where `column <comparison> value`, writing
+/// the rows it drops to `dropped`, if given.
 pub fn compare(
     column: &ColumnView,
     comparison: Comparison,
     value: Value,
     selection: &mut Selection,
+    dropped: Option<&mut Selection>,
 ) {
-    compare_into(column, comparison, value, selection, None);
-}
-
-/// As `compare`, and writes the rows not kept, null or not, to `rejected`, in
-/// the same pass.
-pub fn compare_split(
-    column: &ColumnView,
-    comparison: Comparison,
-    value: Value,
-    selection: &mut Selection,
-    rejected: &mut Selection,
-) {
-    compare_into(column, comparison, value, selection, Some(rejected));
-}
-
-fn compare_into(
-    column: &ColumnView,
-    comparison: Comparison,
-    value: Value,
-    selection: &mut Selection,
-    rejected: Option<&mut Selection>,
-) {
+    check_covers(column, selection);
     match value {
         Value::Int64(value) => {
             check!(column.data_type() == DataType::Int64);
             let cells = column.int64s();
-            compare_values(column, cells, |cell| cell, comparison, value, selection, rejected);
+            compare_cells(column, cells, |cell| cell, comparison, value, selection, dropped);
         }
         Value::Float64(value) => {
             check!(column.data_type() == DataType::Float64);
             let cells = column.float64s();
             let value = float_key(value);
-            compare_values(column, cells, float_key, comparison, value, selection, rejected);
+            compare_cells(column, cells, float_key, comparison, value, selection, dropped);
         }
     }
 }
 
-/// Keeps the null rows if `nulls`, or the others.
-pub fn is_null(column: &ColumnView, nulls: bool, selection: &mut Selection) {
-    is_null_into(column, nulls, selection, None);
-}
-
-/// As `is_null`, and writes the rows not kept to `rejected`, in the same pass.
-pub fn is_null_split(
+/// Narrows `selection` to the null rows if `nulls`, or else to the others,
+/// writing the rows it drops to `dropped`, if given.
+pub fn is_null(
     column: &ColumnView,
     nulls: bool,
     selection: &mut Selection,
-    rejected: &mut Selection,
+    dropped: Option<&mut Selection>,
 ) {
-    is_null_into(column, nulls, selection, Some(rejected));
-}
-
-fn is_null_into(
-    column: &ColumnView,
-    nulls: bool,
-    selection: &mut Selection,
-    rejected: Option<&mut Selection>,
-) {
-    let Some(validity) = covering(column, selection).validity() else {
+    check_covers(column, selection);
+    match column.validity() {
         // No row is null.
-        match rejected {
-            None if nulls => selection.retain(|_| false),
-            None => {}
-            Some(rejected) => selection.partition(rejected, |_| !nulls),
-        }
-        return;
-    };
-    let test = move |row: u16| {
-        // SAFETY: `covering` checked every kept row is a row of `column`.
-        let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-        valid != nulls
-    };
-    match rejected {
-        None => selection.retain(test),
-        Some(rejected) => selection.partition(rejected, test),
+        None => retain(selection, dropped, |_| !nulls),
+        Some(validity) => retain(selection, dropped, move |row| {
+            // SAFETY: `check_covers` checked every row is a row of `column`.
+            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+            valid != nulls
+        }),
     }
 }
 
-/// One loop per comparison, so the loop has no branch on it.
-fn compare_values<T: Copy, K: Copy + PartialOrd>(
+/// `compare` for `cells`, the values of `column`, compared by `key`. One loop
+/// per comparison, so no loop branches on it.
+fn compare_cells<T: Copy, K: Copy + PartialOrd>(
     column: &ColumnView,
     cells: &[T],
     key: impl Fn(T) -> K + Copy,
     comparison: Comparison,
     value: K,
     selection: &mut Selection,
-    rejected: Option<&mut Selection>,
+    dropped: Option<&mut Selection>,
 ) {
-    covering(column, selection);
-    // SAFETY: `covering` checked every kept row is a row of `column`, whose
-    // values `cells` are.
+    // SAFETY: `compare` checked every row is a row of `column`, whose values
+    // `cells` are.
     let at = move |row: u16| key(unsafe { cell(cells, row) });
-    let (selection, rejected) = (selection, rejected);
+    let (s, d) = (selection, dropped);
     match comparison {
-        Comparison::Equal => keep(column, selection, rejected, move |row| at(row) == value),
-        Comparison::NotEqual => keep(column, selection, rejected, move |row| at(row) != value),
-        Comparison::Less => keep(column, selection, rejected, move |row| at(row) < value),
-        Comparison::LessEqual => keep(column, selection, rejected, move |row| at(row) <= value),
-        Comparison::Greater => keep(column, selection, rejected, move |row| at(row) > value),
-        Comparison::GreaterEqual => keep(column, selection, rejected, move |row| at(row) >= value),
+        Comparison::Equal => retain_valid(column, s, d, move |row| at(row) == value),
+        Comparison::NotEqual => retain_valid(column, s, d, move |row| at(row) != value),
+        Comparison::Less => retain_valid(column, s, d, move |row| at(row) < value),
+        Comparison::LessEqual => retain_valid(column, s, d, move |row| at(row) <= value),
+        Comparison::Greater => retain_valid(column, s, d, move |row| at(row) > value),
+        Comparison::GreaterEqual => retain_valid(column, s, d, move |row| at(row) >= value),
     }
 }
 
@@ -145,38 +108,43 @@ fn float_key(value: f64) -> i64 {
     bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()
 }
 
-/// Keeps the non-null rows `test` passes, writing the rest to `rejected` if
-/// there is one, with a loop that skips the null check when `column` has no
-/// nulls. `test` is still run for null rows, whose values are there to read,
-/// so the loop has no branch on it.
-fn keep(
+/// As `retain`, but also drops the null rows of `column`, with a loop that
+/// skips checking for nulls when `column` has none. `test` still runs on
+/// null rows, whose values are there to read, so the loop doesn't branch.
+fn retain_valid(
     column: &ColumnView,
     selection: &mut Selection,
-    rejected: Option<&mut Selection>,
+    dropped: Option<&mut Selection>,
     test: impl Fn(u16) -> bool + Copy,
 ) {
-    match (column.validity(), rejected) {
-        (None, None) => selection.retain(test),
-        (None, Some(rejected)) => selection.partition(rejected, test),
-        (Some(validity), rejected) => {
-            let test = move |row: u16| {
-                // SAFETY: callers check with `covering` first.
-                let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-                valid & test(row)
-            };
-            match rejected {
-                None => selection.retain(test),
-                Some(rejected) => selection.partition(rejected, test),
-            }
-        }
+    match column.validity() {
+        None => retain(selection, dropped, test),
+        Some(validity) => retain(selection, dropped, move |row| {
+            // SAFETY: callers check with `check_covers` first.
+            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+            valid & test(row)
+        }),
+    }
+}
+
+/// Narrows `selection` to the rows `test` is true for, writing the rows it
+/// drops to `dropped`, if given.
+#[inline]
+fn retain(
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+    test: impl FnMut(u16) -> bool,
+) {
+    match dropped {
+        None => selection.retain(test),
+        Some(dropped) => selection.partition(dropped, test),
     }
 }
 
 /// Checks every row `selection` may keep is a row of `column`, so the rows
-/// can be read without checking each, and returns `column`.
-fn covering<'c>(column: &'c ColumnView, selection: &Selection) -> &'c ColumnView {
+/// can then be read without checking each.
+fn check_covers(column: &ColumnView, selection: &Selection) {
     check!(selection.rows() <= column.row_count());
-    column
 }
 
 /// `cells[row]`, without checking it's there.
@@ -229,7 +197,7 @@ mod tests {
     #[test]
     fn compares() {
         let column = int64s(&[]);
-        let rows = |comparison| kept(|s| compare(&column, comparison, Value::Int64(6), s));
+        let rows = |comparison| kept(|s| compare(&column, comparison, Value::Int64(6), s, None));
         assert_eq!(rows(Comparison::Equal), [6]);
         assert_eq!(rows(Comparison::NotEqual), [0, 1, 2, 3, 4, 5, 7, 8, 9]);
         assert_eq!(rows(Comparison::Less), [0, 1, 2, 3, 4, 5]);
@@ -246,7 +214,7 @@ mod tests {
         let column = ColumnView::new(DataType::Float64, values, None);
         let rows = |comparison, value| {
             let mut selection = Selection::all(6);
-            compare(&column, comparison, Value::Float64(value), &mut selection);
+            compare(&column, comparison, Value::Float64(value), &mut selection, None);
             match selection.kept() {
                 Kept::All => (0..6).collect(),
                 Kept::None => Vec::new(),
@@ -266,20 +234,20 @@ mod tests {
     fn never_keeps_nulls() {
         let column = int64s(&[2, 7]);
         assert_eq!(
-            kept(|s| compare(&column, Comparison::NotEqual, Value::Int64(5), s)),
+            kept(|s| compare(&column, Comparison::NotEqual, Value::Int64(5), s, None)),
             [0, 1, 3, 4, 6, 8, 9]
         );
-        assert_eq!(kept(|s| is_null(&column, true, s)), [2, 7]);
-        assert_eq!(kept(|s| is_null(&column, false, s)).len(), 8);
-        assert_eq!(kept(|s| is_null(&int64s(&[]), true, s)), []);
+        assert_eq!(kept(|s| is_null(&column, true, s, None)), [2, 7]);
+        assert_eq!(kept(|s| is_null(&column, false, s, None)).len(), 8);
+        assert_eq!(kept(|s| is_null(&int64s(&[]), true, s, None)), []);
     }
 
     #[test]
     fn narrows_what_is_already_kept() {
         let column = int64s(&[]);
         let rows = kept(|s| {
-            compare(&column, Comparison::Greater, Value::Int64(2), s);
-            compare(&column, Comparison::NotEqual, Value::Int64(5), s);
+            compare(&column, Comparison::Greater, Value::Int64(2), s, None);
+            compare(&column, Comparison::NotEqual, Value::Int64(5), s, None);
         });
         assert_eq!(rows, [3, 4, 6, 7, 8, 9]);
     }

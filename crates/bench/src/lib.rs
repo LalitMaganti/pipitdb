@@ -5,7 +5,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
-use pipit_kernel::predicate::{Node, Predicate};
+use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::selection::Selection;
@@ -226,15 +226,16 @@ pub fn run_filter(
 
 /// Keeps values over 500: about half.
 pub fn greater(column: &ColumnView, selection: &mut Selection) {
-    filter::compare(column, Comparison::Greater, Value::Int64(500), selection);
+    filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
 }
 
 /// `x > 500 AND x < 900`, `x < 100 OR x > 900`, or `NOT (x > 500)`, over the
 /// first column.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn predicate(shape: &str) -> Predicate {
-    let compare =
-        |comparison, value| Node::Compare { column: 0, comparison, value: Value::Int64(value) };
+    let compare = |comparison, value| {
+        Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
+    };
     let nodes: &[Node] = match shape {
         "and" => {
             &[compare(Comparison::Greater, 500), compare(Comparison::Less, 900), Node::And(0, 1)]

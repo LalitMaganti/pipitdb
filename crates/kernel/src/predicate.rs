@@ -18,6 +18,15 @@ pub const PREDICATE_NODES_MAX: usize = 1 << 6;
 /// A node of a predicate. Children come before their parents.
 #[derive(Clone, Copy, Debug)]
 pub enum Node {
+    Leaf(Leaf),
+    And(u32, u32),
+    Or(u32, u32),
+    Not(u32),
+}
+
+/// A condition on one column, which a filter tests.
+#[derive(Clone, Copy, Debug)]
+pub enum Leaf {
     /// The column at `column` in a batch, compared with `value`.
     Compare {
         column: u32,
@@ -27,9 +36,6 @@ pub enum Node {
     IsNull {
         column: u32,
     },
-    And(u32, u32),
-    Or(u32, u32),
-    Not(u32),
 }
 
 /// Its root is its last node.
@@ -49,7 +55,7 @@ impl Predicate {
         check!(!nodes.is_empty());
         for (i, node) in (0..).zip(nodes.iter()) {
             match *node {
-                Node::Compare { .. } | Node::IsNull { .. } => {}
+                Node::Leaf(_) => {}
                 Node::And(a, b) | Node::Or(a, b) => check!(a < i && b < i),
                 Node::Not(a) => check!(a < i),
             }
@@ -87,59 +93,27 @@ impl Predicate {
         let (below, mine) = scratch.split_at_mut(node as usize);
         let Some(mine) = mine.first_mut() else { crate::check::check_failed(line!()) };
         match *at!(self.nodes, node as usize) {
-            Node::Compare { column, comparison, value } => {
-                let comparison = if want { comparison } else { negated(comparison) };
-                filter::compare(at!(columns, column as usize), comparison, value, selection);
-            }
-            Node::IsNull { column } => {
-                filter::is_null(at!(columns, column as usize), want, selection);
-            }
+            Node::Leaf(leaf) => leaf.narrow(want, columns, selection, None),
             Node::Not(child) => self.narrow(child, !want, columns, selection, below),
             // True for both, or false for both: each narrows what the other left.
             Node::And(a, b) if want => self.both(a, b, true, columns, selection, below),
             Node::Or(a, b) if !want => self.both(a, b, false, columns, selection, below),
-            // False for either, or true for either: `a`'s rows, and `b`'s among
-            // the rest.
+            // False for either, or true for either: the rows `a` is `want` for,
+            // and those `b` is among the rest.
             Node::And(a, b) | Node::Or(a, b) => {
-                if !self.split(a, want, columns, selection, mine) {
-                    mine.clone_from(selection);
+                let rest = mine;
+                if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
+                    // In one pass.
+                    leaf.narrow(want, columns, selection, Some(rest));
+                } else {
+                    rest.clone_from(selection);
                     self.narrow(a, want, columns, selection, below);
-                    mine.subtract(selection);
+                    rest.subtract(selection);
                 }
-                self.narrow(b, want, columns, mine, below);
-                selection.union(mine);
+                self.narrow(b, want, columns, rest, below);
+                selection.union(rest);
             }
         }
-    }
-
-    /// For a comparison or `IS NULL`, narrows `selection` to the rows `node`
-    /// is `want` for and writes the rest to `rest`, in one pass, and returns
-    /// true. Other nodes return false.
-    fn split(
-        &self,
-        node: u32,
-        want: bool,
-        columns: &[ColumnView],
-        selection: &mut Selection,
-        rest: &mut Selection,
-    ) -> bool {
-        match *at!(self.nodes, node as usize) {
-            Node::Compare { column, comparison, value } => {
-                let comparison = if want { comparison } else { negated(comparison) };
-                filter::compare_split(
-                    at!(columns, column as usize),
-                    comparison,
-                    value,
-                    selection,
-                    rest,
-                );
-            }
-            Node::IsNull { column } => {
-                filter::is_null_split(at!(columns, column as usize), want, selection, rest);
-            }
-            Node::And(..) | Node::Or(..) | Node::Not(_) => return false,
-        }
-        true
     }
 
     fn both(
@@ -153,6 +127,29 @@ impl Predicate {
     ) {
         self.narrow(a, want, columns, selection, below);
         self.narrow(b, want, columns, selection, below);
+    }
+}
+
+impl Leaf {
+    /// Narrows `selection` to the rows this is `want` for, writing the rows it
+    /// drops to `dropped`, if given.
+    fn narrow(
+        self,
+        want: bool,
+        columns: &[ColumnView],
+        selection: &mut Selection,
+        dropped: Option<&mut Selection>,
+    ) {
+        match self {
+            Leaf::Compare { column, comparison, value } => {
+                let comparison = if want { comparison } else { negated(comparison) };
+                let column = at!(columns, column as usize);
+                filter::compare(column, comparison, value, selection, dropped);
+            }
+            Leaf::IsNull { column } => {
+                filter::is_null(at!(columns, column as usize), want, selection, dropped);
+            }
+        }
     }
 }
 
@@ -225,12 +222,12 @@ mod tests {
     /// Adds `expr`'s nodes to `nodes`, children first, returning its own.
     fn build(expr: &Expr, nodes: &mut Vec<Node>) -> u32 {
         let node = match *expr {
-            Expr::Greater(column, value) => Node::Compare {
+            Expr::Greater(column, value) => Node::Leaf(Leaf::Compare {
                 column,
                 comparison: Comparison::Greater,
                 value: Value::Int64(value),
-            },
-            Expr::IsNull(column) => Node::IsNull { column },
+            }),
+            Expr::IsNull(column) => Node::Leaf(Leaf::IsNull { column }),
             Expr::And(a, b) => Node::And(build(a, nodes), build(b, nodes)),
             Expr::Or(a, b) => Node::Or(build(a, nodes), build(b, nodes)),
             Expr::Not(a) => Node::Not(build(a, nodes)),

@@ -157,15 +157,14 @@ impl Selection {
         self.len = total as u32;
     }
 
-    /// Keeps the rows `keep` says to, and writes the others to `rejected`,
-    /// in one pass.
+    /// Keeps the rows `keep` says to, and moves the others to `dropped`,
+    /// replacing what it kept, in one pass.
     #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
-    pub fn partition(&mut self, rejected: &mut Selection, mut keep: impl FnMut(u16) -> bool) {
+    pub fn partition(&mut self, dropped: &mut Selection, mut keep: impl FnMut(u16) -> bool) {
         let len = self.len as usize;
         check!(len <= self.indices.len());
-        rejected.rows = self.rows;
         let indices = self.indices.as_mut_ptr().cast::<u16>();
-        let others = rejected.indices.as_mut_ptr().cast::<u16>();
+        let others = dropped.indices.as_mut_ptr().cast::<u16>();
         let (mut kept, mut out) = (0, 0);
         // As in `retain`: two loops, so neither checks `all` for each row, and
         // `kept` and `out` never pass `i`, below `len`.
@@ -185,10 +184,13 @@ impl Selection {
             // SAFETY: see above; the first `len` indices were written.
             (0..len).for_each(|i| put(unsafe { indices.add(i).read() }));
         }
-        self.all &= kept == len;
+        // Either side is all rows if it got every one of all of them.
+        let all = self.all;
+        self.all = all && kept == len;
         self.len = kept as u32;
-        rejected.all = false;
-        rejected.len = out as u32;
+        dropped.all = all && out == len;
+        dropped.len = out as u32;
+        dropped.rows = self.rows;
     }
 
     /// All of `rows` rows, at `selection`, in place: the indices aren't
@@ -271,14 +273,15 @@ mod tests {
     #[test]
     fn partitions_in_one_pass() {
         let mut kept = Selection::all(10);
-        let mut rejected = Selection::all(0);
-        kept.partition(&mut rejected, |row| row % 3 == 0);
-        assert_eq!(
-            (rows(&kept), rows(&rejected)),
-            ([0, 3, 6, 9].into(), [1, 2, 4, 5, 7, 8].into())
-        );
-        kept.partition(&mut rejected, |row| row > 3);
-        assert_eq!((rows(&kept), rows(&rejected)), ([6, 9].into(), [0, 3].into()));
+        let mut dropped = Selection::all(0);
+        kept.partition(&mut dropped, |row| row % 3 == 0);
+        assert_eq!((rows(&kept), rows(&dropped)), ([0, 3, 6, 9].into(), [1, 2, 4, 5, 7, 8].into()));
+        kept.partition(&mut dropped, |row| row > 3);
+        assert_eq!((rows(&kept), rows(&dropped)), ([6, 9].into(), [0, 3].into()));
+
+        let mut none = Selection::all(10);
+        none.partition(&mut dropped, |_| false);
+        assert_eq!((none.kept(), dropped.kept()), (Kept::None, Kept::All));
     }
 
     #[test]
