@@ -1,12 +1,10 @@
-//! A case-insensitive table from keywords to small values, built by `const
-//! fn`s so it can be a `static` computed at compile time.
+//! `KeywordTable`: a case-insensitive table from keywords to small values,
+//! built by `const fn`s so it can be a `static` computed at compile time.
 //!
 //! It is a hash table with linear probing. Slots hold a keyword's hash, not
 //! the keyword, so `get` takes a check that the value found is for the word.
 //! Building fails if two keywords hash the same (including the same keyword
 //! twice), or if finding a keyword would take more than `PROBES_MAX` probes.
-
-#![no_std]
 
 /// The most slots a lookup checks.
 pub const PROBES_MAX: usize = 4;
