@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
 pipitdb-operators = { path = "../operators" }
+pipitdb-parquet = { path = "../parquet" }
 pipitdb-pipesql = { path = "../pipesql" }
 
 # Not for Wasm, which only builds the size example.

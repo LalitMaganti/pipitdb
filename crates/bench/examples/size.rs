@@ -10,6 +10,7 @@ use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_parquet::footer::ParquetFile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -141,6 +142,19 @@ pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
         Ok(()) => byte[0],
         Err(_) => 0,
     }
+}
+
+/// How many row groups the Parquet file in `len` bytes from `data` has, or
+/// 0 if it can't be read.
+///
+/// # Safety
+///
+/// `data` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn parquet_row_groups(data: *const u8, len: usize) -> usize {
+    // SAFETY: guaranteed by the caller.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
+    ParquetFile::open(&Heap, &bytes).map_or(0, |file| file.row_groups())
 }
 
 /// Pushes `0..count` to a `SlowVec`, and returns the last.
