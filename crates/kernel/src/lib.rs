@@ -14,4 +14,5 @@ pub mod lexer;
 pub mod parser;
 pub mod registry;
 pub mod row_batch;
+pub mod scan;
 mod settings;
