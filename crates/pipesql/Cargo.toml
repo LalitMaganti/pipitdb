@@ -1,6 +1,6 @@
 [package]
-name = "pipitdb-std"
-description = "pipitdb's standard stages."
+name = "pipitdb-pipesql"
+description = "PipeSQL for pipitdb: lexing, parsing, stages and error messages."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,10 +8,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "pipit_std"
+name = "pipit_pipesql"
 
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
+
+[[bin]]
+name = "pipit-explain"
+path = "src/bin/explain.rs"
 
 [lints]
 workspace = true

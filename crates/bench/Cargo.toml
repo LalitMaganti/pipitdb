@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
-pipitdb-std = { path = "../std" }
+pipitdb-pipesql = { path = "../pipesql" }
 
 # Not for Wasm, which only builds the size example.
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]

@@ -6,6 +6,7 @@
 //! caller's address in the backtrace against a build of the same commit with
 //! debug info.
 
+#[macro_export]
 macro_rules! check {
     ($condition:expr $(,)?) => {
         if cfg!(debug_assertions) {
@@ -18,6 +19,7 @@ macro_rules! check {
 
 /// `slice[index]`, for an index or a range, without a panic location in
 /// release builds: the same trade as `check!`.
+#[macro_export]
 macro_rules! at {
     ($slice:expr, $index:expr) => {
         if cfg!(debug_assertions) {
@@ -32,6 +34,7 @@ macro_rules! at {
 }
 
 /// `&mut slice[index]`, as `at!`.
+#[macro_export]
 macro_rules! at_mut {
     ($slice:expr, $index:expr) => {
         if cfg!(debug_assertions) {
@@ -49,7 +52,7 @@ macro_rules! at_mut {
 /// checks into one call and each keeps its own address.
 #[cold]
 #[inline(never)]
-pub(crate) fn check_failed(line: u32) -> ! {
+pub fn check_failed(line: u32) -> ! {
     core::hint::black_box(line);
     panic!("check failed");
 }

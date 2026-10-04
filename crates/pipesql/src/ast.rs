@@ -4,9 +4,9 @@
 //! index of its first child. Leaves store their token's span instead. See
 //! <https://jhwlr.io/super-flat-ast/>.
 
-use crate::buffer::{Buffer, Primitive};
 use crate::error::{ErrorCode, Span};
 use crate::settings::build_setting;
+use pipit_kernel::buffer::{Buffer, Primitive};
 
 /// Leaves come first, so `tag < Unary` tells them apart.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -256,7 +256,7 @@ impl Nodes {
         let mut block = unsafe { self.first.allocate_uninit_like(BLOCK_BYTES) }
             .map_err(|_| ErrorCode::OutOfMemory)?;
         self.current = block.as_mut_ptr::<Node>();
-        let Some(table) = &self.rest else { crate::check::check_failed(line!()) };
+        let Some(table) = &self.rest else { pipit_kernel::check::check_failed(line!()) };
         // SAFETY: `rest_count` is below the table's length, this slot hasn't
         // been written, and the table is only reachable through `self`.
         unsafe { slots(table).cast_mut().add(self.rest_count).write(block) };
@@ -273,7 +273,7 @@ impl Nodes {
         }
         let slot = (index >> BLOCK_SHIFT) - 1;
         check!(slot < self.rest_count);
-        let Some(table) = &self.rest else { crate::check::check_failed(line!()) };
+        let Some(table) = &self.rest else { pipit_kernel::check::check_failed(line!()) };
         // SAFETY: slots below `rest_count`, and nodes below `count`, have been
         // written.
         unsafe {
@@ -302,7 +302,7 @@ fn slots(table: &Buffer) -> *const Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
+    use pipit_kernel::allocator::Heap;
 
     #[test]
     fn nodes_span_blocks() {
