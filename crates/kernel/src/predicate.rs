@@ -5,6 +5,7 @@
 //! it's false for. A null row is neither, as in SQL, so `NOT` swaps the two
 //! and every node keeps SQL's three-valued logic without building booleans.
 
+use crate::allocator::{AllocError, Allocator};
 use crate::column::ColumnView;
 use crate::filter::{self, Comparison, Value};
 use crate::row_batch::RowBatch;
@@ -71,6 +72,34 @@ impl Predicate {
     /// How many scratch selections `select` needs.
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// The columns its comparisons and `IS NULL`s read, maybe more than once.
+    pub fn columns(&self) -> impl Iterator<Item = u32> + '_ {
+        self.nodes.iter().filter_map(|node| match *node {
+            Node::Leaf(Leaf::Compare { column, .. } | Leaf::IsNull { column }) => Some(column),
+            Node::And(..) | Node::Or(..) | Node::Not(_) => None,
+        })
+    }
+
+    /// A copy that reads column `renumber(c)` wherever this reads `c`, such
+    /// as a plan's column ids turned into positions in batches.
+    pub fn renumbered<A: Allocator + Clone + 'static>(
+        &self,
+        allocator: A,
+        renumber: impl Fn(u32) -> u32,
+    ) -> Result<Predicate, AllocError> {
+        let nodes = self.nodes.iter().map(|&node| match node {
+            Node::Leaf(Leaf::Compare { column, comparison, value }) => {
+                Node::Leaf(Leaf::Compare { column: renumber(column), comparison, value })
+            }
+            Node::Leaf(Leaf::IsNull { column }) => {
+                Node::Leaf(Leaf::IsNull { column: renumber(column) })
+            }
+            node => node,
+        });
+        let nodes = Vec::fixed_from(allocator, nodes)?;
+        Ok(Predicate { nodes, depth: self.depth })
     }
 
     /// Narrows `batch`'s selection to the rows this is true for, working in
