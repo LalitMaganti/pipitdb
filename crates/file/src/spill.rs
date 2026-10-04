@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore};
+use pipit_kernel::error::Error;
+use pipit_kernel::spill::{Block, LogId, SpillStore};
 
 use crate::read_at;
 
@@ -37,49 +38,49 @@ impl FileSpill {
     fn with<T>(
         &self,
         log: LogId,
-        f: impl FnOnce(&mut Log) -> Result<T, SpillError>,
-    ) -> Result<T, SpillError> {
-        let mut logs = self.logs.lock().map_err(|_| SpillError::Io)?;
-        let index = usize::try_from(log.0).map_err(|_| SpillError::Io)?;
-        f(logs.get_mut(index).and_then(Option::as_mut).ok_or(SpillError::Io)?)
+        f: impl FnOnce(&mut Log) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut logs = self.logs.lock().map_err(|_| Error::Io)?;
+        let index = usize::try_from(log.0).map_err(|_| Error::Io)?;
+        f(logs.get_mut(index).and_then(Option::as_mut).ok_or(Error::Io)?)
     }
 }
 
 impl SpillStore for FileSpill {
-    fn create(&self) -> Result<LogId, SpillError> {
-        let file = open_unnamed(&self.dir).map_err(|_| SpillError::Io)?;
+    fn create(&self) -> Result<LogId, Error> {
+        let file = open_unnamed(&self.dir).map_err(|_| Error::Io)?;
         let log = Log { file, len: 0, sealed: false };
-        let mut logs = self.logs.lock().map_err(|_| SpillError::Io)?;
+        let mut logs = self.logs.lock().map_err(|_| Error::Io)?;
         logs.push(Some(log));
         Ok(LogId(logs.len() as u64 - 1))
     }
 
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, SpillError> {
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
         self.with(log, |log| {
             if log.sealed {
-                return Err(SpillError::Io);
+                return Err(Error::Io);
             }
-            log.file.write_all(bytes).map_err(|_| SpillError::Io)?;
+            log.file.write_all(bytes).map_err(|_| Error::Io)?;
             let block = Block { offset: log.len, len: bytes.len() as u64 };
             log.len += block.len;
             Ok(block)
         })
     }
 
-    fn seal(&self, log: LogId) -> Result<(), SpillError> {
+    fn seal(&self, log: LogId) -> Result<(), Error> {
         self.with(log, |log| {
             log.sealed = true;
             Ok(())
         })
     }
 
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
+    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
         self.with(log, |log| {
             let fits = block.offset.checked_add(block.len).is_some_and(|end| end <= log.len);
             if !log.sealed || !fits || block.len != into.len() as u64 {
-                return Err(SpillError::Io);
+                return Err(Error::Io);
             }
-            read_at(&log.file, into, block.offset).map_err(|_| SpillError::Io)
+            read_at(&log.file, into, block.offset).map_err(|_| Error::Io)
         })
     }
 
@@ -167,7 +168,7 @@ mod tests {
             }
         }
         store.delete(a);
-        assert_eq!(read_column(&Heap, &store, a, &spilled[0].0).err(), Some(SpillError::Io));
+        assert_eq!(read_column(&Heap, &store, a, &spilled[0].0).err(), Some(Error::Io));
         store.delete(b);
     }
 
@@ -177,10 +178,10 @@ mod tests {
         let store = FileSpill::new(std::env::temp_dir());
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(&[1, 2, 3])).unwrap();
-        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(SpillError::Io));
+        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(Error::Io));
         store.seal(log).unwrap();
         assert!(read_column(&Heap, &store, log, &spilled).is_ok());
-        assert_eq!(store.append(log, &[0]).err(), Some(SpillError::Io));
+        assert_eq!(store.append(log, &[0]).err(), Some(Error::Io));
         store.delete(log);
     }
 
