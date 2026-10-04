@@ -13,6 +13,16 @@ pub(crate) unsafe fn value_of<'a, T>(value: NonNull<()>) -> &'a T {
     unsafe { value.cast().as_ref() }
 }
 
+/// `value` as the `T` it is, to change.
+///
+/// # Safety
+///
+/// `value` must point to a live `T`, not otherwise borrowed, for `'a`.
+pub(crate) unsafe fn value_mut_of<'a, T>(value: NonNull<()>) -> &'a mut T {
+    // SAFETY: upheld by the caller.
+    unsafe { value.cast().as_mut() }
+}
+
 /// `state` as the `S` it is.
 ///
 /// # Safety

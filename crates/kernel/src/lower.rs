@@ -123,7 +123,7 @@ mod tests {
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
-    use crate::plan::{DynOp, ScanOp};
+    use crate::plan::{DynOp, ScanColumn, ScanOp};
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable};
 
@@ -172,7 +172,9 @@ mod tests {
         let a = plan.add_column("a", DataType::Int64).unwrap();
         let b = plan.add_column("b", DataType::Int64).unwrap();
         let mut columns = Vec::fixed(Heap, 2).unwrap();
-        assert!(columns.push(a).is_ok() && columns.push(b).is_ok());
+        let a_column = ScanColumn { column: 0, binding: a };
+        let b_column = ScanColumn { column: 1, binding: b };
+        assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
         let scan = DynOp::new(Heap, ScanOp { scannable: &table, columns }).unwrap();
         plan.add_node(scan, Vec::fixed(Heap, 0).unwrap()).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
@@ -188,5 +190,38 @@ mod tests {
             physical.columns().iter().map(|c| batch.column(c.position).int64s()).collect();
         assert_eq!(rows, [[10, 20], [1, 2]]);
         assert!(!execution.next(&mut batch));
+    }
+
+    /// `Ab` scanned with `output` as the plan's output, and pruned.
+    fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
+        let table = DynScannable::new(Heap, Ab).unwrap();
+        let mut plan = LogicalPlan::new(Heap).unwrap();
+        let mut columns = Vec::fixed(Heap, 2).unwrap();
+        let mut bindings = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b")] {
+            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            assert!(columns.push(ScanColumn { column, binding }).is_ok());
+            bindings.push(binding);
+        }
+        let scan = DynOp::new(Heap, ScanOp { scannable: &table, columns }).unwrap();
+        plan.add_node(scan, Vec::fixed(Heap, 0).unwrap()).unwrap();
+        for &i in output {
+            assert!(plan.output.push(bindings[i]).is_ok());
+        }
+        crate::optimize::optimize(Heap, &mut plan).unwrap();
+
+        let physical = lower(Heap, &plan).unwrap();
+        let mut execution = physical.pipeline().start(Heap).unwrap();
+        let mut batch = RowBatch::new();
+        assert!(execution.next(&mut batch));
+        (batch.column_count() as usize, batch.column(0).int64s().into())
+    }
+
+    #[test]
+    fn scans_only_needed_columns() {
+        assert_eq!(pruned(&[1]), (1, [10, 20].into()));
+        assert_eq!(pruned(&[1, 0]), (2, [1, 2].into()));
+        // A batch with no columns has no rows, so one is kept.
+        assert_eq!(pruned(&[]), (1, [1, 2].into()));
     }
 }

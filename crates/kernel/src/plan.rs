@@ -9,9 +9,10 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::column::DataType;
-use crate::erase::value_of;
+use crate::erase::{value_mut_of, value_of};
 use crate::lower::Lowering;
 use crate::names::{Name, Names};
+use crate::optimize::{Needed, Pruned};
 use crate::scannable::DynScannable;
 use crate::vec::Vec;
 
@@ -47,6 +48,13 @@ pub trait Op<'c> {
     /// defining the columns it makes.
     fn lower(&self, node: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>)
     -> Result<(), AllocError>;
+
+    /// Drops the columns this makes that aren't in `needed`, and marks the
+    /// ones it reads. By default, it can't say, so everything is kept.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        needed.need_all();
+        Pruned::Keep
+    }
 }
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
@@ -58,6 +66,7 @@ pub struct DynOp<'c> {
         &PlanNode<'c>,
         &mut Lowering<'l, 'c>,
     ) -> Result<(), AllocError>,
+    prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     lifetime: PhantomData<&'c ()>,
 }
 
@@ -70,6 +79,8 @@ impl<'c> DynOp<'c> {
             op: Box::new(allocator, op)?.erase(),
             // SAFETY: only called with this op.
             lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
+            // SAFETY: as above, and the caller has the op mutably.
+            prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
             lifetime: PhantomData,
         })
     }
@@ -81,6 +92,12 @@ impl<'c> DynOp<'c> {
     ) -> Result<(), AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.lower)(self.op.as_ptr(), node, lowering) }
+    }
+
+    pub(crate) fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.prune)(self.op.as_ptr(), needed) }
     }
 }
 
@@ -143,21 +160,41 @@ impl<'c> LogicalPlan<'c> {
     }
 }
 
-/// Reads all the rows of a scannable. `columns` binds each of its columns,
-/// in its order.
+/// Reads all the rows of a scannable, binding the columns in `columns`.
 pub struct ScanOp<'c> {
     pub scannable: &'c DynScannable<'c>,
-    pub columns: Vec<NamedColumn>,
+    pub columns: Vec<ScanColumn>,
+}
+
+/// A column a scan reads, and what it's bound to in the plan.
+#[derive(Clone, Copy)]
+pub struct ScanColumn {
+    /// Which of the scannable's columns.
+    pub column: u32,
+    pub binding: NamedColumn,
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
     fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), AllocError> {
-        check!(self.columns.len() == self.scannable.column_count() as usize);
-        let all = Vec::fixed_from(lowering.allocator(), 0..self.scannable.column_count())?;
-        lowering.set_source(self.scannable.scan(lowering.allocator(), all)?);
+        let read = self.columns.iter().map(|column| column.column);
+        let read = Vec::fixed_from(lowering.allocator(), read)?;
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
         for column in self.columns.iter() {
-            lowering.define(column.id);
+            lowering.define(column.binding.id);
         }
         Ok(())
+    }
+
+    /// Keeps the needed columns, and at least one: a batch with no columns
+    /// has no rows.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
+        let mut first = true;
+        self.columns.retain(|column| {
+            let keep = needed.is_needed(column.binding.id) || (!any && first);
+            first = false;
+            keep
+        });
+        Pruned::Keep
     }
 }
