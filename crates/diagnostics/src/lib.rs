@@ -4,12 +4,10 @@
 //! be printed in a compact form, `pipit:E0007:2+0:5` (code, span start and
 //! length, detail), and explained later with `pipit-explain`.
 
-use alloc::format;
-use alloc::string::{String, ToString};
-use core::fmt::Write;
+use std::fmt::Write;
 
-use crate::error::{Error, ErrorCode, Span};
-use crate::lexer::TokenKind;
+use pipit_pipesql::error::{Error, ErrorCode, Span};
+use pipit_pipesql::lexer::TokenKind;
 
 /// `error` in its compact form, `pipit:E0007:2+0:5`.
 pub fn compact(error: &Error) -> String {
@@ -81,7 +79,7 @@ fn describe(error: &Error, found: &str) -> (String, String) {
         }
         ErrorCode::NestingTooDeep => (
             "expression nests too deeply, or has too many arguments".into(),
-            format!("nesting is limited to {} levels", crate::parser::NESTING_MAX),
+            format!("nesting is limited to {} levels", pipit_pipesql::parser::NESTING_MAX),
         ),
         ErrorCode::OutOfMemory => ("out of memory".into(), "while parsing this query".into()),
         ErrorCode::UnknownStage => (format!("unknown stage {found}"), "not a stage".into()),
@@ -94,7 +92,7 @@ fn describe(error: &Error, found: &str) -> (String, String) {
         }
         ErrorCode::ListTooLong => (
             "the list is too long".into(),
-            format!("lists are limited to {} items", crate::parser::LIST_MAX),
+            format!("lists are limited to {} items", pipit_pipesql::parser::LIST_MAX),
         ),
     }
 }
@@ -155,8 +153,8 @@ fn underline_width(line: &str, column: usize, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::parse_expression;
     use pipit_kernel::allocator::Heap;
+    use pipit_pipesql::parser::parse_expression;
 
     use super::*;
 

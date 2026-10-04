@@ -6,15 +6,14 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let Some(Some(error)) =
-        args.next().map(|text| pipit_pipesql::diagnostics::parse_compact(&text))
+    let Some(Some(error)) = args.next().map(|text| pipitdb_diagnostics::parse_compact(&text))
     else {
         eprintln!("usage: pipit-explain pipit:E0007:2+0:5 [query file]");
         return ExitCode::FAILURE;
     };
     match read_query(args.next()) {
         Ok((source, name)) => {
-            print!("{}", pipit_pipesql::diagnostics::render(&error, &source, &name));
+            print!("{}", pipitdb_diagnostics::render(&error, &source, &name));
             ExitCode::SUCCESS
         }
         Err(message) => {

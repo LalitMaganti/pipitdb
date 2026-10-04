@@ -1,5 +1,5 @@
 //! Errors a caller can cause, such as a bad query. They carry no text:
-//! `diagnostics` turns them into messages.
+//! `pipitdb-diagnostics` turns them into messages.
 
 /// The bytes `start..start + len` of the query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
