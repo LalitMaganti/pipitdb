@@ -2,15 +2,15 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore};
 
-/// Logs are files in a directory. On Unix, a log's file is removed as soon
-/// as it's opened, so nothing is left behind if the process ends early.
-/// As on S3, a log can only be read once sealed.
+/// Logs are files in a directory, without names, so they go when they're
+/// closed, even if the process ends early. As on S3, a log can only be read
+/// once sealed.
 pub struct FileSpill {
     dir: PathBuf,
     logs: Mutex<Vec<Option<Log>>>,
@@ -20,10 +20,6 @@ struct Log {
     file: File,
     len: u64,
     sealed: bool,
-    /// Where the file is, to remove it when the log is deleted, where it
-    /// can't be removed while open.
-    #[cfg(not(unix))]
-    path: PathBuf,
 }
 
 /// Names files uniquely, across stores in this process.
@@ -49,27 +45,8 @@ impl FileSpill {
 
 impl SpillStore for FileSpill {
     fn create(&self) -> Result<LogId, SpillError> {
-        let name = format!(
-            "pipitdb-spill-{}-{}",
-            std::process::id(),
-            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = self.dir.join(name);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|_| SpillError::Io)?;
-        #[cfg(unix)]
-        std::fs::remove_file(&path).map_err(|_| SpillError::Io)?;
-        let log = Log {
-            file,
-            len: 0,
-            sealed: false,
-            #[cfg(not(unix))]
-            path,
-        };
+        let file = open_unnamed(&self.dir).map_err(|_| SpillError::Io)?;
+        let log = Log { file, len: 0, sealed: false };
         let mut logs = self.logs.lock().map_err(|_| SpillError::Io)?;
         logs.push(Some(log));
         Ok(LogId(logs.len() as u64 - 1))
@@ -107,17 +84,45 @@ impl SpillStore for FileSpill {
     fn delete(&self, log: LogId) {
         let Ok(mut logs) = self.logs.lock() else { return };
         let Some(slot) = usize::try_from(log.0).ok().and_then(|i| logs.get_mut(i)) else { return };
-        if let Some(log) = slot.take() {
-            #[cfg(not(unix))]
-            {
-                let path = log.path.clone();
-                drop(log);
-                let _ = std::fs::remove_file(path);
-            }
-            #[cfg(unix)]
-            drop(log);
+        // Closing the file deletes it.
+        drop(slot.take());
+    }
+}
+
+/// `O_TMPFILE`, where it's known: a file in a directory that never has a
+/// name.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const O_TMPFILE: i32 = 0o20_200_000;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const O_TMPFILE: i32 = 0o20_040_000;
+
+/// Opens a file in `dir` that's deleted when it's closed, even if the
+/// process ends first. On Linux it never has a name; on other Unixes it has
+/// one only until it's open, as SQLite does; on Windows, Windows deletes it.
+fn open_unnamed(dir: &Path) -> std::io::Result<File> {
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Not every filesystem has it; then a named file is used.
+        let unnamed = OpenOptions::new().read(true).write(true).custom_flags(O_TMPFILE).open(dir);
+        if let Ok(file) = unnamed {
+            return Ok(file);
         }
     }
+    let id = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("pipitdb-spill-{}-{id}", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        options.custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+    }
+    let file = options.open(&path)?;
+    #[cfg(unix)]
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -199,6 +204,20 @@ mod tests {
         assert!(read_column(&Heap, &store, log, &spilled).is_ok());
         assert_eq!(store.append(log, &[0]).err(), Some(SpillError::Io));
         store.delete(log);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg_attr(miri, ignore = "Miri can't use real files")]
+    fn opens_files_without_names_on_linux() {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A wrong `O_TMPFILE` would quietly fall back to named files.
+        let unnamed = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_TMPFILE)
+            .open(std::env::temp_dir());
+        assert!(unnamed.is_ok());
     }
 
     #[test]
