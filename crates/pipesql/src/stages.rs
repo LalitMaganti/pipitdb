@@ -42,14 +42,14 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     };
     let allocator = compiler.allocator();
     let count = table.column_count();
-    let mut columns = Vec::fixed(allocator.clone(), count as usize)?;
-    let mut scope = Vec::new(allocator.clone(), PLAN_COLUMNS_MAX)?;
+    let mut columns = Vec::fixed(allocator, count as usize)?;
+    let mut scope = Vec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..count {
         let binding = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
         columns.push(ScanColumn { column: i, binding })?;
         scope.push(binding)?;
     }
-    let scan = DynOp::new(allocator.clone(), ScanOp { scannable: table, columns })?;
+    let scan = DynOp::new(allocator, ScanOp { scannable: table, columns })?;
     let children = Vec::fixed(allocator, 0)?;
     compiler.plan.add_node(scan, children)?;
     compiler.scope = scope;
@@ -60,7 +60,7 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let predicate = compile_condition(compiler, compiler.node(stage.first_child()))?;
     let allocator = compiler.allocator();
-    let filter = DynOp::new(allocator.clone(), FilterOp { predicate })?;
+    let filter = DynOp::new(allocator, FilterOp { predicate })?;
     let children = Vec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(filter, children)?;
     Ok(())
@@ -124,12 +124,12 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_query(Heap, &REGISTRY, source.as_bytes()).unwrap();
+        let ast = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_query(Heap, &REGISTRY, source.as_bytes()).unwrap_err();
+        let error = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap_err();
         (error.code, error.span.start)
     }
 

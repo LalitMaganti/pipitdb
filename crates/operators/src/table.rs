@@ -27,13 +27,13 @@ impl Table {
     /// A table with a column for each of `columns`' names and types, in
     /// `row_groups` of a column each, with the same number of rows, at most
     /// `BATCH_ROWS_MAX`. The columns' buffers are shared, not copied.
-    pub fn new<A: Allocator + Clone + 'static>(
-        allocator: A,
+    pub fn new(
+        allocator: &dyn Allocator,
         columns: &[(&str, DataType)],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
         check!(u32::try_from(columns.len()).is_ok());
-        let mut groups = Vec::fixed(allocator.clone(), row_groups.len())?;
+        let mut groups = Vec::fixed(allocator, row_groups.len())?;
         for &views in row_groups {
             check!(views.len() == columns.len());
             let row_count = views.first().map_or(0, ColumnView::row_count);
@@ -41,11 +41,11 @@ impl Table {
             for (view, &(_, data_type)) in views.iter().zip(columns) {
                 check!(view.data_type() == data_type && view.row_count() == row_count);
             }
-            let views = Vec::fixed_from(allocator.clone(), views.iter().cloned())?;
+            let views = Vec::fixed_from(allocator, views.iter().cloned())?;
             groups.push(RowGroup { row_count, columns: views })?;
         }
         let name_bytes = columns.iter().map(|(name, _)| name.len()).sum();
-        let mut names = Names::fixed(allocator.clone(), name_bytes)?;
+        let mut names = Names::fixed(allocator, name_bytes)?;
         let mut schema = Vec::fixed(allocator, columns.len())?;
         for &(name, data_type) in columns {
             schema.push((names.add(name)?, data_type))?;
@@ -131,21 +131,21 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::{DynAllocator, Heap};
+    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
 
     use super::*;
 
     fn int64s(values: impl Iterator<Item = i64>) -> ColumnView {
         let values: Vec<i64> = values.collect();
-        let mut buffer = Buffer::allocate(Heap, values.len() * 8).unwrap();
+        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(&values);
         ColumnView::new(DataType::Int64, buffer, None)
     }
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let mut context = Context::new(DynAllocator::new(Heap).unwrap());
+        let mut context = Context::new(&Heap);
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
@@ -162,7 +162,7 @@ mod tests {
         let empty = [int64s(0..0), int64s(0..0)];
         let second = [int64s(2048..2548), int64s((2048..2548).map(|i| -i))];
         let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
-        let table = Table::new(Heap, &columns, &[&first, &empty, &second]).unwrap();
+        let table = Table::new(&Heap, &columns, &[&first, &empty, &second]).unwrap();
 
         let expected = [(2048, vec![0, 0]), (500, vec![-2048, 2048])];
         assert_eq!(scan(&table, &[1, 0]), expected);
@@ -171,7 +171,7 @@ mod tests {
     #[test]
     fn counts_rows_without_columns() {
         let (first, second) = ([int64s(0..2048)], [int64s(0..904)]);
-        let table = Table::new(Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
+        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
         let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
         assert_eq!(counts, [2048, 904]);
     }
@@ -180,21 +180,21 @@ mod tests {
     #[should_panic(expected = "BATCH_ROWS_MAX")]
     fn checks_row_groups_fit_in_a_batch() {
         let columns = [int64s(0..2049)];
-        let _ = Table::new(Heap, &[("a", DataType::Int64)], &[&columns]);
+        let _ = Table::new(&Heap, &[("a", DataType::Int64)], &[&columns]);
     }
 
     #[test]
     #[should_panic(expected = "data_type")]
     fn checks_column_types() {
         let columns = [int64s(0..1)];
-        let _ = Table::new(Heap, &[("a", DataType::Float64)], &[&columns]);
+        let _ = Table::new(&Heap, &[("a", DataType::Float64)], &[&columns]);
     }
 
     #[test]
     fn finds_columns_by_name() {
         let columns = [int64s(0..1), int64s(0..1)];
         let schema = [("ts", DataType::Int64), ("dur", DataType::Int64)];
-        let table = Table::new(Heap, &schema, &[&columns]).unwrap();
+        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
         assert_eq!((table.find_column("dur"), table.find_column("name")), (Some(1), None));
         assert_eq!(table.column_name(0), "ts");
     }

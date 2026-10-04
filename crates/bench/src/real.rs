@@ -29,7 +29,7 @@ fn data_dir() -> PathBuf {
 pub fn slices() -> Option<&'static DynScannable<'static>> {
     let text = std::fs::read_to_string(data_dir().join("slice_table_for_benchmarks.csv")).ok()?;
     let table = csv_table(&text)?;
-    Some(Box::leak(Box::new(DynScannable::new(Heap, table).ok()?)))
+    Some(Box::leak(Box::new(DynScannable::new(&Heap, table).ok()?)))
 }
 
 /// `query` over `slices`, compiled, optimized and lowered, ready to run.
@@ -38,9 +38,9 @@ pub fn slice_query(
     query: &str,
 ) -> Option<PhysicalPlan<'static>> {
     let catalog: &'static Slices = Box::leak(Box::new(Slices(slices)));
-    let mut plan = compile(Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
-    optimize(Heap, &mut plan).ok()?;
-    lower(Heap, &plan).ok()
+    let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
+    optimize(&Heap, &mut plan).ok()?;
+    lower(&Heap, &plan).ok()
 }
 
 struct Slices(&'static DynScannable<'static>);
@@ -76,7 +76,7 @@ fn csv_table(text: &str) -> Option<Table> {
         })
         .collect();
     let groups: Vec<&[ColumnView]> = groups.iter().map(Vec::as_slice).collect();
-    Table::new(Heap, &schema, &groups).ok()
+    Table::new(&Heap, &schema, &groups).ok()
 }
 
 /// One column: numbers as they are, or ids for strings, with a validity
@@ -84,8 +84,8 @@ fn csv_table(text: &str) -> Option<Table> {
 fn int64s(values: &[Option<String>]) -> Option<ColumnView> {
     let numbers = values.iter().flatten().all(|value| value.parse::<i64>().is_ok());
     let mut ids = HashMap::new();
-    let mut data = Buffer::allocate(Heap, values.len() * 8).ok()?;
-    let mut validity = Buffer::allocate(Heap, values.len().div_ceil(8)).ok()?;
+    let mut data = Buffer::allocate(&Heap, values.len() * 8).ok()?;
+    let mut validity = Buffer::allocate(&Heap, values.len().div_ceil(8)).ok()?;
     let mut any_null = false;
     for (i, value) in values.iter().enumerate() {
         let Some(value) = value else {

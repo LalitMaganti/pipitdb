@@ -2,7 +2,7 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
-use pipit_kernel::allocator::{Allocator, DynAllocator};
+use pipit_kernel::allocator::Allocator;
 use pipit_kernel::plan::{LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::scannable::Catalog;
 use pipit_kernel::vec::Vec;
@@ -17,7 +17,7 @@ pub struct Compiler<'q, 'c> {
     source: &'q [u8],
     ast: &'q Ast,
     catalog: &'c dyn Catalog,
-    allocator: DynAllocator,
+    allocator: &'q dyn Allocator,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: Vec<NamedColumn>,
@@ -43,8 +43,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 
     /// What to make plan nodes with.
-    pub fn allocator(&self) -> DynAllocator {
-        self.allocator.clone()
+    pub fn allocator(&self) -> &'q dyn Allocator {
+        self.allocator
     }
 
     /// The column in scope that `name`, a `Name` node, names.
@@ -65,20 +65,19 @@ impl<'q, 'c> Compiler<'q, 'c> {
 
 /// Parses `source` with the stages in `registry`, and compiles it, finding
 /// tables in `catalog`. The plan's result is the last stage's columns.
-pub fn compile<'c, A: Allocator + Clone + 'static>(
-    allocator: A,
+pub fn compile<'c>(
+    allocator: &dyn Allocator,
     registry: &Registry,
     catalog: &'c dyn Catalog,
     source: &[u8],
 ) -> Result<LogicalPlan<'c>, Error> {
-    let ast = parse_query(allocator.clone(), registry, source)?;
-    let allocator = DynAllocator::new(allocator)?;
+    let ast = parse_query(allocator, registry, source)?;
     let mut compiler = Compiler {
         source,
         ast: &ast,
         catalog,
-        plan: LogicalPlan::new(allocator.clone())?,
-        scope: Vec::new(allocator.clone(), PLAN_COLUMNS_MAX)?,
+        plan: LogicalPlan::new(allocator)?,
+        scope: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
         allocator,
     };
     let query = ast.node(ast.root());
@@ -124,7 +123,7 @@ mod tests {
 
     fn catalog() -> OneTable {
         let column = |data_type, values: [i64; 2]| {
-            let mut buffer = Buffer::allocate(Heap, 16).unwrap();
+            let mut buffer = Buffer::allocate(&Heap, 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
             ColumnView::new(data_type, buffer, None)
         };
@@ -135,17 +134,17 @@ mod tests {
             column(DataType::Float64, floats),
         ];
         let schema = [("a", DataType::Int64), ("b", DataType::Int64), ("f", DataType::Float64)];
-        let table = Table::new(Heap, &schema, &[&columns]).unwrap();
-        OneTable(DynScannable::new(Heap, table).unwrap())
+        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
+        OneTable(DynScannable::new(&Heap, table).unwrap())
     }
 
     /// Runs `query`, returning each result column's name and the values of
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let plan = compile(Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = lower(Heap, &plan).unwrap();
-        let mut execution = physical.pipeline().start(Heap).unwrap();
+        let plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let physical = lower(&Heap, &plan).unwrap();
+        let mut execution = physical.pipeline().start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
@@ -174,7 +173,7 @@ mod tests {
 
     fn error(query: &str) -> (ErrorCode, u32) {
         let catalog = catalog();
-        let error = compile(Heap, &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
+        let error = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
@@ -223,10 +222,10 @@ mod tests {
     #[test]
     fn reads_only_the_columns_selected() {
         let catalog = catalog();
-        let mut plan = compile(Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();
-        pipit_kernel::optimize::optimize(Heap, &mut plan).unwrap();
-        let physical = lower(Heap, &plan).unwrap();
-        let mut execution = physical.pipeline().start(Heap).unwrap();
+        let mut plan = compile(&Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();
+        pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
+        let physical = lower(&Heap, &plan).unwrap();
+        let mut execution = physical.pipeline().start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         assert_eq!(batch.column_count(), 1);

@@ -181,8 +181,8 @@ impl<'a> DynSource<'a> {
         Erased { step, state_layout, new_state, drop_state, run: next, lifetime: PhantomData }
     }
 
-    pub fn new<A: Allocator + Clone + 'static, T: Source + 'a>(
-        allocator: A,
+    pub fn new<T: Source + 'a>(
+        allocator: &dyn Allocator,
         source: T,
     ) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -220,8 +220,8 @@ impl<'a> DynSource<'a> {
 }
 
 impl<'a> DynTransform<'a> {
-    pub fn new<A: Allocator + Clone + 'static, T: Transform + 'a>(
-        allocator: A,
+    pub fn new<T: Transform + 'a>(
+        allocator: &dyn Allocator,
         transform: T,
     ) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -258,8 +258,8 @@ impl<'a> DynTransform<'a> {
 }
 
 impl<'a> DynOperator<'a> {
-    pub fn new<A: Allocator + Clone + 'static, T: Operator + 'a>(
-        allocator: A,
+    pub fn new<T: Operator + 'a>(
+        allocator: &dyn Allocator,
         operator: T,
     ) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };

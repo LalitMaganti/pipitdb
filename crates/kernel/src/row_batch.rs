@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn holds_columns_of_the_same_length() {
-        let mut values = Buffer::allocate(Heap, 3 * 8).unwrap();
+        let mut values = Buffer::allocate(&Heap, 3 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
         let column = ColumnView::new(DataType::Int64, values, None);
 

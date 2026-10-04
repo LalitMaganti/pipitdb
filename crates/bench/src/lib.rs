@@ -1,6 +1,6 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
-use pipit_kernel::allocator::{AllocError, DynAllocator, Heap};
+use pipit_kernel::allocator::{AllocError, Heap};
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
@@ -43,7 +43,7 @@ pub fn expression(terms: usize) -> String {
 }
 
 pub fn count_nodes(source: &[u8]) -> u32 {
-    parse_expression(Heap, source).map_or(0, |ast| ast.node_count())
+    parse_expression(&Heap, source).map_or(0, |ast| ast.node_count())
 }
 
 /// Three-stage queries, one per line.
@@ -58,7 +58,7 @@ pub fn count_query_nodes(source: &str) -> u32 {
     source
         .lines()
         .map(|query| {
-            parse_query(Heap, &REGISTRY, query.as_bytes()).map_or(0, |ast| ast.node_count())
+            parse_query(&Heap, &REGISTRY, query.as_bytes()).map_or(0, |ast| ast.node_count())
         })
         .sum()
 }
@@ -85,7 +85,7 @@ impl Repeat {
     #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
     pub fn new(batches: u32) -> Repeat {
         let size_bytes = BATCH_ROWS_MAX as usize * 8;
-        let values = Buffer::allocate(Heap, size_bytes).expect("allocates");
+        let values = Buffer::allocate(&Heap, size_bytes).expect("allocates");
         Repeat { column: ColumnView::new(DataType::Int64, values, None), batches }
     }
 }
@@ -156,7 +156,7 @@ impl Operator for PassOperator {
 /// Runs `pipeline` once, returning the rows out, or as many as it made
 /// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
-    let Ok(mut execution) = pipeline.start(Heap) else { return 0 };
+    let Ok(mut execution) = pipeline.start(&Heap) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while execution.next(&mut batch) == Ok(true) {
@@ -169,23 +169,23 @@ pub fn run(pipeline: &Pipeline) -> u64 {
 /// operators.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
-    let mut owned = pipit_kernel::vec::Vec::fixed(Heap, steps).expect("allocates");
+    let mut owned = pipit_kernel::vec::Vec::fixed(&Heap, steps).expect("allocates");
     for _ in 0..steps {
         let step = if operators {
-            Step::Operator(DynOperator::new(Heap, PassOperator).expect("allocates"))
+            Step::Operator(DynOperator::new(&Heap, PassOperator).expect("allocates"))
         } else {
-            Step::Transform(DynTransform::new(Heap, PassTransform).expect("allocates"))
+            Step::Transform(DynTransform::new(&Heap, PassTransform).expect("allocates"))
         };
         assert!(owned.push(step).is_ok(), "fixed for `steps`");
     }
-    Pipeline::new(DynSource::new(Heap, Repeat::new(batches)).expect("allocates"), owned)
+    Pipeline::new(DynSource::new(&Heap, Repeat::new(batches)).expect("allocates"), owned)
 }
 
 /// `row_groups` full row groups, with four columns. Kept for the rest of the
 /// run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
-    let values = Buffer::allocate(Heap, BATCH_ROWS_MAX as usize * 8).expect("allocates");
+    let values = Buffer::allocate(&Heap, BATCH_ROWS_MAX as usize * 8).expect("allocates");
     let column = ColumnView::new(DataType::Int64, values, None);
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
@@ -195,16 +195,16 @@ pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
         ("c", DataType::Int64),
         ("d", DataType::Int64),
     ];
-    let table = Table::new(Heap, &schema, &row_groups).expect("allocates");
-    Box::leak(Box::new(DynScannable::new(Heap, table).expect("allocates")))
+    let table = Table::new(&Heap, &schema, &row_groups).expect("allocates");
+    Box::leak(Box::new(DynScannable::new(&Heap, table).expect("allocates")))
 }
 
 /// Scans two of `table`'s columns.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
-    let columns = pipit_kernel::vec::Vec::fixed_from(Heap, [3, 1].into_iter()).expect("allocates");
-    let source = table.scan(Heap, columns).expect("allocates");
-    Pipeline::new(source, pipit_kernel::vec::Vec::fixed(Heap, 0).expect("allocates"))
+    let columns = pipit_kernel::vec::Vec::fixed_from(&Heap, [3, 1].into_iter()).expect("allocates");
+    let source = table.scan(&Heap, columns).expect("allocates");
+    Pipeline::new(source, pipit_kernel::vec::Vec::fixed(&Heap, 0).expect("allocates"))
 }
 
 /// A batch of values in `0..1000`, spread evenly but out of order, with every
@@ -212,12 +212,12 @@ pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static>
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn filter_column(nulls: bool) -> ColumnView {
     let rows = BATCH_ROWS_MAX as usize;
-    let mut values = Buffer::allocate(Heap, rows * 8).expect("allocates");
+    let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
     for (i, value) in (0_i64..).zip(values.as_mut_slice::<i64>()) {
         *value = (i * 7919) % 1000;
     }
     let validity = nulls.then(|| {
-        let mut validity = Buffer::allocate(Heap, rows / 8).expect("allocates");
+        let mut validity = Buffer::allocate(&Heap, rows / 8).expect("allocates");
         validity.as_mut_slice::<u8>().fill(0xff);
         for row in (0..rows).step_by(16) {
             validity.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
@@ -265,14 +265,14 @@ pub fn predicate(shape: &str) -> Predicate {
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
     Predicate::new(
-        pipit_kernel::vec::Vec::fixed_from(Heap, nodes.iter().copied()).expect("allocates"),
+        pipit_kernel::vec::Vec::fixed_from(&Heap, nodes.iter().copied()).expect("allocates"),
     )
 }
 
 /// Runs `predicate` over `batches` batches of `column`, returning the rows kept.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -> u64 {
-    let mut context = Context::new(DynAllocator::new(Heap).expect("allocates"));
+    let mut context = Context::new(&Heap);
     context.reserve_selections(predicate.depth() as usize).expect("allocates");
     let mut batch = RowBatch::new();
     let mut kept = 0;

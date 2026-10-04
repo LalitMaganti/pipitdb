@@ -16,18 +16,12 @@ pub struct Name {
 
 impl Names {
     /// Room for up to `max_bytes` of names, a power of two.
-    pub fn new<A: Allocator + Clone + 'static>(
-        allocator: A,
-        max_bytes: usize,
-    ) -> Result<Names, AllocError> {
+    pub fn new(allocator: &dyn Allocator, max_bytes: usize) -> Result<Names, AllocError> {
         Ok(Names { bytes: Vec::new(allocator, max_bytes)? })
     }
 
     /// Room for exactly `bytes` of names, which never grows.
-    pub fn fixed<A: Allocator + Clone + 'static>(
-        allocator: A,
-        bytes: usize,
-    ) -> Result<Names, AllocError> {
+    pub fn fixed(allocator: &dyn Allocator, bytes: usize) -> Result<Names, AllocError> {
         Ok(Names { bytes: Vec::fixed(allocator, bytes)? })
     }
 
@@ -57,7 +51,7 @@ mod tests {
 
     #[test]
     fn keeps_names() {
-        let mut names = Names::new(Heap, 16).unwrap();
+        let mut names = Names::new(&Heap, 16).unwrap();
         let a = names.add("ts").unwrap();
         let b = names.add("dur").unwrap();
         assert_eq!((names.get(a), names.get(b)), ("ts", "dur"));

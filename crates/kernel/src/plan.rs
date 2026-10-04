@@ -73,10 +73,7 @@ pub struct DynOp<'c> {
 }
 
 impl<'c> DynOp<'c> {
-    pub fn new<A: Allocator + Clone + 'static, T: Op<'c> + 'c>(
-        allocator: A,
-        op: T,
-    ) -> Result<DynOp<'c>, AllocError> {
+    pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
         Ok(DynOp {
             op: Box::new(allocator, op)?.erase(),
             // SAFETY: only called with this op.
@@ -122,13 +119,11 @@ pub struct LogicalPlan<'c> {
 }
 
 impl<'c> LogicalPlan<'c> {
-    pub fn new<A: Allocator + Clone + 'static>(
-        allocator: A,
-    ) -> Result<LogicalPlan<'c>, AllocError> {
+    pub fn new(allocator: &dyn Allocator) -> Result<LogicalPlan<'c>, AllocError> {
         Ok(LogicalPlan {
-            names: Names::new(allocator.clone(), PLAN_NAME_BYTES_MAX)?,
-            columns: Vec::new(allocator.clone(), PLAN_COLUMNS_MAX)?,
-            nodes: Vec::new(allocator.clone(), PLAN_NODES_MAX)?,
+            names: Names::new(allocator, PLAN_NAME_BYTES_MAX)?,
+            columns: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
+            nodes: Vec::new(allocator, PLAN_NODES_MAX)?,
             root: 0,
             output: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
         })
@@ -217,7 +212,7 @@ impl<'c> Op<'c> for FilterOp {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
         let allocator = lowering.allocator();
-        let predicate = self.predicate.renumbered(allocator.clone(), |id| lowering.position(id))?;
+        let predicate = self.predicate.renumbered(allocator, |id| lowering.position(id))?;
         lowering.add_step(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
     }
 

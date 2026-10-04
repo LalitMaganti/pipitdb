@@ -73,8 +73,8 @@ pub struct DynScannable<'a> {
 }
 
 impl<'a> DynScannable<'a> {
-    pub fn new<A: Allocator + Clone + 'static, T: Scannable + 'a>(
-        allocator: A,
+    pub fn new<T: Scannable + 'a>(
+        allocator: &dyn Allocator,
         scannable: T,
     ) -> Result<DynScannable<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -123,9 +123,9 @@ impl<'a> DynScannable<'a> {
     }
 
     /// A source of `columns` of this, in that order.
-    pub fn scan<A: Allocator + Clone + 'static>(
+    pub fn scan(
         &self,
-        allocator: A,
+        allocator: &dyn Allocator,
         columns: Vec<u32>,
     ) -> Result<DynSource<'_>, AllocError> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
@@ -222,7 +222,7 @@ mod tests {
             }
             batch.reset(2);
             for &column in columns {
-                let mut values = Buffer::allocate(Heap, 16).unwrap();
+                let mut values = Buffer::allocate(&Heap, 16).unwrap();
                 let value = i64::from(column);
                 values.as_mut_slice::<i64>().copy_from_slice(&[value, value + 10]);
                 assert!(batch.push_column(ColumnView::new(DataType::Int64, values, None)).is_ok());
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn describes_its_columns() {
-        let scannable = DynScannable::new(Heap, Columns).unwrap();
+        let scannable = DynScannable::new(&Heap, Columns).unwrap();
         assert_eq!(scannable.column_count(), 3);
         assert_eq!(scannable.column_name(1), "b");
         assert!(scannable.column_type(2) == DataType::Int64);
@@ -242,11 +242,11 @@ mod tests {
 
     #[test]
     fn scans_chosen_columns_through_a_pipeline() {
-        let scannable = DynScannable::new(Heap, Columns).unwrap();
-        let columns = Vec::fixed_from(Heap, [2, 0].into_iter()).unwrap();
+        let scannable = DynScannable::new(&Heap, Columns).unwrap();
+        let columns = Vec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
         let pipeline =
-            Pipeline::new(scannable.scan(Heap, columns).unwrap(), Vec::new(Heap, 1).unwrap());
-        let mut execution = pipeline.start(Heap).unwrap();
+            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), Vec::new(&Heap, 1).unwrap());
+        let mut execution = pipeline.start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();

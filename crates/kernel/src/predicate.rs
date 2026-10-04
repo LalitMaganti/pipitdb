@@ -86,9 +86,9 @@ impl Predicate {
 
     /// A copy that reads column `renumber(c)` wherever this reads `c`, such
     /// as a plan's column ids turned into positions in batches.
-    pub fn renumbered<A: Allocator + Clone + 'static>(
+    pub fn renumbered(
         &self,
-        allocator: A,
+        allocator: &dyn Allocator,
         renumber: impl Fn(u32) -> u32,
     ) -> Result<Predicate, AllocError> {
         let nodes = self.nodes.iter().map(|&node| match node {
@@ -240,8 +240,8 @@ mod tests {
     const B: [Option<i64>; 6] = [None, Some(2), None, Some(4), Some(5), Some(1)];
 
     fn column(cells: [Option<i64>; 6]) -> ColumnView {
-        let mut values = Buffer::allocate(Heap, 48).unwrap();
-        let mut validity = Buffer::allocate(Heap, 1).unwrap();
+        let mut values = Buffer::allocate(&Heap, 48).unwrap();
+        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
         for (row, cell) in cells.iter().enumerate() {
             values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
             validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
@@ -296,7 +296,7 @@ mod tests {
     }
 
     fn kept(expr: &Expr) -> StdVec<usize> {
-        let mut nodes = Vec::new(Heap, PREDICATE_NODES_MAX).unwrap();
+        let mut nodes = Vec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         let predicate = Predicate::new(nodes);
         let mut scratch: StdVec<Selection> =
@@ -332,7 +332,7 @@ mod tests {
         ];
         // One scratch selection per `AND` or `OR` nested in another.
         let depth = |expr: &Expr| {
-            let mut nodes = Vec::new(Heap, PREDICATE_NODES_MAX).unwrap();
+            let mut nodes = Vec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
             build(expr, &mut nodes);
             Predicate::new(nodes).depth()
         };
