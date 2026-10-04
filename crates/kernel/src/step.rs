@@ -8,7 +8,8 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::allocator::{AllocError, Allocator};
+use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
@@ -98,10 +99,14 @@ impl Step<'_> {
     }
 }
 
-/// A step of any type, borrowed for `'a`: a pointer to it, and functions that
-/// know its type. `F` is the function a pipeline calls for each batch.
+/// A step of any type that lives for `'a`, owned in memory from an allocator:
+/// a pointer to it, and functions that know its type. `F` is the function a
+/// pipeline calls for each batch.
 pub struct Erased<'a, F> {
     step: NonNull<()>,
+    // Holds the step, which `drop_step` drops.
+    _memory: Buffer,
+    drop_step: unsafe fn(NonNull<()>),
     pub(crate) state_layout: Layout,
     new_state: unsafe fn(NonNull<()>, NonNull<u8>),
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
@@ -119,16 +124,22 @@ pub struct OperatorFunctions {
 }
 
 impl<'a> DynSource<'a> {
-    pub fn new<T: Source>(source: &'a T) -> DynSource<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Source + 'a>(
+        allocator: A,
+        source: T,
+    ) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(source).cast(),
+        let (memory, step) = own(allocator, source)?;
+        Ok(Erased {
+            step,
+            _memory: memory,
+            drop_step: drop_value::<T>,
             state_layout: Layout::new::<T::State>(),
             new_state: new_source_state::<T>,
             drop_state: drop_state::<T::State>,
             run: next::<T>,
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -142,16 +153,22 @@ impl<'a> DynSource<'a> {
 }
 
 impl<'a> DynTransform<'a> {
-    pub fn new<T: Transform>(transform: &'a T) -> DynTransform<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Transform + 'a>(
+        allocator: A,
+        transform: T,
+    ) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(transform).cast(),
+        let (memory, step) = own(allocator, transform)?;
+        Ok(Erased {
+            step,
+            _memory: memory,
+            drop_step: drop_value::<T>,
             state_layout: Layout::new::<T::State>(),
             new_state: new_transform_state::<T>,
             drop_state: drop_state::<T::State>,
             run: process::<T>,
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -164,16 +181,22 @@ impl<'a> DynTransform<'a> {
 }
 
 impl<'a> DynOperator<'a> {
-    pub fn new<T: Operator>(operator: &'a T) -> DynOperator<'a> {
+    pub fn new<A: Allocator + Clone + 'static, T: Operator + 'a>(
+        allocator: A,
+        operator: T,
+    ) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Erased {
-            step: NonNull::from(operator).cast(),
+        let (memory, step) = own(allocator, operator)?;
+        Ok(Erased {
+            step,
+            _memory: memory,
+            drop_step: drop_value::<T>,
             state_layout: Layout::new::<T::State>(),
             new_state: new_operator_state::<T>,
             drop_state: drop_state::<T::State>,
             run: OperatorFunctions { execute: execute::<T>, finish: finish::<T> },
             lifetime: PhantomData,
-        }
+        })
     }
 
     /// # Safety
@@ -207,6 +230,35 @@ impl<F> Erased<'_, F> {
         // the rest.
         unsafe { (self.new_state)(self.step, state) }
     }
+}
+
+impl<F> Drop for Erased<'_, F> {
+    fn drop(&mut self) {
+        // SAFETY: `drop_step` matches `step`'s type, and runs once; the
+        // memory is freed after.
+        unsafe { (self.drop_step)(self.step) }
+    }
+}
+
+/// Moves `value` into memory from `allocator`.
+fn own<A: Allocator + Clone + 'static, T>(
+    allocator: A,
+    value: T,
+) -> Result<(Buffer, NonNull<()>), AllocError> {
+    const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+    // SAFETY: the value is written before anything reads it.
+    let mut memory = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
+    let Some(step) = NonNull::new(memory.as_mut_ptr::<u8>()) else {
+        crate::check::check_failed(line!());
+    };
+    // SAFETY: the memory has room for a `T`, aligned for it.
+    unsafe { step.cast::<T>().write(value) };
+    Ok((memory, step.cast()))
+}
+
+unsafe fn drop_value<T>(value: NonNull<()>) {
+    // SAFETY: see below.
+    unsafe { value.cast::<T>().drop_in_place() }
 }
 
 // These undo the erasure. Each is only stored next to a pointer to a `T`, and

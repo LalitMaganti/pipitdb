@@ -4,7 +4,7 @@
 use std::hint::black_box;
 
 use gungraun::prelude::*;
-use pipit_kernel::step::Step;
+use pipit_kernel::pipeline::Pipeline;
 use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
 
 #[library_benchmark]
@@ -29,22 +29,18 @@ fn query(source: String) -> u32 {
 
 library_benchmark_group!(name = parser_group, benchmarks = [parser, query]);
 
-fn pipeline_input(steps: usize, operators: bool) -> (pipitdb_bench::Repeat, Vec<Step<'static>>) {
-    (pipitdb_bench::Repeat::new(1000), pipitdb_bench::pass_steps(steps, operators))
+#[library_benchmark]
+#[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
+#[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
+#[bench::operators(pipitdb_bench::pass_pipeline(1000, 4, true))]
+fn pipeline(pipeline: Pipeline<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
 
 #[library_benchmark]
-#[bench::source(pipeline_input(0, false))]
-#[bench::transforms(pipeline_input(4, false))]
-#[bench::operators(pipeline_input(4, true))]
-fn pipeline((source, steps): (pipitdb_bench::Repeat, Vec<Step<'static>>)) -> u64 {
-    black_box(pipitdb_bench::run_pipeline(black_box(&source), black_box(&steps)))
-}
-
-#[library_benchmark]
-#[bench::table(pipitdb_bench::table(100, 20_480))]
-fn scan(table: pipit_operators::table::Table) -> u64 {
-    black_box(pipitdb_bench::scan_table(black_box(&table)))
+#[bench::table(pipitdb_bench::scan_pipeline(pipitdb_bench::table(100, 20_480)))]
+fn scan(pipeline: Pipeline<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
 
 library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan]);
