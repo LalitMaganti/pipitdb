@@ -163,12 +163,19 @@ pub fn table(row_groups: usize, rows: u32) -> &'static Table {
     let column = ColumnView::new(DataType::Int64, values, None);
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
-    Box::leak(Box::new(Table::new(Heap, &[DataType::Int64; 4], &row_groups).expect("allocates")))
+    let schema = [
+        ("a", DataType::Int64),
+        ("b", DataType::Int64),
+        ("c", DataType::Int64),
+        ("d", DataType::Int64),
+    ];
+    Box::leak(Box::new(Table::new(Heap, &schema, &row_groups).expect("allocates")))
 }
 
 /// Scans two of `table`'s columns.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn scan_pipeline(table: &'static Table) -> Pipeline<'static> {
-    let source = DynSource::new(Heap, TableScan::new(table, &[3, 1])).expect("allocates");
+    let columns = pipit_kernel::vec::Vec::fixed_from(Heap, [3, 1].into_iter()).expect("allocates");
+    let source = DynSource::new(Heap, TableScan::new(table, columns)).expect("allocates");
     Pipeline::new(source, pipit_kernel::vec::Vec::fixed(Heap, 0).expect("allocates"))
 }
