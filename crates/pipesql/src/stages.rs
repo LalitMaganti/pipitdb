@@ -1,9 +1,8 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
-use pipit_kernel::plan::{DynOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
+use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
 use pipit_kernel::vec::Vec;
-use pipit_operators::filter::FilterOp;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;

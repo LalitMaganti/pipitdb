@@ -7,9 +7,11 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::ColumnView;
+use crate::context::Context;
 use crate::filter::{self, Comparison, Value};
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
+use crate::step::Transform;
 use crate::vec::Vec;
 
 /// The most nodes a predicate can have.
@@ -196,6 +198,24 @@ fn negated(comparison: Comparison) -> Comparison {
         Comparison::LessEqual => Comparison::Greater,
         Comparison::Greater => Comparison::LessEqual,
         Comparison::GreaterEqual => Comparison::Less,
+    }
+}
+
+/// Narrows each batch's selection to the rows `predicate` is true for. The
+/// predicate reads columns by their position in batches.
+pub struct Filter {
+    pub predicate: Predicate,
+}
+
+impl Transform for Filter {
+    type State = ();
+
+    fn new_state(&self, context: &mut Context) -> Result<(), AllocError> {
+        context.reserve_selections(self.predicate.depth() as usize)
+    }
+
+    fn process(&self, context: &mut Context, (): &mut (), batch: &mut RowBatch) {
+        self.predicate.select(context.selections(), batch);
     }
 }
 

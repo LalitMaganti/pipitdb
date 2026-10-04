@@ -13,6 +13,8 @@ name = "pipit_pipesql"
 [dependencies]
 pipitdb-diagnostics = { path = "../diagnostics", optional = true }
 pipitdb-kernel = { path = "../kernel" }
+
+[dev-dependencies]
 pipitdb-operators = { path = "../operators" }
 
 [features]
