@@ -30,29 +30,82 @@ pub fn compare(
     value: Value,
     selection: &mut Selection,
 ) {
+    compare_into(column, comparison, value, selection, None);
+}
+
+/// As `compare`, and writes the rows not kept, null or not, to `rejected`, in
+/// the same pass.
+pub fn compare_split(
+    column: &ColumnView,
+    comparison: Comparison,
+    value: Value,
+    selection: &mut Selection,
+    rejected: &mut Selection,
+) {
+    compare_into(column, comparison, value, selection, Some(rejected));
+}
+
+fn compare_into(
+    column: &ColumnView,
+    comparison: Comparison,
+    value: Value,
+    selection: &mut Selection,
+    rejected: Option<&mut Selection>,
+) {
     match value {
         Value::Int64(value) => {
             check!(column.data_type() == DataType::Int64);
-            compare_values(column, column.int64s(), |cell| cell, comparison, value, selection);
+            let cells = column.int64s();
+            compare_values(column, cells, |cell| cell, comparison, value, selection, rejected);
         }
         Value::Float64(value) => {
             check!(column.data_type() == DataType::Float64);
             let cells = column.float64s();
-            compare_values(column, cells, float_key, comparison, float_key(value), selection);
+            let value = float_key(value);
+            compare_values(column, cells, float_key, comparison, value, selection, rejected);
         }
     }
 }
 
 /// Keeps the null rows if `nulls`, or the others.
 pub fn is_null(column: &ColumnView, nulls: bool, selection: &mut Selection) {
+    is_null_into(column, nulls, selection, None);
+}
+
+/// As `is_null`, and writes the rows not kept to `rejected`, in the same pass.
+pub fn is_null_split(
+    column: &ColumnView,
+    nulls: bool,
+    selection: &mut Selection,
+    rejected: &mut Selection,
+) {
+    is_null_into(column, nulls, selection, Some(rejected));
+}
+
+fn is_null_into(
+    column: &ColumnView,
+    nulls: bool,
+    selection: &mut Selection,
+    rejected: Option<&mut Selection>,
+) {
     let Some(validity) = covering(column, selection).validity() else {
-        if nulls {
-            selection.retain(|_| false);
+        // No row is null.
+        match rejected {
+            None if nulls => selection.retain(|_| false),
+            None => {}
+            Some(rejected) => selection.partition(rejected, |_| !nulls),
         }
         return;
     };
-    // SAFETY: `covering` checked every kept row is a row of `column`.
-    selection.retain(|row| unsafe { validity.is_valid_unchecked(u32::from(row)) } != nulls);
+    let test = move |row: u16| {
+        // SAFETY: `covering` checked every kept row is a row of `column`.
+        let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+        valid != nulls
+    };
+    match rejected {
+        None => selection.retain(test),
+        Some(rejected) => selection.partition(rejected, test),
+    }
 }
 
 /// One loop per comparison, so the loop has no branch on it.
@@ -63,18 +116,20 @@ fn compare_values<T: Copy, K: Copy + PartialOrd>(
     comparison: Comparison,
     value: K,
     selection: &mut Selection,
+    rejected: Option<&mut Selection>,
 ) {
     covering(column, selection);
     // SAFETY: `covering` checked every kept row is a row of `column`, whose
     // values `cells` are.
     let at = move |row: u16| key(unsafe { cell(cells, row) });
+    let (selection, rejected) = (selection, rejected);
     match comparison {
-        Comparison::Equal => keep(column, selection, move |row| at(row) == value),
-        Comparison::NotEqual => keep(column, selection, move |row| at(row) != value),
-        Comparison::Less => keep(column, selection, move |row| at(row) < value),
-        Comparison::LessEqual => keep(column, selection, move |row| at(row) <= value),
-        Comparison::Greater => keep(column, selection, move |row| at(row) > value),
-        Comparison::GreaterEqual => keep(column, selection, move |row| at(row) >= value),
+        Comparison::Equal => keep(column, selection, rejected, move |row| at(row) == value),
+        Comparison::NotEqual => keep(column, selection, rejected, move |row| at(row) != value),
+        Comparison::Less => keep(column, selection, rejected, move |row| at(row) < value),
+        Comparison::LessEqual => keep(column, selection, rejected, move |row| at(row) <= value),
+        Comparison::Greater => keep(column, selection, rejected, move |row| at(row) > value),
+        Comparison::GreaterEqual => keep(column, selection, rejected, move |row| at(row) >= value),
     }
 }
 
@@ -90,17 +145,30 @@ fn float_key(value: f64) -> i64 {
     bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()
 }
 
-/// Keeps the non-null rows `test` passes, with a loop that skips the null
-/// check when `column` has no nulls. `test` is still run for null rows, whose
-/// values are there to read, so the loop has no branch on it.
-fn keep(column: &ColumnView, selection: &mut Selection, test: impl Fn(u16) -> bool) {
-    match column.validity() {
-        None => selection.retain(test),
-        Some(validity) => selection.retain(move |row| {
-            // SAFETY: callers check with `covering` first.
-            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-            valid & test(row)
-        }),
+/// Keeps the non-null rows `test` passes, writing the rest to `rejected` if
+/// there is one, with a loop that skips the null check when `column` has no
+/// nulls. `test` is still run for null rows, whose values are there to read,
+/// so the loop has no branch on it.
+fn keep(
+    column: &ColumnView,
+    selection: &mut Selection,
+    rejected: Option<&mut Selection>,
+    test: impl Fn(u16) -> bool + Copy,
+) {
+    match (column.validity(), rejected) {
+        (None, None) => selection.retain(test),
+        (None, Some(rejected)) => selection.partition(rejected, test),
+        (Some(validity), rejected) => {
+            let test = move |row: u16| {
+                // SAFETY: callers check with `covering` first.
+                let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+                valid & test(row)
+            };
+            match rejected {
+                None => selection.retain(test),
+                Some(rejected) => selection.partition(rejected, test),
+            }
+        }
     }
 }
 

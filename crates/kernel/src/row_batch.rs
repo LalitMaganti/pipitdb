@@ -64,6 +64,15 @@ impl RowBatch {
         &mut self.selection
     }
 
+    /// The columns, to read, and the selection, to narrow, at once.
+    pub fn columns_and_selection(&mut self) -> (&[ColumnView], &mut Selection) {
+        let count = self.column_count as usize;
+        let columns = at!(self.columns, ..count);
+        // SAFETY: the first `column_count` columns are initialized.
+        let columns = unsafe { &*(core::ptr::from_ref(columns) as *const [ColumnView]) };
+        (columns, &mut self.selection)
+    }
+
     /// Fails, giving `column` back, if the batch has `BATCH_COLUMNS_MAX`
     /// columns.
     pub fn push_column(&mut self, column: ColumnView) -> Result<(), ColumnView> {

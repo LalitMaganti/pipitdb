@@ -16,6 +16,7 @@ pub mod names;
 pub mod optimize;
 pub mod pipeline;
 pub mod plan;
+pub mod predicate;
 pub mod row_batch;
 pub mod scannable;
 pub mod selection;

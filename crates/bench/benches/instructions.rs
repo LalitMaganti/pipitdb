@@ -53,5 +53,14 @@ fn filter(
     black_box(pipitdb_bench::run_filter(black_box(&column), 100, filter))
 }
 
-library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan, filter]);
+#[library_benchmark]
+#[bench::and(pipitdb_bench::predicate("and"))]
+#[bench::or(pipitdb_bench::predicate("or"))]
+#[bench::not(pipitdb_bench::predicate("not"))]
+fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
+    let column = pipitdb_bench::filter_column(false);
+    black_box(pipitdb_bench::run_predicate(black_box(&predicate), &column, 100))
+}
+
+library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan, filter, predicate]);
 main!(library_benchmark_groups = lexer_group, parser_group, pipeline_group);

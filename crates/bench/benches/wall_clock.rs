@@ -91,6 +91,12 @@ fn filter(c: &mut Criterion) {
             b.iter(|| pipitdb_bench::run_filter(black_box(column), 1000, filter));
         });
     }
+    for shape in ["and", "or", "not"] {
+        let predicate = pipitdb_bench::predicate(shape);
+        group.bench_function(shape, |b| {
+            b.iter(|| pipitdb_bench::run_predicate(black_box(&predicate), &plain, 1000));
+        });
+    }
     group.finish();
 }
 
