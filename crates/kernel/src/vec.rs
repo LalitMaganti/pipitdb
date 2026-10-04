@@ -78,7 +78,7 @@ impl<T> Vec<T> {
         // SAFETY: only the first `len` values are read, and each is written
         // first.
         let mut buffer = unsafe { Buffer::allocate_uninit(allocator, capacity * size_of::<T>())? };
-        let values = data(&mut buffer).cast();
+        let values = buffer.as_mut_non_null().cast();
         Ok(Vec { buffer, values, len: 0, capacity, max })
     }
 
@@ -121,19 +121,12 @@ fn grow(
 ) -> Result<NonNull<u8>, AllocError> {
     // SAFETY: as in `Vec::empty`.
     let mut grown = unsafe { buffer.allocate_uninit_like(size_bytes)? };
-    let to = data(&mut grown);
+    let to = grown.as_mut_non_null();
     // SAFETY: both hold at least `used_bytes`. Values are moved, not dropped:
     // freeing a `Buffer` doesn't drop what's in it.
-    unsafe { to.copy_from_nonoverlapping(data(buffer), used_bytes) };
+    unsafe { to.copy_from_nonoverlapping(buffer.as_mut_non_null(), used_bytes) };
     *buffer = grown;
     Ok(to)
-}
-
-fn data(buffer: &mut Buffer) -> NonNull<u8> {
-    let Some(data) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
-        crate::check::check_failed(line!());
-    };
-    data
 }
 
 impl<T> Deref for Vec<T> {

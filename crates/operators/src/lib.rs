@@ -6,4 +6,5 @@
 #[macro_use]
 extern crate pipit_kernel;
 
+pub mod names;
 pub mod table;

@@ -77,8 +77,23 @@ impl Buffer {
         let layout =
             Layout::from_size_align(total_bytes, BUFFER_ALIGNMENT_BYTES).map_err(|_| AllocError)?;
         let header = allocator.allocate(layout)?.cast::<Header<A>>();
-        let owner =
-            Owner { references: Cell::new(1), free: free::<A>, allocate_like: allocate_like::<A> };
+        let owner = Owner {
+            references: Cell::new(1),
+            // SAFETY: only called with this header, once no buffer refers to
+            // it. Reading it moves the allocator out before its memory is
+            // freed.
+            free: |owner| unsafe {
+                let header = owner.cast::<Header<A>>();
+                let Header { allocator, layout, .. } = header.read();
+                allocator.deallocate(header.cast(), layout);
+            },
+            // SAFETY: only called with this header, which is live; the
+            // caller upholds `allocate_uninit`'s contract.
+            allocate_like: |owner, size_bytes| unsafe {
+                let allocator = owner.cast::<Header<A>>().as_ref().allocator.clone();
+                Buffer::allocate_uninit(allocator, size_bytes)
+            },
+        };
 
         // SAFETY: `layout` fits a header followed by `size_bytes` bytes.
         let data = unsafe {
@@ -128,6 +143,13 @@ impl Buffer {
         self.data.as_ptr().cast()
     }
 
+    /// The first byte, for writing values that aren't `Primitive`, such as a
+    /// `Vec`'s or a `Box`'s.
+    pub fn as_mut_non_null(&mut self) -> NonNull<u8> {
+        check!(self.owner().references.get() == 1);
+        self.data
+    }
+
     /// As `as_ptr`, for writing.
     pub fn as_mut_ptr<T: Primitive>(&mut self) -> *mut T {
         check!(self.size_bytes.is_multiple_of(size_of::<T>()));
@@ -165,32 +187,6 @@ impl Drop for Buffer {
             // SAFETY: that was the last reference.
             unsafe { free(self.owner) };
         }
-    }
-}
-
-/// Allocates from the allocator of a buffer made by `Buffer::allocate::<A>`.
-///
-/// # Safety
-///
-/// `owner` must start a live `Header<A>`, and the caller must uphold
-/// `allocate_uninit`'s contract.
-unsafe fn allocate_like<A: Allocator + Clone + 'static>(
-    owner: NonNull<Owner>,
-    size_bytes: usize,
-) -> Result<Buffer, AllocError> {
-    // SAFETY: `owner` starts a live `Header<A>`.
-    let allocator = unsafe { owner.cast::<Header<A>>().as_ref() }.allocator.clone();
-    // SAFETY: upheld by the caller.
-    unsafe { Buffer::allocate_uninit(allocator, size_bytes) }
-}
-
-unsafe fn free<A: Allocator>(owner: NonNull<Owner>) {
-    let header = owner.cast::<Header<A>>();
-    // SAFETY: `owner` starts a `Header<A>`. Reading it moves the allocator
-    // out before its memory is freed.
-    unsafe {
-        let Header { allocator, layout, .. } = header.read();
-        allocator.deallocate(header.cast(), layout);
     }
 }
 

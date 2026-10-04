@@ -11,6 +11,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
@@ -122,6 +123,22 @@ pub struct OperatorFunctions {
 }
 
 impl<'a> DynSource<'a> {
+    /// A source from parts that already agree on its step's and state's types.
+    ///
+    /// # Safety
+    ///
+    /// The functions must take `step` and a state of `state_layout`, and the
+    /// step must live for `'a`.
+    pub(crate) unsafe fn from_parts(
+        step: ErasedBox,
+        state_layout: Layout,
+        new_state: unsafe fn(NonNull<()>, NonNull<u8>),
+        drop_state: unsafe fn(NonNull<u8>),
+        next: unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool,
+    ) -> DynSource<'a> {
+        Erased { step, state_layout, new_state, drop_state, run: next, lifetime: PhantomData }
+    }
+
     pub fn new<A: Allocator + Clone + 'static, T: Source + 'a>(
         allocator: A,
         source: T,
@@ -130,9 +147,15 @@ impl<'a> DynSource<'a> {
         Ok(Erased {
             step: Box::new(allocator, source)?.erase(),
             state_layout: Layout::new::<T::State>(),
-            new_state: new_source_state::<T>,
+            // SAFETY: only called with this source and its state, as is each below.
+            new_state: |source, state| unsafe {
+                write_state(state, value_of::<T>(source).new_state());
+            },
             drop_state: drop_state::<T::State>,
-            run: next::<T>,
+            // SAFETY: as above.
+            run: |source, batch, state| unsafe {
+                value_of::<T>(source).next(batch, state_of::<T::State>(state))
+            },
             lifetime: PhantomData,
         })
     }
@@ -156,9 +179,15 @@ impl<'a> DynTransform<'a> {
         Ok(Erased {
             step: Box::new(allocator, transform)?.erase(),
             state_layout: Layout::new::<T::State>(),
-            new_state: new_transform_state::<T>,
+            // SAFETY: only called with this transform and its state, as is each below.
+            new_state: |transform, state| unsafe {
+                write_state(state, value_of::<T>(transform).new_state());
+            },
             drop_state: drop_state::<T::State>,
-            run: process::<T>,
+            // SAFETY: as above.
+            run: |transform, batch, state| unsafe {
+                value_of::<T>(transform).process(batch, state_of::<T::State>(state));
+            },
             lifetime: PhantomData,
         })
     }
@@ -181,9 +210,21 @@ impl<'a> DynOperator<'a> {
         Ok(Erased {
             step: Box::new(allocator, operator)?.erase(),
             state_layout: Layout::new::<T::State>(),
-            new_state: new_operator_state::<T>,
+            // SAFETY: only called with this operator and its state, as is each below.
+            new_state: |operator, state| unsafe {
+                write_state(state, value_of::<T>(operator).new_state());
+            },
             drop_state: drop_state::<T::State>,
-            run: OperatorFunctions { execute: execute::<T>, finish: finish::<T> },
+            run: OperatorFunctions {
+                // SAFETY: as above.
+                execute: |operator, input, output, state| unsafe {
+                    value_of::<T>(operator).execute(input, output, state_of::<T::State>(state))
+                },
+                // SAFETY: as above.
+                finish: |operator, output, state| unsafe {
+                    value_of::<T>(operator).finish(output, state_of::<T::State>(state))
+                },
+            },
             lifetime: PhantomData,
         })
     }
@@ -219,56 +260,4 @@ impl<F> Erased<'_, F> {
         // the rest.
         unsafe { (self.new_state)(self.step.as_ptr(), state) }
     }
-}
-
-// These undo the erasure. Each is only stored next to a pointer to a `T`, and
-// only called with a state of `T`'s type.
-
-unsafe fn new_source_state<T: Source>(source: NonNull<()>, state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast().write(source.cast::<T>().as_ref().new_state()) }
-}
-
-unsafe fn new_transform_state<T: Transform>(transform: NonNull<()>, state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast().write(transform.cast::<T>().as_ref().new_state()) }
-}
-
-unsafe fn new_operator_state<T: Operator>(operator: NonNull<()>, state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast().write(operator.cast::<T>().as_ref().new_state()) }
-}
-
-unsafe fn drop_state<S>(state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { state.cast::<S>().drop_in_place() }
-}
-
-unsafe fn next<T: Source>(source: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>) -> bool {
-    // SAFETY: see above.
-    unsafe { source.cast::<T>().as_ref().next(batch, state.cast().as_mut()) }
-}
-
-unsafe fn process<T: Transform>(transform: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>) {
-    // SAFETY: see above.
-    unsafe { transform.cast::<T>().as_ref().process(batch, state.cast().as_mut()) }
-}
-
-unsafe fn execute<T: Operator>(
-    operator: NonNull<()>,
-    input: &RowBatch,
-    output: &mut RowBatch,
-    state: NonNull<u8>,
-) -> Progress {
-    // SAFETY: see above.
-    unsafe { operator.cast::<T>().as_ref().execute(input, output, state.cast().as_mut()) }
-}
-
-unsafe fn finish<T: Operator>(
-    operator: NonNull<()>,
-    output: &mut RowBatch,
-    state: NonNull<u8>,
-) -> Progress {
-    // SAFETY: see above.
-    unsafe { operator.cast::<T>().as_ref().finish(output, state.cast().as_mut()) }
 }
