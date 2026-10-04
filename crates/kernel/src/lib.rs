@@ -10,6 +10,7 @@ pub mod boxed;
 pub mod buffer;
 pub mod column;
 mod erase;
+pub mod filter;
 pub mod lower;
 pub mod names;
 pub mod optimize;

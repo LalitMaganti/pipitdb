@@ -76,6 +76,24 @@ fn slices(c: &mut Criterion) {
     group.finish();
 }
 
+/// Filtering 1,000 batches of 2,048 rows.
+fn filter(c: &mut Criterion) {
+    let plain = pipitdb_bench::filter_column(false);
+    let nullable = pipitdb_bench::filter_column(true);
+    let mut group = c.benchmark_group("filter");
+    group.throughput(Throughput::Elements(1000 * 2048));
+    let cases: [(&str, &_, fn(&_, &mut _)); 2] = [
+        ("greater", &plain, pipitdb_bench::greater),
+        ("greater_nulls", &nullable, pipitdb_bench::greater),
+    ];
+    for (name, column, filter) in cases {
+        group.bench_function(name, |b| {
+            b.iter(|| pipitdb_bench::run_filter(black_box(column), 1000, filter));
+        });
+    }
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -83,6 +101,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, pipeline, scan, slices
+    targets = lexer, parser, query, pipeline, scan, slices, filter
 }
 criterion_main!(benches);

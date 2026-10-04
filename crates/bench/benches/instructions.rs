@@ -43,5 +43,15 @@ fn scan(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
 
-library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan]);
+#[library_benchmark]
+#[bench::greater(pipitdb_bench::filter_column(false), pipitdb_bench::greater)]
+#[bench::greater_nulls(pipitdb_bench::filter_column(true), pipitdb_bench::greater)]
+fn filter(
+    column: pipit_kernel::column::ColumnView,
+    filter: fn(&pipit_kernel::column::ColumnView, &mut pipit_kernel::selection::Selection),
+) -> u64 {
+    black_box(pipitdb_bench::run_filter(black_box(&column), 100, filter))
+}
+
+library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan, filter]);
 main!(library_benchmark_groups = lexer_group, parser_group, pipeline_group);

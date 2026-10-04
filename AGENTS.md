@@ -3,6 +3,7 @@
 - Follow [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 - The kernel and pipesql crates are `no_std` + `alloc`. No new dependencies without asking.
 - Keep code simple and easy to read.
+- Don't implement something poorly: leave it out until it can be done well.
 - Only add a comment when the code isn't obvious. Keep it short and plain.
 - One small PR at a time.
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
