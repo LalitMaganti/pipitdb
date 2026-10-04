@@ -34,8 +34,6 @@ pub(crate) struct Parser<'a> {
     lexer: Lexer<'a>,
     current: Token,
     nodes: Nodes,
-    /// Set when writing a node fails, and reported at the next token, so that
-    /// writing a node stays cheap.
     failed: Option<ErrorCode>,
 }
 

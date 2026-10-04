@@ -33,6 +33,9 @@ pub struct Error {
     pub span: Span,
 }
 
+// No code is 0, so `Option<ErrorCode>` uses 0 for `None` and needs no tag.
+const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
+
 impl ErrorCode {
     /// The highest code. Update it when adding one.
     pub const LAST: ErrorCode = ErrorCode::OutOfMemory;
