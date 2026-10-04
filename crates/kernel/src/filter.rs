@@ -33,11 +33,12 @@ pub fn compare(
     match value {
         Value::Int64(value) => {
             check!(column.data_type() == DataType::Int64);
-            compare_values(column, column.int64s(), comparison, value, selection);
+            compare_values(column, column.int64s(), |cell| cell, comparison, value, selection);
         }
         Value::Float64(value) => {
             check!(column.data_type() == DataType::Float64);
-            compare_values(column, column.float64s(), comparison, value, selection);
+            let cells = column.float64s();
+            compare_values(column, cells, float_key, comparison, float_key(value), selection);
         }
     }
 }
@@ -55,17 +56,18 @@ pub fn is_null(column: &ColumnView, nulls: bool, selection: &mut Selection) {
 }
 
 /// One loop per comparison, so the loop has no branch on it.
-fn compare_values<T: Copy + PartialOrd>(
+fn compare_values<T: Copy, K: Copy + PartialOrd>(
     column: &ColumnView,
     cells: &[T],
+    key: impl Fn(T) -> K + Copy,
     comparison: Comparison,
-    value: T,
+    value: K,
     selection: &mut Selection,
 ) {
     covering(column, selection);
     // SAFETY: `covering` checked every kept row is a row of `column`, whose
     // values `cells` are.
-    let at = move |row: u16| unsafe { cell(cells, row) };
+    let at = move |row: u16| key(unsafe { cell(cells, row) });
     match comparison {
         Comparison::Equal => keep(column, selection, move |row| at(row) == value),
         Comparison::NotEqual => keep(column, selection, move |row| at(row) != value),
@@ -74,6 +76,18 @@ fn compare_values<T: Copy + PartialOrd>(
         Comparison::Greater => keep(column, selection, move |row| at(row) > value),
         Comparison::GreaterEqual => keep(column, selection, move |row| at(row) >= value),
     }
+}
+
+/// A float's place in the order SQL engines like DuckDB compare floats in:
+/// NaN equals NaN and is above every other number, and -0 equals 0. The
+/// bits of a negative float are flipped so integers order as floats do.
+fn float_key(value: f64) -> i64 {
+    if value.is_nan() {
+        return i64::MAX;
+    }
+    // Adding 0 turns -0 into 0.
+    let bits = (value + 0.0).to_bits().cast_signed();
+    bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()
 }
 
 /// Keeps the non-null rows `test` passes, with a loop that skips the null
@@ -157,13 +171,27 @@ mod tests {
     }
 
     #[test]
-    fn compares_floats() {
-        let mut values = Buffer::allocate(Heap, 24).unwrap();
-        values.as_mut_slice::<f64>().copy_from_slice(&[0.5, f64::NAN, 2.5]);
+    fn compares_floats_as_duckdb_does() {
+        let mut values = Buffer::allocate(Heap, 48).unwrap();
+        let cells = [-1.5, -0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        values.as_mut_slice::<f64>().copy_from_slice(&cells);
         let column = ColumnView::new(DataType::Float64, values, None);
-        let mut selection = Selection::all(3);
-        compare(&column, Comparison::Greater, Value::Float64(0.0), &mut selection);
-        assert_eq!(selection.kept(), Kept::Select(&[0, 2]));
+        let rows = |comparison, value| {
+            let mut selection = Selection::all(6);
+            compare(&column, comparison, Value::Float64(value), &mut selection);
+            match selection.kept() {
+                Kept::All => (0..6).collect(),
+                Kept::None => Vec::new(),
+                Kept::Select(rows) => rows.to_vec(),
+            }
+        };
+        // NaN is above every number, infinity too, and equals NaN.
+        assert_eq!(rows(Comparison::Greater, 0.0), [2, 3, 4]);
+        assert_eq!(rows(Comparison::Less, f64::NAN), [0, 1, 2, 4, 5]);
+        assert_eq!(rows(Comparison::Equal, f64::NAN), [3]);
+        // -0 equals 0.
+        assert_eq!(rows(Comparison::Equal, 0.0), [1]);
+        assert_eq!(rows(Comparison::LessEqual, -1.5), [0, 5]);
     }
 
     #[test]

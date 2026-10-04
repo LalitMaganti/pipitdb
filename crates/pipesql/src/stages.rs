@@ -6,7 +6,7 @@ use pipit_kernel::vec::Vec;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;
-use crate::error::{Error, ErrorCode};
+use crate::error::{Error, ErrorCode, Unsupported};
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -58,7 +58,7 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 /// `WHERE`: needs expressions, which can't be compiled yet.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let span = compiler.span(compiler.node(stage.first_child()));
-    Err(Error::new(ErrorCode::Unsupported, span))
+    Err(Error::unsupported(Unsupported::Where, span))
 }
 
 /// `SELECT a, b`: the named columns, in that order, are the new scope. Only
@@ -69,7 +69,7 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
     for i in 0..list.child_count() {
         let item = compiler.node(list.first_child() + i);
         if item.tag() != Tag::Name {
-            return Err(Error::new(ErrorCode::Unsupported, compiler.span(item)));
+            return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(item)));
         }
         let name = compiler.text(item.span());
         let plan = &compiler.plan;

@@ -36,8 +36,17 @@ pub enum ErrorCode {
     UnknownTable = 14,
     /// A name isn't one of the columns so far.
     UnknownColumn = 15,
-    /// Parsed, but not compiled yet, such as an expression in `SELECT`.
+    /// Parsed, but not compiled yet. `detail` is the `Unsupported` it is.
     Unsupported = 16,
+}
+
+/// What an `Unsupported` error is about. Only ever added to, as codes are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u16)]
+pub enum Unsupported {
+    /// Anything but a column's name in `SELECT`.
+    SelectExpression = 1,
+    Where = 2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +90,11 @@ impl ErrorCode {
 impl Error {
     pub fn new(code: ErrorCode, span: Span) -> Error {
         Error { code, detail: 0, span }
+    }
+
+    /// `Unsupported`, for what isn't.
+    pub fn unsupported(what: Unsupported, span: Span) -> Error {
+        Error { code: ErrorCode::Unsupported, detail: what as u16, span }
     }
 
     /// `ExpectedToken`, where `kind` was expected.

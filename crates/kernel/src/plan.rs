@@ -10,7 +10,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::column::DataType;
 use crate::erase::{value_mut_of, value_of};
-use crate::lower::Lowering;
+use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::scannable::DynScannable;
@@ -47,7 +47,7 @@ pub trait Op<'c> {
     /// children, through `Lowering::lower`, then its own source or steps,
     /// defining the columns it makes.
     fn lower(&self, node: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>)
-    -> Result<(), AllocError>;
+    -> Result<(), LowerError>;
 
     /// Drops the columns this makes that aren't in `needed`, and marks the
     /// ones it reads. By default, it can't say, so everything is kept.
@@ -65,7 +65,7 @@ pub struct DynOp<'c> {
         NonNull<()>,
         &PlanNode<'c>,
         &mut Lowering<'l, 'c>,
-    ) -> Result<(), AllocError>,
+    ) -> Result<(), LowerError>,
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     lifetime: PhantomData<&'c ()>,
 }
@@ -89,7 +89,7 @@ impl<'c> DynOp<'c> {
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
-    ) -> Result<(), AllocError> {
+    ) -> Result<(), LowerError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.lower)(self.op.as_ptr(), node, lowering) }
     }
@@ -175,13 +175,13 @@ pub struct ScanColumn {
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
-    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), AllocError> {
+    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+        for column in self.columns.iter() {
+            lowering.define(column.binding.id)?;
+        }
         let read = self.columns.iter().map(|column| column.column);
         let read = Vec::fixed_from(lowering.allocator(), read)?;
         lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
-        for column in self.columns.iter() {
-            lowering.define(column.binding.id);
-        }
         Ok(())
     }
 

@@ -4,8 +4,29 @@ use crate::allocator::{AllocError, Allocator, DynAllocator};
 use crate::names::{Name, Names};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
+use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::step::{DynSource, Step};
-use crate::vec::Vec;
+use crate::vec::{Full, Vec};
+
+/// Why a plan couldn't be lowered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LowerError {
+    OutOfMemory,
+    /// A batch would need more than `BATCH_COLUMNS_MAX` columns.
+    TooManyColumns,
+}
+
+impl From<AllocError> for LowerError {
+    fn from(_: AllocError) -> LowerError {
+        LowerError::OutOfMemory
+    }
+}
+
+impl<T> From<Full<T>> for LowerError {
+    fn from(_: Full<T>) -> LowerError {
+        LowerError::OutOfMemory
+    }
+}
 
 /// The most steps a pipeline from a plan can have.
 pub const LOWERED_STEPS_MAX: usize = 1 << 6;
@@ -57,7 +78,7 @@ impl<'c> Lowering<'_, 'c> {
     }
 
     /// Lowers `node`, such as a child of the node being lowered.
-    pub fn lower(&mut self, node: PlanNodeId) -> Result<(), AllocError> {
+    pub fn lower(&mut self, node: PlanNodeId) -> Result<(), LowerError> {
         let node = at!(self.plan.nodes, node as usize);
         node.op.lower(node, self)
     }
@@ -68,14 +89,19 @@ impl<'c> Lowering<'_, 'c> {
         self.source = Some(source);
     }
 
-    pub fn add_step(&mut self, step: Step<'c>) -> Result<(), AllocError> {
+    pub fn add_step(&mut self, step: Step<'c>) -> Result<(), LowerError> {
         Ok(self.steps.push(step)?)
     }
 
-    /// Gives `column` the next position in batches.
-    pub fn define(&mut self, column: ColumnId) {
+    /// Gives `column` the next position in batches, which fail to hold more
+    /// than `BATCH_COLUMNS_MAX`.
+    pub fn define(&mut self, column: ColumnId) -> Result<(), LowerError> {
+        if self.column_count == BATCH_COLUMNS_MAX {
+            return Err(LowerError::TooManyColumns);
+        }
         *at_mut!(self.positions, column as usize) = self.column_count;
         self.column_count += 1;
+        Ok(())
     }
 
     /// Where `column` is in batches.
@@ -91,7 +117,7 @@ impl<'c> Lowering<'_, 'c> {
 pub fn lower<'c, A: Allocator + Clone + 'static>(
     allocator: A,
     plan: &LogicalPlan<'c>,
-) -> Result<PhysicalPlan<'c>, AllocError> {
+) -> Result<PhysicalPlan<'c>, LowerError> {
     let allocator = DynAllocator::new(allocator)?;
     let unset = core::iter::repeat_n(u32::MAX, plan.columns.len());
     let positions = Vec::fixed_from(allocator.clone(), unset)?;
@@ -223,5 +249,54 @@ mod tests {
         assert_eq!(pruned(&[1, 0]), (2, [1, 2].into()));
         // A batch with no columns has no rows, so one is kept.
         assert_eq!(pruned(&[]), (1, [1, 2].into()));
+    }
+
+    /// As many columns as it holds, with no rows.
+    struct Wide(u32);
+
+    impl Scannable for Wide {
+        type State = ();
+
+        fn column_count(&self) -> u32 {
+            self.0
+        }
+
+        fn column_name(&self, _: u32) -> &'static str {
+            "c"
+        }
+
+        fn column_type(&self, _: u32) -> DataType {
+            DataType::Int64
+        }
+
+        fn new_state(&self) {}
+
+        fn next(&self, _: &[u32], _: &mut RowBatch, (): &mut ()) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn fails_to_lower_batches_too_wide() {
+        let table = DynScannable::new(Heap, Wide(70)).unwrap();
+        let plan = |output: usize| {
+            let mut plan = LogicalPlan::new(Heap).unwrap();
+            let mut columns = Vec::fixed(Heap, 70).unwrap();
+            for column in 0..70 {
+                let binding = plan.add_column("c", DataType::Int64).unwrap();
+                assert!(columns.push(ScanColumn { column, binding }).is_ok());
+                if (column as usize) < output {
+                    assert!(plan.output.push(binding).is_ok());
+                }
+            }
+            let scan = DynOp::new(Heap, ScanOp { scannable: &table, columns }).unwrap();
+            plan.add_node(scan, Vec::fixed(Heap, 0).unwrap()).unwrap();
+            plan
+        };
+        assert_eq!(lower(Heap, &plan(70)).err(), Some(LowerError::TooManyColumns));
+        // Pruned to the two in the output, it fits.
+        let mut narrow = plan(2);
+        crate::optimize::optimize(Heap, &mut narrow).unwrap();
+        assert!(lower(Heap, &narrow).is_ok());
     }
 }
