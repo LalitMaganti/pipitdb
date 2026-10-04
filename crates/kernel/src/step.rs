@@ -64,6 +64,40 @@ pub enum Step<'a> {
     Operator(DynOperator<'a>),
 }
 
+impl Step<'_> {
+    pub(crate) fn state_layout(&self) -> Layout {
+        match self {
+            Step::Transform(transform) => transform.state_layout,
+            Step::Operator(operator) => operator.state_layout,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// As for `Erased::new_state`.
+    pub(crate) unsafe fn new_state(&self, state: NonNull<u8>) {
+        // SAFETY: upheld by the caller.
+        unsafe {
+            match self {
+                Step::Transform(transform) => transform.new_state(state),
+                Step::Operator(operator) => operator.new_state(state),
+            }
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `state` must hold this step's state, which is then dropped.
+    pub(crate) unsafe fn drop_state(&self, state: NonNull<u8>) {
+        let drop_state = match self {
+            Step::Transform(transform) => transform.drop_state,
+            Step::Operator(operator) => operator.drop_state,
+        };
+        // SAFETY: upheld by the caller.
+        unsafe { drop_state(state) }
+    }
+}
+
 /// A step of any type, borrowed for `'a`: a pointer to it, and functions that
 /// know its type. `F` is the function a pipeline calls for each batch.
 pub struct Erased<'a, F> {
