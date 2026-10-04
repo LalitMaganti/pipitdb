@@ -8,6 +8,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use pipit_kernel::allocator::{Budget, Heap};
 use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
+use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
@@ -123,6 +124,23 @@ pub extern "C" fn second_string_len(first: u32, second: u32) -> usize {
     let Ok(bytes) = Buffer::allocate(&Heap, (first + second) as usize) else { return 0 };
     let column = ColumnView::strings(offsets, bytes, None);
     column.string_values().get(1).len()
+}
+
+/// The byte at `at` of `len` bytes from `data`, read through a
+/// `ByteSource`, or 0 if there's none.
+///
+/// # Safety
+///
+/// `data` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn read_byte(data: *const u8, len: usize, at: u64) -> u8 {
+    // SAFETY: guaranteed by the caller.
+    let source: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
+    let mut byte = [0];
+    match (&source as &dyn ByteSource).read(at, &mut byte) {
+        Ok(()) => byte[0],
+        Err(_) => 0,
+    }
 }
 
 /// Pushes `0..count` to a `Vec`, and returns the last.

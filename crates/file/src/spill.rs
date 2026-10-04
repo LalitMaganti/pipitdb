@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore};
 
+use crate::read_at;
+
 /// Logs are files in a directory, without names, so they go when they're
 /// closed, even if the process ends early. As on S3, a log can only be read
 /// once sealed.
@@ -123,30 +125,6 @@ fn open_unnamed(dir: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     std::fs::remove_file(&path)?;
     Ok(file)
-}
-
-#[cfg(unix)]
-fn read_at(file: &File, into: &mut [u8], offset: u64) -> std::io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, into, offset)
-}
-
-#[cfg(windows)]
-fn read_at(file: &File, mut into: &mut [u8], mut offset: u64) -> std::io::Result<()> {
-    while !into.is_empty() {
-        let read = std::os::windows::fs::FileExt::seek_read(file, into, offset)?;
-        if read == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        into = &mut into[read..];
-        offset += read as u64;
-    }
-    Ok(())
-}
-
-/// Elsewhere, such as Wasm, there are no files to read.
-#[cfg(not(any(unix, windows)))]
-fn read_at(_: &File, _: &mut [u8], _: u64) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(test)]
