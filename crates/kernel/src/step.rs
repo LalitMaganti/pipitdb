@@ -122,6 +122,22 @@ pub struct OperatorFunctions {
 }
 
 impl<'a> DynSource<'a> {
+    /// A source from parts that already agree on its step's and state's types.
+    ///
+    /// # Safety
+    ///
+    /// The functions must take `step` and a state of `state_layout`, and the
+    /// step must live for `'a`.
+    pub(crate) unsafe fn from_parts(
+        step: ErasedBox,
+        state_layout: Layout,
+        new_state: unsafe fn(NonNull<()>, NonNull<u8>),
+        drop_state: unsafe fn(NonNull<u8>),
+        next: unsafe fn(NonNull<()>, &mut RowBatch, NonNull<u8>) -> bool,
+    ) -> DynSource<'a> {
+        Erased { step, state_layout, new_state, drop_state, run: next, lifetime: PhantomData }
+    }
+
     pub fn new<A: Allocator + Clone + 'static, T: Source + 'a>(
         allocator: A,
         source: T,

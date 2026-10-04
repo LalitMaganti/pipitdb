@@ -11,5 +11,6 @@ pub mod buffer;
 pub mod column;
 pub mod pipeline;
 pub mod row_batch;
+pub mod scannable;
 pub mod step;
 pub mod vec;

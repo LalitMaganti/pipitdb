@@ -1,14 +1,20 @@
-//! `Table`: columns in row groups, the shape of a Parquet file's footer.
-//! `TableScan`: a source of a table's rows.
+//! `Table`: named columns in row groups, the shape of a Parquet file's
+//! footer, which pipelines can scan.
 
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::{ColumnView, DataType};
-use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::step::Source;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::scannable::Scannable;
 use pipit_kernel::vec::Vec;
 
+use crate::names::{Name, Names};
+
+/// The most bytes a table's column names take.
+pub const TABLE_NAME_BYTES_MAX: usize = 1 << 12;
+
 pub struct Table {
-    types: Vec<DataType>,
+    names: Names,
+    columns: Vec<(Name, DataType)>,
     row_groups: Vec<RowGroup>,
 }
 
@@ -19,28 +25,38 @@ pub struct RowGroup {
 }
 
 impl Table {
-    /// A table of `row_groups`, each a column of each of `types`, with the
-    /// same number of rows. The columns' buffers are shared, not copied.
+    /// A table with a column for each of `columns`' names and types, in
+    /// `row_groups` of a column each, with the same number of rows. The
+    /// columns' buffers are shared, not copied.
     pub fn new<A: Allocator + Clone + 'static>(
         allocator: A,
-        types: &[DataType],
+        columns: &[(&str, DataType)],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
+        check!(u32::try_from(columns.len()).is_ok());
         let mut groups = Vec::fixed(allocator.clone(), row_groups.len())?;
-        for &columns in row_groups {
-            check!(columns.len() == types.len());
-            let row_count = columns.first().map_or(0, ColumnView::row_count);
-            for (column, &data_type) in columns.iter().zip(types) {
-                check!(column.data_type() == data_type && column.row_count() == row_count);
+        for &views in row_groups {
+            check!(views.len() == columns.len());
+            let row_count = views.first().map_or(0, ColumnView::row_count);
+            for (view, &(_, data_type)) in views.iter().zip(columns) {
+                check!(view.data_type() == data_type && view.row_count() == row_count);
             }
-            let columns = Vec::fixed_from(allocator.clone(), columns.iter().cloned())?;
-            groups.push(RowGroup { row_count, columns })?;
+            let views = Vec::fixed_from(allocator.clone(), views.iter().cloned())?;
+            groups.push(RowGroup { row_count, columns: views })?;
         }
-        Ok(Table { types: Vec::fixed_from(allocator, types.iter().copied())?, row_groups: groups })
+        let mut names = Names::new(allocator.clone(), TABLE_NAME_BYTES_MAX)?;
+        let mut schema = Vec::fixed(allocator, columns.len())?;
+        for &(name, data_type) in columns {
+            schema.push((names.add(name)?, data_type))?;
+        }
+        Ok(Table { names, columns: schema, row_groups: groups })
     }
 
-    pub fn types(&self) -> &[DataType] {
-        &self.types
+    /// The column called `name`, if any.
+    #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
+    pub fn find_column(&self, name: &str) -> Option<u32> {
+        let found = self.columns.iter().position(|&(column, _)| self.names.get(column) == name);
+        found.map(|i| i as u32)
     }
 
     pub fn row_groups(&self) -> &[RowGroup] {
@@ -58,44 +74,44 @@ impl RowGroup {
     }
 }
 
-/// Reads the selected columns of a table, in selection order, a row group at
-/// a time, in batches of up to `BATCH_ROWS_MAX` rows. Nothing is copied.
-pub struct TableScan<'t> {
-    table: &'t Table,
-    columns: &'t [u32],
-}
-
-impl<'t> TableScan<'t> {
-    pub fn new(table: &'t Table, columns: &'t [u32]) -> TableScan<'t> {
-        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
-        check!(columns.iter().all(|&i| (i as usize) < table.types.len()));
-        TableScan { table, columns }
-    }
-}
-
-/// Where a scan is: a row group, and a row in it.
+/// Where a scan of a table is: a row group, and a row in it.
 pub struct ScanState {
     row_group: usize,
     row: u32,
 }
 
-impl Source for TableScan<'_> {
+/// Reads a row group at a time, in batches of up to `BATCH_ROWS_MAX` rows.
+/// Nothing is copied.
+impl Scannable for Table {
     type State = ScanState;
+
+    #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
+    fn column_count(&self) -> u32 {
+        self.columns.len() as u32
+    }
+
+    fn column_name(&self, column: u32) -> &str {
+        self.names.get(at!(self.columns, column as usize).0)
+    }
+
+    fn column_type(&self, column: u32) -> DataType {
+        at!(self.columns, column as usize).1
+    }
 
     fn new_state(&self) -> ScanState {
         ScanState { row_group: 0, row: 0 }
     }
 
-    fn next(&self, batch: &mut RowBatch, at: &mut ScanState) -> bool {
+    fn next(&self, columns: &[u32], batch: &mut RowBatch, at: &mut ScanState) -> bool {
         loop {
-            let Some(row_group) = self.table.row_groups.get(at.row_group) else { return false };
+            let Some(row_group) = self.row_groups.get(at.row_group) else { return false };
             let rows = (row_group.row_count - at.row).min(BATCH_ROWS_MAX);
             if rows == 0 {
                 *at = ScanState { row_group: at.row_group + 1, row: 0 };
                 continue;
             }
             batch.reset(rows);
-            for &i in self.columns {
+            for &i in columns {
                 let column = at!(row_group.columns, i as usize).slice(at.row, rows);
                 check!(batch.push_column(column).is_ok());
             }
@@ -126,11 +142,10 @@ mod tests {
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let scan = TableScan::new(table, columns);
-        let mut state = scan.new_state();
+        let mut state = table.new_state();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while scan.next(&mut batch, &mut state) {
+        while table.next(columns, &mut batch, &mut state) {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }
@@ -142,8 +157,8 @@ mod tests {
         let first = [int64s(0..3000), int64s((0..3000).map(|i| -i))];
         let empty = [int64s(0..0), int64s(0..0)];
         let second = [int64s(3000..3500), int64s((3000..3500).map(|i| -i))];
-        let types = [DataType::Int64; 2];
-        let table = Table::new(Heap, &types, &[&first, &empty, &second]).unwrap();
+        let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
+        let table = Table::new(Heap, &columns, &[&first, &empty, &second]).unwrap();
 
         let expected = [(2048, vec![0, 0]), (952, vec![-2048, 2048]), (500, vec![-3000, 3000])];
         assert_eq!(scan(&table, &[1, 0]), expected);
@@ -152,7 +167,7 @@ mod tests {
     #[test]
     fn counts_rows_without_columns() {
         let columns = [int64s(0..5000)];
-        let table = Table::new(Heap, &[DataType::Int64], &[&columns]).unwrap();
+        let table = Table::new(Heap, &[("a", DataType::Int64)], &[&columns]).unwrap();
         let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
         assert_eq!(counts, [2048, 2048, 904]);
     }
@@ -161,6 +176,15 @@ mod tests {
     #[should_panic(expected = "data_type")]
     fn checks_column_types() {
         let columns = [int64s(0..1)];
-        let _ = Table::new(Heap, &[DataType::Float64], &[&columns]);
+        let _ = Table::new(Heap, &[("a", DataType::Float64)], &[&columns]);
+    }
+
+    #[test]
+    fn finds_columns_by_name() {
+        let columns = [int64s(0..1), int64s(0..1)];
+        let schema = [("ts", DataType::Int64), ("dur", DataType::Int64)];
+        let table = Table::new(Heap, &schema, &[&columns]).unwrap();
+        assert_eq!((table.find_column("dur"), table.find_column("name")), (Some(1), None));
+        assert_eq!(table.column_name(0), "ts");
     }
 }

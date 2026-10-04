@@ -5,10 +5,11 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
-use pipit_operators::table::{Table, TableScan};
+use pipit_operators::table::Table;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -158,17 +159,25 @@ pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'s
 /// `row_groups` row groups of `rows` rows, with four columns. Kept for the
 /// rest of the run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn table(row_groups: usize, rows: u32) -> &'static Table {
+pub fn table(row_groups: usize, rows: u32) -> &'static DynScannable<'static> {
     let values = Buffer::allocate(Heap, rows as usize * 8).expect("allocates");
     let column = ColumnView::new(DataType::Int64, values, None);
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
-    Box::leak(Box::new(Table::new(Heap, &[DataType::Int64; 4], &row_groups).expect("allocates")))
+    let schema = [
+        ("a", DataType::Int64),
+        ("b", DataType::Int64),
+        ("c", DataType::Int64),
+        ("d", DataType::Int64),
+    ];
+    let table = Table::new(Heap, &schema, &row_groups).expect("allocates");
+    Box::leak(Box::new(DynScannable::new(Heap, table).expect("allocates")))
 }
 
 /// Scans two of `table`'s columns.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn scan_pipeline(table: &'static Table) -> Pipeline<'static> {
-    let source = DynSource::new(Heap, TableScan::new(table, &[3, 1])).expect("allocates");
+pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
+    let columns = pipit_kernel::vec::Vec::fixed_from(Heap, [3, 1].into_iter()).expect("allocates");
+    let source = table.scan(Heap, columns).expect("allocates");
     Pipeline::new(source, pipit_kernel::vec::Vec::fixed(Heap, 0).expect("allocates"))
 }
