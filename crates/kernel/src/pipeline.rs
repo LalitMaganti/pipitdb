@@ -129,8 +129,10 @@ impl<'p> Execution<'p> {
                 return;
             };
             at!(pipeline.steps, i).new_state(memory.add(state));
-            let slot = Slot { state, input: RowBatch::new() };
-            memory.add(slots).cast::<Slot>().add(i).write(slot);
+            // Built in place: a batch is too big to build and then copy.
+            let slot = memory.add(slots).cast::<Slot>().add(i).as_ptr();
+            (&raw mut (*slot).state).write(state);
+            RowBatch::init(&raw mut (*slot).input);
         });
         check!(layout.is_ok());
         let execution = Execution { pipeline, memory, slots, source_state, _buffer: buffer };

@@ -97,6 +97,23 @@ impl Selection {
         self.len = kept as u32;
     }
 
+    /// All of `rows` rows, at `selection`, in place: the indices aren't
+    /// written.
+    ///
+    /// # Safety
+    ///
+    /// `selection` must be valid for writes of a `Selection`, and is then one.
+    pub(crate) unsafe fn init(selection: *mut Selection, rows: u32) {
+        check!(rows <= BATCH_ROWS_MAX);
+        // SAFETY: upheld by the caller. The indices need no writing, as none
+        // are read until written.
+        unsafe {
+            (&raw mut (*selection).len).write(rows);
+            (&raw mut (*selection).all).write(true);
+            (&raw mut (*selection).rows).write(rows);
+        }
+    }
+
     /// Back to all of `rows` rows.
     pub(crate) fn reset(&mut self, rows: u32) {
         check!(rows <= BATCH_ROWS_MAX);

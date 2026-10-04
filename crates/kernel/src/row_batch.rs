@@ -29,6 +29,22 @@ impl RowBatch {
         }
     }
 
+    /// Makes an empty batch at `batch`, in place: only the counts are written,
+    /// so a big batch isn't built and then copied there.
+    ///
+    /// # Safety
+    ///
+    /// `batch` must be valid for writes of a `RowBatch`, and is then one.
+    pub(crate) unsafe fn init(batch: *mut RowBatch) {
+        // SAFETY: upheld by the caller. The column array needs no writing, as
+        // none are counted.
+        unsafe {
+            (&raw mut (*batch).row_count).write(0);
+            (&raw mut (*batch).column_count).write(0);
+            Selection::init(&raw mut (*batch).selection, 0);
+        }
+    }
+
     /// Empties the batch so it can be refilled with `row_count` rows, all
     /// kept. Inlined, as every source and operator calls it for each batch.
     #[inline]
