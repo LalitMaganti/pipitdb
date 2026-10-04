@@ -6,21 +6,21 @@ use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
-use pipit_kernel::vec::Vec;
+use pipit_kernel::slow_vec::SlowVec;
 
 use pipit_kernel::names::{Name, Names};
 
 pub struct Table {
     names: Names,
-    columns: Vec<(Name, DataType)>,
-    row_groups: Vec<RowGroup>,
+    columns: SlowVec<(Name, DataType)>,
+    row_groups: SlowVec<RowGroup>,
 }
 
 /// Rows stored together, at most a batch's: a column of each of the
 /// table's types. A scan reads each as one batch.
 pub struct RowGroup {
     row_count: u32,
-    columns: Vec<ColumnView>,
+    columns: SlowVec<ColumnView>,
 }
 
 impl Table {
@@ -33,7 +33,7 @@ impl Table {
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
         check!(u32::try_from(columns.len()).is_ok());
-        let mut groups = Vec::fixed(allocator, row_groups.len())?;
+        let mut groups = SlowVec::fixed(allocator, row_groups.len())?;
         for &views in row_groups {
             check!(views.len() == columns.len());
             let row_count = views.first().map_or(0, ColumnView::row_count);
@@ -41,12 +41,12 @@ impl Table {
             for (view, &(_, data_type)) in views.iter().zip(columns) {
                 check!(view.data_type() == data_type && view.row_count() == row_count);
             }
-            let views = Vec::fixed_from(allocator, views.iter().cloned())?;
+            let views = SlowVec::fixed_from(allocator, views.iter().cloned())?;
             groups.push(RowGroup { row_count, columns: views })?;
         }
         let name_bytes = columns.iter().map(|(name, _)| name.len()).sum();
         let mut names = Names::fixed(allocator, name_bytes)?;
-        let mut schema = Vec::fixed(allocator, columns.len())?;
+        let mut schema = SlowVec::fixed(allocator, columns.len())?;
         for &(name, data_type) in columns {
             schema.push((names.add(name)?, data_type))?;
         }

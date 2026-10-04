@@ -1,10 +1,10 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::vec::Vec;
+use crate::slow_vec::SlowVec;
 
 pub struct Names {
-    bytes: Vec<u8>,
+    bytes: SlowVec<u8>,
 }
 
 /// Where a name is in its `Names`.
@@ -17,12 +17,12 @@ pub struct Name {
 impl Names {
     /// Room for up to `max_bytes` of names, a power of two.
     pub fn new(allocator: &dyn Allocator, max_bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: Vec::new(allocator, max_bytes)? })
+        Ok(Names { bytes: SlowVec::new(allocator, max_bytes)? })
     }
 
     /// Room for exactly `bytes` of names, which never grows.
     pub fn fixed(allocator: &dyn Allocator, bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: Vec::fixed(allocator, bytes)? })
+        Ok(Names { bytes: SlowVec::fixed(allocator, bytes)? })
     }
 
     /// Copies `name` in.

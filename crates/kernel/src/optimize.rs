@@ -4,7 +4,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NODES_MAX, PlanNodeId};
-use crate::vec::Vec;
+use crate::slow_vec::SlowVec;
 
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
@@ -13,7 +13,7 @@ pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result
 
 /// The columns something later in a plan uses, by id.
 pub struct Needed {
-    columns: Vec<bool>,
+    columns: SlowVec<bool>,
 }
 
 impl Needed {
@@ -48,13 +48,13 @@ pub fn prune_columns(
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     let unneeded = core::iter::repeat_n(false, plan.columns.len());
-    let mut needed = Needed { columns: Vec::fixed_from(allocator, unneeded)? };
+    let mut needed = Needed { columns: SlowVec::fixed_from(allocator, unneeded)? };
     for column in plan.output.iter() {
         needed.need(column.id);
     }
     // Nodes left to prune, and where each is referred to from: its parent's
     // children, or the root if `None`.
-    let mut pending = Vec::new(allocator, PLAN_NODES_MAX)?;
+    let mut pending = SlowVec::new(allocator, PLAN_NODES_MAX)?;
     pending.push((plan.root, None::<(PlanNodeId, usize)>))?;
     while let Some((mut id, from)) = pending.pop() {
         loop {

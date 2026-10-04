@@ -5,8 +5,8 @@ use crate::names::{Name, Names};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
 use crate::row_batch::BATCH_COLUMNS_MAX;
+use crate::slow_vec::{Full, SlowVec};
 use crate::step::{DynSource, Step};
-use crate::vec::{Full, Vec};
 
 /// Why a plan couldn't be lowered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,7 +43,7 @@ pub struct OutputColumn {
 pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
     names: Names,
-    columns: Vec<OutputColumn>,
+    columns: SlowVec<OutputColumn>,
 }
 
 impl<'c> PhysicalPlan<'c> {
@@ -65,9 +65,9 @@ pub struct Lowering<'p, 'c> {
     plan: &'p LogicalPlan<'c>,
     allocator: &'p dyn Allocator,
     source: Option<DynSource<'c>>,
-    steps: Vec<Step<'c>>,
+    steps: SlowVec<Step<'c>>,
     /// Each column's position in batches, or `u32::MAX` until defined.
-    positions: Vec<u32>,
+    positions: SlowVec<u32>,
     column_count: u32,
 }
 
@@ -119,19 +119,19 @@ pub fn lower<'c>(
     plan: &LogicalPlan<'c>,
 ) -> Result<PhysicalPlan<'c>, LowerError> {
     let unset = core::iter::repeat_n(u32::MAX, plan.columns.len());
-    let positions = Vec::fixed_from(allocator, unset)?;
+    let positions = SlowVec::fixed_from(allocator, unset)?;
     let mut lowering = Lowering {
         plan,
         allocator,
         source: None,
-        steps: Vec::new(allocator, LOWERED_STEPS_MAX)?,
+        steps: SlowVec::new(allocator, LOWERED_STEPS_MAX)?,
         positions,
         column_count: 0,
     };
     lowering.lower(plan.root)?;
 
     let mut names = Names::new(allocator, PLAN_NAME_BYTES_MAX)?;
-    let mut columns = Vec::fixed(allocator, plan.output.len())?;
+    let mut columns = SlowVec::fixed(allocator, plan.output.len())?;
     for column in plan.output.iter() {
         let name = names.add(plan.names.get(column.name))?;
         columns.push(OutputColumn { name, position: lowering.position(column.id) })?;
@@ -206,12 +206,12 @@ mod tests {
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let a = plan.add_column("a", DataType::Int64).unwrap();
         let b = plan.add_column("b", DataType::Int64).unwrap();
-        let mut columns = Vec::fixed(&Heap, 2).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let a_column = ScanColumn { column: 0, binding: a };
         let b_column = ScanColumn { column: 1, binding: b };
         assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
         let scan = DynOp::new(&Heap, ScanOp { scannable: &table, columns }).unwrap();
-        plan.add_node(scan, Vec::fixed(&Heap, 0).unwrap()).unwrap();
+        plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
 
         let physical = lower(&Heap, &plan).unwrap();
@@ -231,7 +231,7 @@ mod tests {
     fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
         let table = DynScannable::new(&Heap, Ab).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = Vec::fixed(&Heap, 2).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64).unwrap();
@@ -239,7 +239,7 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp { scannable: &table, columns }).unwrap();
-        plan.add_node(scan, Vec::fixed(&Heap, 0).unwrap()).unwrap();
+        plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         for &i in output {
             assert!(plan.output.push(bindings[i]).is_ok());
         }
@@ -318,7 +318,7 @@ mod tests {
     fn filters_and_keeps_the_columns_it_reads() {
         let table = DynScannable::new(&Heap, Nullable).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = Vec::fixed(&Heap, 2).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64).unwrap();
@@ -326,14 +326,14 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp { scannable: &table, columns }).unwrap();
-        let scan = plan.add_node(scan, Vec::fixed(&Heap, 0).unwrap()).unwrap();
+        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         let (a, b) = (bindings[0].id, bindings[1].id);
         let greater =
             Leaf::Compare { column: a, comparison: Comparison::Greater, value: Value::Int64(1) };
         let nodes = [Node::Leaf(greater), Node::Leaf(Leaf::IsNull { column: b }), Node::Or(0, 1)];
-        let predicate = Predicate::new(Vec::fixed_from(&Heap, nodes.into_iter()).unwrap());
+        let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
         let filter = DynOp::new(&Heap, FilterOp { predicate }).unwrap();
-        plan.add_node(filter, Vec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        plan.add_node(filter, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
@@ -392,7 +392,7 @@ mod tests {
         let table = DynScannable::new(&Heap, Wide(70)).unwrap();
         let plan = |output: usize| {
             let mut plan = LogicalPlan::new(&Heap).unwrap();
-            let mut columns = Vec::fixed(&Heap, 70).unwrap();
+            let mut columns = SlowVec::fixed(&Heap, 70).unwrap();
             for column in 0..70 {
                 let binding = plan.add_column("c", DataType::Int64).unwrap();
                 assert!(columns.push(ScanColumn { column, binding }).is_ok());
@@ -401,7 +401,7 @@ mod tests {
                 }
             }
             let scan = DynOp::new(&Heap, ScanOp { scannable: &table, columns }).unwrap();
-            plan.add_node(scan, Vec::fixed(&Heap, 0).unwrap()).unwrap();
+            plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
             plan
         };
         assert_eq!(lower(&Heap, &plan(70)).err(), Some(LowerError::TooManyColumns));

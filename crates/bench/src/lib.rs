@@ -169,7 +169,7 @@ pub fn run(pipeline: &Pipeline) -> u64 {
 /// operators.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
-    let mut owned = pipit_kernel::vec::Vec::fixed(&Heap, steps).expect("allocates");
+    let mut owned = pipit_kernel::slow_vec::SlowVec::fixed(&Heap, steps).expect("allocates");
     for _ in 0..steps {
         let step = if operators {
             Step::Operator(DynOperator::new(&Heap, PassOperator).expect("allocates"))
@@ -202,9 +202,10 @@ pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
 /// Scans two of `table`'s columns.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
-    let columns = pipit_kernel::vec::Vec::fixed_from(&Heap, [3, 1].into_iter()).expect("allocates");
+    let columns =
+        pipit_kernel::slow_vec::SlowVec::fixed_from(&Heap, [3, 1].into_iter()).expect("allocates");
     let source = table.scan(&Heap, columns).expect("allocates");
-    Pipeline::new(source, pipit_kernel::vec::Vec::fixed(&Heap, 0).expect("allocates"))
+    Pipeline::new(source, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
 }
 
 /// A batch of values in `0..1000`, spread evenly but out of order, with every
@@ -265,7 +266,8 @@ pub fn predicate(shape: &str) -> Predicate {
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
     Predicate::new(
-        pipit_kernel::vec::Vec::fixed_from(&Heap, nodes.iter().copied()).expect("allocates"),
+        pipit_kernel::slow_vec::SlowVec::fixed_from(&Heap, nodes.iter().copied())
+            .expect("allocates"),
     )
 }
 

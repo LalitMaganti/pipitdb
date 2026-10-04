@@ -5,7 +5,7 @@
 use pipit_kernel::allocator::Allocator;
 use pipit_kernel::plan::{LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::vec::Vec;
+use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Ast, Node};
 use crate::error::{Error, ErrorCode, Span};
@@ -20,7 +20,7 @@ pub struct Compiler<'q, 'c> {
     allocator: &'q dyn Allocator,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
-    pub scope: Vec<NamedColumn>,
+    pub scope: SlowVec<NamedColumn>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -77,7 +77,7 @@ pub fn compile<'c>(
         ast: &ast,
         catalog,
         plan: LogicalPlan::new(allocator)?,
-        scope: Vec::new(allocator, PLAN_COLUMNS_MAX)?,
+        scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
         allocator,
     };
     let query = ast.node(ast.root());

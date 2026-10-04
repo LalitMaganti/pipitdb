@@ -126,7 +126,7 @@ impl Buffer {
     }
 
     /// The first byte, for writing values that aren't `Primitive`, such as a
-    /// `Vec`'s or a `Box`'s.
+    /// `SlowVec`'s or a `Box`'s.
     pub fn as_mut_non_null(&mut self) -> NonNull<u8> {
         check!(self.header().references.get() == 1);
         self.data
