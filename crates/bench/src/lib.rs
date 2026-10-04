@@ -3,16 +3,16 @@
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
-use pipit_kernel::lexer::{Lexer, TokenKind};
-use pipit_kernel::parser::{parse_expression, parse_query};
 use pipit_kernel::pipeline::Pipeline;
-use pipit_kernel::registry::Registry;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
+use pipit_pipesql::lexer::{Lexer, TokenKind};
+use pipit_pipesql::parser::{parse_expression, parse_query};
+use pipit_pipesql::registry::Registry;
 
-static REGISTRY: Registry = Registry::new(&[pipit_std::RELATIONAL]);
+static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 
 /// Queries shaped like real ones, repeated `count` times.
 pub fn typical_queries(count: usize) -> String {

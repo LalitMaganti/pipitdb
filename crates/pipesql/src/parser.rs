@@ -3,12 +3,12 @@
 //! `Parser` is the cursor over tokens that every part of the grammar uses, and
 //! writes the tree.
 
-use crate::allocator::Allocator;
 use crate::ast::{Ast, BLOCK_BYTES, DATA_MAX, Node, Nodes, Operator, Tag};
-use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
+use pipit_kernel::allocator::Allocator;
+use pipit_kernel::buffer::Buffer;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
@@ -275,7 +275,9 @@ impl Parser<'_> {
                         self.expect(TokenKind::RightParen)?;
                         operand
                     }
-                    Pending::Call(_) | Pending::Argument(_) => crate::check::check_failed(line!()),
+                    Pending::Call(_) | Pending::Argument(_) => {
+                        pipit_kernel::check::check_failed(line!())
+                    }
                 };
             }
         }
@@ -464,9 +466,9 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::allocator::Heap;
     use crate::ast::Tag;
     use crate::error::ErrorCode;
+    use pipit_kernel::allocator::Heap;
 
     /// Renders the tree as an s-expression.
     fn render(ast: &Ast, source: &str, index: u32) -> String {

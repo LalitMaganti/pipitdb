@@ -232,7 +232,7 @@ impl<'a> Lexer<'a> {
 
     fn advance(&mut self, count: usize) {
         check!(count <= self.rest().len());
-        let Ok(count) = u32::try_from(count) else { crate::check::check_failed(line!()) };
+        let Ok(count) = u32::try_from(count) else { pipit_kernel::check::check_failed(line!()) };
         self.position += count;
     }
 

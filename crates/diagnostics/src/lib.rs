@@ -1,36 +1,56 @@
-//! Turns pipitdb errors into messages, in the style of rustc.
+//! What every frontend needs to turn its errors into messages, in the style
+//! of rustc. Frontends write the messages; this lays them out.
 //!
-//! The kernel's errors carry no text so that small builds stay small. They can
-//! be printed in a compact form, `pipit:E0007:2+0:5` (code, span start and
-//! length, detail), and explained later with `pipit-explain`.
+//! Errors carry no text, so that small builds stay small. They can be printed
+//! in a compact form, `pipit:E0007:2+0:5` (code, span start and length,
+//! detail), and explained later against the query.
 
-use std::fmt::Write;
+#![no_std]
 
-use pipit_kernel::error::{Error, ErrorCode, Span};
-use pipit_kernel::lexer::TokenKind;
+extern crate alloc;
 
-/// `error` in its compact form, `pipit:E0007:2+0:5`.
-pub fn compact(error: &Error) -> String {
-    let Span { start, len } = error.span;
-    format!("pipit:E{:04}:{start}+{len}:{}", error.code as u16, error.detail)
+use alloc::format;
+use alloc::string::{String, ToString};
+use core::fmt::Write;
+
+/// An error as numbers, which is all its compact form holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Compact {
+    pub code: u16,
+    pub start: u32,
+    pub len: u32,
+    pub detail: u16,
 }
 
-/// The error a compact form describes, or `None` if it isn't one.
-pub fn parse_compact(text: &str) -> Option<Error> {
-    let rest = text.strip_prefix("pipit:E")?;
-    let mut parts = rest.split(':');
-    let code = parts.next()?.parse::<u16>().ok()?;
-    let (start, len) = parts.next()?.split_once('+')?;
-    let detail = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        return None;
+impl Compact {
+    /// The error `text`, as `format` writes it, describes; `None` if it isn't
+    /// one.
+    pub fn parse(text: &str) -> Option<Compact> {
+        let rest = text.strip_prefix("pipit:E")?;
+        let mut parts = rest.split(':');
+        let code = parts.next()?.parse().ok()?;
+        let (start, len) = parts.next()?.split_once('+')?;
+        let detail = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Compact { code, start: start.parse().ok()?, len: len.parse().ok()?, detail })
     }
-    let code = ErrorCode::from_u16(code)?;
-    let span = Span { start: start.parse().ok()?, len: len.parse().ok()? };
-    Some(Error { code, detail, span })
+
+    pub fn format(&self) -> String {
+        let Compact { code, start, len, detail } = self;
+        format!("pipit:E{code:04}:{start}+{len}:{detail}")
+    }
 }
 
-/// `error` as a message about `source`, which is called `name`:
+/// What a message says: a title, and a label under the source.
+pub struct Message {
+    pub title: String,
+    pub label: String,
+}
+
+/// `message`, about error `code` at bytes `start..start + len` of `source`,
+/// which is called `name`:
 ///
 /// ```text
 /// error[E0007]: expected `)`, found the end of the query
@@ -39,96 +59,33 @@ pub fn parse_compact(text: &str) -> Option<Error> {
 /// 1 | (a
 ///   |   ^ expected `)`
 /// ```
-pub fn render(error: &Error, source: &str, name: &str) -> String {
-    let found = found(error.span, source);
-    let (title, label) = describe(error, &found);
-    let (line_number, line, column) = locate(source, error.span.start as usize);
-    let width = underline_width(line, column, error.span.len as usize);
+pub fn render(
+    code: u16,
+    start: u32,
+    len: u32,
+    message: &Message,
+    source: &str,
+    name: &str,
+) -> String {
+    let (line_number, line, column) = locate(source, start as usize);
+    let width = underline_width(line, column, len as usize);
     let gutter = " ".repeat(line_number.to_string().len());
 
-    let mut out = format!("error[E{:04}]: {title}\n", error.code as u16);
+    let mut out = format!("error[E{code:04}]: {}\n", message.title);
     let _ = writeln!(out, "{gutter}--> {name}:{line_number}:{}", column + 1);
     let _ = writeln!(out, "{gutter} |");
     let _ = writeln!(out, "{line_number} | {line}");
     let carets = "^".repeat(width);
-    let _ = writeln!(out, "{gutter} | {}{carets} {label}", " ".repeat(column));
+    let _ = writeln!(out, "{gutter} | {}{carets} {}", " ".repeat(column), message.label);
     out
 }
 
-/// The title and the label under the source for `error`.
-fn describe(error: &Error, found: &str) -> (String, String) {
-    let kind = u8::try_from(error.detail).ok().and_then(TokenKind::from_u8);
-    let expected = kind.map_or("?", token);
-    match error.code {
-        ErrorCode::QueryTooLarge => {
-            ("the query is too large to parse".into(), "parsing stopped here".into())
-        }
-        ErrorCode::UnexpectedCharacter => {
-            (format!("unexpected character {found}"), "not part of any token".into())
-        }
-        ErrorCode::UnterminatedString => {
-            ("unterminated string".into(), "this string has no closing `'`".into())
-        }
-        ErrorCode::TokenTooLong => ("token too long".into(), "tokens are limited to 16 MiB".into()),
-        ErrorCode::ExpectedExpression => {
-            (format!("expected an expression, found {found}"), "expected an expression".into())
-        }
-        ErrorCode::UnexpectedToken => (format!("unexpected {found}"), "unexpected".into()),
-        ErrorCode::ExpectedToken => {
-            (format!("expected {expected}, found {found}"), format!("expected {expected}"))
-        }
-        ErrorCode::NestingTooDeep => (
-            "expression nests too deeply, or has too many arguments".into(),
-            format!("nesting is limited to {} levels", pipit_kernel::parser::NESTING_MAX),
-        ),
-        ErrorCode::OutOfMemory => ("out of memory".into(), "while parsing this query".into()),
-        ErrorCode::UnknownStage => (format!("unknown stage {found}"), "not a stage".into()),
-        ErrorCode::ExpectedSource => (
-            format!("a query must start with a source, found {found}"),
-            "expected a source, such as `FROM`".into(),
-        ),
-        ErrorCode::UnexpectedSource => {
-            (format!("{found} can only start a query"), "a source can't follow `|>`".into())
-        }
-        ErrorCode::ListTooLong => (
-            "the list is too long".into(),
-            format!("lists are limited to {} items", pipit_kernel::parser::LIST_MAX),
-        ),
-    }
-}
-
-/// What the error's span covers, for "found ...".
-fn found(span: Span, source: &str) -> String {
-    let start = span.start as usize;
-    match source.get(start..start + span.len as usize) {
+/// What bytes `start..start + len` of `source` hold, for "found ...".
+pub fn found(start: u32, len: u32, source: &str) -> String {
+    let start = start as usize;
+    match source.get(start..start + len as usize) {
         Some("") | None => "the end of the query".into(),
         Some(text) => format!("`{text}`"),
-    }
-}
-
-fn token(kind: TokenKind) -> &'static str {
-    match kind {
-        TokenKind::Identifier => "a name",
-        TokenKind::Integer => "an integer",
-        TokenKind::Float => "a number",
-        TokenKind::String => "a string",
-        TokenKind::Pipe => "`|>`",
-        TokenKind::LeftParen => "`(`",
-        TokenKind::RightParen => "`)`",
-        TokenKind::Comma => "`,`",
-        TokenKind::Dot => "`.`",
-        TokenKind::Semicolon => "`;`",
-        TokenKind::Star => "`*`",
-        TokenKind::Plus => "`+`",
-        TokenKind::Minus => "`-`",
-        TokenKind::Slash => "`/`",
-        TokenKind::Equal => "`=`",
-        TokenKind::NotEqual => "`!=`",
-        TokenKind::Less => "`<`",
-        TokenKind::LessEqual => "`<=`",
-        TokenKind::Greater => "`>`",
-        TokenKind::GreaterEqual => "`>=`",
-        TokenKind::End => "the end of the query",
     }
 }
 
@@ -153,28 +110,22 @@ fn underline_width(line: &str, column: usize, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
-    use pipit_kernel::parser::parse_expression;
-
     use super::*;
 
     #[test]
-    fn renders_a_parse_error() {
-        let source = "a +\n  (b * c";
-        let error = parse_expression(Heap, source.as_bytes()).unwrap_err();
+    fn renders_a_message() {
+        let message = Message { title: "bad thing".into(), label: "here".into() };
         assert_eq!(
-            render(&error, source, "query"),
-            "error[E0007]: expected `)`, found the end of the query\n \
-             --> query:2:9\n  |\n2 |   (b * c\n  |         ^ expected `)`\n"
+            render(7, 6, 2, &message, "a +\n  (b * c", "query"),
+            "error[E0007]: bad thing\n --> query:2:3\n  |\n2 |   (b * c\n  |   ^^ here\n"
         );
     }
 
     #[test]
     fn compact_round_trips() {
-        let error = parse_expression(Heap, b"a b").unwrap_err();
-        let text = compact(&error);
-        assert_eq!(text, "pipit:E0006:2+1:0");
-        assert_eq!(parse_compact(&text), Some(error));
-        assert_eq!(parse_compact("pipit:E0099:0+0:0"), None);
+        let compact = Compact { code: 6, start: 2, len: 1, detail: 0 };
+        assert_eq!(compact.format(), "pipit:E0006:2+1:0");
+        assert_eq!(Compact::parse("pipit:E0006:2+1:0"), Some(compact));
+        assert_eq!(Compact::parse("pipit:E0006:2+1"), None);
     }
 }

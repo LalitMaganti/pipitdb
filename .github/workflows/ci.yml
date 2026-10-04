@@ -23,9 +23,11 @@ jobs:
           key: ${{ hashFiles('Cargo.toml') }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets -p pipitdb-pipesql --features diagnostics
       - run: cargo test
+      - run: cargo test -p pipitdb-pipesql --features diagnostics
       # Small blocks, so the tests also cover growing and running out of them.
-      - run: cargo test -p pipitdb-kernel
+      - run: cargo test -p pipitdb-pipesql
         env:
           PIPIT_AST_BLOCK_BYTES: 4096
           PIPIT_AST_BLOCK_SLOTS: 4

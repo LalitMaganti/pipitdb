@@ -123,13 +123,13 @@ impl Buffer {
 
     /// The first byte, for buffers whose bytes are tracked as written by the
     /// caller, which `as_slice` can't read.
-    pub(crate) fn as_ptr<T: Primitive>(&self) -> *const T {
+    pub fn as_ptr<T: Primitive>(&self) -> *const T {
         check!(self.size_bytes.is_multiple_of(size_of::<T>()));
         self.data.as_ptr().cast()
     }
 
     /// As `as_ptr`, for writing.
-    pub(crate) fn as_mut_ptr<T: Primitive>(&mut self) -> *mut T {
+    pub fn as_mut_ptr<T: Primitive>(&mut self) -> *mut T {
         check!(self.size_bytes.is_multiple_of(size_of::<T>()));
         check!(self.owner().references.get() == 1);
         self.data.as_ptr().cast()

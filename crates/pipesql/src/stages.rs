@@ -1,9 +1,7 @@
-//! pipitdb's standard stages, as rules for the kernel's registry. They use the
-//! same API as any extension.
+//! The stages PipeSQL comes with, as rules for a registry. They use the same
+//! API as any extension.
 
-#![no_std]
-
-use pipit_kernel::registry::{Item, Point, Rule, Shared};
+use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule =
     Rule { keyword: "from", point: Point::Source, items: &[Item::One(Shared::Name)] };
@@ -25,11 +23,11 @@ mod tests {
     use std::string::{String, ToString};
     use std::vec::Vec;
 
+    use crate::ast::{Ast, Tag};
+    use crate::error::ErrorCode;
+    use crate::parser::parse_query;
+    use crate::registry::Registry;
     use pipit_kernel::allocator::Heap;
-    use pipit_kernel::ast::{Ast, Tag};
-    use pipit_kernel::error::ErrorCode;
-    use pipit_kernel::parser::parse_query;
-    use pipit_kernel::registry::Registry;
 
     use super::*;
 
