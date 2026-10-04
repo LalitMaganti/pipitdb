@@ -1,6 +1,6 @@
 [package]
 name = "pipitdb-bench"
-description = "Benchmarks for pipitdb."
+description = "Benchmarks for pipitdb: speed, instructions and binary size."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,9 +12,20 @@ publish = false
 pipitdb-kernel = { path = "../kernel" }
 pipitdb-std = { path = "../std" }
 
-[dev-dependencies]
+# Not for Wasm, which only builds the size example.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 gungraun = "0.20"
+
+[features]
+# Builds the size example, which `cargo test` can't: it has no unwinding.
+size = []
+
+# A library that uses the kernel, whose size CI checks against `sizes`.
+[[example]]
+name = "size"
+crate-type = ["cdylib"]
+required-features = ["size"]
 
 [[bench]]
 name = "wall_clock"

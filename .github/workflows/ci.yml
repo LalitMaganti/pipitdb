@@ -47,10 +47,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
-      - run: cargo clippy -p pipitdb-size --target ${{ matrix.target }}
+      - run: cargo clippy -p pipitdb-bench --example size --features size --target ${{ matrix.target }}
       # `shell: bash` sets pipefail, so `tee` doesn't hide a failure.
       - shell: bash
-        run: crates/size/check.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
+        run: crates/bench/check_size.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Fails if a benchmark's instruction count is more than 5% off
   # crates/bench/instructions.
