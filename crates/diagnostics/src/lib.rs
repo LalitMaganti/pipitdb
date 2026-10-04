@@ -60,12 +60,12 @@ pub struct Message {
 ///   |   ^ expected `)`
 /// ```
 pub fn render(
+    source: &str,
+    name: &str,
     code: u16,
     start: u32,
     len: u32,
     message: &Message,
-    source: &str,
-    name: &str,
 ) -> String {
     let (line_number, line, column) = locate(source, start as usize);
     let width = underline_width(line, column, len as usize);
@@ -81,7 +81,7 @@ pub fn render(
 }
 
 /// What bytes `start..start + len` of `source` hold, for "found ...".
-pub fn found(start: u32, len: u32, source: &str) -> String {
+pub fn found(source: &str, start: u32, len: u32) -> String {
     let start = start as usize;
     match source.get(start..start + len as usize) {
         Some("") | None => "the end of the query".into(),
@@ -116,7 +116,7 @@ mod tests {
     fn renders_a_message() {
         let message = Message { title: "bad thing".into(), label: "here".into() };
         assert_eq!(
-            render(7, 6, 2, &message, "a +\n  (b * c", "query"),
+            render("a +\n  (b * c", "query", 7, 6, 2, &message),
             "error[E0007]: bad thing\n --> query:2:3\n  |\n2 |   (b * c\n  |   ^^ here\n"
         );
     }

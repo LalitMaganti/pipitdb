@@ -179,9 +179,9 @@ mod tests {
         fn next(
             &self,
             columns: &[u32],
-            batch: &mut RowBatch,
-            done: &mut bool,
             _: &mut Context,
+            done: &mut bool,
+            batch: &mut RowBatch,
         ) -> bool {
             if *done {
                 return false;
@@ -280,7 +280,7 @@ mod tests {
             Ok(())
         }
 
-        fn next(&self, _: &[u32], _: &mut RowBatch, (): &mut (), _: &mut Context) -> bool {
+        fn next(&self, _: &[u32], _: &mut Context, (): &mut (), _: &mut RowBatch) -> bool {
             false
         }
     }

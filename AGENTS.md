@@ -5,6 +5,7 @@
 - Keep code simple and easy to read.
 - Don't implement something poorly: leave it out until it can be done well.
 - Only add a comment when the code isn't obvious. Keep it short and plain.
+- Order parameters from longest-lived to shortest, e.g. `context, state, batch`.
 - One small PR at a time.
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.

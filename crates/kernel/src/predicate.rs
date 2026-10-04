@@ -76,11 +76,11 @@ impl Predicate {
     /// Narrows `batch`'s selection to the rows this is true for, working in
     /// `scratch`, which holds at least `depth` selections.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX` nodes")]
-    pub fn select(&self, batch: &mut RowBatch, scratch: &mut [Selection]) {
+    pub fn select(&self, scratch: &mut [Selection], batch: &mut RowBatch) {
         check!(scratch.len() >= self.depth as usize);
         let (columns, selection) = batch.columns_and_selection();
         let root = self.nodes.len() as u32 - 1;
-        self.narrow(root, true, columns, selection, scratch);
+        self.narrow(scratch, root, true, columns, selection);
     }
 
     /// Narrows `selection` to the rows node `node` is `want` for. A node that
@@ -88,18 +88,18 @@ impl Predicate {
     /// in the rest.
     fn narrow(
         &self,
+        scratch: &mut [Selection],
         node: u32,
         want: bool,
         columns: &[ColumnView],
         selection: &mut Selection,
-        scratch: &mut [Selection],
     ) {
         match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => leaf.narrow(want, columns, selection, None),
-            Node::Not(child) => self.narrow(child, !want, columns, selection, scratch),
+            Node::Leaf(leaf) => leaf.narrow(None, want, columns, selection),
+            Node::Not(child) => self.narrow(scratch, child, !want, columns, selection),
             // True for both, or false for both: each narrows what the other left.
-            Node::And(a, b) if want => self.both(a, b, true, columns, selection, scratch),
-            Node::Or(a, b) if !want => self.both(a, b, false, columns, selection, scratch),
+            Node::And(a, b) if want => self.both(scratch, a, b, true, columns, selection),
+            Node::Or(a, b) if !want => self.both(scratch, a, b, false, columns, selection),
             // False for either, or true for either: the rows `a` is `want` for,
             // and those `b` is among the rest.
             Node::And(a, b) | Node::Or(a, b) => {
@@ -108,13 +108,13 @@ impl Predicate {
                 };
                 if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
                     // In one pass.
-                    leaf.narrow(want, columns, selection, Some(rest));
+                    leaf.narrow(Some(rest), want, columns, selection);
                 } else {
                     rest.clone_from(selection);
-                    self.narrow(a, want, columns, selection, scratch);
+                    self.narrow(scratch, a, want, columns, selection);
                     rest.subtract(selection);
                 }
-                self.narrow(b, want, columns, rest, scratch);
+                self.narrow(scratch, b, want, columns, rest);
                 selection.union(rest);
             }
         }
@@ -122,15 +122,15 @@ impl Predicate {
 
     fn both(
         &self,
+        scratch: &mut [Selection],
         a: u32,
         b: u32,
         want: bool,
         columns: &[ColumnView],
         selection: &mut Selection,
-        scratch: &mut [Selection],
     ) {
-        self.narrow(a, want, columns, selection, scratch);
-        self.narrow(b, want, columns, selection, scratch);
+        self.narrow(scratch, a, want, columns, selection);
+        self.narrow(scratch, b, want, columns, selection);
     }
 }
 
@@ -139,10 +139,10 @@ impl Leaf {
     /// drops to `dropped`, if given.
     fn narrow(
         self,
+        dropped: Option<&mut Selection>,
         want: bool,
         columns: &[ColumnView],
         selection: &mut Selection,
-        dropped: Option<&mut Selection>,
     ) {
         match self {
             Leaf::Compare { column, comparison, value } => {
@@ -249,7 +249,7 @@ mod tests {
         let mut batch = RowBatch::new();
         batch.reset(6);
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
-        predicate.select(&mut batch, &mut scratch);
+        predicate.select(&mut scratch, &mut batch);
         match batch.selection().kept() {
             Kept::All => (0..6).collect(),
             Kept::None => StdVec::new(),

@@ -104,9 +104,9 @@ impl Scannable for Table {
     fn next(
         &self,
         columns: &[u32],
-        batch: &mut RowBatch,
-        at: &mut ScanState,
         _: &mut Context,
+        at: &mut ScanState,
+        batch: &mut RowBatch,
     ) -> bool {
         loop {
             let Some(row_group) = self.row_groups.get(at.row_group) else { return false };
@@ -151,7 +151,7 @@ mod tests {
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while table.next(columns, &mut batch, &mut state, &mut context) {
+        while table.next(columns, &mut context, &mut state, &mut batch) {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }

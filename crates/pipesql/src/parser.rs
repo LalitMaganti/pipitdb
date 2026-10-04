@@ -471,21 +471,21 @@ mod tests {
     use pipit_kernel::allocator::Heap;
 
     /// Renders the tree as an s-expression.
-    fn render(ast: &Ast, source: &str, index: u32) -> String {
+    fn render(source: &str, ast: &Ast, index: u32) -> String {
         let node = ast.node(index);
         match node.tag() {
             Tag::Unary => {
-                format!("({:?} {})", node.operator(), render(ast, source, node.first_child()))
+                format!("({:?} {})", node.operator(), render(source, ast, node.first_child()))
             }
             Tag::Binary => format!(
                 "({:?} {} {})",
                 node.operator(),
-                render(ast, source, node.first_child()),
-                render(ast, source, node.first_child() + 1)
+                render(source, ast, node.first_child()),
+                render(source, ast, node.first_child() + 1)
             ),
             Tag::Call => {
                 let children = (0..node.child_count())
-                    .map(|i| render(ast, source, node.first_child() + i))
+                    .map(|i| render(source, ast, node.first_child() + i))
                     .collect::<alloc::vec::Vec<_>>();
                 format!("(Call {})", children.join(" "))
             }
@@ -498,7 +498,7 @@ mod tests {
 
     fn parse(source: &str) -> String {
         let ast = parse_expression(Heap, source.as_bytes()).unwrap();
-        render(&ast, source, ast.root())
+        render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {

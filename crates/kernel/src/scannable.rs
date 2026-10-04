@@ -38,9 +38,9 @@ pub trait Scannable {
     fn next(
         &self,
         columns: &[u32],
-        batch: &mut RowBatch,
-        state: &mut Self::State,
         context: &mut Context,
+        state: &mut Self::State,
+        batch: &mut RowBatch,
     ) -> bool;
 }
 
@@ -51,7 +51,7 @@ pub trait Catalog {
 }
 
 type ScannableNext =
-    unsafe fn(NonNull<()>, &[u32], &mut RowBatch, NonNull<u8>, &mut Context) -> bool;
+    unsafe fn(NonNull<()>, &[u32], &mut Context, NonNull<u8>, &mut RowBatch) -> bool;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
 /// allocator, and functions that know its type.
@@ -87,16 +87,16 @@ impl<'a> DynScannable<'a> {
             },
             state_layout: Layout::new::<T::State>(),
             // SAFETY: as above.
-            new_state: |scannable, state, context| unsafe {
+            new_state: |scannable, context, state| unsafe {
                 let made = value_of::<T>(scannable).new_state(context)?;
                 write_state(state, made);
                 Ok(())
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
-            next: |scannable, columns, batch, state, context| unsafe {
+            next: |scannable, columns, context, state, batch| unsafe {
                 let state = state_of::<T::State>(state);
-                value_of::<T>(scannable).next(columns, batch, state, context)
+                value_of::<T>(scannable).next(columns, context, state, batch)
             },
             lifetime: PhantomData,
         })
@@ -149,20 +149,20 @@ struct Scan {
 
 unsafe fn scan_new_state(
     step: NonNull<()>,
-    state: NonNull<u8>,
     context: &mut Context,
+    state: NonNull<u8>,
 ) -> Result<(), AllocError> {
     // SAFETY: `step` is a `Scan`, whose scannable outlives it.
     let scannable = unsafe { step.cast::<Scan>().as_ref().scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), state, context) }
+    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), context, state) }
 }
 
 unsafe fn scan_next(
     step: NonNull<()>,
-    batch: &mut RowBatch,
-    state: NonNull<u8>,
     context: &mut Context,
+    state: NonNull<u8>,
+    batch: &mut RowBatch,
 ) -> bool {
     // SAFETY: as in `scan_new_state`.
     let scan = unsafe { step.cast::<Scan>().as_ref() };
@@ -170,7 +170,7 @@ unsafe fn scan_next(
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
-    unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, batch, state, context) }
+    unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, context, state, batch) }
 }
 
 #[cfg(test)]
@@ -208,9 +208,9 @@ mod tests {
         fn next(
             &self,
             columns: &[u32],
-            batch: &mut RowBatch,
-            done: &mut bool,
             _: &mut Context,
+            done: &mut bool,
+            batch: &mut RowBatch,
         ) -> bool {
             if *done {
                 return false;

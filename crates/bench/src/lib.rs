@@ -97,7 +97,7 @@ impl Source for Repeat {
         Ok(0)
     }
 
-    fn next(&self, batch: &mut RowBatch, made: &mut u32, _: &mut Context) -> bool {
+    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> bool {
         if *made == self.batches {
             return false;
         }
@@ -117,7 +117,7 @@ impl Transform for PassTransform {
         Ok(())
     }
 
-    fn process(&self, _: &mut RowBatch, (): &mut (), _: &mut Context) {}
+    fn process(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) {}
 }
 
 /// Outputs its input, to measure what an operator costs the pipeline.
@@ -132,10 +132,10 @@ impl Operator for PassOperator {
 
     fn execute(
         &self,
+        _: &mut Context,
+        (): &mut (),
         input: &RowBatch,
         output: &mut RowBatch,
-        (): &mut (),
-        _: &mut Context,
     ) -> Progress {
         output.reset(input.row_count());
         for i in 0..input.column_count() {
@@ -271,7 +271,7 @@ pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -
     for _ in 0..batches {
         batch.reset(column.row_count());
         let _ = batch.push_column(column.clone());
-        predicate.select(&mut batch, context.selections());
+        predicate.select(context.selections(), &mut batch);
         kept += u64::from(batch.selection().len());
     }
     kept

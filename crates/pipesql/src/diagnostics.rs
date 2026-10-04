@@ -21,14 +21,14 @@ pub fn parse_compact(text: &str) -> Option<Error> {
 }
 
 /// `error` as a message about `source`, which is called `name`.
-pub fn render(error: &Error, source: &str, name: &str) -> String {
+pub fn render(source: &str, name: &str, error: &Error) -> String {
     let Span { start, len } = error.span;
-    let message = describe(error, &found(start, len, source));
-    pipitdb_diagnostics::render(error.code as u16, start, len, &message, source, name)
+    let message = describe(&found(source, start, len), error);
+    pipitdb_diagnostics::render(source, name, error.code as u16, start, len, &message)
 }
 
 /// The title and the label under the source for `error`.
-fn describe(error: &Error, found: &str) -> Message {
+fn describe(found: &str, error: &Error) -> Message {
     let kind = u8::try_from(error.detail).ok().and_then(TokenKind::from_u8);
     let expected = kind.map_or("?", token);
     let (title, label): (String, String) = match error.code {
@@ -120,7 +120,7 @@ mod tests {
         let source = "a +\n  (b * c";
         let error = parse_expression(Heap, source.as_bytes()).unwrap_err();
         assert_eq!(
-            render(&error, source, "query"),
+            render(source, "query", &error),
             "error[E0007]: expected `)`, found the end of the query\n \
              --> query:2:9\n  |\n2 |   (b * c\n  |         ^ expected `)`\n"
         );

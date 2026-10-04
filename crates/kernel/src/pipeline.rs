@@ -140,8 +140,8 @@ impl<'p> Execution<'p> {
                 return;
             }
             let made = match i {
-                None => pipeline.source.new_state(memory.add(state), &mut context),
-                Some(i) => at!(pipeline.steps, i).new_state(memory.add(state), &mut context),
+                None => pipeline.source.new_state(&mut context, memory.add(state)),
+                Some(i) => at!(pipeline.steps, i).new_state(&mut context, memory.add(state)),
             };
             if made.is_err() {
                 failed = true;
@@ -185,7 +185,7 @@ impl<'p> Execution<'p> {
     /// Fills `output` with the next batch, or returns false when there are
     /// none left.
     pub fn next(&mut self, output: &mut RowBatch) -> bool {
-        self.run.next(output, &mut self.context)
+        self.run.next(&mut self.context, output)
     }
 }
 
@@ -195,11 +195,11 @@ impl Run<'_> {
     /// Starting from the last segment, it moves to the one before when a
     /// segment's operator needs input, and to the one after when a segment
     /// makes a batch or ends.
-    fn next(&mut self, output: &mut RowBatch, context: &mut Context) -> bool {
+    fn next(&mut self, context: &mut Context, output: &mut RowBatch) -> bool {
         let last = self.pipeline.segment_count - 1;
         let mut k = self.ready(last);
         loop {
-            match self.make(k, output, context) {
+            match self.make(context, k, output) {
                 Made::Nothing => k = self.ready(k),
                 Made::Batch if k == last => return true,
                 Made::End if k == last => return false,
@@ -237,7 +237,7 @@ impl Run<'_> {
 
     /// Runs segment `k` once. Its batch goes to the next operator's input, or
     /// to `output` if it is the last segment.
-    fn make(&self, k: usize, output: &mut RowBatch, context: &mut Context) -> Made {
+    fn make(&self, context: &mut Context, k: usize, output: &mut RowBatch) -> Made {
         // SAFETY: the segments were written by `Execution::new`.
         let segment = unsafe { &mut *self.segment(k) };
         let end = segment.end;
@@ -248,9 +248,9 @@ impl Run<'_> {
             unsafe { &mut (*self.slot(end)).input }
         };
         let (made, first) = if k == 0 {
-            (self.read_source(batch, context), 0)
+            (self.read_source(context, batch), 0)
         } else {
-            (self.execute(segment, batch, context), segment.head + 1)
+            (self.execute(context, segment, batch), segment.head + 1)
         };
         if made == Made::Batch {
             for i in first..end {
@@ -258,16 +258,16 @@ impl Run<'_> {
                     crate::check::check_failed(line!());
                 };
                 // SAFETY: the transform's state was made by `Execution::new`.
-                unsafe { transform.process(batch, self.state(Some(i)), context) };
+                unsafe { transform.process(context, self.state(Some(i)), batch) };
             }
         }
         if made == Made::Batch && batch.selection().is_empty() { Made::Nothing } else { made }
     }
 
-    fn read_source(&self, batch: &mut RowBatch, context: &mut Context) -> Made {
+    fn read_source(&self, context: &mut Context, batch: &mut RowBatch) -> Made {
         batch.reset(0);
         // SAFETY: the source's state was made by `Execution::new`.
-        if unsafe { self.pipeline.source.next(batch, self.state(None), context) } {
+        if unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Made::Batch
         } else {
             Made::End
@@ -275,7 +275,7 @@ impl Run<'_> {
     }
 
     /// Runs the operator heading `segment` once.
-    fn execute(&self, segment: &mut Segment, output: &mut RowBatch, context: &mut Context) -> Made {
+    fn execute(&self, context: &mut Context, segment: &mut Segment, output: &mut RowBatch) -> Made {
         let op = segment.head;
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
             crate::check::check_failed(line!());
@@ -289,11 +289,11 @@ impl Run<'_> {
                 Status::Done => return Made::End,
                 Status::Ready => {
                     output.reset(0);
-                    operator.execute(input, output, state, context)
+                    operator.execute(context, state, input, output)
                 }
                 Status::Ended => {
                     output.reset(0);
-                    operator.finish(output, state, context)
+                    operator.finish(context, state, output)
                 }
                 Status::Waiting => crate::check::check_failed(line!()),
             }
@@ -376,7 +376,7 @@ mod tests {
             Ok(0)
         }
 
-        fn next(&self, batch: &mut RowBatch, i: &mut i64, _: &mut Context) -> bool {
+        fn next(&self, _: &mut Context, i: &mut i64, batch: &mut RowBatch) -> bool {
             if *i == self.batches {
                 return false;
             }
@@ -398,7 +398,7 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, batch: &mut RowBatch, (): &mut (), _: &mut Context) {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) {
             batch.columns_mut().reverse();
         }
     }
@@ -418,9 +418,9 @@ mod tests {
 
         fn process(
             &self,
-            batch: &mut RowBatch,
-            (position, _): &mut (i64, Rc<()>),
             _: &mut Context,
+            (position, _): &mut (i64, Rc<()>),
+            batch: &mut RowBatch,
         ) {
             let column = int64s(&alloc::vec![*position; batch.row_count() as usize]);
             assert!(batch.push_column(column).is_ok());
@@ -438,7 +438,7 @@ mod tests {
             Ok(false)
         }
 
-        fn process(&self, batch: &mut RowBatch, odd: &mut bool, _: &mut Context) {
+        fn process(&self, _: &mut Context, odd: &mut bool, batch: &mut RowBatch) {
             if *odd {
                 batch.reset(0);
             }
@@ -456,7 +456,7 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, batch: &mut RowBatch, (): &mut (), _: &mut Context) {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) {
             let column = batch.column(0).clone();
             batch.selection_mut().retain(|row| column.int64s()[row as usize] % 2 == 0);
         }
@@ -472,7 +472,7 @@ mod tests {
             Ok(())
         }
 
-        fn process(&self, batch: &mut RowBatch, (): &mut (), _: &mut Context) {
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) {
             batch.selection_mut().retain(|_| false);
         }
     }
@@ -489,10 +489,10 @@ mod tests {
 
         fn execute(
             &self,
+            _: &mut Context,
+            row: &mut u32,
             input: &RowBatch,
             output: &mut RowBatch,
-            row: &mut u32,
-            _: &mut Context,
         ) -> Progress {
             output.reset(1);
             for column in 0..input.column_count() {
@@ -520,16 +520,16 @@ mod tests {
 
         fn execute(
             &self,
+            _: &mut Context,
+            sum: &mut i64,
             input: &RowBatch,
             _: &mut RowBatch,
-            sum: &mut i64,
-            _: &mut Context,
         ) -> Progress {
             *sum += input.column(0).int64s().iter().sum::<i64>();
             Progress::NeedInput
         }
 
-        fn finish(&self, output: &mut RowBatch, sum: &mut i64, _: &mut Context) -> Progress {
+        fn finish(&self, _: &mut Context, sum: &mut i64, output: &mut RowBatch) -> Progress {
             output.reset(1);
             assert!(output.push_column(int64s(&[*sum])).is_ok());
             Progress::NeedInput
@@ -552,7 +552,7 @@ mod tests {
             crate::boxed::Box::new(context.allocator().clone(), 7)
         }
 
-        fn process(&self, batch: &mut RowBatch, number: &mut Self::State, _: &mut Context) {
+        fn process(&self, _: &mut Context, number: &mut Self::State, batch: &mut RowBatch) {
             let column = int64s(&alloc::vec![**number; batch.row_count() as usize]);
             assert!(batch.push_column(column).is_ok());
         }
