@@ -17,10 +17,9 @@ impl<T> From<Full<T>> for AllocError {
     }
 }
 
-/// Every `Vec` has a most values it can hold, `max`. It grows towards it as
-/// needed, doubling, so one made with room for `max` never grows. `max` is a
-/// power of two, and the room for values is rounded up to one, unless it is
-/// 0.
+/// Every `Vec` has a most values it can hold, `max`, a power of two. One made
+/// by `new` grows towards it as needed, doubling; one made by `fixed` has room
+/// for `max` from the start, and never grows.
 ///
 /// Its values live in a `Buffer`, which also remembers the allocator, so a
 /// `Vec` isn't generic over it.
@@ -38,27 +37,8 @@ impl<T> Vec<T> {
         allocator: A,
         max: usize,
     ) -> Result<Vec<T>, AllocError> {
-        Vec::with_capacity(allocator, 0, max)
-    }
-
-    /// An empty `Vec` with room for at least `capacity` values, that can grow
-    /// to `max`.
-    pub fn with_capacity<A: Allocator + Clone + 'static>(
-        allocator: A,
-        capacity: usize,
-        max: usize,
-    ) -> Result<Vec<T>, AllocError> {
-        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
-        let capacity = if capacity == 0 { 0 } else { capacity.next_power_of_two() };
-        check!(capacity <= max);
-        max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
-        let size_bytes = capacity * size_of::<T>();
-        // SAFETY: only the first `len` values are read, and each is written
-        // first.
-        let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
-        let values = data(&mut buffer).cast();
-        Ok(Vec { buffer, values, len: 0, capacity, max })
+        Vec::empty(allocator, 0, max)
     }
 
     /// An empty `Vec` with room for `len` values, rounded up, that never
@@ -68,7 +48,7 @@ impl<T> Vec<T> {
         len: usize,
     ) -> Result<Vec<T>, AllocError> {
         let max = len.next_power_of_two();
-        Vec::with_capacity(allocator, max, max)
+        Vec::empty(allocator, max, max)
     }
 
     /// `values`, in a `Vec` that never grows.
@@ -85,6 +65,21 @@ impl<T> Vec<T> {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// An empty `Vec` with room for `capacity` values, 0 or `max`.
+    fn empty<A: Allocator + Clone + 'static>(
+        allocator: A,
+        capacity: usize,
+        max: usize,
+    ) -> Result<Vec<T>, AllocError> {
+        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+        max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
+        // SAFETY: only the first `len` values are read, and each is written
+        // first.
+        let mut buffer = unsafe { Buffer::allocate_uninit(allocator, capacity * size_of::<T>())? };
+        let values = data(&mut buffer).cast();
+        Ok(Vec { buffer, values, len: 0, capacity, max })
     }
 
     /// Adds `value` at the end, growing if full. Fails, giving `value` back,
@@ -124,7 +119,7 @@ fn grow(
     used_bytes: usize,
     size_bytes: usize,
 ) -> Result<NonNull<u8>, AllocError> {
-    // SAFETY: as in `Vec::with_capacity`.
+    // SAFETY: as in `Vec::empty`.
     let mut grown = unsafe { buffer.allocate_uninit_like(size_bytes)? };
     let to = data(&mut grown);
     // SAFETY: both hold at least `used_bytes`. Values are moved, not dropped:
@@ -261,7 +256,7 @@ mod tests {
 
     #[test]
     fn rounds_its_room_up() {
-        let values = Vec::<u64>::with_capacity(Heap, 5, 8).unwrap();
+        let values = Vec::<u64>::fixed(Heap, 5).unwrap();
         assert_eq!(values.capacity(), 8);
     }
 }
