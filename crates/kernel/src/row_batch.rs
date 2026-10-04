@@ -30,7 +30,8 @@ impl RowBatch {
     }
 
     /// Empties the batch so it can be refilled with `row_count` rows, all
-    /// kept.
+    /// kept. Inlined, as every source and operator calls it for each batch.
+    #[inline]
     pub fn reset(&mut self, row_count: u32) {
         check!(row_count <= BATCH_ROWS_MAX);
         self.drop_columns();
