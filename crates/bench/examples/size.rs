@@ -15,6 +15,7 @@ use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore, read_column, write_column};
 use pipit_kernel::vec::Vec;
 
 #[unsafe(no_mangle)]
@@ -48,6 +49,68 @@ pub extern "C" fn budget_peak(value: u64, limit: usize) -> usize {
     let Ok(boxed) = Box::new(&budget, value) else { return 0 };
     drop(boxed);
     budget.peak()
+}
+
+/// One log, in a fixed array.
+struct Fixed {
+    bytes: core::cell::UnsafeCell<[u8; 256]>,
+    len: core::cell::Cell<usize>,
+}
+
+impl Fixed {
+    /// Bytes `start..start + len` of the log, if it has room.
+    fn range(&self, start: usize, len: usize) -> Result<*mut u8, SpillError> {
+        if start.checked_add(len).is_none_or(|end| end > 256) {
+            return Err(SpillError::Io);
+        }
+        // SAFETY: `start` is within the array.
+        Ok(unsafe { self.bytes.get().cast::<u8>().add(start) })
+    }
+}
+
+impl SpillStore for Fixed {
+    fn create(&self) -> Result<LogId, SpillError> {
+        Ok(LogId(0))
+    }
+
+    fn append(&self, _: LogId, bytes: &[u8]) -> Result<Block, SpillError> {
+        let offset = self.len.get();
+        let to = self.range(offset, bytes.len())?;
+        // SAFETY: `to` has room for `bytes`, which don't overlap the array.
+        unsafe { to.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+        self.len.set(offset + bytes.len());
+        Ok(Block { offset: offset as u64, len: bytes.len() as u64 })
+    }
+
+    fn seal(&self, _: LogId) -> Result<(), SpillError> {
+        Ok(())
+    }
+
+    fn read(&self, _: LogId, block: Block, into: &mut [u8]) -> Result<(), SpillError> {
+        let from = self.range(block.offset as usize, into.len())?;
+        // SAFETY: as in `append`.
+        unsafe { into.as_mut_ptr().copy_from_nonoverlapping(from, into.len()) };
+        Ok(())
+    }
+
+    fn delete(&self, _: LogId) {}
+}
+
+/// `value`, spilled as a one-row column and read back, or 0 if that fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn spill_round_trip(value: i64) -> i64 {
+    let store =
+        Fixed { bytes: core::cell::UnsafeCell::new([0; 256]), len: core::cell::Cell::new(0) };
+    let Ok(mut values) = Buffer::allocate(&Heap, 8) else { return 0 };
+    values.as_mut_slice::<i64>()[0] = value;
+    let column = ColumnView::new(DataType::Int64, values, None);
+    let Ok(log) = store.create() else { return 0 };
+    let Ok(spilled) = write_column(&store, log, &column) else { return 0 };
+    if store.seal(log).is_err() {
+        return 0;
+    }
+    let Ok(read) = read_column(&Heap, &store, log, &spilled) else { return 0 };
+    read.int64s()[0]
 }
 
 /// Pushes `0..count` to a `Vec`, and returns the last.

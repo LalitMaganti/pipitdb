@@ -21,5 +21,6 @@ pub mod predicate;
 pub mod row_batch;
 pub mod scannable;
 pub mod selection;
+pub mod spill;
 pub mod step;
 pub mod vec;
