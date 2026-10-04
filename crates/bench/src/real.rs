@@ -9,6 +9,7 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::lower::{PhysicalPlan, lower};
+use pipit_kernel::optimize::optimize;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_operators::table::Table;
 use pipit_pipesql::compile::compile;
@@ -33,13 +34,14 @@ pub fn slices() -> Option<&'static DynScannable<'static>> {
     Some(Box::leak(Box::new(DynScannable::new(Heap, table).ok()?)))
 }
 
-/// `query` over `slices`, compiled and lowered, ready to run.
+/// `query` over `slices`, compiled, optimized and lowered, ready to run.
 pub fn slice_query(
     slices: &'static DynScannable<'static>,
     query: &str,
 ) -> Option<PhysicalPlan<'static>> {
     let catalog: &'static Slices = Box::leak(Box::new(Slices(slices)));
-    let plan = compile(Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
+    let mut plan = compile(Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
+    optimize(Heap, &mut plan).ok()?;
     lower(Heap, &plan).ok()
 }
 
