@@ -116,6 +116,39 @@ impl<T> Vec<T> {
         Ok(())
     }
 
+    /// Removes the last value, if any.
+    pub fn pop(&mut self) -> Option<T> {
+        self.len = self.len.checked_sub(1)?;
+        // SAFETY: the value at the old last place was written, and is no
+        // longer counted, so it's moved out once.
+        Some(unsafe { self.values.add(self.len).read() })
+    }
+
+    /// Keeps the values `keep` says to, in order, dropping the rest.
+    pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        let len = self.len;
+        // Counted as empty while values move, so a panic in `keep` leaks
+        // rather than drops twice.
+        self.len = 0;
+        let mut kept = 0;
+        for i in 0..len {
+            // SAFETY: values below `len` were written, and each is read or
+            // dropped once here; `kept` never passes `i`.
+            unsafe {
+                let value = self.values.add(i);
+                if keep(value.as_ref()) {
+                    if kept != i {
+                        self.values.add(kept).write(value.read());
+                    }
+                    kept += 1;
+                } else {
+                    value.drop_in_place();
+                }
+            }
+        }
+        self.len = kept;
+    }
+
     /// Grows so `additional` more values fit, unless that's past `max`.
     #[cold]
     #[inline(never)]
@@ -294,6 +327,20 @@ mod tests {
         assert_eq!(u32::MAX - left.get(), 2);
         assert_eq!(values.extend_from_slice(&[0; 11]), Err(AllocError));
         assert_eq!(values.len(), 6);
+    }
+
+    #[test]
+    fn retains_and_pops() {
+        let value = Rc::new(());
+        let mut values = Vec::new(Heap, 8).unwrap();
+        for i in 0..6 {
+            assert!(values.push((i, value.clone())).is_ok());
+        }
+        values.retain(|(i, _)| i % 2 == 1);
+        assert_eq!(values.iter().map(|(i, _)| *i).collect::<alloc::vec::Vec<_>>(), [1, 3, 5]);
+        assert_eq!(Rc::strong_count(&value), 4);
+        assert_eq!(values.pop().map(|(i, _)| i), Some(5));
+        assert_eq!(Rc::strong_count(&value), 3);
     }
 
     #[test]

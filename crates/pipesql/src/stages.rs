@@ -1,7 +1,7 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
-use pipit_kernel::plan::{DynOp, PLAN_COLUMNS_MAX, ScanOp};
+use pipit_kernel::plan::{DynOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
 use pipit_kernel::vec::Vec;
 
 use crate::ast::{Node, Tag};
@@ -44,9 +44,9 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     let mut columns = Vec::fixed(allocator.clone(), count as usize)?;
     let mut scope = Vec::new(allocator.clone(), PLAN_COLUMNS_MAX)?;
     for i in 0..count {
-        let column = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
-        columns.push(column)?;
-        scope.push(column)?;
+        let binding = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
+        columns.push(ScanColumn { column: i, binding })?;
+        scope.push(binding)?;
     }
     let scan = DynOp::new(allocator.clone(), ScanOp { scannable: table, columns })?;
     let children = Vec::fixed(allocator, 0)?;

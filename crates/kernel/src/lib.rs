@@ -12,6 +12,7 @@ pub mod column;
 mod erase;
 pub mod lower;
 pub mod names;
+pub mod optimize;
 pub mod pipeline;
 pub mod plan;
 pub mod row_batch;

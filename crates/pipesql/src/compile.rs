@@ -164,4 +164,17 @@ mod tests {
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> WHERE a > 1"), (ErrorCode::Unsupported, 16));
     }
+
+    #[test]
+    fn reads_only_the_columns_selected() {
+        let catalog = catalog();
+        let mut plan = compile(Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();
+        pipit_kernel::optimize::optimize(Heap, &mut plan).unwrap();
+        let physical = lower(Heap, &plan).unwrap();
+        let mut execution = physical.pipeline().start(Heap).unwrap();
+        let mut batch = RowBatch::new();
+        assert!(execution.next(&mut batch));
+        assert_eq!(batch.column_count(), 1);
+        assert_eq!(batch.column(physical.columns()[0].position).int64s(), [10, 20]);
+    }
 }
