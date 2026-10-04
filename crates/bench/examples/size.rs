@@ -10,6 +10,7 @@ use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::context::Context;
 use pipit_parquet::chunk::ChunkReader;
 use pipit_parquet::footer::ParquetFile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
@@ -17,7 +18,7 @@ use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
-use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::spill::{Block, LogId, SpillError, SpillStore, read_column, write_column};
 
@@ -157,16 +158,18 @@ pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
     let Ok(file) = ParquetFile::open(&Heap, &bytes) else { return 0 };
     let Some(&column) = file.columns().first() else { return 0 };
+    let mut context = Context::new(&Heap);
     let mut rows = 0;
     for group in 0..file.row_groups() {
         let Ok(mut reader) = ChunkReader::new(&bytes, column, file.chunk(group, 0)) else {
             return 0;
         };
-        while let Ok(left) = reader.page_left(&Heap) {
-            if left == 0 || reader.read(&Heap, left).is_err() {
+        while let Ok(left) = reader.page_left(&mut context) {
+            let batch = left.min(BATCH_ROWS_MAX as usize);
+            if batch == 0 || reader.read(&mut context, batch).is_err() {
                 break;
             }
-            rows += left;
+            rows += batch;
         }
     }
     rows

@@ -1,10 +1,11 @@
 //! `ChunkReader`: a column chunk's values, a page at a time, decoded into
 //! columns a batch at a time.
 
-use pipit_kernel::allocator::Allocator;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::context::Context;
+use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
 use crate::Error;
 use crate::footer::{Chunk, Column, Physical};
@@ -72,9 +73,9 @@ impl<'s> ChunkReader<'s> {
     /// How many rows are left in the page being read, moving to the next
     /// page if that one's done: 0 once the chunk is. Only reads the next
     /// page's header, not its body.
-    pub fn page_left(&mut self, allocator: &dyn Allocator) -> Result<usize, Error> {
+    pub fn page_left(&mut self, context: &mut Context) -> Result<usize, Error> {
         while self.position.left == 0 && self.position.next < self.end {
-            self.next_page(allocator)?;
+            self.next_page(context)?;
         }
         Ok(self.position.left)
     }
@@ -92,13 +93,13 @@ impl<'s> ChunkReader<'s> {
     /// Passes over the next `rows` rows, which must be in the page being
     /// read, without decoding their values. Passing over the rest of a page
     /// that hasn't been read from doesn't read it at all.
-    pub fn skip(&mut self, allocator: &dyn Allocator, rows: usize) -> Result<(), Error> {
+    pub fn skip(&mut self, context: &mut Context, rows: usize) -> Result<(), Error> {
         check!(rows <= self.position.left);
         if rows == self.position.left && !self.position.started {
             self.position.left = 0;
             return Ok(());
         }
-        let page = self.body(allocator)?;
+        let page = self.body(context)?;
         let page = page.as_slice::<u8>();
         let mut valid = rows;
         if self.column.optional {
@@ -124,11 +125,11 @@ impl<'s> ChunkReader<'s> {
     }
 
     /// The next `rows` rows, which must be in the page being read.
-    pub fn read(&mut self, allocator: &dyn Allocator, rows: usize) -> Result<ColumnView, Error> {
+    pub fn read(&mut self, context: &mut Context, rows: usize) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left);
-        let page = self.body(allocator)?;
+        let page = self.body(context)?;
         let page = page.as_slice::<u8>();
-        let validity = self.validity(allocator, page, rows)?;
+        let validity = self.validity(context, page, rows)?;
         let valid = |row: usize| {
             validity
                 .as_ref()
@@ -145,10 +146,11 @@ impl<'s> ChunkReader<'s> {
                     total += len;
                     at += 4 + len;
                 }
-                let mut offsets = Buffer::allocate(allocator, (rows + 1) * 4)?;
-                let mut bytes = Buffer::allocate(allocator, total)?;
+                let mut offsets = context.column_buffer((rows + 1) * 4)?;
+                let mut bytes = context.column_buffer(total)?;
                 let (ends, out) = (offsets.as_mut_slice::<u32>(), bytes.as_mut_slice::<u8>());
                 let (mut from, mut to) = (0, 0);
+                *at_mut!(ends, 0) = 0;
                 for row in 0..rows {
                     if valid(row) {
                         let len = length(values, from)?;
@@ -162,9 +164,10 @@ impl<'s> ChunkReader<'s> {
             }
             DataType::Int64 | DataType::Float64 => {
                 let (physical, width) = (self.column.physical, self.width());
-                let mut out = Buffer::allocate(allocator, rows * 8)?;
+                let mut out = context.column_buffer(rows * 8)?;
                 let mut at = 0;
                 for (row, word) in out.as_mut_slice::<i64>().iter_mut().enumerate() {
+                    *word = 0;
                     if valid(row) {
                         let bytes = values.get(at..at + width).ok_or(Error::Corrupt)?;
                         *word = plain(physical, bytes).ok_or(Error::Corrupt)?;
@@ -188,28 +191,34 @@ impl<'s> ChunkReader<'s> {
     /// `None` if they can't be null or none are.
     fn validity(
         &mut self,
-        allocator: &dyn Allocator,
+        context: &mut Context,
         page: &[u8],
         rows: usize,
     ) -> Result<Option<Buffer>, Error> {
         if !self.column.optional {
             return Ok(None);
         }
+        check!(rows <= BATCH_ROWS_MAX as usize);
         let levels = page.get(self.position.levels.0..self.position.levels.1);
         let levels = levels.ok_or(Error::Corrupt)?;
-        let mut bits = Buffer::allocate(allocator, rows.div_ceil(8))?;
+        let mut bits = [0_u8; BATCH_ROWS_MAX as usize / 8];
         let mut nulls = 0;
         for row in 0..rows {
             let valid = self.position.level.next(levels).ok_or(Error::Corrupt)? == 1;
-            *at_mut!(bits.as_mut_slice::<u8>(), row / 8) |= u8::from(valid) << (row % 8);
+            *at_mut!(bits, row / 8) |= u8::from(valid) << (row % 8);
             nulls += usize::from(!valid);
         }
-        Ok((nulls > 0).then_some(bits))
+        if nulls == 0 {
+            return Ok(None);
+        }
+        let mut validity = context.column_buffer(rows.div_ceil(8))?;
+        validity.as_mut_slice::<u8>().copy_from_slice(at!(bits, ..rows.div_ceil(8)));
+        Ok(Some(validity))
     }
 
     /// Moves to the next page, reading only its header.
-    fn next_page(&mut self, allocator: &dyn Allocator) -> Result<(), Error> {
-        let (header, body) = self.header(allocator)?;
+    fn next_page(&mut self, context: &mut Context) -> Result<(), Error> {
+        let (header, body) = self.header(context)?;
         let next = body.checked_add(header.len).ok_or(Error::Corrupt)?;
         self.position.next = next;
         match header.kind {
@@ -228,13 +237,13 @@ impl<'s> ChunkReader<'s> {
 
     /// The body of the page being read, read if it isn't already, and its
     /// levels and values found if they haven't been.
-    fn body(&mut self, allocator: &dyn Allocator) -> Result<Buffer, Error> {
+    fn body(&mut self, context: &mut Context) -> Result<Buffer, Error> {
         let body = self.position.body;
         let page = match &self.page {
             Some((at, page)) if *at == body => page.clone(),
             _ => {
                 let len = usize::try_from(self.position.len).map_err(|_| Error::Corrupt)?;
-                let mut page = Buffer::allocate(allocator, len)?;
+                let mut page = Buffer::allocate(context.allocator(), len)?;
                 self.source.read(body, page.as_mut_slice::<u8>())?;
                 self.page = Some((body, page.clone()));
                 page
@@ -253,13 +262,13 @@ impl<'s> ChunkReader<'s> {
     }
 
     /// The header of the page at `next`, and where its body starts.
-    fn header(&self, allocator: &dyn Allocator) -> Result<(PageHeader, u64), Error> {
+    fn header(&self, context: &Context) -> Result<(PageHeader, u64), Error> {
         let next = self.position.next;
         let mut window = HEADER_BYTES as u64;
         loop {
             let len = (self.end - next).min(window);
             let size = usize::try_from(len).map_err(|_| Error::Corrupt)?;
-            let mut bytes = Buffer::allocate(allocator, size)?;
+            let mut bytes = Buffer::allocate(context.allocator(), size)?;
             self.source.read(next, bytes.as_mut_slice::<u8>())?;
             let mut c = Cursor::new(bytes.as_slice::<u8>());
             if let Some(header) = page_header(&mut c) {
@@ -377,16 +386,17 @@ mod tests {
     fn read_all(mut bytes: &[u8], c: usize) -> Vec<Cell> {
         let source: &dyn ByteSource = &mut bytes;
         let file = ParquetFile::open(&Heap, source).unwrap();
+        let mut context = Context::new(&Heap);
         let column = file.columns()[c];
         let mut all = Vec::new();
         for group in 0..file.row_groups() {
             let mut reader = ChunkReader::new(source, column, file.chunk(group, c)).unwrap();
             loop {
-                let rows = reader.page_left(&Heap).unwrap().min(1000);
+                let rows = reader.page_left(&mut context).unwrap().min(1000);
                 if rows == 0 {
                     break;
                 }
-                all.extend(cells(&reader.read(&Heap, rows).unwrap()));
+                all.extend(cells(&reader.read(&mut context, rows).unwrap()));
             }
         }
         all
@@ -419,24 +429,25 @@ mod tests {
         let mut bytes = NULLS;
         let source: &dyn ByteSource = &mut bytes;
         let file = ParquetFile::open(&Heap, source).unwrap();
+        let mut context = Context::new(&Heap);
         for c in 0..3 {
             let mut reader = ChunkReader::new(source, file.columns()[c], file.chunk(0, c)).unwrap();
             let mut row = 0;
             loop {
-                let left = reader.page_left(&Heap).unwrap();
+                let left = reader.page_left(&mut context).unwrap();
                 if left == 0 {
                     break;
                 }
                 let skip = left.min(300);
-                reader.skip(&Heap, skip).unwrap();
+                reader.skip(&mut context, skip).unwrap();
                 let rows = (left - skip).min(50);
                 let start = reader.position();
-                let read = cells(&reader.read(&Heap, rows).unwrap());
+                let read = cells(&reader.read(&mut context, rows).unwrap());
                 let from = i64::try_from(row + skip).unwrap();
                 let expected: Vec<_> = (from..from + 50).take(rows).map(|i| nulls(c, i)).collect();
                 assert_eq!(read, expected);
                 reader.seek(start);
-                assert_eq!(cells(&reader.read(&Heap, rows).unwrap()), expected);
+                assert_eq!(cells(&reader.read(&mut context, rows).unwrap()), expected);
                 row += skip + rows;
             }
             assert_eq!(row, 2048);
@@ -461,15 +472,16 @@ mod tests {
     fn skipping_pages_reads_only_headers() {
         let source = Counting(SMALL, core::cell::Cell::new(0));
         let file = ParquetFile::open(&Heap, &source).unwrap();
+        let mut context = Context::new(&Heap);
         let chunk = file.chunk(0, 0);
         let mut reader = ChunkReader::new(&source, file.columns()[0], chunk).unwrap();
         source.1.set(0);
         loop {
-            let left = reader.page_left(&Heap).unwrap();
+            let left = reader.page_left(&mut context).unwrap();
             if left == 0 {
                 break;
             }
-            reader.skip(&Heap, left).unwrap();
+            reader.skip(&mut context, left).unwrap();
         }
         assert!(source.1.get() * 10 < chunk.len);
     }
