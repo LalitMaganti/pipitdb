@@ -8,6 +8,7 @@ pub mod check;
 pub mod allocator;
 pub mod boxed;
 pub mod buffer;
+pub mod bytes;
 pub mod column;
 pub mod context;
 mod erase;
