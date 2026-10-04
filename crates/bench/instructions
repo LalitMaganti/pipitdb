@@ -1,7 +1,7 @@
 lexer.long_text 103516
 lexer.typical 286202
 parser.expression 457068
-pipeline.operators 1430469
-pipeline.source 241333
-pipeline.transforms 333741
+pipeline.operators 1248554
+pipeline.source 217435
+pipeline.transforms 284965
 query.typical 992029
