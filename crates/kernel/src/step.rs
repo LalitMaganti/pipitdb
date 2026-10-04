@@ -9,7 +9,8 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::boxed::{Box, ErasedBox};
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
@@ -103,10 +104,7 @@ impl Step<'_> {
 /// a pointer to it, and functions that know its type. `F` is the function a
 /// pipeline calls for each batch.
 pub struct Erased<'a, F> {
-    step: NonNull<()>,
-    // Holds the step, which `drop_step` drops.
-    _memory: Buffer,
-    drop_step: unsafe fn(NonNull<()>),
+    step: ErasedBox,
     pub(crate) state_layout: Layout,
     new_state: unsafe fn(NonNull<()>, NonNull<u8>),
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
@@ -129,11 +127,8 @@ impl<'a> DynSource<'a> {
         source: T,
     ) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        let (memory, step) = own(allocator, source)?;
         Ok(Erased {
-            step,
-            _memory: memory,
-            drop_step: drop_value::<T>,
+            step: Box::new(allocator, source)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_source_state::<T>,
             drop_state: drop_state::<T::State>,
@@ -148,7 +143,7 @@ impl<'a> DynSource<'a> {
     pub(crate) unsafe fn next(&self, batch: &mut RowBatch, state: NonNull<u8>) -> bool {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
-        unsafe { (self.run)(self.step, batch, state) }
+        unsafe { (self.run)(self.step.as_ptr(), batch, state) }
     }
 }
 
@@ -158,11 +153,8 @@ impl<'a> DynTransform<'a> {
         transform: T,
     ) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        let (memory, step) = own(allocator, transform)?;
         Ok(Erased {
-            step,
-            _memory: memory,
-            drop_step: drop_value::<T>,
+            step: Box::new(allocator, transform)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_transform_state::<T>,
             drop_state: drop_state::<T::State>,
@@ -176,7 +168,7 @@ impl<'a> DynTransform<'a> {
     /// As for `DynSource::next`.
     pub(crate) unsafe fn process(&self, batch: &mut RowBatch, state: NonNull<u8>) {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run)(self.step, batch, state) }
+        unsafe { (self.run)(self.step.as_ptr(), batch, state) }
     }
 }
 
@@ -186,11 +178,8 @@ impl<'a> DynOperator<'a> {
         operator: T,
     ) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        let (memory, step) = own(allocator, operator)?;
         Ok(Erased {
-            step,
-            _memory: memory,
-            drop_step: drop_value::<T>,
+            step: Box::new(allocator, operator)?.erase(),
             state_layout: Layout::new::<T::State>(),
             new_state: new_operator_state::<T>,
             drop_state: drop_state::<T::State>,
@@ -209,7 +198,7 @@ impl<'a> DynOperator<'a> {
         state: NonNull<u8>,
     ) -> Progress {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.execute)(self.step, input, output, state) }
+        unsafe { (self.run.execute)(self.step.as_ptr(), input, output, state) }
     }
 
     /// # Safety
@@ -217,7 +206,7 @@ impl<'a> DynOperator<'a> {
     /// As for `DynSource::next`.
     pub(crate) unsafe fn finish(&self, output: &mut RowBatch, state: NonNull<u8>) -> Progress {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.finish)(self.step, output, state) }
+        unsafe { (self.run.finish)(self.step.as_ptr(), output, state) }
     }
 }
 
@@ -228,37 +217,8 @@ impl<F> Erased<'_, F> {
     pub(crate) unsafe fn new_state(&self, state: NonNull<u8>) {
         // SAFETY: `new_state` matches `step`'s type, and the caller upholds
         // the rest.
-        unsafe { (self.new_state)(self.step, state) }
+        unsafe { (self.new_state)(self.step.as_ptr(), state) }
     }
-}
-
-impl<F> Drop for Erased<'_, F> {
-    fn drop(&mut self) {
-        // SAFETY: `drop_step` matches `step`'s type, and runs once; the
-        // memory is freed after.
-        unsafe { (self.drop_step)(self.step) }
-    }
-}
-
-/// Moves `value` into memory from `allocator`.
-fn own<A: Allocator + Clone + 'static, T>(
-    allocator: A,
-    value: T,
-) -> Result<(Buffer, NonNull<()>), AllocError> {
-    const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-    // SAFETY: the value is written before anything reads it.
-    let mut memory = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
-    let Some(step) = NonNull::new(memory.as_mut_ptr::<u8>()) else {
-        crate::check::check_failed(line!());
-    };
-    // SAFETY: the memory has room for a `T`, aligned for it.
-    unsafe { step.cast::<T>().write(value) };
-    Ok((memory, step.cast()))
-}
-
-unsafe fn drop_value<T>(value: NonNull<()>) {
-    // SAFETY: see below.
-    unsafe { value.cast::<T>().drop_in_place() }
 }
 
 // These undo the erasure. Each is only stored next to a pointer to a `T`, and

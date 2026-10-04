@@ -6,6 +6,7 @@ extern crate alloc;
 pub mod check;
 
 pub mod allocator;
+pub mod boxed;
 pub mod buffer;
 pub mod column;
 pub mod pipeline;
