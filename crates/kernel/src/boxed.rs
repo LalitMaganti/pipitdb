@@ -16,10 +16,7 @@ pub struct Box<T> {
 }
 
 impl<T> Box<T> {
-    pub fn new<A: Allocator + Clone + 'static>(
-        allocator: A,
-        value: T,
-    ) -> Result<Box<T>, AllocError> {
+    pub fn new(allocator: &dyn Allocator, value: T) -> Result<Box<T>, AllocError> {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         // SAFETY: the value is written before anything reads it.
         let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
@@ -97,7 +94,7 @@ mod tests {
     #[test]
     fn holds_and_drops_its_value() {
         let live = Rc::new(());
-        let mut boxed = Box::new(Heap, (1, live.clone())).unwrap();
+        let mut boxed = Box::new(&Heap, (1, live.clone())).unwrap();
         boxed.0 += 1;
         assert_eq!(boxed.0, 2);
         assert_eq!(Rc::strong_count(&live), 2);
@@ -108,7 +105,7 @@ mod tests {
     #[test]
     fn drops_its_value_once_erased() {
         let live = Rc::new(());
-        let erased = Box::new(Heap, live.clone()).unwrap().erase();
+        let erased = Box::new(&Heap, live.clone()).unwrap().erase();
         // SAFETY: it holds an `Rc<()>`.
         assert_eq!(unsafe { erased.as_ptr().cast::<Rc<()>>().as_ref() }, &live);
         assert_eq!(Rc::strong_count(&live), 2);

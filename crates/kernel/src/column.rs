@@ -122,9 +122,9 @@ mod tests {
 
     #[test]
     fn reads_values_and_nulls() {
-        let mut values = Buffer::allocate(Heap, 4 * 8).unwrap();
+        let mut values = Buffer::allocate(&Heap, 4 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3, 4]);
-        let mut validity = Buffer::allocate(Heap, 1).unwrap();
+        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
         validity.as_mut_slice::<u8>()[0] = 0b1011;
 
         let column = ColumnView::new(DataType::Int64, values, Some(validity));
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Int64")]
     fn reading_the_wrong_type_panics() {
-        let values = Buffer::allocate(Heap, 8).unwrap();
+        let values = Buffer::allocate(&Heap, 8).unwrap();
         ColumnView::new(DataType::Float64, values, None).int64s();
     }
 }

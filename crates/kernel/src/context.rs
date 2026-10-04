@@ -1,29 +1,29 @@
 //! `Context`: what a run's steps share, passed to each as it runs, so what
 //! they share can grow without changing every step's functions.
 
-use crate::allocator::{AllocError, DynAllocator};
+use crate::allocator::{AllocError, Allocator};
 use crate::selection::Selection;
 use crate::vec::Vec;
 
 /// The most scratch selections a run can have.
 pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
 
-pub struct Context {
-    allocator: DynAllocator,
+pub struct Context<'a> {
+    allocator: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
     selections: Option<Vec<Selection>>,
 }
 
-impl Context {
+impl<'a> Context<'a> {
     /// A context whose states allocate from `allocator`, for steps run
     /// outside a pipeline, such as in tests.
-    pub fn new(allocator: DynAllocator) -> Context {
+    pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
         Context { allocator, selections: None }
     }
 
     /// What the run's memory comes from, for states to allocate with.
-    pub fn allocator(&self) -> &DynAllocator {
-        &self.allocator
+    pub fn allocator(&self) -> &'a dyn Allocator {
+        self.allocator
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
@@ -36,9 +36,7 @@ impl Context {
         }
         let selections = match &mut self.selections {
             Some(selections) => selections,
-            None => {
-                self.selections.insert(Vec::new(self.allocator.clone(), SCRATCH_SELECTIONS_MAX)?)
-            }
+            None => self.selections.insert(Vec::new(self.allocator, SCRATCH_SELECTIONS_MAX)?),
         };
         while selections.len() < count {
             selections.push(Selection::all(0))?;
@@ -60,7 +58,7 @@ mod tests {
 
     #[test]
     fn shares_scratch_between_steps() {
-        let mut context = Context::new(DynAllocator::new(Heap).unwrap());
+        let mut context = Context::new(&Heap);
         assert!(context.selections().is_empty());
         // As many as the most reserved, not the sum.
         assert!(context.reserve_selections(2).is_ok() && context.reserve_selections(1).is_ok());

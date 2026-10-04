@@ -19,7 +19,7 @@ use pipit_kernel::vec::Vec;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
-    let Ok(mut values) = Buffer::allocate(Heap, count as usize * size_of::<i64>()) else {
+    let Ok(mut values) = Buffer::allocate(&Heap, count as usize * size_of::<i64>()) else {
         return 0;
     };
     values.as_mut_slice::<i64>().fill(value);
@@ -35,7 +35,7 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
 /// `value` doubled, through a `Box`.
 #[unsafe(no_mangle)]
 pub extern "C" fn box_double(value: u64) -> u64 {
-    let Ok(mut boxed) = Box::new(Heap, value) else { return 0 };
+    let Ok(mut boxed) = Box::new(&Heap, value) else { return 0 };
     *boxed *= 2;
     *boxed
 }
@@ -43,7 +43,7 @@ pub extern "C" fn box_double(value: u64) -> u64 {
 /// Pushes `0..count` to a `Vec`, and returns the last.
 #[unsafe(no_mangle)]
 pub extern "C" fn vec_sum(count: u32) -> u64 {
-    let Ok(mut values) = Vec::new(Heap, (count as usize).next_power_of_two()) else { return 0 };
+    let Ok(mut values) = Vec::new(&Heap, (count as usize).next_power_of_two()) else { return 0 };
     for i in 0..count {
         if values.push(u64::from(i)).is_err() {
             return 0;
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn token_count(source: *const u8, len: usize) -> u32 {
 pub unsafe extern "C" fn expression_node_count(source: *const u8, len: usize) -> u32 {
     // SAFETY: guaranteed by the caller.
     let source = unsafe { core::slice::from_raw_parts(source, len) };
-    match parse_expression(Heap, source) {
+    match parse_expression(&Heap, source) {
         Ok(ast) => ast.node_count(),
         Err(error) => u32::from(error.code as u16),
     }
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn expression_node_count(source: *const u8, len: usize) ->
 pub unsafe extern "C" fn query_node_count(source: *const u8, len: usize) -> u32 {
     // SAFETY: guaranteed by the caller.
     let source = unsafe { core::slice::from_raw_parts(source, len) };
-    match parse_query(Heap, &REGISTRY, source) {
+    match parse_query(&Heap, &REGISTRY, source) {
         Ok(ast) => ast.node_count(),
         Err(error) => u32::from(error.code as u16),
     }

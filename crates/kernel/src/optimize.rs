@@ -7,10 +7,7 @@ use crate::plan::{ColumnId, LogicalPlan, PLAN_NODES_MAX, PlanNodeId};
 use crate::vec::Vec;
 
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
-pub fn optimize<A: Allocator + Clone + 'static>(
-    allocator: A,
-    plan: &mut LogicalPlan<'_>,
-) -> Result<(), AllocError> {
+pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)
 }
 
@@ -46,12 +43,12 @@ pub enum Pruned {
 /// Drops columns that nothing in the plan uses, so sources read less and ops
 /// skip work nobody reads, as Perfetto's `PruneColumns`. From the output down,
 /// each op drops what it makes that isn't needed, and marks what it reads.
-pub fn prune_columns<A: Allocator + Clone + 'static>(
-    allocator: A,
+pub fn prune_columns(
+    allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     let unneeded = core::iter::repeat_n(false, plan.columns.len());
-    let mut needed = Needed { columns: Vec::fixed_from(allocator.clone(), unneeded)? };
+    let mut needed = Needed { columns: Vec::fixed_from(allocator, unneeded)? };
     for column in plan.output.iter() {
         needed.need(column.id);
     }

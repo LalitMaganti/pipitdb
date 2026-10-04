@@ -18,8 +18,8 @@ pub const NESTING_MAX: usize = 64;
 pub const LIST_MAX: usize = 64;
 
 /// Parses `source` as a query, with the stages in `registry`.
-pub fn parse_query<A: Allocator + Clone + 'static>(
-    allocator: A,
+pub fn parse_query(
+    allocator: &dyn Allocator,
     registry: &Registry,
     source: &[u8],
 ) -> Result<Ast, Error> {
@@ -33,10 +33,7 @@ pub fn parse_query<A: Allocator + Clone + 'static>(
 }
 
 /// Parses `source` as a single expression.
-pub fn parse_expression<A: Allocator + Clone + 'static>(
-    allocator: A,
-    source: &[u8],
-) -> Result<Ast, Error> {
+pub fn parse_expression(allocator: &dyn Allocator, source: &[u8]) -> Result<Ast, Error> {
     let mut parser = Parser::new(allocator, source)?;
     let root = parser.expression()?;
     let current = parser.current();
@@ -55,10 +52,7 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new<A: Allocator + Clone + 'static>(
-        allocator: A,
-        source: &'a [u8],
-    ) -> Result<Parser<'a>, Error> {
+    pub(crate) fn new(allocator: &dyn Allocator, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
         // SAFETY: nodes are read only once written.
@@ -497,12 +491,12 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_expression(Heap, source.as_bytes()).unwrap();
+        let ast = parse_expression(&Heap, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_expression(Heap, source.as_bytes()).err().unwrap();
+        let error = parse_expression(&Heap, source.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
@@ -532,7 +526,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn parses_past_the_first_block() {
         let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        let ast = parse_expression(Heap, long.as_bytes()).unwrap();
+        let ast = parse_expression(&Heap, long.as_bytes()).unwrap();
         assert_eq!(ast.node_count() as usize, 2 * crate::ast::BLOCK_NODES - 1);
     }
 

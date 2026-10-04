@@ -214,10 +214,10 @@ mod tests {
 
     /// `0, 1, ..., 9`, with rows in `nulls` null.
     fn int64s(nulls: &[u16]) -> ColumnView {
-        let mut values = Buffer::allocate(Heap, 80).unwrap();
+        let mut values = Buffer::allocate(&Heap, 80).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut validity = Buffer::allocate(Heap, 2).unwrap();
+            let mut validity = Buffer::allocate(&Heap, 2).unwrap();
             for row in 0..10_u16 {
                 if !nulls.contains(&row) {
                     validity.as_mut_slice::<u8>()[row as usize / 8] |= 1 << (row % 8);
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn compares_at_the_ends_of_the_range() {
         let cells = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
-        let mut values = Buffer::allocate(Heap, 56).unwrap();
+        let mut values = Buffer::allocate(&Heap, 56).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&cells);
         let column = ColumnView::new(DataType::Int64, values, None);
         let comparisons: [(Comparison, Holds); 6] = [
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn compares_floats_as_duckdb_does() {
-        let mut values = Buffer::allocate(Heap, 48).unwrap();
+        let mut values = Buffer::allocate(&Heap, 48).unwrap();
         let cells = [-1.5, -0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
         values.as_mut_slice::<f64>().copy_from_slice(&cells);
         let column = ColumnView::new(DataType::Float64, values, None);
