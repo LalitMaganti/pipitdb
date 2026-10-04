@@ -1,0 +1,17 @@
+[package]
+name = "pipitdb-file"
+description = "What pipitdb needs from the operating system's files, such as spilling to local disk."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_file"
+
+[dependencies]
+pipitdb-kernel = { path = "../kernel" }
+
+[lints]
+workspace = true
