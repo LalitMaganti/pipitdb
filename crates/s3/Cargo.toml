@@ -1,0 +1,21 @@
+[package]
+name = "pipitdb-s3"
+description = "Spilling pipitdb's state to S3, or anything that speaks its API."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_s3"
+
+[dependencies]
+pipitdb-file = { path = "../file" }
+pipitdb-kernel = { path = "../kernel" }
+rusty-s3 = { version = "0.10", default-features = false, features = ["rustcrypto", "xml"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+url = "2"
+
+[lints]
+workspace = true

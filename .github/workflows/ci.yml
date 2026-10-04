@@ -31,7 +31,29 @@ jobs:
         env:
           PIPIT_AST_BLOCK_BYTES: 4096
           PIPIT_AST_BLOCK_SLOTS: 4
-      - run: cargo build --release --target wasm32-unknown-unknown
+      # Spilling to S3 needs sockets, which Wasm doesn't have.
+      - run: cargo build --release --target wasm32-unknown-unknown --workspace --exclude pipitdb-s3
+
+  # Spilling to a real S3 API: Silo, a maintained fork of MinIO's server.
+  s3:
+    runs-on: ubuntu-latest
+    env:
+      PIPIT_S3_ENDPOINT: http://127.0.0.1:9000
+      PIPIT_S3_KEY: pipitdb
+      PIPIT_S3_SECRET: pipitdb-secret
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: |
+          docker run -d -p 9000:9000 \
+            -e MINIO_ROOT_USER=$PIPIT_S3_KEY -e MINIO_ROOT_PASSWORD=$PIPIT_S3_SECRET \
+            docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
+      - uses: ./.github/actions/setup-rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      # Silo takes a moment to start.
+      - run: timeout 60 sh -c 'until curl -s $PIPIT_S3_ENDPOINT/minio/health/live; do sleep 1; done'
+      - run: cargo test -p pipitdb-s3
 
   # The engine on Windows, where files work differently. The benchmarks are
   # left out: one of their dependencies needs a C compiler there.
