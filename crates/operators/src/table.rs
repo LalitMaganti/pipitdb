@@ -1,8 +1,9 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
 //! footer, which pipelines can scan.
 
-use pipit_kernel::allocator::{AllocError, Allocator, DynAllocator};
+use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::vec::Vec;
@@ -96,11 +97,17 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
-    fn new_state(&self, _: &DynAllocator) -> Result<ScanState, AllocError> {
+    fn new_state(&self, _: &mut Context) -> Result<ScanState, AllocError> {
         Ok(ScanState { row_group: 0, row: 0 })
     }
 
-    fn next(&self, columns: &[u32], batch: &mut RowBatch, at: &mut ScanState) -> bool {
+    fn next(
+        &self,
+        columns: &[u32],
+        batch: &mut RowBatch,
+        at: &mut ScanState,
+        _: &mut Context,
+    ) -> bool {
         loop {
             let Some(row_group) = self.row_groups.get(at.row_group) else { return false };
             let rows = (row_group.row_count - at.row).min(BATCH_ROWS_MAX);
@@ -126,7 +133,7 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
+    use pipit_kernel::allocator::{DynAllocator, Heap};
     use pipit_kernel::buffer::Buffer;
 
     use super::*;
@@ -140,11 +147,11 @@ mod tests {
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let allocator = DynAllocator::new(Heap).unwrap();
-        let mut state = table.new_state(&allocator).unwrap();
+        let mut context = Context::new(DynAllocator::new(Heap).unwrap());
+        let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while table.next(columns, &mut batch, &mut state) {
+        while table.next(columns, &mut batch, &mut state, &mut context) {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }

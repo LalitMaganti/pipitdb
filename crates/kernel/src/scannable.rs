@@ -5,10 +5,11 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator, DynAllocator};
+use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::DataType;
+use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::step::{DynSource, NewState};
@@ -29,12 +30,18 @@ pub trait Scannable {
     /// What `column` holds. Every batch's `column` has this type.
     fn column_type(&self, column: u32) -> DataType;
 
-    /// The state of a read from the first row, with memory from `allocator`.
-    fn new_state(&self, allocator: &DynAllocator) -> Result<Self::State, AllocError>;
+    /// The state of a read from the first row.
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, AllocError>;
 
     /// Fills `batch`, which is empty when called, with the next rows of
     /// `columns`, in that order, or returns false when no rows are left.
-    fn next(&self, columns: &[u32], batch: &mut RowBatch, state: &mut Self::State) -> bool;
+    fn next(
+        &self,
+        columns: &[u32],
+        batch: &mut RowBatch,
+        state: &mut Self::State,
+        context: &mut Context,
+    ) -> bool;
 }
 
 /// The tables a frontend can read, provided by the embedder.
@@ -42,6 +49,9 @@ pub trait Catalog {
     /// What's registered as `name`, if anything.
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
+
+type ScannableNext =
+    unsafe fn(NonNull<()>, &[u32], &mut RowBatch, NonNull<u8>, &mut Context) -> bool;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
 /// allocator, and functions that know its type.
@@ -53,7 +63,7 @@ pub struct DynScannable<'a> {
     state_layout: Layout,
     new_state: NewState,
     drop_state: unsafe fn(NonNull<u8>),
-    next: unsafe fn(NonNull<()>, &[u32], &mut RowBatch, NonNull<u8>) -> bool,
+    next: ScannableNext,
     lifetime: PhantomData<&'a ()>,
 }
 
@@ -77,15 +87,16 @@ impl<'a> DynScannable<'a> {
             },
             state_layout: Layout::new::<T::State>(),
             // SAFETY: as above.
-            new_state: |scannable, state, allocator| unsafe {
-                let made = value_of::<T>(scannable).new_state(allocator)?;
+            new_state: |scannable, state, context| unsafe {
+                let made = value_of::<T>(scannable).new_state(context)?;
                 write_state(state, made);
                 Ok(())
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
-            next: |scannable, columns, batch, state| unsafe {
-                value_of::<T>(scannable).next(columns, batch, state_of::<T::State>(state))
+            next: |scannable, columns, batch, state, context| unsafe {
+                let state = state_of::<T::State>(state);
+                value_of::<T>(scannable).next(columns, batch, state, context)
             },
             lifetime: PhantomData,
         })
@@ -139,22 +150,27 @@ struct Scan {
 unsafe fn scan_new_state(
     step: NonNull<()>,
     state: NonNull<u8>,
-    allocator: &DynAllocator,
+    context: &mut Context,
 ) -> Result<(), AllocError> {
     // SAFETY: `step` is a `Scan`, whose scannable outlives it.
     let scannable = unsafe { step.cast::<Scan>().as_ref().scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), state, allocator) }
+    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), state, context) }
 }
 
-unsafe fn scan_next(step: NonNull<()>, batch: &mut RowBatch, state: NonNull<u8>) -> bool {
+unsafe fn scan_next(
+    step: NonNull<()>,
+    batch: &mut RowBatch,
+    state: NonNull<u8>,
+    context: &mut Context,
+) -> bool {
     // SAFETY: as in `scan_new_state`.
     let scan = unsafe { step.cast::<Scan>().as_ref() };
     // SAFETY: as in `scan_new_state`.
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
-    unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, batch, state) }
+    unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, batch, state, context) }
 }
 
 #[cfg(test)]
@@ -185,11 +201,17 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &DynAllocator) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
             Ok(false)
         }
 
-        fn next(&self, columns: &[u32], batch: &mut RowBatch, done: &mut bool) -> bool {
+        fn next(
+            &self,
+            columns: &[u32],
+            batch: &mut RowBatch,
+            done: &mut bool,
+            _: &mut Context,
+        ) -> bool {
             if *done {
                 return false;
             }

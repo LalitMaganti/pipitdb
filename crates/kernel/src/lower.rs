@@ -149,6 +149,7 @@ mod tests {
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
+    use crate::context::Context;
     use crate::plan::{DynOp, ScanColumn, ScanOp};
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable};
@@ -171,11 +172,17 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &DynAllocator) -> Result<bool, AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<bool, AllocError> {
             Ok(false)
         }
 
-        fn next(&self, columns: &[u32], batch: &mut RowBatch, done: &mut bool) -> bool {
+        fn next(
+            &self,
+            columns: &[u32],
+            batch: &mut RowBatch,
+            done: &mut bool,
+            _: &mut Context,
+        ) -> bool {
             if *done {
                 return false;
             }
@@ -269,11 +276,11 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &DynAllocator) -> Result<(), AllocError> {
+        fn new_state(&self, _: &mut Context) -> Result<(), AllocError> {
             Ok(())
         }
 
-        fn next(&self, _: &[u32], _: &mut RowBatch, (): &mut ()) -> bool {
+        fn next(&self, _: &[u32], _: &mut RowBatch, (): &mut (), _: &mut Context) -> bool {
             false
         }
     }

@@ -5,7 +5,6 @@
 //! it's false for. A null row is neither, as in SQL, so `NOT` swaps the two
 //! and every node keeps SQL's three-valued logic without building booleans.
 
-use crate::allocator::{AllocError, Allocator};
 use crate::column::ColumnView;
 use crate::filter::{self, Comparison, Value};
 use crate::row_batch::RowBatch;
@@ -41,47 +40,52 @@ pub enum Leaf {
 /// Its root is its last node.
 pub struct Predicate {
     nodes: Vec<Node>,
-}
-
-/// Selections a predicate's `AND`s and `OR`s work in, one for each node, made
-/// once for a run so no batch allocates.
-pub struct Scratch {
-    selections: Vec<Selection>,
+    depth: u32,
 }
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
     pub fn new(nodes: Vec<Node>) -> Predicate {
-        check!(!nodes.is_empty());
+        check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
+        // Each node's depth: how many selections it holds at once, at most.
+        let mut depths = [0_u32; PREDICATE_NODES_MAX];
         for (i, node) in (0..).zip(nodes.iter()) {
-            match *node {
-                Node::Leaf(_) => {}
-                Node::And(a, b) | Node::Or(a, b) => check!(a < i && b < i),
-                Node::Not(a) => check!(a < i),
-            }
+            let depth = |child: u32| *at!(depths, child as usize);
+            *at_mut!(depths, i as usize) = match *node {
+                Node::Leaf(_) => 0,
+                // One while its children run, in case it needs the rows left.
+                Node::And(a, b) | Node::Or(a, b) => {
+                    check!(a < i && b < i);
+                    1 + depth(a).max(depth(b))
+                }
+                Node::Not(a) => {
+                    check!(a < i);
+                    depth(a)
+                }
+            };
         }
-        Predicate { nodes }
+        let depth = *at!(depths, nodes.len() - 1);
+        Predicate { nodes, depth }
     }
 
-    pub fn scratch<A: Allocator + Clone + 'static>(
-        &self,
-        allocator: A,
-    ) -> Result<Scratch, AllocError> {
-        let selections = (0..self.nodes.len()).map(|_| Selection::all(0));
-        Ok(Scratch { selections: Vec::fixed_from(allocator, selections)? })
+    /// How many scratch selections `select` needs.
+    pub fn depth(&self) -> u32 {
+        self.depth
     }
 
-    /// Narrows `batch`'s selection to the rows this is true for.
+    /// Narrows `batch`'s selection to the rows this is true for, working in
+    /// `scratch`, which holds at least `depth` selections.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX` nodes")]
-    pub fn select(&self, batch: &mut RowBatch, scratch: &mut Scratch) {
-        check!(scratch.selections.len() == self.nodes.len());
+    pub fn select(&self, batch: &mut RowBatch, scratch: &mut [Selection]) {
+        check!(scratch.len() >= self.depth as usize);
         let (columns, selection) = batch.columns_and_selection();
         let root = self.nodes.len() as u32 - 1;
-        self.narrow(root, true, columns, selection, &mut scratch.selections);
+        self.narrow(root, true, columns, selection, scratch);
     }
 
-    /// Narrows `selection` to the rows node `node` is `want` for. Children come
-    /// before parents, so a node's scratch is past all its children's.
+    /// Narrows `selection` to the rows node `node` is `want` for. A node that
+    /// needs a selection takes the first of `scratch`, and its children work
+    /// in the rest.
     fn narrow(
         &self,
         node: u32,
@@ -90,27 +94,27 @@ impl Predicate {
         selection: &mut Selection,
         scratch: &mut [Selection],
     ) {
-        let (below, mine) = scratch.split_at_mut(node as usize);
-        let Some(mine) = mine.first_mut() else { crate::check::check_failed(line!()) };
         match *at!(self.nodes, node as usize) {
             Node::Leaf(leaf) => leaf.narrow(want, columns, selection, None),
-            Node::Not(child) => self.narrow(child, !want, columns, selection, below),
+            Node::Not(child) => self.narrow(child, !want, columns, selection, scratch),
             // True for both, or false for both: each narrows what the other left.
-            Node::And(a, b) if want => self.both(a, b, true, columns, selection, below),
-            Node::Or(a, b) if !want => self.both(a, b, false, columns, selection, below),
+            Node::And(a, b) if want => self.both(a, b, true, columns, selection, scratch),
+            Node::Or(a, b) if !want => self.both(a, b, false, columns, selection, scratch),
             // False for either, or true for either: the rows `a` is `want` for,
             // and those `b` is among the rest.
             Node::And(a, b) | Node::Or(a, b) => {
-                let rest = mine;
+                let Some((rest, scratch)) = scratch.split_first_mut() else {
+                    crate::check::check_failed(line!());
+                };
                 if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
                     // In one pass.
                     leaf.narrow(want, columns, selection, Some(rest));
                 } else {
                     rest.clone_from(selection);
-                    self.narrow(a, want, columns, selection, below);
+                    self.narrow(a, want, columns, selection, scratch);
                     rest.subtract(selection);
                 }
-                self.narrow(b, want, columns, rest, below);
+                self.narrow(b, want, columns, rest, scratch);
                 selection.union(rest);
             }
         }
@@ -123,10 +127,10 @@ impl Predicate {
         want: bool,
         columns: &[ColumnView],
         selection: &mut Selection,
-        below: &mut [Selection],
+        scratch: &mut [Selection],
     ) {
-        self.narrow(a, want, columns, selection, below);
-        self.narrow(b, want, columns, selection, below);
+        self.narrow(a, want, columns, selection, scratch);
+        self.narrow(b, want, columns, selection, scratch);
     }
 }
 
@@ -240,7 +244,8 @@ mod tests {
         let mut nodes = Vec::new(Heap, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         let predicate = Predicate::new(nodes);
-        let mut scratch = predicate.scratch(Heap).unwrap();
+        let mut scratch: StdVec<Selection> =
+            (0..predicate.depth()).map(|_| Selection::all(0)).collect();
         let mut batch = RowBatch::new();
         batch.reset(6);
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
@@ -270,6 +275,13 @@ mod tests {
             &Expr::Not(&NULL_OR_B),
             &Expr::Not(&Expr::Not(&Expr::And(&EITHER, &Expr::Not(&BOTH)))),
         ];
+        // One scratch selection per `AND` or `OR` nested in another.
+        let depth = |expr: &Expr| {
+            let mut nodes = Vec::new(Heap, PREDICATE_NODES_MAX).unwrap();
+            build(expr, &mut nodes);
+            Predicate::new(nodes).depth()
+        };
+        assert_eq!([&A2, &BOTH, exprs[8]].map(depth), [0, 1, 2]);
         for expr in exprs {
             let expected: StdVec<usize> =
                 (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
