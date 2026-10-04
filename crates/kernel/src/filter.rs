@@ -36,17 +36,21 @@ pub fn compare(
     dropped: Option<&mut Selection>,
 ) {
     check_covers(column, selection);
+    let key = match value {
+        Value::Int64(value) => value,
+        Value::Float64(value) => float_key(value),
+    };
+    let Some(range) = Range::of(comparison, key) else {
+        return drop_all(selection, dropped);
+    };
     match value {
-        Value::Int64(value) => {
+        Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
-            let cells = column.int64s();
-            compare_cells(column, cells, |cell| cell, comparison, value, selection, dropped);
+            compare_cells(column, column.int64s(), |cell| cell, range, selection, dropped);
         }
-        Value::Float64(value) => {
+        Value::Float64(_) => {
             check!(column.data_type() == DataType::Float64);
-            let cells = column.float64s();
-            let value = float_key(value);
-            compare_cells(column, cells, float_key, comparison, value, selection, dropped);
+            compare_cells(column, column.float64s(), float_key, range, selection, dropped);
         }
     }
 }
@@ -62,7 +66,8 @@ pub fn is_null(
     check_covers(column, selection);
     match column.validity() {
         // No row is null.
-        None => retain(selection, dropped, |_| !nulls),
+        None if nulls => drop_all(selection, dropped),
+        None => keep_all(selection, dropped),
         Some(validity) => retain(selection, dropped, move |row| {
             // SAFETY: `check_covers` checked every row is a row of `column`.
             let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
@@ -71,29 +76,48 @@ pub fn is_null(
     }
 }
 
-/// `compare` for `cells`, the values of `column`, compared by `key`. One loop
-/// per comparison, so no loop branches on it.
-fn compare_cells<T: Copy, K: Copy + PartialOrd>(
+/// The keys `lo` to `lo + span`, wrapping from `i64::MAX` to `i64::MIN`, so
+/// one test covers every comparison: `!= v` is `v + 1` round to `v - 1`.
+#[derive(Clone, Copy)]
+struct Range {
+    lo: i64,
+    span: u64,
+}
+
+impl Range {
+    /// The keys `key <comparison> value` is true for, or `None` if none.
+    fn of(comparison: Comparison, value: i64) -> Option<Range> {
+        let (lo, hi) = match comparison {
+            Comparison::Equal => (value, value),
+            Comparison::NotEqual => (value.wrapping_add(1), value.wrapping_sub(1)),
+            Comparison::Less => (i64::MIN, value.checked_sub(1)?),
+            Comparison::LessEqual => (i64::MIN, value),
+            Comparison::Greater => (value.checked_add(1)?, i64::MAX),
+            Comparison::GreaterEqual => (value, i64::MAX),
+        };
+        Some(Range { lo, span: hi.wrapping_sub(lo).cast_unsigned() })
+    }
+
+    /// One subtraction and one comparison, with no branch.
+    #[inline]
+    fn contains(self, key: i64) -> bool {
+        key.wrapping_sub(self.lo).cast_unsigned() <= self.span
+    }
+}
+
+/// `compare` for `cells`, the values of `column`, whose keys are `key`.
+fn compare_cells<T: Copy>(
     column: &ColumnView,
     cells: &[T],
-    key: impl Fn(T) -> K + Copy,
-    comparison: Comparison,
-    value: K,
+    key: impl Fn(T) -> i64 + Copy,
+    range: Range,
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
 ) {
     // SAFETY: `compare` checked every row is a row of `column`, whose values
     // `cells` are.
     let at = move |row: u16| key(unsafe { cell(cells, row) });
-    let (s, d) = (selection, dropped);
-    match comparison {
-        Comparison::Equal => retain_valid(column, s, d, move |row| at(row) == value),
-        Comparison::NotEqual => retain_valid(column, s, d, move |row| at(row) != value),
-        Comparison::Less => retain_valid(column, s, d, move |row| at(row) < value),
-        Comparison::LessEqual => retain_valid(column, s, d, move |row| at(row) <= value),
-        Comparison::Greater => retain_valid(column, s, d, move |row| at(row) > value),
-        Comparison::GreaterEqual => retain_valid(column, s, d, move |row| at(row) >= value),
-    }
+    retain_valid(column, selection, dropped, move |row| range.contains(at(row)));
 }
 
 /// A float's place in the order SQL engines like DuckDB compare floats in:
@@ -125,6 +149,27 @@ fn retain_valid(
             valid & test(row)
         }),
     }
+}
+
+/// Drops every row, writing them to `dropped`, if given.
+fn drop_all(selection: &mut Selection, dropped: Option<&mut Selection>) {
+    if let Some(dropped) = dropped {
+        dropped.clone_from(selection);
+    }
+    selection.retain(never);
+}
+
+/// Keeps every row, so `dropped`, if given, is left with none.
+fn keep_all(selection: &Selection, dropped: Option<&mut Selection>) {
+    if let Some(dropped) = dropped {
+        dropped.clone_from(selection);
+        dropped.retain(never);
+    }
+}
+
+/// One function, so `drop_all` and `keep_all` share a loop.
+fn never(_: u16) -> bool {
+    false
 }
 
 /// Narrows `selection` to the rows `test` is true for, writing the rows it
@@ -204,6 +249,51 @@ mod tests {
         assert_eq!(rows(Comparison::LessEqual), [0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(rows(Comparison::Greater), [7, 8, 9]);
         assert_eq!(rows(Comparison::GreaterEqual), [6, 7, 8, 9]);
+    }
+
+    /// Whether a comparison holds, as Rust's operators say.
+    type Holds = fn(&i64, &i64) -> bool;
+
+    #[test]
+    fn compares_at_the_ends_of_the_range() {
+        let cells = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        let mut values = Buffer::allocate(Heap, 56).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&cells);
+        let column = ColumnView::new(DataType::Int64, values, None);
+        let comparisons: [(Comparison, Holds); 6] = [
+            (Comparison::Equal, i64::eq),
+            (Comparison::NotEqual, i64::ne),
+            (Comparison::Less, i64::lt),
+            (Comparison::LessEqual, i64::le),
+            (Comparison::Greater, i64::gt),
+            (Comparison::GreaterEqual, i64::ge),
+        ];
+        for (comparison, holds) in comparisons {
+            for value in cells {
+                let mut selection = Selection::all(7);
+                let mut dropped = Selection::all(0);
+                compare(
+                    &column,
+                    comparison,
+                    Value::Int64(value),
+                    &mut selection,
+                    Some(&mut dropped),
+                );
+                let rows = |selection: &Selection| match selection.kept() {
+                    Kept::All => (0..7).collect(),
+                    Kept::None => Vec::new(),
+                    Kept::Select(rows) => rows.to_vec(),
+                };
+                let expected: Vec<u16> =
+                    (0..7).filter(|&row| holds(&cells[usize::from(row)], &value)).collect();
+                let others: Vec<u16> = (0..7).filter(|row| !expected.contains(row)).collect();
+                assert_eq!(
+                    (rows(&selection), rows(&dropped)),
+                    (expected, others),
+                    "{comparison:?} {value}"
+                );
+            }
+        }
     }
 
     #[test]
