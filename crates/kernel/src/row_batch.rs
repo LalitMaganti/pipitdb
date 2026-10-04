@@ -54,6 +54,12 @@ impl RowBatch {
         unsafe { at!(self.columns, index as usize).assume_init_ref() }
     }
 
+    pub fn columns_mut(&mut self) -> &mut [ColumnView] {
+        let columns = at_mut!(self.columns, ..self.column_count as usize);
+        // SAFETY: as in `column`.
+        unsafe { &mut *(core::ptr::from_mut(columns) as *mut [ColumnView]) }
+    }
+
     fn drop_columns(&mut self) {
         let count = self.column_count as usize;
         self.column_count = 0;
