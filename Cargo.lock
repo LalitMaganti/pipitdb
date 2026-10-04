@@ -363,6 +363,10 @@ name = "pipitdb-kernel"
 version = "0.0.0"
 
 [[package]]
+name = "pipitdb-keywords"
+version = "0.0.0"
+
+[[package]]
 name = "pipitdb-size"
 version = "0.0.0"
 dependencies = [
