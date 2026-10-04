@@ -20,6 +20,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod predicate;
 pub mod row_batch;
+pub mod row_batch_pool;
 pub mod scannable;
 pub mod selection;
 pub mod slow_vec;

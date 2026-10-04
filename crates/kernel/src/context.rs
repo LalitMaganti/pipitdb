@@ -2,6 +2,7 @@
 //! they share can grow without changing every step's functions.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::row_batch_pool::RowBatchPool;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -12,18 +13,24 @@ pub struct Context<'a> {
     allocator: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
     selections: Option<SlowVec<Selection>>,
+    row_batch_pool: RowBatchPool<'a>,
 }
 
 impl<'a> Context<'a> {
     /// A context whose states allocate from `allocator`, for steps run
     /// outside a pipeline, such as in tests.
     pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
-        Context { allocator, selections: None }
+        Context { allocator, selections: None, row_batch_pool: RowBatchPool::new(allocator) }
     }
 
     /// What the run's memory comes from, for states to allocate with.
     pub fn allocator(&self) -> &'a dyn Allocator {
         self.allocator
+    }
+
+    /// Where steps get the memory they fill batches' columns with.
+    pub fn row_batch_pool(&mut self) -> &mut RowBatchPool<'a> {
+        &mut self.row_batch_pool
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
