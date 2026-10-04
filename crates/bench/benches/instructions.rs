@@ -41,5 +41,11 @@ fn pipeline((source, steps): (pipitdb_bench::Repeat, Vec<Step<'static>>)) -> u64
     black_box(pipitdb_bench::run_pipeline(black_box(&source), black_box(&steps)))
 }
 
-library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline]);
+#[library_benchmark]
+#[bench::table(pipitdb_bench::table(100, 20_480))]
+fn scan(table: pipit_operators::table::Table) -> u64 {
+    black_box(pipitdb_bench::scan_table(black_box(&table)))
+}
+
+library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan]);
 main!(library_benchmark_groups = lexer_group, parser_group, pipeline_group);
