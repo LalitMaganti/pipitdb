@@ -66,6 +66,9 @@ fn describe(error: &Error, found: &str) -> Message {
             "the list is too long".into(),
             format!("lists are limited to {} items", crate::parser::LIST_MAX),
         ),
+        ErrorCode::UnknownTable => (format!("no table {found}"), "not in the catalog".into()),
+        ErrorCode::UnknownColumn => (format!("no column {found}"), "not a column here".into()),
+        ErrorCode::Unsupported => ("not supported yet".into(), "this can't be run yet".into()),
     };
     Message { title, label }
 }

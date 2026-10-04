@@ -1,6 +1,9 @@
 //! Errors a caller can cause, such as a bad query. They carry no text:
 //! The `diagnostics` feature turns them into messages.
 
+use pipit_kernel::allocator::AllocError;
+use pipit_kernel::vec::Full;
+
 /// The bytes `start..start + len` of the query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
@@ -29,6 +32,12 @@ pub enum ErrorCode {
     /// A source, like `FROM`, can only start a query.
     UnexpectedSource = 12,
     ListTooLong = 13,
+    /// `FROM` names a table the catalog doesn't have.
+    UnknownTable = 14,
+    /// A name isn't one of the columns so far.
+    UnknownColumn = 15,
+    /// Parsed, but not compiled yet, such as an expression in `SELECT`.
+    Unsupported = 16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,12 +48,26 @@ pub struct Error {
     pub span: Span,
 }
 
+/// Running out of memory, which isn't about any one part of the query, so
+/// points at its start.
+impl From<AllocError> for Error {
+    fn from(_: AllocError) -> Error {
+        Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 })
+    }
+}
+
+impl<T> From<Full<T>> for Error {
+    fn from(_: Full<T>) -> Error {
+        Error::from(AllocError)
+    }
+}
+
 // No code is 0, so `Option<ErrorCode>` uses 0 for `None` and needs no tag.
 const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::ListTooLong;
+    pub const LAST: ErrorCode = ErrorCode::Unsupported;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

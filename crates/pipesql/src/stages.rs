@@ -1,19 +1,87 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
+use pipit_kernel::plan::{DynOp, PLAN_COLUMNS_MAX, ScanOp};
+use pipit_kernel::vec::Vec;
+
+use crate::ast::{Node, Tag};
+use crate::compile::Compiler;
+use crate::error::{Error, ErrorCode};
 use crate::registry::{Item, Point, Rule, Shared};
 
-pub const FROM: Rule =
-    Rule { keyword: "from", point: Point::Source, items: &[Item::One(Shared::Name)] };
+pub const FROM: Rule = Rule {
+    keyword: "from",
+    point: Point::Source,
+    items: &[Item::One(Shared::Name)],
+    compile: compile_from,
+};
 
-pub const WHERE: Rule =
-    Rule { keyword: "where", point: Point::Stage, items: &[Item::One(Shared::Expr)] };
+pub const WHERE: Rule = Rule {
+    keyword: "where",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Expr)],
+    compile: compile_where,
+};
 
-pub const SELECT: Rule =
-    Rule { keyword: "select", point: Point::Stage, items: &[Item::List(Shared::Expr)] };
+pub const SELECT: Rule = Rule {
+    keyword: "select",
+    point: Point::Stage,
+    items: &[Item::List(Shared::Expr)],
+    compile: compile_select,
+};
 
 /// Selecting and filtering rows.
 pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
+
+/// `FROM t`: scans the table `t`, whose columns are then in scope.
+fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let name = compiler.node(stage.first_child()).span();
+    let Some(table) = compiler.catalog().find(compiler.text(name)) else {
+        return Err(Error::new(ErrorCode::UnknownTable, name));
+    };
+    let allocator = compiler.allocator();
+    let count = table.column_count();
+    let mut columns = Vec::fixed(allocator.clone(), count as usize)?;
+    let mut scope = Vec::new(allocator.clone(), PLAN_COLUMNS_MAX)?;
+    for i in 0..count {
+        let column = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
+        columns.push(column)?;
+        scope.push(column)?;
+    }
+    let scan = DynOp::new(allocator.clone(), ScanOp { scannable: table, columns })?;
+    let children = Vec::fixed(allocator, 0)?;
+    compiler.plan.add_node(scan, children)?;
+    compiler.scope = scope;
+    Ok(())
+}
+
+/// `WHERE`: needs expressions, which can't be compiled yet.
+fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let span = compiler.span(compiler.node(stage.first_child()));
+    Err(Error::new(ErrorCode::Unsupported, span))
+}
+
+/// `SELECT a, b`: the named columns, in that order, are the new scope. Only
+/// names, for now.
+fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let list = compiler.node(stage.first_child());
+    let mut scope = Vec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    for i in 0..list.child_count() {
+        let item = compiler.node(list.first_child() + i);
+        if item.tag() != Tag::Name {
+            return Err(Error::new(ErrorCode::Unsupported, compiler.span(item)));
+        }
+        let name = compiler.text(item.span());
+        let plan = &compiler.plan;
+        let found = compiler.scope.iter().find(|column| plan.names.get(column.name) == name);
+        let Some(&column) = found else {
+            return Err(Error::new(ErrorCode::UnknownColumn, item.span()));
+        };
+        scope.push(column)?;
+    }
+    compiler.scope = scope;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

@@ -374,6 +374,7 @@ version = "0.0.0"
 dependencies = [
  "pipitdb-diagnostics",
  "pipitdb-kernel",
+ "pipitdb-operators",
 ]
 
 [[package]]

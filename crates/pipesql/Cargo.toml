@@ -14,6 +14,9 @@ name = "pipit_pipesql"
 pipitdb-diagnostics = { path = "../diagnostics", optional = true }
 pipitdb-kernel = { path = "../kernel" }
 
+[dev-dependencies]
+pipitdb-operators = { path = "../operators" }
+
 [features]
 # Error messages, and `pipit-explain` to print them.
 diagnostics = ["dep:pipitdb-diagnostics"]

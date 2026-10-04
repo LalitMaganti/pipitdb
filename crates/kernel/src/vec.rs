@@ -78,9 +78,7 @@ impl<T> Vec<T> {
     ) -> Result<Vec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         max.checked_mul(size_of::<T>()).ok_or(AllocError)?;
-        // SAFETY: only the first `len` values are read, and each is written
-        // first.
-        let mut buffer = unsafe { Buffer::allocate_uninit(allocator, capacity * size_of::<T>())? };
+        let mut buffer = allocate(allocator, capacity * size_of::<T>())?;
         let values = buffer.as_mut_non_null().cast();
         Ok(Vec { buffer, values, len: 0, capacity, max })
     }
@@ -134,6 +132,17 @@ impl<T> Vec<T> {
         self.capacity = capacity;
         Ok(())
     }
+}
+
+/// Memory for a `Vec`'s values. Shared by every `Vec<T>` with an `A`, so it
+/// isn't copied for each `T`.
+#[inline(never)]
+fn allocate<A: Allocator + Clone + 'static>(
+    allocator: A,
+    size_bytes: usize,
+) -> Result<Buffer, AllocError> {
+    // SAFETY: only the first `len` values are read, and each is written first.
+    unsafe { Buffer::allocate_uninit(allocator, size_bytes) }
 }
 
 /// Moves the first `used_bytes` of `buffer` to one of `size_bytes`, from the
