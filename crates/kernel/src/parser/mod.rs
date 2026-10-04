@@ -6,7 +6,7 @@
 mod expression;
 
 use crate::allocator::Allocator;
-use crate::ast::{Ast, BLOCK_BYTES, BLOCK_NODES, Node, Operator, Tag};
+use crate::ast::{Ast, BLOCK_BYTES, Node, Nodes, Operator, Tag};
 use crate::buffer::Buffer;
 use crate::error::{Error, ErrorCode, Span};
 use crate::lexer::{Lexer, Token, TokenKind};
@@ -33,9 +33,10 @@ pub(crate) struct Parser<'a> {
     source: &'a [u8],
     lexer: Lexer<'a>,
     current: Token,
-    nodes: Buffer,
-    node_count: u32,
-    full: bool,
+    nodes: Nodes,
+    /// Set when writing a node fails, and reported at the next token, so that
+    /// writing a node stays cheap.
+    failed: Option<ErrorCode>,
 }
 
 impl<'a> Parser<'a> {
@@ -45,11 +46,10 @@ impl<'a> Parser<'a> {
     ) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        // SAFETY: nodes are only read up to `node_count`, after they are
-        // written.
-        let nodes = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
+        // SAFETY: nodes are read only once written.
+        let first = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { source, lexer, current, nodes, node_count: 0, full: false })
+        Ok(Parser { source, lexer, current, nodes: Nodes::new(first), failed: None })
     }
 
     /// The token the parser is on.
@@ -59,8 +59,8 @@ impl<'a> Parser<'a> {
 
     /// Moves to the next token and returns the one it was on.
     pub(crate) fn advance(&mut self) -> Result<Token, Error> {
-        if self.full {
-            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        if let Some(code) = self.failed {
+            return Err(Error::new(code, self.current.span));
         }
         let token = self.current;
         self.current = self.lexer.next_token()?;
@@ -89,7 +89,7 @@ impl<'a> Parser<'a> {
     /// Writes `nodes` to the tree, next to each other, and returns the index
     /// of the first.
     pub(crate) fn write(&mut self, nodes: &[Node]) -> u32 {
-        let first = self.node_count;
+        let first = self.nodes.len();
         for &node in nodes {
             self.push(node);
         }
@@ -97,28 +97,27 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn node_count(&self) -> u32 {
-        self.node_count
+        self.nodes.len()
     }
 
     /// Writes `root` to the tree, last, and returns the tree.
     pub(crate) fn finish(mut self, root: Node) -> Result<Ast, Error> {
         self.push(root);
-        if self.full {
-            return Err(Error::new(ErrorCode::QueryTooLarge, self.current.span));
+        if let Some(code) = self.failed {
+            return Err(Error::new(code, self.current.span));
         }
-        Ok(Ast::new(self.nodes, self.node_count))
+        Ok(Ast::new(self.nodes))
     }
 
-    /// When the block is full, sets `full` instead of failing, so writing a
-    /// node stays cheap. `advance` reports it at the next token.
+    /// If the next block can't be had, later nodes overwrite the last block,
+    /// which is safe as `failed` stops the parse before the tree is read.
     fn push(&mut self, node: Node) {
-        if self.node_count as usize == BLOCK_NODES {
-            self.full = true;
-            return;
+        self.nodes.push(node);
+        if self.nodes.needs_block()
+            && let Err(code) = self.nodes.grow()
+        {
+            self.failed = Some(code);
         }
-        // SAFETY: `node_count` is below `BLOCK_NODES`, so this is in the block.
-        unsafe { self.nodes.as_mut_ptr::<Node>().add(self.node_count as usize).write(node) };
-        self.node_count += 1;
     }
 }
 
@@ -193,9 +192,10 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "too slow under Miri")]
-    fn reports_a_full_block() {
+    fn parses_past_the_first_block() {
         let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        assert_eq!(error(&long).0, ErrorCode::QueryTooLarge);
+        let ast = parse_expression(Heap, long.as_bytes()).unwrap();
+        assert_eq!(ast.node_count() as usize, 2 * crate::ast::BLOCK_NODES - 1);
     }
 
     #[test]
