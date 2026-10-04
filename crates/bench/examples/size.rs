@@ -114,6 +114,17 @@ pub extern "C" fn spill_round_trip(value: i64) -> i64 {
     read.int64s()[0]
 }
 
+/// The length of the second of two strings, of `first` and `second` bytes.
+#[unsafe(no_mangle)]
+pub extern "C" fn second_string_len(first: u32, second: u32) -> usize {
+    let Ok(mut offsets) = Buffer::allocate(&Heap, 3 * 4) else { return 0 };
+    let ends = offsets.as_mut_slice::<u32>();
+    (ends[1], ends[2]) = (first, first + second);
+    let Ok(bytes) = Buffer::allocate(&Heap, (first + second) as usize) else { return 0 };
+    let column = ColumnView::strings(offsets, bytes, None);
+    column.string_values().get(1).len()
+}
+
 /// Pushes `0..count` to a `Vec`, and returns the last.
 #[unsafe(no_mangle)]
 pub extern "C" fn vec_sum(count: u32) -> u64 {
