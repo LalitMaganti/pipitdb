@@ -302,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     #[expect(clippy::cast_precision_loss, reason = "small test values")]
     fn reads_plain_values() {
         let rows = 0..5000_i64;
@@ -314,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     #[expect(clippy::cast_precision_loss, reason = "small test values")]
     fn reads_nulls() {
         let rows = 0..5000_i64;
