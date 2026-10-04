@@ -64,6 +64,17 @@ impl ColumnView {
         self.values()
     }
 
+    /// Whether any row may be null.
+    pub fn has_nulls(&self) -> bool {
+        self.validity.is_some()
+    }
+
+    /// Which rows aren't null, or `None` if none are, for reading in a loop.
+    pub fn validity(&self) -> Option<Validity<'_>> {
+        let bits = self.validity.as_ref()?.as_slice::<u8>();
+        Some(Validity { bits, start: self.start, row_count: self.row_count })
+    }
+
     pub fn is_null(&self, row: u32) -> bool {
         check!(row < self.row_count);
         let Some(validity) = &self.validity else { return false };
@@ -74,6 +85,33 @@ impl ColumnView {
     fn values<T: Primitive>(&self) -> &[T] {
         let start = self.start as usize;
         at!(self.values.as_slice::<T>(), start..start + self.row_count as usize)
+    }
+}
+
+/// A view's bitmap of the rows that aren't null.
+#[derive(Clone, Copy)]
+pub struct Validity<'a> {
+    bits: &'a [u8],
+    start: u32,
+    row_count: u32,
+}
+
+impl Validity<'_> {
+    pub fn row_count(self) -> u32 {
+        self.row_count
+    }
+
+    /// Whether `row` isn't null, without checking it's a row.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be below `row_count`.
+    #[inline]
+    pub unsafe fn is_valid_unchecked(self, row: u32) -> bool {
+        let bit = (self.start + row) as usize;
+        // SAFETY: `ColumnView::new` checked the bitmap covers every row, and
+        // `slice` keeps rows within it.
+        (unsafe { *self.bits.get_unchecked(bit / 8) } >> (bit % 8)) & 1 != 0
     }
 }
 

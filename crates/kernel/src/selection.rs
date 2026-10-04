@@ -10,6 +10,8 @@ pub struct Selection {
     /// How many rows are kept: all of them, if `all`.
     len: u32,
     all: bool,
+    /// How many rows the batch has: every kept row is below it.
+    rows: u32,
     // Unless `all`, the first `len` are the kept rows, in increasing order;
     // only those are written. Kept whatever the state, so narrowing never
     // sets it up again.
@@ -32,6 +34,7 @@ impl Selection {
         Selection {
             len: rows,
             all: true,
+            rows,
             indices: [MaybeUninit::uninit(); BATCH_ROWS_MAX as usize],
         }
     }
@@ -48,6 +51,12 @@ impl Selection {
         }
     }
 
+    /// How many rows the batch has. Every kept row is below it, so a filter
+    /// can check its column covers them once, rather than each row.
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
     /// How many rows are kept.
     pub fn len(&self) -> u32 {
         self.len
@@ -61,16 +70,27 @@ impl Selection {
     /// goes: it never writes past where it has read.
     #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
     pub fn retain(&mut self, mut keep: impl FnMut(u16) -> bool) {
+        let len = self.len as usize;
+        check!(len <= self.indices.len());
+        let indices = self.indices.as_mut_ptr().cast::<u16>();
         let mut kept = 0;
-        for i in 0..self.len as usize {
-            let row = if self.all {
-                i as u16
-            } else {
-                // SAFETY: unless `all`, the first `len` indices were written.
-                unsafe { at!(self.indices, i).assume_init() }
-            };
-            at_mut!(self.indices, kept).write(row);
-            kept += usize::from(keep(row));
+        // Two loops, so neither checks `all` for each row. In both, `kept`
+        // never passes `i`, which is below `len`, so every index is in bounds.
+        if self.all {
+            for i in 0..len {
+                let row = i as u16;
+                // SAFETY: see above.
+                unsafe { indices.add(kept).write(row) };
+                kept += usize::from(keep(row));
+            }
+        } else {
+            for i in 0..len {
+                // SAFETY: see above; the first `len` indices were written.
+                let row = unsafe { indices.add(i).read() };
+                // SAFETY: see above.
+                unsafe { indices.add(kept).write(row) };
+                kept += usize::from(keep(row));
+            }
         }
         // Every row still kept stays `all`, which needs no indices.
         self.all &= kept == self.len as usize;
@@ -82,6 +102,7 @@ impl Selection {
         check!(rows <= BATCH_ROWS_MAX);
         self.len = rows;
         self.all = true;
+        self.rows = rows;
     }
 }
 
@@ -96,6 +117,7 @@ impl Clone for Selection {
     fn clone_from(&mut self, other: &Selection) {
         self.len = other.len;
         self.all = other.all;
+        self.rows = other.rows;
         if !other.all {
             let len = other.len as usize;
             at_mut!(self.indices, ..len).copy_from_slice(at!(other.indices, ..len));

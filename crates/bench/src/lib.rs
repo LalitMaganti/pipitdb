@@ -3,9 +3,11 @@
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
+use pipit_kernel::selection::Selection;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
@@ -183,4 +185,51 @@ pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static>
     let columns = pipit_kernel::vec::Vec::fixed_from(Heap, [3, 1].into_iter()).expect("allocates");
     let source = table.scan(Heap, columns).expect("allocates");
     Pipeline::new(source, pipit_kernel::vec::Vec::fixed(Heap, 0).expect("allocates"))
+}
+
+/// A batch of values in `0..1000`, spread evenly but out of order, with every
+/// 16th row null if `nulls`.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn filter_column(nulls: bool) -> ColumnView {
+    let rows = BATCH_ROWS_MAX as usize;
+    let mut values = Buffer::allocate(Heap, rows * 8).expect("allocates");
+    for (i, value) in (0_i64..).zip(values.as_mut_slice::<i64>()) {
+        *value = (i * 7919) % 1000;
+    }
+    let validity = nulls.then(|| {
+        let mut validity = Buffer::allocate(Heap, rows / 8).expect("allocates");
+        validity.as_mut_slice::<u8>().fill(0xff);
+        for row in (0..rows).step_by(16) {
+            validity.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
+        }
+        validity
+    });
+    ColumnView::new(DataType::Int64, values, validity)
+}
+
+/// Filters `batches` fresh selections of `column` with `filter`, returning
+/// the rows kept.
+pub fn run_filter(
+    column: &ColumnView,
+    batches: u32,
+    filter: impl Fn(&ColumnView, &mut Selection),
+) -> u64 {
+    let mut kept = 0;
+    for _ in 0..batches {
+        let mut selection = Selection::all(column.row_count());
+        filter(column, &mut selection);
+        kept += u64::from(selection.len());
+    }
+    kept
+}
+
+/// Keeps values over 500: about half.
+pub fn greater(column: &ColumnView, selection: &mut Selection) {
+    filter::compare(column, Comparison::Greater, Value::Int64(500), selection);
+}
+
+/// Keeps eight values of the thousand.
+pub fn in_eight(column: &ColumnView, selection: &mut Selection) {
+    let values = [3, 99, 211, 400, 517, 640, 777, 901].map(Value::Int64);
+    filter::is_in(column, &values, selection);
 }
