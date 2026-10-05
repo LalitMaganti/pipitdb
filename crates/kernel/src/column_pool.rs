@@ -14,20 +14,24 @@ const BUFFERS_MAX: usize = 1 << 6;
 /// after batch asks for the same sizes, so filling them neither allocates
 /// nor zeroes: a buffer handed out again holds what it last held.
 ///
-/// The buffers it keeps count against the allocator's budget. Dropping the
-/// pool frees those nothing holds; the rest are freed by their last drop.
+/// It keeps track of at most `BUFFERS_MAX`, giving them up in turn to make
+/// room for new sizes. Those it keeps count against the allocator's budget.
+/// A buffer given up, by that or by dropping the pool, is freed now if
+/// nothing holds it, and else by its last drop.
 pub(crate) struct ColumnPool {
-    /// Every buffer not given up, held or not. Made with the first buffer.
+    /// The buffers kept track of, held or not. Made with the first buffer.
     buffers: Option<SlowVec<NonNull<u8>>>,
+    /// Which buffer to give up next when there's no room.
+    next: usize,
 }
 
 impl ColumnPool {
     pub(crate) fn new() -> ColumnPool {
-        ColumnPool { buffers: None }
+        ColumnPool { buffers: None, next: 0 }
     }
 
-    /// A buffer of `size_bytes`, one the pool has if one's free, or else a
-    /// new one, zeroed, which it keeps track of.
+    /// A buffer of `size_bytes`: one the pool has, if one's free, or else a
+    /// new one, zeroed.
     pub(crate) fn take(
         &mut self,
         allocator: &dyn Allocator,
@@ -35,7 +39,7 @@ impl ColumnPool {
     ) -> Result<Buffer, AllocError> {
         let buffers = match &mut self.buffers {
             Some(buffers) => buffers,
-            None => self.buffers.insert(SlowVec::new(allocator, BUFFERS_MAX)?),
+            None => self.buffers.insert(SlowVec::fixed(allocator, BUFFERS_MAX)?),
         };
         for &data in buffers.iter() {
             // SAFETY: the pool hasn't given up its buffers.
@@ -43,17 +47,17 @@ impl ColumnPool {
                 return Ok(buffer);
             }
         }
-        let buffer = Buffer::allocate(allocator, size_bytes)?;
-        if buffers.len() == BUFFERS_MAX {
-            // Full: frees those nothing holds, such as of sizes no longer
-            // asked for, to make room.
-            // SAFETY: the pool hasn't given up its buffers, and forgets those
-            // freed.
-            buffers.retain(|&data| !unsafe { Buffer::free_if_unused(data) });
-        }
-        // Pooled only once kept track of, so it's freed if it can't be.
-        if buffers.push(buffer.as_non_null()).is_ok() {
-            buffer.set_pooled();
+        let buffer = Buffer::allocate_pooled(allocator, size_bytes)?;
+        let data = buffer.as_non_null();
+        if buffers.len() < BUFFERS_MAX {
+            let Ok(()) = buffers.push(data) else { crate::check::check_failed(line!()) };
+        } else {
+            let slot = at_mut!(buffers, self.next);
+            // SAFETY: the pool hasn't given up its buffers, and forgets this
+            // one.
+            unsafe { Buffer::unpool(*slot) };
+            *slot = data;
+            self.next = (self.next + 1) % BUFFERS_MAX;
         }
         Ok(buffer)
     }
@@ -92,15 +96,22 @@ mod tests {
     }
 
     #[test]
-    fn makes_room_by_freeing_buffers_nothing_holds() {
+    fn makes_room_by_giving_buffers_up_in_turn() {
         let budget = Budget::new(&Heap, 1 << 20);
         let mut pool = ColumnPool::new();
-        for size in 1..=BUFFERS_MAX {
+        // The first is held when given up, so it's freed by its last drop.
+        let held = pool.take(&budget, 1).unwrap();
+        for size in 2..=BUFFERS_MAX {
             drop(pool.take(&budget, size).unwrap());
         }
         let used = budget.used();
         drop(pool.take(&budget, 4096).unwrap());
-        assert!(budget.used() < used);
+        assert_eq!(budget.used(), used + 64 + 4096);
+        drop(held);
+        assert_eq!(budget.used(), used + 4096 - 1);
+        // The second, free when given up, is freed then.
+        drop(pool.take(&budget, 8192).unwrap());
+        assert_eq!(budget.used(), used + 4096 - 1 + 8192 - 2);
     }
 
     #[test]

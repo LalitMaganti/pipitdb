@@ -156,10 +156,16 @@ impl Buffer {
         unsafe { header(self.data) }
     }
 
-    /// Makes the last drop keep the bytes, for the `ColumnPool` that holds
-    /// `as_non_null` of them to hand out again.
-    pub(crate) fn set_pooled(&self) {
-        self.header().pooled.set(true);
+    /// Allocates `size_bytes` zeroed bytes, as `allocate`, whose last drop
+    /// keeps them for the `ColumnPool` that holds `as_non_null` of them, to
+    /// hand out again, until it gives them up.
+    pub(crate) fn allocate_pooled(
+        allocator: &dyn Allocator,
+        size_bytes: usize,
+    ) -> Result<Buffer, AllocError> {
+        let buffer = Buffer::allocate(allocator, size_bytes)?;
+        buffer.header().pooled.set(true);
+        Ok(buffer)
     }
 
     /// Where the bytes are, for a `ColumnPool` to find them again.
@@ -182,22 +188,6 @@ impl Buffer {
         })
     }
 
-    /// Frees the pooled buffer at `data` if nothing references it, and
-    /// returns whether it did.
-    ///
-    /// # Safety
-    ///
-    /// As for `reuse`; if freed, `data` mustn't be used again.
-    pub(crate) unsafe fn free_if_unused(data: NonNull<u8>) -> bool {
-        // SAFETY: pooled bytes live until given up.
-        let unused = unsafe { header(data) }.references.get() == 0;
-        if unused {
-            // SAFETY: nothing references the bytes.
-            unsafe { deallocate(data) };
-        }
-        unused
-    }
-
     /// Gives up the pooled buffer at `data`: it's freed now if nothing
     /// references it, and by its last drop if something does.
     ///
@@ -205,10 +195,13 @@ impl Buffer {
     ///
     /// As for `reuse`; `data` mustn't be used again.
     pub(crate) unsafe fn unpool(data: NonNull<u8>) {
-        // SAFETY: as above.
-        unsafe {
-            header(data).pooled.set(false);
-            Buffer::free_if_unused(data);
+        // SAFETY: pooled bytes live until given up.
+        let header = unsafe { header(data) };
+        header.pooled.set(false);
+        if header.references.get() == 0 {
+            // SAFETY: nothing references the bytes, and they're no longer
+            // pooled.
+            unsafe { deallocate(data) };
         }
     }
 }
