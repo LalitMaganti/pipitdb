@@ -207,9 +207,13 @@ fn add(
         DataType::Int64 => {
             let first = if total.count == 0 { i128::from(first) } else { total.int };
             total.int = match function {
-                Function::Min => words.iter().fold(first, |min, &w| min.min(i128::from(w))),
-                Function::Max => words.iter().fold(first, |max, &w| max.max(i128::from(w))),
-                _ => total.int + words.iter().map(|&w| i128::from(w)).sum::<i128>(),
+                Function::Min => {
+                    first.min(i128::from(words.iter().fold(i64::MAX, |m, &w| m.min(w))))
+                }
+                Function::Max => {
+                    first.max(i128::from(words.iter().fold(i64::MIN, |m, &w| m.max(w))))
+                }
+                _ => total.int + sum(words),
             };
         }
         DataType::Float64 => {
@@ -224,6 +228,16 @@ fn add(
         DataType::String => crate::check::check_failed(line!()),
     }
     total.count += words.len() as u64;
+}
+
+/// The sum of `words`, of which there are at most `BATCH_ROWS_MAX`: their
+/// high and low halves are summed apart, as neither sum can overflow, so the
+/// loop needs no wider type.
+fn sum(words: &[i64]) -> i128 {
+    check!(words.len() <= BATCH_ROWS_MAX as usize);
+    let high: i64 = words.iter().map(|&w| w >> 32).sum();
+    let low: u64 = words.iter().map(|&w| w.cast_unsigned() & 0xffff_ffff).sum();
+    (i128::from(high) << 32) + i128::from(low)
 }
 
 /// How many kept rows of `column` aren't null.
@@ -407,6 +421,13 @@ mod tests {
         assert_eq!(aggregate(false, &ints), [Some(4), Some(bits(1.0))]);
         let floats = [(Sum, Some(1)), (Min, Some(1)), (Max, Some(1)), (Avg, Some(1))];
         assert_eq!(aggregate(false, &floats), [2.0, -1.5, 2.0, 0.5].map(|f| Some(bits(f))));
+    }
+
+    #[test]
+    fn sums_beyond_64_bits() {
+        let words = [i64::MAX, i64::MAX, -1, i64::MIN, 1 << 40, -(1 << 33) - 7];
+        assert_eq!(sum(&words), words.iter().map(|&w| i128::from(w)).sum::<i128>());
+        assert_eq!(sum(&[i64::MIN; 2048]), i128::from(i64::MIN) * 2048);
     }
 
     #[test]
