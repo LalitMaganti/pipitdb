@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
-use crate::row_batch::RowBatch;
+use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::{Kept, Selection};
 use crate::slow_vec::SlowVec;
 use crate::step::{DynOperator, Operator, Progress, Step};
@@ -156,7 +156,8 @@ impl Operator for Aggregation {
     }
 }
 
-/// Adds the kept rows of `column`, of `data_type`, to `total`.
+/// Adds the kept rows of `column`, of `data_type`, that aren't null to
+/// `total`.
 fn add(
     function: Function,
     data_type: DataType,
@@ -164,50 +165,68 @@ fn add(
     selection: &Selection,
     total: &mut Total,
 ) {
-    match (function, data_type) {
-        (Function::Count, _) => each_valid(column, selection, |_| total.count += 1),
-        (_, DataType::Int64) => {
-            let values = column.int64s();
-            each_valid(column, selection, |row| {
-                let value = i128::from(*at!(values, row));
-                total.int = match (function, total.count) {
-                    (Function::Sum | Function::Avg, _) => total.int + value,
-                    (_, 0) => value,
-                    (Function::Min, _) => total.int.min(value),
-                    _ => total.int.max(value),
-                };
-                total.count += 1;
-            });
-        }
-        (_, DataType::Float64) => {
-            let values = column.float64s();
-            each_valid(column, selection, |row| {
-                let value = *at!(values, row);
-                total.float = match (function, total.count) {
-                    (Function::Sum | Function::Avg, _) => total.float + value,
-                    (_, 0) => value,
-                    (Function::Min, _) => total.float.min(value),
-                    _ => total.float.max(value),
-                };
-                total.count += 1;
-            });
-        }
-        (_, DataType::String) => crate::check::check_failed(line!()),
+    if function == Function::Count {
+        total.count += count_valid(column, selection);
+        return;
     }
-}
-
-/// Calls `f` with each kept row of `column` that isn't null.
-fn each_valid(column: &ColumnView, selection: &Selection, mut f: impl FnMut(usize)) {
-    let mut row = |row: u32| {
-        if !column.is_null(row) {
-            f(row as usize);
+    let all = column.words();
+    let mut gathered = [0_i64; BATCH_ROWS_MAX as usize];
+    let words = match (selection.kept(), column.validity()) {
+        (Kept::All, None) => all,
+        (kept, validity) => {
+            let mut n = 0;
+            let mut gather = |row: u32| {
+                // SAFETY: kept rows are below the batch's row count, which is
+                // the column's.
+                if validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(row) }) {
+                    *at_mut!(gathered, n) = *at!(all, row as usize);
+                    n += 1;
+                }
+            };
+            match kept {
+                Kept::All => (0..selection.rows()).for_each(&mut gather),
+                Kept::Select(rows) => rows.iter().for_each(|&row| gather(u32::from(row))),
+                Kept::None => {}
+            }
+            at!(gathered, ..n)
         }
     };
-    match selection.kept() {
-        Kept::All => (0..selection.rows()).for_each(row),
-        Kept::Select(rows) => rows.iter().for_each(|&r| row(u32::from(r))),
-        Kept::None => {}
+    let Some(&first) = words.first() else { return };
+    match data_type {
+        DataType::Int64 => {
+            let first = if total.count == 0 { i128::from(first) } else { total.int };
+            total.int = match function {
+                Function::Min => words.iter().fold(first, |min, &w| min.min(i128::from(w))),
+                Function::Max => words.iter().fold(first, |max, &w| max.max(i128::from(w))),
+                _ => total.int + words.iter().map(|&w| i128::from(w)).sum::<i128>(),
+            };
+        }
+        DataType::Float64 => {
+            let float = |w: &i64| f64::from_bits(w.cast_unsigned());
+            let first = if total.count == 0 { float(&first) } else { total.float };
+            total.float = match function {
+                Function::Min => words.iter().map(float).fold(first, f64::min),
+                Function::Max => words.iter().map(float).fold(first, f64::max),
+                _ => total.float + words.iter().map(float).sum::<f64>(),
+            };
+        }
+        DataType::String => crate::check::check_failed(line!()),
     }
+    total.count += words.len() as u64;
+}
+
+/// How many kept rows of `column` aren't null.
+fn count_valid(column: &ColumnView, selection: &Selection) -> u64 {
+    let Some(validity) = column.validity() else { return u64::from(selection.len()) };
+    // SAFETY: kept rows are below the batch's row count, which is the
+    // column's.
+    let valid = |row: u32| unsafe { validity.is_valid_unchecked(row) };
+    let count = match selection.kept() {
+        Kept::All => (0..selection.rows()).filter(|&row| valid(row)).count(),
+        Kept::Select(rows) => rows.iter().filter(|&&row| valid(u32::from(row))).count(),
+        Kept::None => 0,
+    };
+    count as u64
 }
 
 /// The one-row column of `aggregate`'s result.

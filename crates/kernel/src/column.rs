@@ -124,6 +124,13 @@ impl ColumnView {
         at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
     }
 
+    /// The view's values of a fixed-width type, as words: integers, or
+    /// floats' bits.
+    pub(crate) fn words(&self) -> &[i64] {
+        check!(!self.data_type.has_offsets());
+        self.values()
+    }
+
     /// The view's values, as bytes.
     pub(crate) fn value_bytes(&self) -> &[u8] {
         let width = self.data_type.width_bytes();
