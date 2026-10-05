@@ -230,15 +230,9 @@ fn add(
     total.count += words.len() as u64;
 }
 
-/// The sum of `words`, of which there are at most `BATCH_ROWS_MAX`: their
-/// high and low halves are summed apart, as neither sum can overflow, so the
-/// loop needs no wider type.
+/// The sum of `words`.
 fn sum(words: &[i64]) -> i128 {
-    check!(words.len() <= BATCH_ROWS_MAX as usize);
-    let (high, low) = words.iter().fold((0_i64, 0_u64), |(high, low), &w| {
-        (high + (w >> 32), low + (w.cast_unsigned() & 0xffff_ffff))
-    });
-    (i128::from(high) << 32) + i128::from(low)
+    words.iter().map(|&w| i128::from(w)).sum()
 }
 
 /// How many kept rows of `column` aren't null.
