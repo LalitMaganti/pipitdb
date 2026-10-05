@@ -1,6 +1,7 @@
 //! `AggregateOp`: aggregates, such as `COUNT(*)` and `SUM(x)`, over all of
 //! its child's rows, as one row; and `Aggregation`, the operator that runs it.
 
+use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
@@ -114,27 +115,37 @@ struct Total {
     float: f64,
 }
 
-impl Operator for Aggregation {
-    type State = SlowVec<Total>;
+/// The totals so far, and room to gather a batch's values into.
+struct Totals {
+    totals: SlowVec<Total>,
+    gathered: Buffer,
+}
 
-    fn new_state(&self, context: &mut Context) -> Result<SlowVec<Total>, Error> {
+impl Operator for Aggregation {
+    type State = Totals;
+
+    fn new_state(&self, context: &mut Context) -> Result<Totals, Error> {
         let totals = core::iter::repeat_n(Total::default(), self.aggregates.len());
-        Ok(SlowVec::fixed_from(context.allocator(), totals)?)
+        let totals = SlowVec::fixed_from(context.allocator(), totals)?;
+        let gathered = Buffer::allocate(context.allocator(), BATCH_ROWS_MAX as usize * 8)?;
+        Ok(Totals { totals, gathered })
     }
 
     fn execute(
         &self,
         _: &mut Context,
-        totals: &mut SlowVec<Total>,
+        totals: &mut Totals,
         input: &RowBatch,
         _: &mut RowBatch,
     ) -> Result<Progress, Error> {
         let selection = input.selection();
-        for (aggregate, total) in self.aggregates.iter().zip(totals.iter_mut()) {
+        let gathered = totals.gathered.as_mut_slice::<i64>();
+        for (aggregate, total) in self.aggregates.iter().zip(totals.totals.iter_mut()) {
             match aggregate.input {
                 None => total.count += u64::from(selection.len()),
                 Some((position, data_type)) => {
-                    add(aggregate.function, data_type, input.column(position), selection, total);
+                    let column = input.column(position);
+                    add(aggregate.function, data_type, column, selection, gathered, total);
                 }
             }
         }
@@ -144,11 +155,11 @@ impl Operator for Aggregation {
     fn finish(
         &self,
         context: &mut Context,
-        totals: &mut SlowVec<Total>,
+        totals: &mut Totals,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
         output.reset(1);
-        for (aggregate, total) in self.aggregates.iter().zip(totals.iter()) {
+        for (aggregate, total) in self.aggregates.iter().zip(totals.totals.iter()) {
             let column = result(context, *aggregate, *total)?;
             let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
         }
@@ -157,12 +168,13 @@ impl Operator for Aggregation {
 }
 
 /// Adds the kept rows of `column`, of `data_type`, that aren't null to
-/// `total`.
+/// `total`, gathering them into `gathered` first unless they're all of them.
 fn add(
     function: Function,
     data_type: DataType,
     column: &ColumnView,
     selection: &Selection,
+    gathered: &mut [i64],
     total: &mut Total,
 ) {
     if function == Function::Count {
@@ -170,7 +182,6 @@ fn add(
         return;
     }
     let all = column.words();
-    let mut gathered = [0_i64; BATCH_ROWS_MAX as usize];
     let words = match (selection.kept(), column.validity()) {
         (Kept::All, None) => all,
         (kept, validity) => {
