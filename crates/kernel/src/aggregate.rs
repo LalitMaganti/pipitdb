@@ -209,7 +209,9 @@ fn add(
             total.int = match function {
                 Function::Min => first.min(i128::from(lanes(words, i64::MAX, |w| w, i64::min))),
                 Function::Max => first.max(i128::from(lanes(words, i64::MIN, |w| w, i64::max))),
-                _ => total.int + lanes(words, 0, i128::from, |a, b| a + b),
+                // Summed plainly: the compiler does better with this than in
+                // lanes.
+                _ => total.int + words.iter().map(|&w| i128::from(w)).sum::<i128>(),
             };
         }
         DataType::Float64 => {
