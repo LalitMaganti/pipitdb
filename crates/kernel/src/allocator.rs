@@ -56,20 +56,20 @@ unsafe impl Allocator for Heap {
 }
 
 /// Allocates from another allocator while the bytes allocated stay within
-/// `limit`, and fails past it, so a run can't use more memory than it's
-/// given. `peak` is the most it allocated at once. Like any allocator, it
+/// `limit`, and fails past it, so a run under it can't use more memory than
+/// it's given. `peak` is the most it allocated at once. Like any allocator, it
 /// must outlive what's allocated from it: dropping it while anything is
 /// still allocated fails a check.
-pub struct Budget<'a> {
+pub struct LimitAllocator<'a> {
     allocator: &'a dyn Allocator,
     limit: usize,
     used: Cell<usize>,
     peak: Cell<usize>,
 }
 
-impl<'a> Budget<'a> {
-    pub fn new(allocator: &'a dyn Allocator, limit: usize) -> Budget<'a> {
-        Budget { allocator, limit, used: Cell::new(0), peak: Cell::new(0) }
+impl<'a> LimitAllocator<'a> {
+    pub fn new(allocator: &'a dyn Allocator, limit: usize) -> LimitAllocator<'a> {
+        LimitAllocator { allocator, limit, used: Cell::new(0), peak: Cell::new(0) }
     }
 
     /// The bytes allocated now.
@@ -83,7 +83,7 @@ impl<'a> Budget<'a> {
     }
 }
 
-impl Budget<'_> {
+impl LimitAllocator<'_> {
     /// Allocates `layout`, zeroed if `zeroed`, if it fits within the limit,
     /// and counts it.
     fn charge(&self, layout: Layout, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
@@ -103,7 +103,7 @@ impl Budget<'_> {
 }
 
 // SAFETY: forwards to the allocator it holds.
-unsafe impl Allocator for Budget<'_> {
+unsafe impl Allocator for LimitAllocator<'_> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
         self.charge(layout, false)
     }
@@ -119,7 +119,7 @@ unsafe impl Allocator for Budget<'_> {
     }
 }
 
-impl Drop for Budget<'_> {
+impl Drop for LimitAllocator<'_> {
     fn drop(&mut self) {
         check!(self.used.get() == 0);
     }
@@ -131,36 +131,36 @@ mod tests {
     use crate::boxed::Box;
 
     #[test]
-    fn budgets_fail_past_their_limit_and_count_the_peak() {
-        let budget = Budget::new(&Heap, 1000);
-        let first = Box::new(&budget, [0_u8; 600]).unwrap();
+    fn fails_past_its_limit_and_counts_the_peak() {
+        let limit = LimitAllocator::new(&Heap, 1000);
+        let first = Box::new(&limit, [0_u8; 600]).unwrap();
         // A box's header counts too.
-        let one = budget.used();
+        let one = limit.used();
         assert!(one > 600);
-        assert!(Box::new(&budget, [0_u8; 600]).is_err());
-        assert_eq!(budget.used(), one);
+        assert!(Box::new(&limit, [0_u8; 600]).is_err());
+        assert_eq!(limit.used(), one);
 
         // What's freed can be allocated again.
         drop(first);
-        assert_eq!(budget.used(), 0);
-        let second = Box::new(&budget, [0_u8; 800]).unwrap();
-        let two = budget.used();
+        assert_eq!(limit.used(), 0);
+        let second = Box::new(&limit, [0_u8; 800]).unwrap();
+        let two = limit.used();
         drop(second);
-        assert_eq!((budget.used(), budget.peak()), (0, two));
+        assert_eq!((limit.used(), limit.peak()), (0, two));
     }
 
     #[test]
     fn zeroed_memory_is_zero_and_counted() {
-        let budget = Budget::new(&Heap, 1000);
+        let limit = LimitAllocator::new(&Heap, 1000);
         let layout = Layout::from_size_align(256, 64).unwrap();
-        let ptr = budget.allocate_zeroed(layout).unwrap();
+        let ptr = limit.allocate_zeroed(layout).unwrap();
         // SAFETY: the allocation holds 256 bytes.
         assert!(unsafe { core::slice::from_raw_parts(ptr.as_ptr(), 256) }.iter().all(|&b| b == 0));
-        assert_eq!(budget.used(), 256);
-        assert!(budget.allocate_zeroed(Layout::from_size_align(800, 64).unwrap()).is_err());
+        assert_eq!(limit.used(), 256);
+        assert!(limit.allocate_zeroed(Layout::from_size_align(800, 64).unwrap()).is_err());
         // SAFETY: allocated just above with this layout.
-        unsafe { budget.deallocate(ptr, layout) };
-        assert_eq!(budget.used(), 0);
+        unsafe { limit.deallocate(ptr, layout) };
+        assert_eq!(limit.used(), 0);
     }
 
     /// Hands out one static block, so what's allocated from it can be
@@ -187,9 +187,9 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "used")]
-    fn budgets_check_nothing_outlives_them() {
-        let budget = Budget::new(&Static, 1000);
-        // Leaked, so it's never freed through the dropped budget.
-        core::mem::forget(Box::new(&budget, 7_u64).unwrap());
+    fn checks_nothing_outlives_it() {
+        let limit = LimitAllocator::new(&Static, 1000);
+        // Leaked, so it's never freed through the dropped allocator.
+        core::mem::forget(Box::new(&limit, 7_u64).unwrap());
     }
 }

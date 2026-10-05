@@ -8,6 +8,7 @@ use pipit_kernel::error::Error;
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
+use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::selection::Selection;
@@ -156,7 +157,8 @@ impl Operator for PassOperator {
 /// Runs `pipeline` once, returning the rows out, or as many as it made
 /// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
-    let Ok(mut execution) = pipeline.start(&Heap) else { return 0 };
+    let query = QueryAllocators::new(&Heap);
+    let Ok(mut execution) = pipeline.start(&query) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while execution.next(&mut batch) == Ok(true) {

@@ -232,7 +232,7 @@ impl<'s> ChunkReader<'s> {
         if nulls == 0 {
             return Ok(None);
         }
-        let mut validity = context.column_buffer(rows.div_ceil(8))?;
+        let mut validity = context.small_buffer(rows.div_ceil(8))?;
         validity.as_mut_slice::<u8>().copy_from_slice(at!(bits, ..rows.div_ceil(8)));
         Ok(Some(validity))
     }
@@ -423,8 +423,8 @@ fn decode<'p>(
             for _ in (0..rows).filter(|&row| valid(row)) {
                 total += sizing.string()?.len();
             }
-            let mut offsets = context.column_buffer((rows + 1) * 4)?;
-            let mut bytes = context.column_buffer(total)?;
+            let mut offsets = context.indices_buffer((rows + 1) * 4)?;
+            let mut bytes = context.bytes_buffer(total)?;
             let (ends, out) = (offsets.as_mut_slice::<u32>(), bytes.as_mut_slice::<u8>());
             let mut to = 0;
             *at_mut!(ends, 0) = 0;
@@ -439,7 +439,7 @@ fn decode<'p>(
             Ok((values, offsets, Some(bytes)))
         }
         DataType::Int64 | DataType::Float64 => {
-            let mut out = context.column_buffer(rows * 8)?;
+            let mut out = context.values_buffer(rows * 8)?;
             for (row, word) in out.as_mut_slice::<i64>().iter_mut().enumerate() {
                 *word = if valid(row) { values.word(physical)? } else { 0 };
             }

@@ -3,7 +3,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column_pool::ColumnPool;
+use crate::query_allocators::QueryAllocators;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -11,17 +11,33 @@ use crate::slow_vec::SlowVec;
 pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
 
 pub struct Context<'a> {
+    /// What states and other metadata allocate from.
     allocator: &'a dyn Allocator,
+    /// What column buffers of each kind allocate from.
+    values: &'a dyn Allocator,
+    indices: &'a dyn Allocator,
+    small: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
     selections: Option<SlowVec<Selection>>,
-    columns: ColumnPool,
 }
 
 impl<'a> Context<'a> {
-    /// A context whose states allocate from `allocator`, for steps run
-    /// outside a pipeline, such as in tests.
+    /// A context whose states and column buffers all allocate from
+    /// `allocator`, for steps run outside a pipeline, such as in tests.
     pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
-        Context { allocator, selections: None, columns: ColumnPool::new() }
+        let (values, indices, small) = (allocator, allocator, allocator);
+        Context { allocator, values, indices, small, selections: None }
+    }
+
+    /// A query's context, which allocates from `query`'s allocators.
+    pub fn for_query(query: &'a QueryAllocators<'a>) -> Context<'a> {
+        Context {
+            allocator: query.metadata,
+            values: &query.values,
+            indices: &query.indices,
+            small: &query.small,
+            selections: None,
+        }
     }
 
     /// What the run's memory comes from, for states to allocate with.
@@ -29,12 +45,30 @@ impl<'a> Context<'a> {
         self.allocator
     }
 
-    /// Memory for filling a batch's column. Steps get all their columns'
-    /// memory here, so how it's found can change in one place: it's reused,
-    /// once no column holds it, for the next of the same size. What it holds
-    /// is unspecified: whoever fills it writes every byte that's read.
-    pub fn column_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        self.columns.take(self.allocator, size_bytes)
+    /// Memory for a batch's column of 8-byte values, `size_bytes` of them,
+    /// at most a batch's. Steps get all their columns' memory from these
+    /// functions, by kind, so how it's found can change in one place. It
+    /// isn't zeroed: whoever fills it writes every byte that's read.
+    pub fn values_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        buffer(self.values, size_bytes)
+    }
+
+    /// As `values_buffer`, for 4-byte values, such as dictionary indices, or
+    /// string offsets, of which there's one more than rows.
+    pub fn indices_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        buffer(self.indices, size_bytes)
+    }
+
+    /// As `values_buffer`, for small things a column needs: its header, its
+    /// validity bitmap, a lazy column's handle.
+    pub fn small_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        buffer(self.small, size_bytes)
+    }
+
+    /// As `values_buffer`, for column data of no fixed size, such as
+    /// strings' bytes.
+    pub fn bytes_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
+        buffer(self.allocator, size_bytes)
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
@@ -60,6 +94,12 @@ impl<'a> Context<'a> {
     pub fn selections(&mut self) -> &mut [Selection] {
         self.selections.as_deref_mut().unwrap_or_default()
     }
+}
+
+/// `size_bytes` bytes from `allocator`, not zeroed.
+fn buffer(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
+    // SAFETY: whoever fills it writes every byte that's read.
+    unsafe { Buffer::allocate_uninit(allocator, size_bytes) }
 }
 
 #[cfg(test)]
