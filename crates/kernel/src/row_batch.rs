@@ -133,12 +133,14 @@ mod tests {
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::DataType;
+    use crate::context::Context;
 
     #[test]
     fn holds_columns_of_the_same_length() {
         let mut values = Buffer::allocate(&Heap, 3 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
-        let column = ColumnView::new(DataType::Int64, values, None);
+        let column =
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
 
         let mut batch = RowBatch::new();
         batch.reset(3);

@@ -100,6 +100,7 @@ mod tests {
     use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
+    use pipit_kernel::context::Context;
     use pipit_kernel::lower::lower;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
@@ -125,7 +126,7 @@ mod tests {
         let column = |data_type, values: [i64; 2]| {
             let mut buffer = Buffer::allocate(&Heap, 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-            ColumnView::new(data_type, buffer, None)
+            ColumnView::new(&mut Context::new(&Heap), data_type, buffer, None).unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
         let columns = [

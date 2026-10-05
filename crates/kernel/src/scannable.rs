@@ -182,6 +182,7 @@ mod tests {
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::ColumnView;
+    use crate::context::Context;
     use crate::pipeline::Pipeline;
 
     /// One batch, with column `i` holding `i` and `i + 10`.
@@ -221,7 +222,19 @@ mod tests {
                 let mut values = Buffer::allocate(&Heap, 16).unwrap();
                 let value = i64::from(column);
                 values.as_mut_slice::<i64>().copy_from_slice(&[value, value + 10]);
-                assert!(batch.push_column(ColumnView::new(DataType::Int64, values, None)).is_ok());
+                assert!(
+                    batch
+                        .push_column(
+                            ColumnView::new(
+                                &mut Context::new(&Heap),
+                                DataType::Int64,
+                                values,
+                                None
+                            )
+                            .unwrap()
+                        )
+                        .is_ok()
+                );
             }
             *done = true;
             Ok(true)

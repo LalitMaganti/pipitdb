@@ -141,7 +141,7 @@ mod tests {
         let values: Vec<i64> = values.collect();
         let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-        ColumnView::new(DataType::Int64, buffer, None)
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
     }
 
     /// Each batch's row count, and its first row.

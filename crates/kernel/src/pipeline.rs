@@ -383,13 +383,14 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::column::{ColumnView, DataType};
+    use crate::context::Context;
     use crate::selection::Kept;
     use crate::step::{DynOperator, DynTransform, Operator, Source, Transform};
 
     fn int64s(values: &[i64]) -> ColumnView {
         let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        ColumnView::new(DataType::Int64, buffer, None)
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
     }
 
     /// `batches` batches of two rows, with two columns, `[2i, 2i + 1]` and

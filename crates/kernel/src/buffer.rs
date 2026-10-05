@@ -168,6 +168,11 @@ impl Buffer {
         Ok(buffer)
     }
 
+    /// Whether this is the only reference to the bytes.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.header().references.get() == 1
+    }
+
     /// Where the bytes are, for a `ColumnPool` to find them again.
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.data

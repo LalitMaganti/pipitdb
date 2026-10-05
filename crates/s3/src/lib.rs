@@ -255,6 +255,7 @@ mod tests {
     use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
+    use pipit_kernel::context::Context;
     use pipit_kernel::spill::{read_column, write_column};
     use rusty_s3::UrlStyle;
 
@@ -282,7 +283,7 @@ mod tests {
         for (o, v) in buffer.as_mut_slice::<i64>().iter_mut().zip(0..) {
             *o = v * 3;
         }
-        ColumnView::new(DataType::Int64, buffer, None)
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
     }
 
     #[test]
@@ -309,7 +310,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&Heap, &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
             assert_eq!(read.int64s(), column.int64s());
         }
         store.delete(log);
@@ -320,9 +321,12 @@ mod tests {
         let Some(store) = store(PART_BYTES_MIN) else { return };
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(10)).unwrap();
-        assert_eq!(read_column(&Heap, &store, log, &spilled).err(), Some(Error::Io));
+        assert_eq!(
+            read_column(&mut Context::new(&Heap), &store, log, &spilled).err(),
+            Some(Error::Io)
+        );
         store.seal(log).unwrap();
-        assert!(read_column(&Heap, &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(&Heap), &store, log, &spilled).is_ok());
         store.delete(log);
     }
 

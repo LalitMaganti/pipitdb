@@ -179,8 +179,8 @@ impl<'s> ChunkReader<'s> {
         self.advance(values);
         self.position.left -= rows;
         Ok(match bytes {
-            Some(bytes) => ColumnView::strings(buffer, bytes, validity),
-            None => ColumnView::new(data_type, buffer, validity),
+            Some(bytes) => ColumnView::strings(context, buffer, bytes, validity)?,
+            None => ColumnView::new(context, data_type, buffer, validity)?,
         })
     }
 
