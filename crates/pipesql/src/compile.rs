@@ -221,6 +221,25 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_rows() {
+        let query = "FROM t |> AGGREGATE COUNT(*), sum(a), Avg(f), MIN(b), max(b)";
+        let names = ["count(*)", "sum(a)", "avg(f)", "min(b)", "max(b)"];
+        let values = [2.0, 3.0, 1.5, 10.0, 20.0];
+        let expected: StdVec<_> =
+            names.iter().zip(values).map(|(n, v)| (n.as_bytes().to_vec(), [v].to_vec())).collect();
+        assert_eq!(run(query), expected);
+        assert_eq!(kept("FROM t |> WHERE a > 1 |> AGGREGATE count(a)"), [1.0]);
+        assert_eq!(error("FROM t |> AGGREGATE a"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE sum(*)"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
+        assert_eq!(error("FROM t |> AGGREGATE count(c)"), (ErrorCode::UnknownColumn, 26));
+        assert_eq!(
+            error("FROM t |> AGGREGATE count(a) |> SELECT a"),
+            (ErrorCode::UnknownColumn, 39)
+        );
+    }
+
+    #[test]
     fn reads_only_the_columns_selected() {
         let catalog = catalog();
         let mut plan = compile(&Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();

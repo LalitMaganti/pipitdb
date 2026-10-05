@@ -1,6 +1,7 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
+use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -31,8 +32,24 @@ pub const SELECT: Rule = Rule {
     compile: compile_select,
 };
 
-/// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
+pub const AGGREGATE: Rule = Rule {
+    keyword: "aggregate",
+    point: Point::Stage,
+    items: &[Item::List(Shared::Expr)],
+    compile: compile_aggregate,
+};
+
+/// Selecting, filtering and aggregating rows.
+pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, AGGREGATE];
+
+/// The aggregate functions, by name.
+const FUNCTIONS: [(&str, Function); 5] = [
+    ("count", Function::Count),
+    ("sum", Function::Sum),
+    ("min", Function::Min),
+    ("max", Function::Max),
+    ("avg", Function::Avg),
+];
 
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
@@ -78,6 +95,50 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
         }
         scope.push(compiler.find_column(item)?)?;
     }
+    compiler.scope = scope;
+    Ok(())
+}
+
+/// `AGGREGATE COUNT(*), SUM(a)`: one row of the aggregates of every row is
+/// the new scope, named as `count(*)` and `sum(a)`.
+fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let list = compiler.node(stage.first_child());
+    let allocator = compiler.allocator();
+    let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    for i in 0..list.child_count() {
+        let item = compiler.node(list.first_child() + i);
+        let span = compiler.span(item);
+        let unsupported = Error::unsupported(Unsupported::Aggregate, span);
+        if item.tag() != Tag::Call || item.child_count() != 2 {
+            return Err(unsupported);
+        }
+        let name = compiler.node(item.first_child()).span();
+        let text = compiler.text(name);
+        let Some(&(function_name, function)) =
+            FUNCTIONS.iter().find(|(f, _)| f.eq_ignore_ascii_case(text))
+        else {
+            return Err(Error::new(ErrorCode::UnknownFunction, name));
+        };
+        let argument = compiler.node(item.first_child() + 1);
+        let input = match argument.tag() {
+            Tag::Star if function == Function::Count => None,
+            Tag::Name => Some(compiler.find_column(argument)?.id),
+            _ => return Err(unsupported),
+        };
+        let input_type = input.map(|id| at!(compiler.plan.columns, id as usize).data_type);
+        let Some(output_type) = function.output_type(input_type) else {
+            return Err(Error::unsupported(Unsupported::AggregateType, span));
+        };
+        let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
+        let name = compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?;
+        let binding = compiler.plan.add_named_column(name, output_type)?;
+        aggregates.push(Aggregate { function, input, binding })?;
+        scope.push(binding)?;
+    }
+    let aggregate = DynOp::new(allocator, AggregateOp { aggregates })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(aggregate, children)?;
     compiler.scope = scope;
     Ok(())
 }

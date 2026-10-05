@@ -78,26 +78,41 @@ fn describe(found: &str, error: &Error) -> Message {
                 pipit_kernel::predicate::PREDICATE_NODES_MAX
             ),
         ),
-        ErrorCode::Unsupported => match error.detail {
-            what if what == Unsupported::SelectExpression as u16 => {
-                ("only column names can be selected yet".into(), "not a column's name".into())
-            }
-            what if what == Unsupported::Where as u16 => (
-                "only comparisons of a column with a number can filter yet".into(),
-                "can't filter on this yet".into(),
-            ),
-            what if what == Unsupported::NumberType as u16 => (
-                format!("{found} can't be compared with this column yet"),
-                "a float can't hold this integer exactly".into(),
-            ),
-            what if what == Unsupported::Decimal as u16 => (
-                "numbers with a decimal point can't be compared yet".into(),
-                "not an integer".into(),
-            ),
-            _ => ("not supported yet".into(), "this can't be run yet".into()),
-        },
+        ErrorCode::UnknownFunction => {
+            (format!("no function {found}"), "not a function here".into())
+        }
+        ErrorCode::Unsupported => unsupported(found, error.detail),
     };
     Message { title, label }
+}
+
+/// The title and label of an `Unsupported` error about `what`.
+fn unsupported(found: &str, what: u16) -> (String, String) {
+    match what {
+        what if what == Unsupported::SelectExpression as u16 => {
+            ("only column names can be selected yet".into(), "not a column's name".into())
+        }
+        what if what == Unsupported::Where as u16 => (
+            "only comparisons of a column with a number can filter yet".into(),
+            "can't filter on this yet".into(),
+        ),
+        what if what == Unsupported::NumberType as u16 => (
+            format!("{found} can't be compared with this column yet"),
+            "a float can't hold this integer exactly".into(),
+        ),
+        what if what == Unsupported::Decimal as u16 => {
+            ("numbers with a decimal point can't be compared yet".into(), "not an integer".into())
+        }
+        what if what == Unsupported::Aggregate as u16 => (
+            "only aggregates of a column, or `COUNT(*)`, can be computed yet".into(),
+            "not an aggregate of a column".into(),
+        ),
+        what if what == Unsupported::AggregateType as u16 => (
+            "this aggregate can't take this column's type yet".into(),
+            "not of a type it can take".into(),
+        ),
+        _ => ("not supported yet".into(), "this can't be run yet".into()),
+    }
 }
 
 fn token(kind: TokenKind) -> &'static str {

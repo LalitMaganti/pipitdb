@@ -42,6 +42,8 @@ pub enum ErrorCode {
     NumberTooLarge = 17,
     /// A condition has more than `PREDICATE_NODES_MAX` parts.
     ConditionTooLarge = 18,
+    /// A call names a function there isn't, such as an aggregate's.
+    UnknownFunction = 19,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -57,6 +59,12 @@ pub enum Unsupported {
     NumberType = 3,
     /// A number with a decimal point, which conditions can't compare yet.
     Decimal = 4,
+    /// Anything but an aggregate function of a column, or `COUNT(*)`, in
+    /// `AGGREGATE`.
+    Aggregate = 5,
+    /// An aggregate of a column of a type it can't take, such as the sum of
+    /// strings.
+    AggregateType = 6,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,7 +94,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::ConditionTooLarge;
+    pub const LAST: ErrorCode = ErrorCode::UnknownFunction;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

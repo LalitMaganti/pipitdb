@@ -11,8 +11,13 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
+use pipit_kernel::lower::lower;
+use pipit_kernel::optimize::optimize;
+use pipit_kernel::scannable::DynScannable;
+use pipit_operators::table::Table;
 use pipit_parquet::chunk::ChunkReader;
 use pipit_parquet::footer::ParquetFile;
+use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -238,6 +243,45 @@ pub unsafe extern "C" fn query_node_count(source: *const u8, len: usize) -> u32 
         Ok(ast) => ast.node_count(),
         Err(error) => u32::from(error.code as u16),
     }
+}
+
+/// The one table queries read, `t`: `a` is 0 to 99.
+struct Catalog(DynScannable<'static>);
+
+impl pipit_kernel::scannable::Catalog for Catalog {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        (name == "t").then_some(&self.0)
+    }
+}
+
+/// Compiles, optimizes and runs the query in `len` bytes from `source`, and
+/// returns how many rows it makes, or 0 if it fails.
+///
+/// # Safety
+///
+/// `source` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn query_rows(source: *const u8, len: usize) -> u32 {
+    // SAFETY: guaranteed by the caller.
+    let source = unsafe { core::slice::from_raw_parts(source, len) };
+    let Ok(mut values) = Buffer::allocate(&Heap, 100 * 8) else { return 0 };
+    for (i, value) in (0..).zip(values.as_mut_slice::<i64>()) {
+        *value = i;
+    }
+    let columns = [ColumnView::new(DataType::Int64, values, None)];
+    let Ok(table) = Table::new(&Heap, &[("a", DataType::Int64)], &[&columns]) else { return 0 };
+    let Ok(table) = DynScannable::new(&Heap, table) else { return 0 };
+    let catalog = Catalog(table);
+    let Ok(mut plan) = compile(&Heap, &REGISTRY, &catalog, source) else { return 0 };
+    let Ok(()) = optimize(&Heap, &mut plan) else { return 0 };
+    let Ok(physical) = lower(&Heap, &plan) else { return 0 };
+    let Ok(mut execution) = physical.pipeline().start(&Heap) else { return 0 };
+    let mut batch = RowBatch::new();
+    let mut rows = 0;
+    while let Ok(true) = execution.next(&mut batch) {
+        rows += batch.selection().len();
+    }
+    rows
 }
 
 #[cfg_attr(target_arch = "wasm32", link(wasm_import_module = "env"))]

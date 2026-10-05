@@ -27,12 +27,25 @@ impl Names {
 
     /// Copies `name` in.
     pub fn add(&mut self, name: &str) -> Result<Name, AllocError> {
-        let (Ok(start), Ok(len)) = (u32::try_from(self.bytes.len()), u32::try_from(name.len()))
-        else {
+        self.add_parts(&[name])
+    }
+
+    /// Copies in the name made of `parts`, one after another. Fails, adding
+    /// none of it, if there isn't room.
+    pub fn add_parts(&mut self, parts: &[&str]) -> Result<Name, AllocError> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let (Ok(start), Ok(len32)) = (u32::try_from(self.bytes.len()), u32::try_from(len)) else {
             return Err(AllocError);
         };
-        self.bytes.extend_from_slice(name.as_bytes())?;
-        Ok(Name { start, len })
+        for part in parts {
+            if self.bytes.extend_from_slice(part.as_bytes()).is_err() {
+                while self.bytes.len() > start as usize {
+                    self.bytes.pop();
+                }
+                return Err(AllocError);
+            }
+        }
+        Ok(Name { start, len: len32 })
     }
 
     pub fn get(&self, name: Name) -> &str {
@@ -56,5 +69,10 @@ mod tests {
         let b = names.add("dur").unwrap();
         assert_eq!((names.get(a), names.get(b)), ("ts", "dur"));
         assert_eq!(names.add("too long for the rest").err(), Some(AllocError));
+        let c = names.add_parts(&["f(", "x)"]).unwrap();
+        assert_eq!(names.get(c), "f(x)");
+        // What doesn't fit isn't added in part.
+        assert_eq!(names.add_parts(&["abcd", "efgh"]).err(), Some(AllocError));
+        assert_eq!(names.add("abc").map(|d| names.get(d) == "abc"), Ok(true));
     }
 }

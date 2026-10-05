@@ -130,14 +130,23 @@ impl<'c> LogicalPlan<'c> {
     }
 
     /// A new column, with a copy of `name`.
-    #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
     pub fn add_column(
         &mut self,
         name: &str,
         data_type: DataType,
     ) -> Result<NamedColumn, AllocError> {
-        let id = self.columns.len() as ColumnId;
         let name = self.names.add(name)?;
+        self.add_named_column(name, data_type)
+    }
+
+    /// A new column, with a name already in `names`.
+    #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
+    pub fn add_named_column(
+        &mut self,
+        name: Name,
+        data_type: DataType,
+    ) -> Result<NamedColumn, AllocError> {
+        let id = self.columns.len() as ColumnId;
         self.columns.push(ColumnSchema { name, data_type })?;
         Ok(NamedColumn { name, id })
     }
