@@ -3,6 +3,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
+use crate::column_pool::ColumnPool;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -13,13 +14,14 @@ pub struct Context<'a> {
     allocator: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
     selections: Option<SlowVec<Selection>>,
+    columns: ColumnPool,
 }
 
 impl<'a> Context<'a> {
     /// A context whose states allocate from `allocator`, for steps run
     /// outside a pipeline, such as in tests.
     pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
-        Context { allocator, selections: None }
+        Context { allocator, selections: None, columns: ColumnPool::new() }
     }
 
     /// What the run's memory comes from, for states to allocate with.
@@ -28,11 +30,11 @@ impl<'a> Context<'a> {
     }
 
     /// Memory for filling a batch's column. Steps get all their columns'
-    /// memory here, so how it's found, such as from a pool, can change in one
-    /// place. What it holds is unspecified: whoever fills it writes every byte
-    /// that's read.
+    /// memory here, so how it's found can change in one place: it's reused,
+    /// once no column holds it, for the next of the same size. What it holds
+    /// is unspecified: whoever fills it writes every byte that's read.
     pub fn column_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        Buffer::allocate(self.allocator, size_bytes)
+        self.columns.take(self.allocator, size_bytes)
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
