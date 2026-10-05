@@ -235,8 +235,9 @@ fn add(
 /// loop needs no wider type.
 fn sum(words: &[i64]) -> i128 {
     check!(words.len() <= BATCH_ROWS_MAX as usize);
-    let high: i64 = words.iter().map(|&w| w >> 32).sum();
-    let low: u64 = words.iter().map(|&w| w.cast_unsigned() & 0xffff_ffff).sum();
+    let (high, low) = words.iter().fold((0_i64, 0_u64), |(high, low), &w| {
+        (high + (w >> 32), low + (w.cast_unsigned() & 0xffff_ffff))
+    });
     (i128::from(high) << 32) + i128::from(low)
 }
 
