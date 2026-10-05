@@ -38,6 +38,19 @@ impl Hybrid {
             } else {
                 let width = self.width as usize;
                 let mask = (1_u64 << width) - 1;
+                // Groups of 8 values of up to 8 bits each fit in a word, so
+                // whole groups are split from one load.
+                let mut values = values;
+                while width <= 8 && values.len() >= 8 && self.bit.is_multiple_of(8 * width.max(1)) {
+                    let byte = self.packed + self.bit / 8;
+                    let Some(word) = bytes.get(byte..byte + 8) else { break };
+                    let word = u64::from_le_bytes(word.try_into().ok()?);
+                    let (group, rest) = values.split_at_mut(8);
+                    for (k, value) in group.iter_mut().enumerate() {
+                        *value = ((word >> (k * width)) & mask) as u32;
+                    }
+                    (self.bit, values) = (self.bit + 8 * width, rest);
+                }
                 for value in values {
                     let (byte, shift) = (self.packed + self.bit / 8, self.bit % 8);
                     let word = match bytes.get(byte..byte + 8) {
@@ -55,6 +68,19 @@ impl Hybrid {
             (self.left, at) = (self.left - n, at + n);
         }
         Some(())
+    }
+
+    /// Passes over the next `count` values of `bytes` if they're all in one
+    /// run of `value`, and says whether they were.
+    pub fn skip_run_of(&mut self, bytes: &[u8], value: u32, count: usize) -> Option<bool> {
+        if self.left == 0 {
+            self.start_run(bytes)?;
+        }
+        let in_run = self.rle == Some(value) && self.left >= count;
+        if in_run {
+            self.left -= count;
+        }
+        Some(in_run)
     }
 
     /// Passes over the next `count` values of `bytes` without decoding them,
@@ -130,5 +156,11 @@ mod tests {
         assert_eq!(hybrid.take(&bytes, &mut five), Some(()));
         assert_eq!((two, five), ([1, 1], [2, 3, 4, 5, 6]));
         assert_eq!(hybrid.skip(&bytes, 4), None);
+        // Runs of one value are passed over whole, or not at all.
+        let mut hybrid = Hybrid::new(3);
+        assert_eq!(hybrid.skip_run_of(&bytes, 1, 4), Some(false));
+        assert_eq!(hybrid.skip_run_of(&bytes, 1, 2), Some(true));
+        assert_eq!(hybrid.skip_run_of(&bytes, 1, 1), Some(true));
+        assert_eq!(hybrid.skip_run_of(&bytes, 0, 1), Some(false));
     }
 }

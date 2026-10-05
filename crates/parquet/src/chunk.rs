@@ -248,6 +248,11 @@ impl<'s> ChunkReader<'s> {
             return Ok((None, rows));
         }
         let levels = self.levels(page)?;
+        // Columns that can be null often aren't: then the rows are in one run
+        // of 1s.
+        if self.position.level.skip_run_of(levels, 1, rows).ok_or(Error::Corrupt)? {
+            return Ok((None, rows));
+        }
         let mut decoded = [0_u32; BATCH_ROWS_MAX as usize];
         let decoded = at_mut!(decoded, ..rows);
         self.position.level.take(levels, decoded).ok_or(Error::Corrupt)?;
