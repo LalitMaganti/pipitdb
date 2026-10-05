@@ -24,7 +24,6 @@ impl Hybrid {
 
     /// Fills `out` with the next values of `bytes`, or returns `None` if
     /// there aren't that many or they're damaged.
-    #[expect(clippy::cast_possible_truncation, reason = "values are at most 32 bits")]
     pub fn take(&mut self, bytes: &[u8], out: &mut [u32]) -> Option<()> {
         let mut at = 0;
         while at < out.len() {
@@ -36,38 +35,43 @@ impl Hybrid {
             if let Some(value) = self.rle {
                 values.fill(value);
             } else {
-                let width = self.width as usize;
-                let mask = (1_u64 << width) - 1;
-                // Groups of 8 values of up to 8 bits each fit in a word, so
-                // whole groups are split from one load.
-                let mut values = values;
-                while width <= 8 && values.len() >= 8 && self.bit.is_multiple_of(8 * width.max(1)) {
-                    let byte = self.packed + self.bit / 8;
-                    let Some(word) = bytes.get(byte..byte + 8) else { break };
-                    let word = u64::from_le_bytes(word.try_into().ok()?);
-                    let (group, rest) = values.split_at_mut(8);
-                    for (k, value) in group.iter_mut().enumerate() {
-                        *value = ((word >> (k * width)) & mask) as u32;
-                    }
-                    (self.bit, values) = (self.bit + 8 * width, rest);
-                }
-                for value in values {
-                    let (byte, shift) = (self.packed + self.bit / 8, self.bit % 8);
-                    let word = match bytes.get(byte..byte + 8) {
-                        Some(word) => u64::from_le_bytes(word.try_into().ok()?),
-                        // Near the end, fewer bytes are left than a word.
-                        None => (0..8).fold(0, |word, i| {
-                            let byte = bytes.get(byte + i).copied().unwrap_or(0);
-                            word | u64::from(byte) << (8 * i)
-                        }),
-                    };
-                    *value = ((word >> shift) & mask) as u32;
-                    self.bit += width;
-                }
+                self.unpack(bytes, values);
             }
             (self.left, at) = (self.left - n, at + n);
         }
         Some(())
+    }
+
+    /// Fills `values` from the packed run, whose bytes `start_run` checked
+    /// are there. The bits stream through a word, topped up 4 bytes at a
+    /// time.
+    #[expect(clippy::cast_possible_truncation, reason = "values are at most 32 bits")]
+    fn unpack(&mut self, bytes: &[u8], values: &mut [u32]) {
+        let width = self.width;
+        let mask = (1_u64 << width) - 1;
+        let (mut at, skip) = (self.packed + self.bit / 8, self.bit % 8);
+        let (mut word, mut bits) = (0_u64, 0_u32);
+        let mut top_up = |word: &mut u64, bits: &mut u32| {
+            let next = match bytes.get(at..at + 4) {
+                Some(next) => u32::from_le_bytes([next[0], next[1], next[2], next[3]]),
+                // Near the end, fewer than 4 bytes may be left.
+                None => (0..4).fold(0, |next, i| {
+                    next | u32::from(bytes.get(at + i).copied().unwrap_or(0)) << (8 * i)
+                }),
+            };
+            *word |= u64::from(next) << *bits;
+            (*bits, at) = (*bits + 32, at + 4);
+        };
+        top_up(&mut word, &mut bits);
+        (word, bits) = (word >> skip, bits - skip as u32);
+        for value in values.iter_mut() {
+            if bits < width {
+                top_up(&mut word, &mut bits);
+            }
+            *value = (word & mask) as u32;
+            (word, bits) = (word >> width, bits - width);
+        }
+        self.bit += values.len() * width as usize;
     }
 
     /// Passes over the next `count` values of `bytes` if they're all in one
@@ -135,6 +139,8 @@ impl Hybrid {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -162,5 +168,38 @@ mod tests {
         assert_eq!(hybrid.skip_run_of(&bytes, 1, 2), Some(true));
         assert_eq!(hybrid.skip_run_of(&bytes, 1, 1), Some(true));
         assert_eq!(hybrid.skip_run_of(&bytes, 0, 1), Some(false));
+    }
+
+    /// `values`, a multiple of 8 of them, packed `width` bits each.
+    fn packed(values: &[u32], width: u32) -> std::vec::Vec<u8> {
+        let groups = values.len() / 8;
+        let mut bytes = std::vec![u8::try_from(groups << 1 | 1).unwrap()];
+        let mut bits = std::vec![0_u8; groups * width as usize];
+        for (i, &value) in values.iter().enumerate() {
+            for b in 0..width as usize {
+                let bit = i * width as usize + b;
+                bits[bit / 8] |= u8::from(value >> b & 1 == 1) << (bit % 8);
+            }
+        }
+        bytes.extend(bits);
+        bytes
+    }
+
+    #[test]
+    fn unpacks_wide_values() {
+        for width in [10, 17, 32] {
+            let values: std::vec::Vec<u32> =
+                (0..48_u32).map(|i| i.wrapping_mul(2_654_435_761) >> (32 - width)).collect();
+            let bytes = packed(&values, width);
+            let mut out = std::vec![0; 48];
+            assert_eq!(Hybrid::new(width).take(&bytes, &mut out), Some(()));
+            assert_eq!(out, values);
+            // From the middle of a value's byte.
+            let mut hybrid = Hybrid::new(width);
+            let (mut three, mut rest) = ([0; 3], std::vec![0; 45]);
+            assert_eq!(hybrid.take(&bytes, &mut three), Some(()));
+            assert_eq!(hybrid.take(&bytes, &mut rest), Some(()));
+            assert_eq!((&three[..], &rest[..]), (&values[..3], &values[3..]));
+        }
     }
 }
