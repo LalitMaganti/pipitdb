@@ -1,6 +1,7 @@
 //! `lower`: a `LogicalPlan` to a `PhysicalPlan`, a pipeline ready to run.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::column::DataType;
 use crate::names::{Name, Names};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
@@ -102,6 +103,19 @@ impl<'p, 'c> Lowering<'p, 'c> {
         *at_mut!(self.positions, column as usize) = self.column_count;
         self.column_count += 1;
         Ok(())
+    }
+
+    /// Starts defining columns from the first position again, after a step
+    /// that makes new batches, such as an aggregation. Columns defined before
+    /// aren't in them.
+    pub fn restart_columns(&mut self) {
+        self.positions.fill(u32::MAX);
+        self.column_count = 0;
+    }
+
+    /// What `column` holds.
+    pub fn data_type(&self, column: ColumnId) -> DataType {
+        at!(self.plan.columns, column as usize).data_type
     }
 
     /// Where `column` is in batches.
@@ -229,7 +243,8 @@ mod tests {
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
-    fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
+    /// How many columns and rows the first batch has, and its first column.
+    fn pruned(output: &[usize]) -> (u32, u32, StdVec<i64>) {
         let table = DynScannable::new(&Heap, Ab).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
@@ -250,15 +265,16 @@ mod tests {
         let mut execution = physical.pipeline().start(&Heap).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
-        (batch.column_count() as usize, batch.column(0).int64s().into())
+        let first = (batch.column_count() > 0).then(|| batch.column(0).int64s().into());
+        (batch.column_count(), batch.row_count(), first.unwrap_or_default())
     }
 
     #[test]
     fn scans_only_needed_columns() {
-        assert_eq!(pruned(&[1]), (1, [10, 20].into()));
-        assert_eq!(pruned(&[1, 0]), (2, [1, 2].into()));
-        // A batch with no columns has no rows, so one is kept.
-        assert_eq!(pruned(&[]), (1, [1, 2].into()));
+        assert_eq!(pruned(&[1]), (1, 2, [10, 20].into()));
+        assert_eq!(pruned(&[1, 0]), (2, 2, [1, 2].into()));
+        // With no columns, the rows are still there, to count.
+        assert_eq!(pruned(&[]), (0, 2, [].into()));
     }
 
     /// One batch of four rows: `a` is 1, 2, null and 0, `b` 10, 20, 30 and

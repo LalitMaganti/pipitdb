@@ -182,16 +182,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
         Ok(())
     }
 
-    /// Keeps the needed columns, and at least one: a batch with no columns
-    /// has no rows.
+    /// Keeps the needed columns, maybe none: batches still have rows, to
+    /// count.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
-        let mut first = true;
-        self.columns.retain(|column| {
-            let keep = needed.is_needed(column.binding.id) || (!any && first);
-            first = false;
-            keep
-        });
+        self.columns.retain(|column| needed.is_needed(column.binding.id));
         Pruned::Keep
     }
 }

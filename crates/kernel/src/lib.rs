@@ -5,6 +5,7 @@ extern crate alloc;
 #[macro_use]
 pub mod check;
 
+pub mod aggregate;
 pub mod allocator;
 pub mod boxed;
 pub mod buffer;
