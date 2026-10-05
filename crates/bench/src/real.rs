@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::context::Context;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
@@ -98,7 +99,8 @@ fn int64s(values: &[Option<String>]) -> Option<ColumnView> {
         data.as_mut_slice::<i64>()[i] = number;
         validity.as_mut_slice::<u8>()[i / 8] |= 1 << (i % 8);
     }
-    Some(ColumnView::new(DataType::Int64, data, any_null.then_some(validity)))
+    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, data, any_null.then_some(validity))
+        .ok()
 }
 
 /// The fields of a CSV line: quoted ones can hold commas, and `""` for a

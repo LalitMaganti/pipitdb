@@ -194,7 +194,19 @@ mod tests {
                 let mut values = Buffer::allocate(&Heap, 16).unwrap();
                 let first = [1, 10][column as usize];
                 values.as_mut_slice::<i64>().copy_from_slice(&[first, first * 2]);
-                assert!(batch.push_column(ColumnView::new(DataType::Int64, values, None)).is_ok());
+                assert!(
+                    batch
+                        .push_column(
+                            ColumnView::new(
+                                &mut Context::new(&Heap),
+                                DataType::Int64,
+                                values,
+                                None
+                            )
+                            .unwrap()
+                        )
+                        .is_ok()
+                );
             }
             *done = true;
             Ok(true)
@@ -304,7 +316,13 @@ mod tests {
                     values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
                     validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
                 }
-                let column = ColumnView::new(DataType::Int64, values, Some(validity));
+                let column = ColumnView::new(
+                    &mut Context::new(&Heap),
+                    DataType::Int64,
+                    values,
+                    Some(validity),
+                )
+                .unwrap();
                 assert!(batch.push_column(column).is_ok());
             }
             *done = true;

@@ -6,7 +6,7 @@
 //! and every node keeps SQL's three-valued logic without building booleans.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::ColumnView;
+use crate::column::{ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Comparison, Value};
@@ -221,6 +221,20 @@ impl Transform for Filter {
         (): &mut (),
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
+        // Filters test flat and constant columns. Dictionary ones, which
+        // only strings are read as so far, aren't filtered yet: refused
+        // rather than made flat, which would copy every value.
+        //
+        // TODO: filter a dictionary column by testing each of its entries
+        // once, with the flat column's test on its values, into a bit for
+        // each, and then keeping the rows whose index's bit is set. The bits
+        // are kept between batches, as a chunk's batches share its
+        // dictionary, so a dictionary of a few strings over millions of rows
+        // costs a few tests. This is what DuckDB does.
+        let mut columns = self.predicate.columns();
+        if columns.any(|position| matches!(batch.column(position).form(), Form::Dictionary(_))) {
+            return Err(Error::Unsupported);
+        }
         self.predicate.select(context.selections(), batch);
         Ok(())
     }
@@ -234,6 +248,7 @@ mod tests {
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::DataType;
+    use crate::context::Context;
     use crate::selection::Kept;
 
     /// `a` and `b`, with `None` for null.
@@ -247,7 +262,7 @@ mod tests {
             values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
             validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
         }
-        ColumnView::new(DataType::Int64, values, Some(validity))
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity)).unwrap()
     }
 
     /// A predicate to evaluate both ways: by `Predicate`, and by hand.
@@ -343,5 +358,22 @@ mod tests {
                 (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
             assert_eq!(kept(expr), expected);
         }
+    }
+
+    #[test]
+    fn filters_refuse_dictionary_columns() {
+        let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+        build(&Expr::Greater(0, 2), &mut nodes);
+        let filter = Filter { predicate: Predicate::new(nodes) };
+        let mut context = Context::new(&Heap);
+        filter.new_state(&mut context).unwrap();
+        let mut indices = crate::buffer::Buffer::allocate(&Heap, 6 * 4).unwrap();
+        indices.as_mut_slice::<u32>().copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+        let mut batch = RowBatch::new();
+        batch.reset(6);
+        let dictionary =
+            ColumnView::dictionary(&mut Context::new(&Heap), &column(A), indices).unwrap();
+        assert!(batch.push_column(dictionary).is_ok());
+        assert_eq!(filter.process(&mut context, &mut (), &mut batch), Err(Error::Unsupported));
     }
 }

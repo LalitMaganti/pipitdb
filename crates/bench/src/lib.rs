@@ -87,7 +87,11 @@ impl Repeat {
     pub fn new(batches: u32) -> Repeat {
         let size_bytes = BATCH_ROWS_MAX as usize * 8;
         let values = Buffer::allocate(&Heap, size_bytes).expect("allocates");
-        Repeat { column: ColumnView::new(DataType::Int64, values, None), batches }
+        Repeat {
+            column: ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
+                .expect("allocates"),
+            batches,
+        }
     }
 }
 
@@ -182,7 +186,8 @@ pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'s
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
     let values = Buffer::allocate(&Heap, BATCH_ROWS_MAX as usize * 8).expect("allocates");
-    let column = ColumnView::new(DataType::Int64, values, None);
+    let column = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
+        .expect("allocates");
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
     let schema = [
@@ -221,7 +226,7 @@ pub fn filter_column(nulls: bool) -> ColumnView {
         }
         validity
     });
-    ColumnView::new(DataType::Int64, values, validity)
+    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).expect("allocates")
 }
 
 /// Filters `batches` fresh selections of `column` with `filter`, returning

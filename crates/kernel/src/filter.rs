@@ -6,7 +6,7 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
-use crate::column::{ColumnView, DataType};
+use crate::column::{ColumnView, DataType, Form};
 use crate::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -46,12 +46,37 @@ pub fn compare(
     match value {
         Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
-            compare_cells(column, column.int64s(), |cell| cell, range, selection, dropped);
+            compare_form(column, column.values().int64s(), |cell| cell, range, selection, dropped);
         }
         Value::Float64(_) => {
             check!(column.data_type() == DataType::Float64);
-            compare_cells(column, column.float64s(), float_key, range, selection, dropped);
+            compare_form(column, column.values().float64s(), float_key, range, selection, dropped);
         }
+    }
+}
+
+/// `compare` for any form of `column`, whose values `cells` reads.
+fn compare_form<T: Copy>(
+    column: &ColumnView,
+    cells: &[T],
+    key: impl Fn(T) -> i64 + Copy,
+    range: Range,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    let values = column.values();
+    match column.form() {
+        Form::Flat => compare_cells(column, cells, key, range, selection, dropped),
+        // One value for every row: kept or dropped together.
+        Form::Constant => {
+            if !values.is_null(0) && range.contains(key(*at!(cells, 0))) {
+                keep_all(selection, dropped);
+            } else {
+                drop_all(selection, dropped);
+            }
+        }
+        // `Filter` refuses dictionary columns.
+        Form::Dictionary(_) => crate::check::check_failed(line!()),
     }
 }
 
@@ -64,6 +89,14 @@ pub fn is_null(
     dropped: Option<&mut Selection>,
 ) {
     check_covers(column, selection);
+    match column.form() {
+        Form::Flat => {}
+        // One value for every row: kept or dropped together.
+        Form::Constant if column.is_null(0) == nulls => return keep_all(selection, dropped),
+        Form::Constant => return drop_all(selection, dropped),
+        // `Filter` refuses dictionary columns.
+        Form::Dictionary(_) => crate::check::check_failed(line!()),
+    }
     match column.validity() {
         // No row is null.
         None if nulls => drop_all(selection, dropped),
@@ -210,6 +243,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
+    use crate::context::Context;
     use crate::selection::Kept;
 
     /// `0, 1, ..., 9`, with rows in `nulls` null.
@@ -225,7 +259,7 @@ mod tests {
             }
             validity
         });
-        ColumnView::new(DataType::Int64, values, validity)
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
     }
 
     /// The rows `filter` keeps of all ten.
@@ -259,7 +293,8 @@ mod tests {
         let cells = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
         let mut values = Buffer::allocate(&Heap, 56).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&cells);
-        let column = ColumnView::new(DataType::Int64, values, None);
+        let column =
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
             (Comparison::NotEqual, i64::ne),
@@ -301,7 +336,8 @@ mod tests {
         let mut values = Buffer::allocate(&Heap, 48).unwrap();
         let cells = [-1.5, -0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
         values.as_mut_slice::<f64>().copy_from_slice(&cells);
-        let column = ColumnView::new(DataType::Float64, values, None);
+        let column =
+            ColumnView::new(&mut Context::new(&Heap), DataType::Float64, values, None).unwrap();
         let rows = |comparison, value| {
             let mut selection = Selection::all(6);
             compare(&column, comparison, Value::Float64(value), &mut selection, None);
@@ -340,5 +376,28 @@ mod tests {
             compare(&column, Comparison::NotEqual, Value::Int64(5), s, None);
         });
         assert_eq!(rows, [3, 4, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn filters_constants_once() {
+        let mut values = Buffer::allocate(&Heap, 2 * 8).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&[20, 0]);
+        let mut bits = Buffer::allocate(&Heap, 1).unwrap();
+        bits.as_mut_slice::<u8>()[0] = 0b01;
+        let values =
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(bits)).unwrap();
+        let compare_on = |column: &ColumnView, value| {
+            let mut selection = Selection::all(column.row_count());
+            compare(column, Comparison::GreaterEqual, Value::Int64(value), &mut selection, None);
+            selection.len()
+        };
+        let twenties =
+            ColumnView::constant(&mut Context::new(&Heap), &values.slice(0, 1), 4).unwrap();
+        assert_eq!((compare_on(&twenties, 15), compare_on(&twenties, 25)), (4, 0));
+        let nulls = ColumnView::constant(&mut Context::new(&Heap), &values.slice(1, 1), 4).unwrap();
+        assert_eq!(compare_on(&nulls, -100), 0);
+        let mut selection = Selection::all(4);
+        is_null(&nulls, true, &mut selection, None);
+        assert_eq!(selection.len(), 4);
     }
 }

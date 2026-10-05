@@ -29,7 +29,11 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
         return 0;
     };
     values.as_mut_slice::<i64>().fill(value);
-    let column = ColumnView::new(DataType::Int64, values, None).slice(1, count - 1);
+    let mut context = Context::new(&Heap);
+    let Ok(column) = ColumnView::new(&mut context, DataType::Int64, values, None) else {
+        return 0;
+    };
+    let column = column.slice(1, count - 1);
     let mut batch = RowBatch::new();
     batch.reset(column.row_count());
     if batch.push_column(column).is_err() || batch.column(0).is_null(0) {
@@ -109,13 +113,16 @@ pub extern "C" fn spill_round_trip(value: i64) -> i64 {
         Fixed { bytes: core::cell::UnsafeCell::new([0; 256]), len: core::cell::Cell::new(0) };
     let Ok(mut values) = Buffer::allocate(&Heap, 8) else { return 0 };
     values.as_mut_slice::<i64>()[0] = value;
-    let column = ColumnView::new(DataType::Int64, values, None);
+    let mut context = Context::new(&Heap);
+    let Ok(column) = ColumnView::new(&mut context, DataType::Int64, values, None) else {
+        return 0;
+    };
     let Ok(log) = store.create() else { return 0 };
     let Ok(spilled) = write_column(&store, log, &column) else { return 0 };
     if store.seal(log).is_err() {
         return 0;
     }
-    let Ok(read) = read_column(&Heap, &store, log, &spilled) else { return 0 };
+    let Ok(read) = read_column(&mut context, &store, log, &spilled) else { return 0 };
     read.int64s()[0]
 }
 
@@ -126,7 +133,8 @@ pub extern "C" fn second_string_len(first: u32, second: u32) -> usize {
     let ends = offsets.as_mut_slice::<u32>();
     (ends[1], ends[2]) = (first, first + second);
     let Ok(bytes) = Buffer::allocate(&Heap, (first + second) as usize) else { return 0 };
-    let column = ColumnView::strings(offsets, bytes, None);
+    let mut context = Context::new(&Heap);
+    let Ok(column) = ColumnView::strings(&mut context, offsets, bytes, None) else { return 0 };
     column.string_values().get(1).len()
 }
 
