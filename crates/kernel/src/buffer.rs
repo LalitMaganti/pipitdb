@@ -37,6 +37,8 @@ pub struct Buffer {
 #[repr(C, align(64))]
 struct Header {
     references: Cell<u32>,
+    /// Whether the last drop keeps the bytes for a `ColumnPool`.
+    pooled: Cell<bool>,
     size_bytes: usize,
     allocator: NonNull<dyn Allocator>,
 }
@@ -76,7 +78,12 @@ impl Buffer {
         };
         // SAFETY: the allocation fits a header followed by `size_bytes` bytes.
         let data = unsafe {
-            header.write(Header { references: Cell::new(1), size_bytes, allocator });
+            header.write(Header {
+                references: Cell::new(1),
+                pooled: Cell::new(false),
+                size_bytes,
+                allocator,
+            });
             header.cast::<u8>().add(HEADER_BYTES)
         };
         Ok(Buffer { data })
@@ -145,10 +152,82 @@ impl Buffer {
     }
 
     fn header(&self) -> &Header {
-        // SAFETY: the header is right in front of the bytes, and lives as
-        // long as any reference to it.
-        unsafe { self.data.sub(HEADER_BYTES).cast::<Header>().as_ref() }
+        // SAFETY: the buffer references its bytes.
+        unsafe { header(self.data) }
     }
+
+    /// Allocates `size_bytes` zeroed bytes, as `allocate`, whose last drop
+    /// keeps them for the `ColumnPool` that holds `as_non_null` of them, to
+    /// hand out again, until it gives them up.
+    pub(crate) fn allocate_pooled(
+        allocator: &dyn Allocator,
+        size_bytes: usize,
+    ) -> Result<Buffer, AllocError> {
+        let buffer = Buffer::allocate(allocator, size_bytes)?;
+        buffer.header().pooled.set(true);
+        Ok(buffer)
+    }
+
+    /// Where the bytes are, for a `ColumnPool` to find them again.
+    pub(crate) fn as_non_null(&self) -> NonNull<u8> {
+        self.data
+    }
+
+    /// The pooled buffer at `data`, if nothing references it and it has
+    /// `size_bytes` bytes.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be from a pooled buffer's `as_non_null`, not yet given up.
+    pub(crate) unsafe fn reuse(data: NonNull<u8>, size_bytes: usize) -> Option<Buffer> {
+        // SAFETY: pooled bytes live until given up.
+        let header = unsafe { header(data) };
+        (header.references.get() == 0 && header.size_bytes == size_bytes).then(|| {
+            header.references.set(1);
+            Buffer { data }
+        })
+    }
+
+    /// Gives up the pooled buffer at `data`: it's freed now if nothing
+    /// references it, and by its last drop if something does.
+    ///
+    /// # Safety
+    ///
+    /// As for `reuse`; `data` mustn't be used again.
+    pub(crate) unsafe fn unpool(data: NonNull<u8>) {
+        // SAFETY: pooled bytes live until given up.
+        let header = unsafe { header(data) };
+        header.pooled.set(false);
+        if header.references.get() == 0 {
+            // SAFETY: nothing references the bytes, and they're no longer
+            // pooled.
+            unsafe { deallocate(data) };
+        }
+    }
+}
+
+/// The header of the bytes at `data`.
+///
+/// # Safety
+///
+/// `data` must be a buffer's bytes, which haven't been freed.
+unsafe fn header<'a>(data: NonNull<u8>) -> &'a Header {
+    // SAFETY: the header is right in front of the bytes.
+    unsafe { data.sub(HEADER_BYTES).cast::<Header>().as_ref() }
+}
+
+/// Frees the bytes at `data`, and their header.
+///
+/// # Safety
+///
+/// As for `header`, and nothing may use them again.
+unsafe fn deallocate(data: NonNull<u8>) {
+    // SAFETY: upheld by the caller.
+    let header = unsafe { header(data) };
+    let Ok(layout) = layout(header.size_bytes) else { crate::check::check_failed(line!()) };
+    // SAFETY: the header and bytes were allocated together with this layout,
+    // from this allocator, which outlives them.
+    unsafe { header.allocator.as_ref().deallocate(data.sub(HEADER_BYTES), layout) };
 }
 
 /// A header and `size_bytes` bytes after it.
@@ -167,15 +246,16 @@ impl Clone for Buffer {
 }
 
 impl Drop for Buffer {
+    // Out of line: buffers are dropped in many places, each of which would
+    // otherwise carry a copy.
+    #[inline(never)]
     fn drop(&mut self) {
         let header = self.header();
         let references = header.references.get() - 1;
         header.references.set(references);
-        if references == 0 {
-            let Ok(layout) = layout(header.size_bytes) else { crate::check::check_failed(line!()) };
-            // SAFETY: that was the last reference, and the header and bytes
-            // were allocated together with this layout, from this allocator.
-            unsafe { self.allocator().deallocate(self.data.sub(HEADER_BYTES), layout) };
+        if references == 0 && !header.pooled.get() {
+            // SAFETY: that was the last reference.
+            unsafe { deallocate(self.data) };
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod boxed;
 pub mod buffer;
 pub mod bytes;
 pub mod column;
+mod column_pool;
 pub mod context;
 mod erase;
 pub mod error;
