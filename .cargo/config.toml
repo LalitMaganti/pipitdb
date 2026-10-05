@@ -1,0 +1,8 @@
+# Google's Snappy, which `snappy_src` compiles without its CMake
+# configuration: these are what that configuration would set. Without them
+# its asserts stay on, and it falls back from compiler builtins and NEON.
+[env]
+CXXFLAGS_aarch64_apple_darwin = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1 -DSNAPPY_HAVE_NEON=1"
+CXXFLAGS_aarch64_unknown_linux_gnu = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1 -DSNAPPY_HAVE_NEON=1"
+CXXFLAGS_x86_64_unknown_linux_gnu = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1"
+CXXFLAGS_x86_64_apple_darwin = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1"
