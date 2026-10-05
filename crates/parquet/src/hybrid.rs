@@ -2,7 +2,24 @@
 //! dictionary indices: runs of one value, and groups of 8 values packed in
 //! `width` bits each.
 
-/// Where decoding is: its bytes are passed to `next`, so it can be kept
+/// Values decoded together: `n` copies of one value, or `n` values unpacked
+/// into the caller's memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Run {
+    Repeat(u32, usize),
+    Packed(usize),
+}
+
+impl Run {
+    /// How many values it has.
+    pub fn len(self) -> usize {
+        match self {
+            Run::Repeat(_, n) | Run::Packed(n) => n,
+        }
+    }
+}
+
+/// Where decoding is: its bytes are passed to `next_run`, so it can be kept
 /// between calls without borrowing them.
 #[derive(Clone, Copy, Default)]
 pub struct Hybrid {
@@ -22,22 +39,32 @@ impl Hybrid {
         Hybrid { pos: 0, width, left: 0, rle: None, bit: 0, packed: 0 }
     }
 
+    /// The next values of `bytes`, at most `out.len()` of them: a run of one
+    /// value, or values unpacked into `out`. `None` if there are no more or
+    /// they're damaged.
+    pub fn next_run(&mut self, bytes: &[u8], out: &mut [u32]) -> Option<Run> {
+        if self.left == 0 {
+            self.start_run(bytes)?;
+        }
+        let n = self.left.min(out.len());
+        self.left -= n;
+        if let Some(value) = self.rle {
+            return Some(Run::Repeat(value, n));
+        }
+        self.unpack(bytes, at_mut!(out, ..n));
+        Some(Run::Packed(n))
+    }
+
     /// Fills `out` with the next values of `bytes`, or returns `None` if
     /// there aren't that many or they're damaged.
     pub fn take(&mut self, bytes: &[u8], out: &mut [u32]) -> Option<()> {
         let mut at = 0;
         while at < out.len() {
-            if self.left == 0 {
-                self.start_run(bytes)?;
+            let run = self.next_run(bytes, at_mut!(out, at..))?;
+            if let Run::Repeat(value, n) = run {
+                at_mut!(out, at..at + n).fill(value);
             }
-            let n = self.left.min(out.len() - at);
-            let values = at_mut!(out, at..at + n);
-            if let Some(value) = self.rle {
-                values.fill(value);
-            } else {
-                self.unpack(bytes, values);
-            }
-            (self.left, at) = (self.left - n, at + n);
+            at += run.len();
         }
         Some(())
     }
@@ -72,19 +99,6 @@ impl Hybrid {
             (word, bits) = (word >> width, bits - width);
         }
         self.bit += values.len() * width as usize;
-    }
-
-    /// Passes over the next `count` values of `bytes` if they're all in one
-    /// run of `value`, and says whether they were.
-    pub fn skip_run_of(&mut self, bytes: &[u8], value: u32, count: usize) -> Option<bool> {
-        if self.left == 0 {
-            self.start_run(bytes)?;
-        }
-        let in_run = self.rle == Some(value) && self.left >= count;
-        if in_run {
-            self.left -= count;
-        }
-        Some(in_run)
     }
 
     /// Passes over the next `count` values of `bytes` without decoding them,
@@ -162,12 +176,6 @@ mod tests {
         assert_eq!(hybrid.take(&bytes, &mut five), Some(()));
         assert_eq!((two, five), ([1, 1], [2, 3, 4, 5, 6]));
         assert_eq!(hybrid.skip(&bytes, 4), None);
-        // Runs of one value are passed over whole, or not at all.
-        let mut hybrid = Hybrid::new(3);
-        assert_eq!(hybrid.skip_run_of(&bytes, 1, 4), Some(false));
-        assert_eq!(hybrid.skip_run_of(&bytes, 1, 2), Some(true));
-        assert_eq!(hybrid.skip_run_of(&bytes, 1, 1), Some(true));
-        assert_eq!(hybrid.skip_run_of(&bytes, 0, 1), Some(false));
     }
 
     /// `values`, a multiple of 8 of them, packed `width` bits each.

@@ -9,7 +9,7 @@ use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
 use crate::Error;
 use crate::footer::{Chunk, Column, Physical};
-use crate::hybrid::Hybrid;
+use crate::hybrid::{Hybrid, Run};
 use crate::thrift::{Cursor, Value};
 
 /// Page headers are read in windows of this size, larger if need be.
@@ -206,11 +206,7 @@ impl<'s> ChunkReader<'s> {
                 let mut out = context.column_buffer(rows * 8)?;
                 let words = out.as_mut_slice::<i64>();
                 if let Some(dictionary) = &dictionary {
-                    let indices = self.indices(page, dictionary, at_mut!(decoded, ..valid))?;
-                    let values = dictionary.values.as_slice::<i64>();
-                    for (word, &i) in words.iter_mut().zip(indices.iter()) {
-                        *word = *at!(values, i as usize);
-                    }
+                    self.lookup(page, dictionary, decoded, at_mut!(words, ..valid))?;
                 } else {
                     let (physical, at) = (self.column.physical, self.position.value);
                     self.position.value = plain_words(physical, page, at, at_mut!(words, ..valid))?;
@@ -237,6 +233,35 @@ impl<'s> ChunkReader<'s> {
     /// The page's definition levels.
     fn levels<'p>(&self, page: &'p [u8]) -> Result<&'p [u8], Error> {
         page.get(self.position.levels.0..self.position.levels.1).ok_or(Error::Corrupt)
+    }
+
+    /// Fills `words` with the dictionary's values at the page's next indices,
+    /// a run at a time, decoding packed indices into `decoded`.
+    fn lookup(
+        &mut self,
+        page: &[u8],
+        dictionary: &Dictionary,
+        decoded: &mut [u32],
+        words: &mut [i64],
+    ) -> Result<(), Error> {
+        let bytes = page.get(self.position.value..).ok_or(Error::Corrupt)?;
+        let values = dictionary.values.as_slice::<i64>();
+        let value = |i: u32| values.get(i as usize).copied().ok_or(Error::Corrupt);
+        let mut at = 0;
+        while at < words.len() {
+            let left = at_mut!(decoded, ..words.len() - at);
+            let run = self.position.index.next_run(bytes, left).ok_or(Error::Corrupt)?;
+            match run {
+                Run::Repeat(i, n) => at_mut!(words, at..at + n).fill(value(i)?),
+                Run::Packed(n) => {
+                    for (word, &i) in at_mut!(words, at..at + n).iter_mut().zip(decoded.iter()) {
+                        *word = value(i)?;
+                    }
+                }
+            }
+            at += run.len();
+        }
+        Ok(())
     }
 
     /// Fills `indices` with the page's next indices into `dictionary`,
@@ -269,18 +294,26 @@ impl<'s> ChunkReader<'s> {
             return Ok((None, rows));
         }
         let levels = self.levels(page)?;
-        // Columns that can be null often aren't: then the rows are in one run
-        // of 1s.
-        if self.position.level.skip_run_of(levels, 1, rows).ok_or(Error::Corrupt)? {
-            return Ok((None, rows));
-        }
-        let decoded = at_mut!(decoded, ..rows);
-        self.position.level.take(levels, decoded).ok_or(Error::Corrupt)?;
         let mut bits = [0_u8; BATCH_ROWS_MAX as usize / 8];
-        for (byte, levels) in bits.iter_mut().zip(decoded.chunks(8)) {
-            *byte = levels.iter().rev().fold(0, |byte, &level| byte << 1 | u8::from(level == 1));
+        let (mut row, mut valid) = (0, 0);
+        while row < rows {
+            let left = at_mut!(decoded, ..rows - row);
+            match self.position.level.next_run(levels, left).ok_or(Error::Corrupt)? {
+                Run::Repeat(level, n) => {
+                    if level == 1 {
+                        set_bits(&mut bits, row, n);
+                        valid += n;
+                    }
+                    row += n;
+                }
+                Run::Packed(n) => {
+                    for &level in at!(decoded, ..n) {
+                        *at_mut!(bits, row / 8) |= u8::from(level == 1) << (row % 8);
+                        (row, valid) = (row + 1, valid + usize::from(level == 1));
+                    }
+                }
+            }
         }
-        let valid = decoded.iter().filter(|&&level| level == 1).count();
         if valid == rows {
             return Ok((None, rows));
         }
@@ -491,6 +524,24 @@ fn gather_strings(
         *at_mut!(ends, row + 1) = u32::try_from(to).map_err(|_| Error::Unsupported)?;
     }
     Ok((offsets, copied))
+}
+
+/// Sets bits `start..start + count` of `bits`.
+fn set_bits(bits: &mut [u8], start: usize, count: usize) {
+    let end = start + count;
+    let mut bit = start;
+    // Up to a whole byte, then whole bytes, then the rest.
+    while bit < end && !bit.is_multiple_of(8) {
+        *at_mut!(bits, bit / 8) |= 1 << (bit % 8);
+        bit += 1;
+    }
+    let whole = (end - bit) / 8;
+    at_mut!(bits, bit / 8..bit / 8 + whole).fill(0xff);
+    bit += whole * 8;
+    while bit < end {
+        *at_mut!(bits, bit / 8) |= 1 << (bit % 8);
+        bit += 1;
+    }
 }
 
 /// Moves the first `valid` of `words` to the rows `validity` says aren't null,
