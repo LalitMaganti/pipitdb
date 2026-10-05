@@ -29,7 +29,14 @@ pub struct ChunkReader<'s> {
     dictionary_page: Option<(u64, u64, usize)>,
     /// The dictionary's values, once a page needs them.
     dictionary: Option<Dictionary>,
+    /// Room to decode a batch's levels or indices, and find its strings,
+    /// made the first time it's needed.
+    scratch: Option<Buffer>,
 }
+
+/// A batch's worth of `u32`s for levels or indices, and then for strings'
+/// starts and lengths.
+const SCRATCH_BYTES: usize = 3 * BATCH_ROWS_MAX as usize * 4;
 
 /// Where reading is in a chunk. It's small and copied, so a lazy column can
 /// keep one and read its rows from it later, with `seek`.
@@ -97,6 +104,7 @@ impl<'s> ChunkReader<'s> {
             page,
             dictionary_page,
             dictionary,
+            scratch: None,
         })
     }
 
@@ -134,13 +142,15 @@ impl<'s> ChunkReader<'s> {
         let mut valid = rows;
         if self.column.optional {
             let levels = self.levels(page)?;
-            let mut chunk = [0_u32; BATCH_ROWS_MAX as usize];
+            let mut scratch = self.take_scratch(context)?;
+            let decoded = at_mut!(scratch.as_mut_slice::<u32>(), ..BATCH_ROWS_MAX as usize);
             valid = 0;
-            for start in (0..rows).step_by(chunk.len()) {
-                let chunk = at_mut!(chunk, ..(rows - start).min(BATCH_ROWS_MAX as usize));
+            for start in (0..rows).step_by(decoded.len()) {
+                let chunk = at_mut!(decoded, ..(rows - start).min(BATCH_ROWS_MAX as usize));
                 self.position.level.take(levels, chunk).ok_or(Error::Corrupt)?;
                 valid += chunk.iter().filter(|&&level| level == 1).count();
             }
+            self.scratch = Some(scratch);
         }
         let at = self.position.value;
         match (self.position.indexed, self.data_type) {
@@ -167,36 +177,36 @@ impl<'s> ChunkReader<'s> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
         let (page, dictionary) = self.body(context)?;
         let page = page.as_slice::<u8>();
-        let (validity, valid) = self.validity(context, page, rows)?;
+        let mut scratch = self.take_scratch(context)?;
+        let (decoded, places) = scratch.as_mut_slice::<u32>().split_at_mut(BATCH_ROWS_MAX as usize);
+        let (validity, valid) = self.validity(context, page, rows, decoded)?;
         let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
         let column = match self.data_type {
             DataType::String => {
-                let mut spans = [(0_u32, 0_u32); BATCH_ROWS_MAX as usize];
-                let spans = at_mut!(spans, ..valid);
+                let (starts, lens) = places.split_at_mut(BATCH_ROWS_MAX as usize);
+                let (starts, lens) = (at_mut!(starts, ..valid), at_mut!(lens, ..valid));
                 let bytes = if let Some(dictionary) = &dictionary {
-                    let mut indices = [0_u32; BATCH_ROWS_MAX as usize];
-                    let indices = self.indices(page, dictionary, at_mut!(indices, ..valid))?;
+                    let indices = self.indices(page, dictionary, at_mut!(decoded, ..valid))?;
                     let offsets = dictionary.values.as_slice::<u32>();
-                    for (span, &i) in spans.iter_mut().zip(indices.iter()) {
-                        let (start, end) =
+                    for ((start, len), &i) in starts.iter_mut().zip(lens.iter_mut()).zip(indices) {
+                        let (first, end) =
                             (*at!(offsets, i as usize), *at!(offsets, i as usize + 1));
-                        *span = (start, end - start);
+                        (*start, *len) = (first, end - first);
                     }
                     let Some(bytes) = &dictionary.bytes else { return Err(Error::Corrupt) };
                     bytes.as_slice::<u8>()
                 } else {
-                    self.position.value = plain_strings(page, self.position.value, spans)?;
+                    self.position.value = plain_strings(page, self.position.value, starts, lens)?;
                     page
                 };
-                let (offsets, bytes) = gather_strings(context, bytes, spans, rows, bits)?;
+                let (offsets, bytes) = gather_strings(context, bytes, starts, lens, rows, bits)?;
                 ColumnView::strings(offsets, bytes, validity)
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut out = context.column_buffer(rows * 8)?;
                 let words = out.as_mut_slice::<i64>();
                 if let Some(dictionary) = &dictionary {
-                    let mut indices = [0_u32; BATCH_ROWS_MAX as usize];
-                    let indices = self.indices(page, dictionary, at_mut!(indices, ..valid))?;
+                    let indices = self.indices(page, dictionary, at_mut!(decoded, ..valid))?;
                     let values = dictionary.values.as_slice::<i64>();
                     for (word, &i) in words.iter_mut().zip(indices.iter()) {
                         *word = *at!(values, i as usize);
@@ -211,8 +221,17 @@ impl<'s> ChunkReader<'s> {
                 ColumnView::new(self.data_type, out, validity)
             }
         };
+        self.scratch = Some(scratch);
         self.position.left -= rows;
         Ok(column)
+    }
+
+    /// The scratch memory, to give back once used.
+    fn take_scratch(&mut self, context: &Context) -> Result<Buffer, Error> {
+        match self.scratch.take() {
+            Some(scratch) => Ok(scratch),
+            None => Ok(Buffer::allocate(context.allocator(), SCRATCH_BYTES)?),
+        }
     }
 
     /// The page's definition levels.
@@ -238,11 +257,13 @@ impl<'s> ChunkReader<'s> {
 
     /// The next `rows` rows' validity, from their definition levels, or
     /// `None` if they can't be null or none are; and how many aren't null.
+    /// Levels are decoded into `decoded`.
     fn validity(
         &mut self,
         context: &mut Context,
         page: &[u8],
         rows: usize,
+        decoded: &mut [u32],
     ) -> Result<(Option<Buffer>, usize), Error> {
         if !self.column.optional {
             return Ok((None, rows));
@@ -253,7 +274,6 @@ impl<'s> ChunkReader<'s> {
         if self.position.level.skip_run_of(levels, 1, rows).ok_or(Error::Corrupt)? {
             return Ok((None, rows));
         }
-        let mut decoded = [0_u32; BATCH_ROWS_MAX as usize];
         let decoded = at_mut!(decoded, ..rows);
         self.position.level.take(levels, decoded).ok_or(Error::Corrupt)?;
         let mut bits = [0_u8; BATCH_ROWS_MAX as usize / 8];
@@ -421,41 +441,48 @@ fn plain_words(
     Ok(end)
 }
 
-/// Finds the plain strings in `bytes` from `at`, filling `spans` with each
-/// one's start and length, and returns where they end.
-fn plain_strings(bytes: &[u8], mut at: usize, spans: &mut [(u32, u32)]) -> Result<usize, Error> {
-    for span in spans {
+/// Finds the plain strings in `bytes` from `at`, filling `starts` and
+/// `lens` with where each starts and how long it is, and returns where they
+/// end.
+fn plain_strings(
+    bytes: &[u8],
+    mut at: usize,
+    starts: &mut [u32],
+    lens: &mut [u32],
+) -> Result<usize, Error> {
+    for (start, len_out) in starts.iter_mut().zip(lens) {
         let len = length(bytes, at)?;
         let first = at + 4;
         if first + len > bytes.len() {
             return Err(Error::Corrupt);
         }
         let span32 = (u32::try_from(first), u32::try_from(len));
-        let (Ok(start), Ok(len32)) = span32 else { return Err(Error::Unsupported) };
-        *span = (start, len32);
+        let (Ok(start32), Ok(len32)) = span32 else { return Err(Error::Unsupported) };
+        (*start, *len_out) = (start32, len32);
         at = first + len;
     }
     Ok(at)
 }
 
-/// Copies the strings at `spans` of `bytes`, which are the values of the rows
-/// `validity` says aren't null, into a column's offsets and bytes.
+/// Copies the strings of `bytes` at `starts`, of `lens`, which are the values
+/// of the rows `validity` says aren't null, into a column's offsets and bytes.
 fn gather_strings(
     context: &mut Context,
     bytes: &[u8],
-    spans: &[(u32, u32)],
+    starts: &[u32],
+    lens: &[u32],
     rows: usize,
     validity: Option<&[u8]>,
 ) -> Result<(Buffer, Buffer), Error> {
-    let total: usize = spans.iter().map(|&(_, len)| len as usize).sum();
+    let total: usize = lens.iter().map(|&len| len as usize).sum();
     let mut offsets = context.column_buffer((rows + 1) * 4)?;
     let mut copied = context.column_buffer(total)?;
     let (ends, out) = (offsets.as_mut_slice::<u32>(), copied.as_mut_slice::<u8>());
-    let (mut to, mut next) = (0, spans.iter());
+    let (mut to, mut next) = (0, starts.iter().zip(lens));
     *at_mut!(ends, 0) = 0;
     for row in 0..rows {
         if validity.is_none_or(|bits| *at!(bits, row / 8) >> (row % 8) & 1 != 0) {
-            let Some(&(start, len)) = next.next() else { return Err(Error::Corrupt) };
+            let Some((&start, &len)) = next.next() else { return Err(Error::Corrupt) };
             let (start, len) = (start as usize, len as usize);
             let value = bytes.get(start..start + len).ok_or(Error::Corrupt)?;
             at_mut!(out, to..to + len).copy_from_slice(value);
