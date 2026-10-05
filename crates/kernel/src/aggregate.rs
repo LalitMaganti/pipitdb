@@ -207,22 +207,18 @@ fn add(
         DataType::Int64 => {
             let first = if total.count == 0 { i128::from(first) } else { total.int };
             total.int = match function {
-                Function::Min => {
-                    first.min(i128::from(words.iter().fold(i64::MAX, |m, &w| m.min(w))))
-                }
-                Function::Max => {
-                    first.max(i128::from(words.iter().fold(i64::MIN, |m, &w| m.max(w))))
-                }
-                _ => total.int + sum(words),
+                Function::Min => first.min(i128::from(lanes(words, i64::MAX, |w| w, i64::min))),
+                Function::Max => first.max(i128::from(lanes(words, i64::MIN, |w| w, i64::max))),
+                _ => total.int + lanes(words, 0, i128::from, |a, b| a + b),
             };
         }
         DataType::Float64 => {
-            let float = |w: &i64| f64::from_bits(w.cast_unsigned());
-            let first = if total.count == 0 { float(&first) } else { total.float };
+            let float = |w: i64| f64::from_bits(w.cast_unsigned());
+            let first = if total.count == 0 { float(first) } else { total.float };
             total.float = match function {
-                Function::Min => words.iter().map(float).fold(first, f64::min),
-                Function::Max => words.iter().map(float).fold(first, f64::max),
-                _ => total.float + words.iter().map(float).sum::<f64>(),
+                Function::Min => first.min(lanes(words, f64::INFINITY, float, f64::min)),
+                Function::Max => first.max(lanes(words, f64::NEG_INFINITY, float, f64::max)),
+                _ => total.float + lanes(words, 0.0, float, |a, b| a + b),
             };
         }
         DataType::String => crate::check::check_failed(line!()),
@@ -230,9 +226,25 @@ fn add(
     total.count += words.len() as u64;
 }
 
-/// The sum of `words`.
-fn sum(words: &[i64]) -> i128 {
-    words.iter().map(|&w| i128::from(w)).sum()
+/// Combines `words`, each made a `T` by `value`, with `combine`, from
+/// `start`. Four lanes are combined apart and then together, so the CPU can
+/// work on four at once rather than wait on each.
+fn lanes<T: Copy>(
+    words: &[i64],
+    start: T,
+    value: impl Fn(i64) -> T,
+    combine: impl Fn(T, T) -> T,
+) -> T {
+    let (chunks, rest) = words.as_chunks::<4>();
+    let mut lanes = [start; 4];
+    for chunk in chunks {
+        for (lane, &word) in lanes.iter_mut().zip(chunk) {
+            *lane = combine(*lane, value(word));
+        }
+    }
+    let [a, b, c, d] = lanes;
+    let all = combine(combine(a, b), combine(c, d));
+    rest.iter().fold(all, |all, &word| combine(all, value(word)))
 }
 
 /// How many kept rows of `column` aren't null.
@@ -421,8 +433,11 @@ mod tests {
     #[test]
     fn sums_beyond_64_bits() {
         let words = [i64::MAX, i64::MAX, -1, i64::MIN, 1 << 40, -(1 << 33) - 7];
+        let sum = |words: &[i64]| lanes(words, 0, i128::from, |a, b| a + b);
         assert_eq!(sum(&words), words.iter().map(|&w| i128::from(w)).sum::<i128>());
         assert_eq!(sum(&[i64::MIN; 2048]), i128::from(i64::MIN) * 2048);
+        // Fewer than a lane each, and a few left over.
+        assert_eq!(lanes(&[3, -1, 7, 2, 9, -4, 5], i64::MAX, |w| w, i64::min), -4);
     }
 
     #[test]
