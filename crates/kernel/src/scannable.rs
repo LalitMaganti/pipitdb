@@ -54,9 +54,10 @@ pub trait Scannable {
         columns: &'s [(u32, Forms)],
     ) -> Result<Self::State<'s>, Error>;
 
-    /// Fills `batch`, which is empty when called, with the next rows of the
-    /// columns `state` was opened with, or returns false when no rows are
-    /// left. Its columns may view what the scannable holds.
+    /// Resets `batch`, which holds the last batch, and fills it with the
+    /// next rows of the columns `state` was opened with, or returns false
+    /// when no rows are left. Its columns may view what the scannable
+    /// holds.
     fn next<'s>(
         &'s self,
         context: &mut Context,
