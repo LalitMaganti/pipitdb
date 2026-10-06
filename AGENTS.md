@@ -5,13 +5,15 @@
 - Keep code simple and easy to read.
 - Don't implement something poorly: leave it out until it can be done well.
 - Refactor early and often. When a change shows the code should be shaped differently, such as two types that are really one, reshape it now rather than leaving it: later means migrating more code.
-- Only add a comment when the code isn't obvious. Keep it short and plain.
+- Only add a comment when the code isn't obvious. Keep it as short as it can be, but no shorter, and plain.
+- Comment every field of a struct, or variant of an enum, or none of them: never some but not others.
+- Group fields and functions by what they do.
 - Order parameters from longest-lived to shortest, e.g. `context, state, batch`.
 - One small PR at a time.
 - Avoid work: design for laziness first. Skip what statistics and dictionaries rule out, and don't read, decode or copy values until something needs them.
 - One hard memory budget per query: every allocation counts against it. Over budget, operators spill; with nothing left to spill, the query fails with an error. Parallelism is sized from the budget, never the other way round.
 - Design for spilling to remote storage from the start: state that grows with the data is partitioned and appended in blocks to a spill log, which can be local disk or object storage (staged locally, uploaded in large parts, sealed before it's read).
-- Steps get every buffer they fill for a batch's column from `Context::column_buffer`, never from the allocator directly, so how column memory is found (e.g. pooling) can change in one place. Its contents are unspecified: write every byte that's read, and don't rely on zeroing.
+- Steps get every buffer they fill for a batch's column from `Context`, by kind (`values_buffer`, `indices_buffer`, `small_buffer`, `bytes_buffer`), never from the allocator directly, so how column memory is found can change in one place. Its contents are unspecified: write every byte that's read, and don't rely on zeroing.
 - Threads are the executor's job, a bonus on a single thread that's already competitive: it runs copies of the work between pipeline breakers, so operators aren't written for threads. Breakers, such as sorts and aggregations, build small local results in each copy and then merge them.
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
