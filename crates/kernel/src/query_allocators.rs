@@ -87,9 +87,9 @@ impl<'a> FixedAllocator<'a> {
 // checks none is still handed out.
 unsafe impl Allocator for FixedAllocator<'_> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        if layout.size() > self.block_bytes || layout.align() > BUFFER_ALIGNMENT_BYTES {
-            return Err(AllocError);
-        }
+        // Asking for more than a block is a caller's mistake, not running out
+        // of memory, which `AllocError` would say, and spilling can't fix.
+        check!(layout.size() <= self.block_bytes && layout.align() <= BUFFER_ALIGNMENT_BYTES);
         let block = if let Some(block) = self.free.get() {
             // SAFETY: a freed block holds the next one.
             self.free.set(unsafe { block.cast::<Option<NonNull<u8>>>().read() });
@@ -207,8 +207,15 @@ mod tests {
         let offsets = Buffer::allocate(&query.indices, (rows + 1) * 4).unwrap();
         let short = Buffer::allocate(&query.indices, 10 * 4).unwrap();
         assert_eq!(short.size_bytes(), 40);
-        assert!(Buffer::allocate(&query.small, SMALL_BYTES).is_err());
         drop((offsets, short));
+    }
+
+    #[test]
+    #[should_panic(expected = "block_bytes")]
+    fn checks_nothing_asks_for_more_than_a_block() {
+        let query = QueryAllocators::new(&Heap);
+        // With its header, it's more than a small block.
+        let _ = Buffer::allocate(&query.small, SMALL_BYTES);
     }
 
     #[test]
