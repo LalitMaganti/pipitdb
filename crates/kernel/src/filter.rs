@@ -351,8 +351,10 @@ fn never(_: u16) -> bool {
 }
 
 /// Narrows `selection` to the rows `test` is true for, writing the rows it
-/// drops to `dropped`, if given.
-#[inline]
+/// drops to `dropped`, if given. Never inlined, so each test's loop is in a
+/// small function of its own, where it's aligned: inlined into a large one,
+/// it looks cold, and isn't.
+#[inline(never)]
 fn retain(
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
