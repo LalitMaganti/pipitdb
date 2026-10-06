@@ -249,6 +249,79 @@ impl<'s> ChunkReader<'s> {
         Ok(())
     }
 
+    /// The next `rows` rows, as `read` gives them, but with values only for
+    /// the rows `kept` lists, in increasing order: the others hold any value.
+    /// The indices or values of the rows between are passed over, not
+    /// decoded. Strings are read whole.
+    pub fn read_kept(
+        &mut self,
+        context: &mut Context,
+        rows: usize,
+        kept: &[u16],
+        forms: Forms,
+    ) -> Result<ColumnView, Error> {
+        check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
+        check!(kept.windows(2).all(|pair| pair[0] < pair[1]));
+        check!(kept.last().is_none_or(|&row| usize::from(row) < rows));
+        if self.data_type == DataType::String {
+            return self.read(context, rows, forms);
+        }
+        let (body, dictionary) = self.body(context)?;
+        let page = body.as_slice::<u8>();
+        let mut scratch = self.take_scratch(context)?;
+        let (validity, valid) = self.validity(context, page, rows, scratch.as_mut_slice())?;
+        self.scratch = Some(scratch);
+        let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
+        let bounds = match &dictionary {
+            Some(dictionary) => dictionary.bounds,
+            None => self.bounds,
+        };
+        // The rows not kept hold a value within the bounds, so they're still
+        // true of every value.
+        let mut out = context.values_buffer(rows * 8)?;
+        let values = out.as_mut_slice::<i64>();
+        at_mut!(values, ..rows).fill(bounds.map_or(0, |bounds| bounds.min));
+        // Each kept row's value: how many rows before it aren't null.
+        let (mut row, mut before) = (0, 0);
+        let mut value_of = |kept: usize| {
+            if let Some(bits) = bits {
+                before += (row..kept).filter(|&r| bits::get(bits, r)).count();
+                row = kept;
+                bits::get(bits, kept).then_some(before)
+            } else {
+                Some(kept)
+            }
+        };
+        let mut passed = 0;
+        if let Some(dictionary) = &dictionary {
+            let Some(words) = &dictionary.words else { return Err(Error::Corrupt) };
+            let entries = at!(words.as_slice::<i64>(), ..dictionary.count);
+            let indices = page.get(self.position.value..).ok_or(Error::Corrupt)?;
+            let index = &mut self.position.index;
+            let mut one = [0];
+            for &kept in kept {
+                let kept = usize::from(kept);
+                let Some(value) = value_of(kept) else { continue };
+                index.skip(indices, value - passed).ok_or(Error::Corrupt)?;
+                index.take(indices, &mut one).ok_or(Error::Corrupt)?;
+                *at_mut!(values, kept) = *entries.get(one[0] as usize).ok_or(Error::Corrupt)?;
+                passed = value + 1;
+            }
+            index.skip(indices, valid - passed).ok_or(Error::Corrupt)?;
+        } else {
+            let (width, at) = (plain::width(self.column.physical), self.position.value);
+            for &kept in kept {
+                let kept = usize::from(kept);
+                let Some(value) = value_of(kept) else { continue };
+                plain::words(self.column, page, at + value * width, at_mut!(values, kept..=kept))?;
+            }
+            self.position.value = at + valid * width;
+        }
+        self.position.left -= rows;
+        let column = ColumnView::new(context, self.data_type, out, validity)?;
+        Ok(bounds::bounded(column, bounds))
+    }
+
     /// The next `rows` rows, which must be in the page being read and are at
     /// most `BATCH_ROWS_MAX`: a column in one of `forms`.
     pub fn read(
@@ -653,12 +726,22 @@ mod tests {
     /// 6, and `name` "name" and the row mod 13.
     const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
 
-    #[derive(PartialEq, Debug)]
+    #[derive(Clone, PartialEq, Debug)]
     enum Cell {
         Int(i64),
         Float(f64),
         Text(String),
         Null,
+    }
+
+    /// Row `i` of column `c` of `small`.
+    #[expect(clippy::cast_precision_loss, reason = "small test values")]
+    fn small(c: usize, i: i64) -> Cell {
+        match c {
+            0 => Cell::Int(i),
+            1 => Cell::Float(i as f64 * 0.5),
+            _ => Cell::Text(std::format!("row{i}")),
+        }
     }
 
     /// Row `i` of column `c` of `nulls`.
@@ -815,6 +898,42 @@ mod tests {
                 row += skip + rows;
             }
             assert_eq!(row, 2048);
+        }
+    }
+
+    #[test]
+    fn reads_kept_rows_as_read_does() {
+        reads_kept_rows_in(SMALL, small);
+        reads_kept_rows_in(NULLS, nulls);
+        reads_kept_rows_in(DICT, dict);
+    }
+
+    /// Reads batches of each column's first chunk of `bytes` keeping some
+    /// rows, then the next batch whole, which must start where they ended.
+    fn reads_kept_rows_in(mut bytes: &[u8], expected: fn(usize, i64) -> Cell) {
+        let source: &dyn ByteSource = &mut bytes;
+        let file = ParquetFile::open(&Heap, source).unwrap();
+        let mut context = Context::new(&Heap);
+        let patterns: [&[u16]; 4] = [&[], &[0], &[3, 4, 5, 90, 299], &[1, 7, 150, 151, 152]];
+        for c in 0..3 {
+            let mut reader =
+                ChunkReader::new(source, &Uncompressed, file.columns()[c], file.chunk(0, c))
+                    .unwrap();
+            let mut row = 0;
+            for kept in patterns {
+                let rows = reader.page_left(&mut context).unwrap().min(300);
+                let read = cells(&reader.read_kept(&mut context, rows, kept, ANY).unwrap());
+                let got: Vec<_> = kept.iter().map(|&r| read[usize::from(r)].clone()).collect();
+                let from = i64::try_from(row).unwrap();
+                let want: Vec<_> = kept.iter().map(|&r| expected(c, from + i64::from(r))).collect();
+                assert_eq!(got, want, "column {c} from {row}");
+                row += rows;
+                let rows = reader.page_left(&mut context).unwrap().min(10);
+                let from = i64::try_from(row).unwrap();
+                let want: Vec<_> = (from..).take(rows).map(|i| expected(c, i)).collect();
+                assert_eq!(cells(&reader.read(&mut context, rows, ANY).unwrap()), want);
+                row += rows;
+            }
         }
     }
 
