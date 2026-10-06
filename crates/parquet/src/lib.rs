@@ -6,9 +6,13 @@
 #[macro_use]
 extern crate pipit_kernel;
 
+mod bits;
+mod bounds;
 pub mod chunk;
 pub mod footer;
 mod hybrid;
+mod page;
+mod plain;
 pub mod table;
 mod thrift;
 

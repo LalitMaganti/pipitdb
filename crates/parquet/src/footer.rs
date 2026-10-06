@@ -38,8 +38,11 @@ pub enum Logical {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Column {
+    /// Its name, in the file's names.
     pub name: Name,
+    /// How its values are stored.
     pub physical: Physical,
+    /// What its stored values mean, as far as this reader cares.
     pub logical: Logical,
     /// Whether rows can be null.
     pub optional: bool,
@@ -55,6 +58,8 @@ impl Column {
             | (Physical::Boolean | Physical::Int96 | Physical::FixedLenByteArray, _) => None,
             (Physical::Int32 | Physical::Int64, _) => Some(DataType::Int64),
             (Physical::Float | Physical::Double, _) => Some(DataType::Float64),
+            // Whether annotated as text or not, as strings are bytes,
+            // which needn't be UTF-8.
             (Physical::ByteArray, _) => Some(DataType::String),
         }
     }
@@ -63,21 +68,26 @@ impl Column {
 /// A column's values in a row group.
 #[derive(Clone, Copy, Debug)]
 pub struct Chunk {
-    /// Where its first page starts, a dictionary page if it has one, and how
-    /// many bytes its pages take.
+    /// Where its first page starts, a dictionary page if it has one.
     pub start: u64,
+    /// How many bytes its pages take.
     pub len: u64,
     /// Parquet's number for how its pages are compressed: 0 for none.
     pub codec: u8,
+    /// How many values it has, nulls included.
     pub values: u64,
-    /// The smallest and largest value, for integer columns that record them.
+    /// The smallest value, for integer columns that record it.
     pub min: Option<i64>,
+    /// The largest value, likewise.
     pub max: Option<i64>,
 }
 
 pub struct ParquetFile {
+    /// The columns' names.
     names: Names,
+    /// The columns, in order.
     columns: SlowVec<Column>,
+    /// How many rows each row group has.
     group_rows: SlowVec<u64>,
     /// Row group by row group, a chunk for each column.
     chunks: SlowVec<Chunk>,

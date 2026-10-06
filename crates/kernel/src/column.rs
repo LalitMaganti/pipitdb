@@ -7,6 +7,10 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 
+/// A column's type. Strings are bytes, as stored: usually UTF-8 text, but
+/// not checked to be, as nothing reads them as text. They're compared,
+/// hashed and grouped byte by byte; what shows them to people decides what
+/// to do with bytes that aren't UTF-8.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Int64,
@@ -558,6 +562,18 @@ mod tests {
             offsets.as_mut_slice::<u32>()[i + 1] = u32::try_from(at).unwrap();
         }
         ColumnView::strings(&mut Context::new(&Heap), offsets, bytes, None).unwrap()
+    }
+
+    #[test]
+    fn strings_are_bytes() {
+        // Not UTF-8: a lone continuation byte, and an overlong encoding.
+        let mut offsets = Buffer::allocate(&Heap, 3 * 4).unwrap();
+        offsets.as_mut_slice::<u32>().copy_from_slice(&[0, 1, 3]);
+        let mut bytes = Buffer::allocate(&Heap, 3).unwrap();
+        bytes.as_mut_slice::<u8>().copy_from_slice(&[0x80, 0xc0, 0x80]);
+        let column = ColumnView::strings(&mut Context::new(&Heap), offsets, bytes, None).unwrap();
+        let values = column.string_values();
+        assert_eq!((values.get(0), values.get(1)), (&[0x80][..], &[0xc0, 0x80][..]));
     }
 
     #[test]

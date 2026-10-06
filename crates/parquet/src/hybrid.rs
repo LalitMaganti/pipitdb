@@ -23,14 +23,18 @@ impl Run {
 /// between calls without borrowing them.
 #[derive(Clone, Copy, Default)]
 pub struct Hybrid {
+    /// Where the next run's header is.
     pos: usize,
+    /// How many bits each value takes.
     width: u32,
     /// Values left in the run being read.
     left: usize,
-    /// For a run of one value, the value; else where the packed run's next
-    /// value starts, in bits from `pos`'s start.
+    /// For a run of one value, the value.
     rle: Option<u32>,
+    /// For a packed run, where its next value starts, in bits from where
+    /// its values start.
     bit: usize,
+    /// For a packed run, where its values start.
     packed: usize,
 }
 
