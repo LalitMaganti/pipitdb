@@ -6,7 +6,7 @@
 //! and every node keeps SQL's three-valued logic without building booleans.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{Bounds, ColumnView, Form};
+use crate::column::{ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Comparison, Entries, Value};
@@ -95,38 +95,80 @@ impl Predicate {
         Predicate { nodes, strings, depth }
     }
 
+    /// Its nodes, the last its root.
+    pub(crate) fn nodes(&self) -> &[Node] {
+        &self.nodes
+    }
+
     /// How many scratch selections `select` needs.
     pub fn depth(&self) -> u32 {
         self.depth
     }
 
-    /// Values of `column` every row this is true for has, from comparisons
-    /// of it with integers that must all hold, as in `a > 1 AND a < 5`: a
-    /// row whose value is outside them isn't kept. Others keep all values.
-    pub fn kept(&self, column: u32) -> Bounds {
+    /// The conjuncts, the parts of its top-level `AND`s, that read only
+    /// `column`, joined by `AND`, or `None` if there are none.
+    pub fn conjuncts_on(
+        &self,
+        allocator: &dyn Allocator,
+        column: u32,
+    ) -> Result<Option<Predicate>, AllocError> {
+        let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
-        self.kept_by(self.nodes.len() as u32 - 1, column)
+        let root = self.copy_on(self.nodes.len() as u32 - 1, column, &mut nodes, None)?;
+        if root.is_none() {
+            return Ok(None);
+        }
+        let strings = match &self.strings {
+            Some(strings) => Some(SlowVec::fixed_from(allocator, strings.iter().copied())?),
+            None => None,
+        };
+        Ok(Some(Predicate::with_strings(nodes, strings)))
     }
 
-    fn kept_by(&self, node: u32, column: u32) -> Bounds {
-        match *at!(self.nodes, node as usize) {
-            Node::Leaf(Leaf::Compare { column: c, comparison, value: Value::Int64(value) })
-                if c == column =>
-            {
-                // Saturating, `a < i64::MIN` gives `i64::MIN`: more than it
-                // keeps, which is still true of every row kept.
-                match comparison {
-                    Comparison::Equal => Bounds { min: value, max: value },
-                    Comparison::NotEqual => Bounds::ALL,
-                    Comparison::Less => Bounds { max: value.saturating_sub(1), ..Bounds::ALL },
-                    Comparison::LessEqual => Bounds { max: value, ..Bounds::ALL },
-                    Comparison::Greater => Bounds { min: value.saturating_add(1), ..Bounds::ALL },
-                    Comparison::GreaterEqual => Bounds { min: value, ..Bounds::ALL },
-                }
-            }
-            Node::And(a, b) => self.kept_by(a, column).intersect(self.kept_by(b, column)),
-            Node::Leaf(_) | Node::Or(..) | Node::Not(_) => Bounds::ALL,
+    /// Copies node `node`'s conjuncts that read only `column` to `nodes`,
+    /// each joined to `root`, those so far, by `AND`: the new root.
+    fn copy_on(
+        &self,
+        node: u32,
+        column: u32,
+        nodes: &mut SlowVec<Node>,
+        root: Option<u32>,
+    ) -> Result<Option<u32>, AllocError> {
+        if let Node::And(a, b) = *at!(self.nodes, node as usize) {
+            let root = self.copy_on(a, column, nodes, root)?;
+            return self.copy_on(b, column, nodes, root);
         }
+        if !self.reads_only(node, column) {
+            return Ok(root);
+        }
+        let copied = self.copy(node, nodes)?;
+        Ok(Some(match root {
+            Some(root) => push(nodes, Node::And(root, copied))?,
+            None => copied,
+        }))
+    }
+
+    /// Whether node `node` reads only `column`.
+    fn reads_only(&self, node: u32, column: u32) -> bool {
+        match *at!(self.nodes, node as usize) {
+            Node::Leaf(leaf) => leaf.column() == column,
+            Node::And(a, b) | Node::Or(a, b) => {
+                self.reads_only(a, column) && self.reads_only(b, column)
+            }
+            Node::Not(a) => self.reads_only(a, column),
+        }
+    }
+
+    /// Copies node `node` and those under it to `nodes`, returning where it
+    /// is there.
+    fn copy(&self, node: u32, nodes: &mut SlowVec<Node>) -> Result<u32, AllocError> {
+        let copied = match *at!(self.nodes, node as usize) {
+            Node::Leaf(leaf) => Node::Leaf(leaf),
+            Node::And(a, b) => Node::And(self.copy(a, nodes)?, self.copy(b, nodes)?),
+            Node::Or(a, b) => Node::Or(self.copy(a, nodes)?, self.copy(b, nodes)?),
+            Node::Not(a) => Node::Not(self.copy(a, nodes)?),
+        };
+        push(nodes, copied)
     }
 
     /// Whether every condition it has on `column` compares it with a string,
@@ -329,6 +371,14 @@ fn negated(comparison: Comparison) -> Comparison {
     }
 }
 
+/// Adds `node` to `nodes`, returning where it is.
+fn push(nodes: &mut SlowVec<Node>, node: Node) -> Result<u32, AllocError> {
+    #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
+    let at = nodes.len() as u32;
+    nodes.push(node)?;
+    Ok(at)
+}
+
 /// Narrows each batch's selection to the rows `predicate` is true for. The
 /// predicate reads columns by their position in batches.
 pub struct Filter {
@@ -427,10 +477,18 @@ mod tests {
     }
 
     /// The rows `expr` keeps of `a` and `b`.
-    fn kept(expr: &Expr) -> StdVec<usize> {
+    fn predicate_of(expr: &Expr) -> Predicate {
         let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
-        let predicate = Predicate::new(nodes);
+        Predicate::new(nodes)
+    }
+
+    fn kept(expr: &Expr) -> StdVec<usize> {
+        kept_by(&predicate_of(expr))
+    }
+
+    /// The rows of `a` and `b` `predicate` keeps.
+    fn kept_by(predicate: &Predicate) -> StdVec<usize> {
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
         let mut entries = predicate.new_entries(&Heap).unwrap();
@@ -443,6 +501,25 @@ mod tests {
             Kept::None => StdVec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
         }
+    }
+
+    #[test]
+    fn copies_the_conjuncts_on_a_column() {
+        const A2: Expr = Expr::Greater(0, 2);
+        const A4_OR_NULL: Expr = Expr::Or(&Expr::Greater(0, 4), &Expr::IsNull(0));
+        const EITHER: Expr = Expr::Or(&A2, &Expr::Greater(1, 2));
+        // `(a > 2 AND b IS NULL) AND (a > 4 OR a IS NULL) AND (a > 2 OR b > 2)`.
+        const ALL: Expr =
+            Expr::And(&Expr::And(&Expr::And(&A2, &Expr::IsNull(1)), &A4_OR_NULL), &EITHER);
+        let predicate = predicate_of(&ALL);
+        let on_a = predicate.conjuncts_on(&Heap, 0).unwrap().unwrap();
+        assert!(on_a.columns().all(|column| column == 0));
+        assert_eq!(kept_by(&on_a), kept(&Expr::And(&A2, &A4_OR_NULL)));
+        // None reads only a column it doesn't read.
+        assert!(predicate.conjuncts_on(&Heap, 2).unwrap().is_none());
+        // One conjunct on the column is all of it.
+        let all = predicate_of(&A4_OR_NULL).conjuncts_on(&Heap, 0).unwrap().unwrap();
+        assert_eq!(kept_by(&all), kept(&A4_OR_NULL));
     }
 
     #[test]
@@ -475,40 +552,6 @@ mod tests {
                 (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
             assert_eq!(kept(expr), expected);
         }
-    }
-
-    #[test]
-    fn keeps_the_values_comparisons_that_must_hold_allow() {
-        const A2: Expr = Expr::Greater(0, 2);
-        const B2: Expr = Expr::Greater(1, 2);
-        const NARROWER: Expr = Expr::And(&A2, &Expr::Not(&Expr::IsNull(0)));
-        let kept = |expr: &Expr, column| {
-            let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
-            build(expr, &mut nodes);
-            Predicate::new(nodes).kept(column)
-        };
-        assert_eq!(kept(&A2, 0), Bounds { min: 3, ..Bounds::ALL });
-        assert_eq!(kept(&A2, 1), Bounds::ALL);
-        assert_eq!(kept(&Expr::And(&NARROWER, &Expr::Greater(0, 4)), 0).min, 5);
-        assert_eq!(kept(&Expr::And(&A2, &B2), 1), Bounds { min: 3, ..Bounds::ALL });
-        // Either side of an `OR` could hold, and a `NOT` keeps the others.
-        assert_eq!(kept(&Expr::Or(&A2, &A2), 0), Bounds::ALL);
-        assert_eq!(kept(&Expr::Not(&A2), 0), Bounds::ALL);
-
-        let compared = |comparison, value| {
-            let leaf = Leaf::Compare { column: 0, comparison, value: Value::Int64(value) };
-            let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-            Predicate::new(nodes).kept(0)
-        };
-        let (min, max) = (i64::MIN, i64::MAX);
-        assert_eq!(compared(Comparison::Equal, 7), Bounds { min: 7, max: 7 });
-        assert_eq!(compared(Comparison::NotEqual, 7), Bounds::ALL);
-        assert_eq!(compared(Comparison::Less, 7), Bounds { min, max: 6 });
-        assert_eq!(compared(Comparison::LessEqual, 7), Bounds { min, max: 7 });
-        assert_eq!(compared(Comparison::GreaterEqual, 7), Bounds { min: 7, max });
-        // Keeping more than `a < i64::MIN` does is still right.
-        assert_eq!(compared(Comparison::Less, min), Bounds { min, max: min });
-        assert_eq!(compared(Comparison::Greater, max), Bounds { min: max, max });
     }
 
     /// `values` as a string column, `None` null.

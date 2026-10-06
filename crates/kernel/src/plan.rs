@@ -8,7 +8,8 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
-use crate::column::{Bounds, DataType, Forms};
+use crate::column::{DataType, Forms};
+use crate::condition::{CONDITIONS_MAX, Condition};
 use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
@@ -82,26 +83,36 @@ pub trait Op<'c> {
         Forms::FLAT
     }
 
-    /// The values of `column` in the rows this passes on, if it passes on
-    /// its child's rows as they are but for leaving some out, as a filter
-    /// does: a row whose value is outside them could be left out below it.
-    /// `None` if it passes on other rows, so what's below must make them
-    /// all. By default, `None`.
-    fn keeps(&self, column: ColumnId) -> Option<Bounds> {
-        let _ = column;
-        None
-    }
-
-    /// Tells this, if it makes rows, the values everything above keeps of
-    /// each column in `ranges`, so it may leave out rows outside them: the
-    /// plan pushing down what its filters keep. By default, it makes all.
-    fn restrict(
+    /// If this passes on its child's rows as they are but for leaving some
+    /// out, as a filter does: a copy of the part of its condition that reads
+    /// only `column`, for what makes the rows to skip by. By default, it
+    /// passes on other rows, so nothing below can use its condition.
+    fn give_condition(
         &mut self,
         allocator: &dyn Allocator,
-        ranges: &[(ColumnId, Bounds)],
+        column: ColumnId,
+    ) -> Result<Given, AllocError> {
+        let _ = (allocator, column);
+        Ok(Given::Stop)
+    }
+
+    /// Whether this makes `column` and takes conditions on it. By default,
+    /// no.
+    fn takes_condition(&self, column: ColumnId) -> bool {
+        let _ = column;
+        false
+    }
+
+    /// Takes `condition`, from an op above, on the rows it makes of
+    /// `column`: pushdown. Only called if `takes_condition` says so.
+    fn take_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+        condition: Predicate,
     ) -> Result<(), AllocError> {
-        let _ = (allocator, ranges);
-        Ok(())
+        let _ = (allocator, column, condition);
+        crate::check::check_failed(line!())
     }
 
     /// The op that loads `columns`, which this makes lazy, each in one of
@@ -117,8 +128,21 @@ pub trait Op<'c> {
     }
 }
 
-type Restrict =
-    unsafe fn(NonNull<()>, &dyn Allocator, &[(ColumnId, Bounds)]) -> Result<(), AllocError>;
+/// What an op gives up of its condition on a column.
+pub enum Given {
+    /// It passes on other rows than its child's: nothing below can apply a
+    /// condition of it, or of anything above it.
+    Stop,
+    /// It passes on its child's rows: a copy of the part of its condition
+    /// that reads only the column, if any, and any above may give theirs
+    /// too.
+    Passed(Option<Predicate>),
+}
+
+type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
+
+type TakeCondition =
+    unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -139,8 +163,9 @@ pub struct DynOp<'c> {
     reads: unsafe fn(NonNull<()>, &mut Needed),
     accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
-    keeps: unsafe fn(NonNull<()>, ColumnId) -> Option<Bounds>,
-    restrict: Restrict,
+    give_condition: GiveCondition,
+    takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
+    take_condition: TakeCondition,
     materialize: Materialize<'c>,
     lifetime: PhantomData<&'c ()>,
 }
@@ -159,11 +184,15 @@ impl<'c> DynOp<'c> {
             accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
             // SAFETY: as for `prune`.
             allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
-            // SAFETY: as for `lower`.
-            keeps: |op, column| unsafe { value_of::<T>(op).keeps(column) },
             // SAFETY: as for `prune`.
-            restrict: |op, allocator, ranges| unsafe {
-                value_mut_of::<T>(op).restrict(allocator, ranges)
+            give_condition: |op, allocator, column| unsafe {
+                value_mut_of::<T>(op).give_condition(allocator, column)
+            },
+            // SAFETY: as for `lower`.
+            takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
+            // SAFETY: as for `prune`.
+            take_condition: |op, allocator, column, condition| unsafe {
+                value_mut_of::<T>(op).take_condition(allocator, column, condition)
             },
             // SAFETY: as for `lower`.
             materialize: |op, allocator, columns| unsafe {
@@ -204,19 +233,30 @@ impl<'c> DynOp<'c> {
         unsafe { (self.allow)(self.op.as_ptr(), column, allowed) }
     }
 
-    pub(crate) fn keeps(&self, column: ColumnId) -> Option<Bounds> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.keeps)(self.op.as_ptr(), column) }
-    }
-
-    pub(crate) fn restrict(
+    pub(crate) fn give_condition(
         &mut self,
         allocator: &dyn Allocator,
-        ranges: &[(ColumnId, Bounds)],
+        column: ColumnId,
+    ) -> Result<Given, AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.give_condition)(self.op.as_ptr(), allocator, column) }
+    }
+
+    pub(crate) fn takes_condition(&self, column: ColumnId) -> bool {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.takes_condition)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn take_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+        condition: Predicate,
     ) -> Result<(), AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.restrict)(self.op.as_ptr(), allocator, ranges) }
+        unsafe { (self.take_condition)(self.op.as_ptr(), allocator, column, condition) }
     }
 
     pub(crate) fn materialize(
@@ -288,19 +328,19 @@ impl<'c> LogicalPlan<'c> {
     }
 }
 
-/// Reads the rows of a scannable, binding the columns in `columns`: all, or
-/// at least those whose values are within `ranges`.
+/// Reads the rows of a scannable, binding the columns in `columns`, maybe
+/// skipping some failing `conditions`.
 pub struct ScanOp<'c> {
     scannable: &'c DynScannable<'c>,
     columns: SlowVec<ScanColumn>,
-    /// The values everything above keeps, by the scannable's column, if the
-    /// plan pushed any down.
-    ranges: Option<SlowVec<(u32, Bounds)>>,
+    /// Conditions the plan pushed down from filters above, if any, which the
+    /// scannable may use to skip: the filters still test every row.
+    conditions: Option<SlowVec<Condition>>,
 }
 
 impl<'c> ScanOp<'c> {
     pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
-        ScanOp { scannable, columns, ranges: None }
+        ScanOp { scannable, columns, conditions: None }
     }
 }
 
@@ -321,8 +361,8 @@ impl<'c> Op<'c> for ScanOp<'c> {
             lowering.define(column.binding.id)?;
         }
         let read = self.columns.iter().map(|column| (column.column, column.forms));
-        let ranges = self.ranges.as_deref().unwrap_or(&[]);
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read, ranges)?);
+        let conditions = self.conditions.as_deref().unwrap_or(&[]);
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read, conditions)?);
         Ok(())
     }
 
@@ -342,25 +382,26 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Reads none: it makes them.
     fn reads(&self, _: &mut Needed) {}
 
-    /// Passes them on to the scannable, which may read fewer rows.
-    fn restrict(
+    /// Those on its columns.
+    fn takes_condition(&self, column: ColumnId) -> bool {
+        self.columns.iter().any(|scanned| scanned.binding.id == column)
+    }
+
+    fn take_condition(
         &mut self,
         allocator: &dyn Allocator,
-        ranges: &[(ColumnId, Bounds)],
+        column: ColumnId,
+        condition: Predicate,
     ) -> Result<(), AllocError> {
-        let scanned = |&(id, bounds): &(ColumnId, Bounds)| {
-            let column = self.columns.iter().find(|column| column.binding.id == id)?;
-            Some((column.column, bounds))
+        let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
+            crate::check::check_failed(line!());
         };
-        let count = ranges.iter().filter_map(scanned).count();
-        if count > 0 {
-            let mut scanned_ranges = SlowVec::fixed(allocator, count)?;
-            for range in ranges.iter().filter_map(scanned) {
-                scanned_ranges.push(range)?;
-            }
-            self.ranges = Some(scanned_ranges);
-        }
-        Ok(())
+        let condition = Condition::new(scanned.column, &condition);
+        let conditions = match &mut self.conditions {
+            Some(conditions) => conditions,
+            None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
+        };
+        conditions.push(condition).map_err(|_| AllocError)
     }
 
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
@@ -459,8 +500,12 @@ impl<'c> Op<'c> for FilterOp {
         }
     }
 
-    /// What its predicate keeps.
-    fn keeps(&self, column: ColumnId) -> Option<Bounds> {
-        Some(self.predicate.kept(column))
+    /// A copy of the conjuncts of its predicate that read only `column`.
+    fn give_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+    ) -> Result<Given, AllocError> {
+        Ok(Given::Passed(self.predicate.conjuncts_on(allocator, column)?))
     }
 }
