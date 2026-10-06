@@ -5,7 +5,7 @@ use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -76,14 +76,17 @@ impl RowGroup {
     }
 }
 
-/// Where a scan of a table is: the next row group.
-pub struct ScanState {
+/// Where a scan of a table is.
+pub struct ScanState<'s> {
+    /// The columns read, in order, each checked to be one of the table's.
+    columns: &'s [(u32, Forms)],
+    /// The next row group.
     row_group: usize,
 }
 
 /// Reads each row group as one batch. Nothing is copied.
 impl Scannable for Table {
-    type State = ScanState;
+    type State<'s> = ScanState<'s>;
     type Loader = ();
 
     #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
@@ -99,16 +102,20 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
-    fn new_state(&self, _: &mut Context) -> Result<ScanState, Error> {
-        Ok(ScanState { row_group: 0 })
+    fn open<'s>(
+        &'s self,
+        _: &mut Context,
+        columns: &'s [(u32, Forms)],
+    ) -> Result<ScanState<'s>, Error> {
+        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
+        check!(columns.iter().all(|&(column, _)| column < self.column_count()));
+        Ok(ScanState { columns, row_group: 0 })
     }
 
     fn next(
         &self,
-        columns: &[u32],
-        _: &[Forms],
         _: &mut Context,
-        at: &mut ScanState,
+        at: &mut ScanState<'_>,
         batch: &mut RowBatch,
     ) -> Result<bool, Error> {
         loop {
@@ -119,8 +126,14 @@ impl Scannable for Table {
                 continue;
             }
             batch.reset(row_group.row_count);
-            for &i in columns {
-                check!(batch.push_column(at!(row_group.columns, i as usize).clone()).is_ok());
+            for &(i, _) in at.columns {
+                // SAFETY: `open` checked `i` is one of the table's columns,
+                // and `new` that each row group has a view of each.
+                let column = unsafe { row_group.columns.get_unchecked(i as usize) }.clone();
+                // At most `BATCH_COLUMNS_MAX`, checked by `open`.
+                let Ok(()) = batch.push_column(column) else {
+                    pipit_kernel::check::check_failed(line!());
+                };
             }
             return Ok(true);
         }
@@ -149,13 +162,11 @@ mod tests {
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
         let mut context = Context::new(&Heap);
-        let mut state = table.new_state(&mut context).unwrap();
+        let columns: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
+        let mut state = table.open(&mut context, &columns).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while table
-            .next(columns, &vec![Forms::FLAT; columns.len()], &mut context, &mut state, &mut batch)
-            .unwrap()
-        {
+        while table.next(&mut context, &mut state, &mut batch).unwrap() {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }
@@ -203,5 +214,12 @@ mod tests {
         let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
         assert_eq!((table.find_column("dur"), table.find_column("name")), (Some(1), None));
         assert_eq!(table.column_name(0), "ts");
+    }
+
+    #[test]
+    #[should_panic(expected = "column_count")]
+    fn checks_columns_read_when_opened() {
+        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
+        let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
     }
 }

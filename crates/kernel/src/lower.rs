@@ -171,7 +171,10 @@ mod tests {
     struct Ab;
 
     impl Scannable for Ab {
-        type State = bool;
+        type State<'s>
+            = (bool, &'s [(u32, Forms)])
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -186,23 +189,25 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
-            Ok(false)
+        fn open<'s>(
+            &'s self,
+            _: &mut Context,
+            columns: &'s [(u32, Forms)],
+        ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
+            Ok((false, columns))
         }
 
         fn next(
             &self,
-            columns: &[u32],
-            _: &[Forms],
             _: &mut Context,
-            done: &mut bool,
+            (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }
             batch.reset(2);
-            for &column in columns {
+            for &(column, _) in *columns {
                 let mut values = Buffer::allocate(&Heap, 16).unwrap();
                 let first = [1, 10][column as usize];
                 values.as_mut_slice::<i64>().copy_from_slice(&[first, first * 2]);
@@ -292,7 +297,10 @@ mod tests {
     struct Nullable;
 
     impl Scannable for Nullable {
-        type State = bool;
+        type State<'s>
+            = (bool, &'s [(u32, Forms)])
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -307,23 +315,25 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
-            Ok(false)
+        fn open<'s>(
+            &'s self,
+            _: &mut Context,
+            columns: &'s [(u32, Forms)],
+        ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
+            Ok((false, columns))
         }
 
         fn next(
             &self,
-            columns: &[u32],
-            _: &[Forms],
             _: &mut Context,
-            done: &mut bool,
+            (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }
             batch.reset(4);
-            for &column in columns {
+            for &(column, _) in *columns {
                 let cells =
                     [[Some(1), Some(2), None, Some(0)], [Some(10), Some(20), Some(30), None]];
                 let mut values = Buffer::allocate(&Heap, 32).unwrap();
@@ -394,7 +404,10 @@ mod tests {
     struct Wide(u32);
 
     impl Scannable for Wide {
-        type State = ();
+        type State<'s>
+            = ()
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -409,18 +422,11 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+        fn open(&self, _: &mut Context, _: &[(u32, Forms)]) -> Result<(), Error> {
             Ok(())
         }
 
-        fn next(
-            &self,
-            _: &[u32],
-            _: &[Forms],
-            _: &mut Context,
-            (): &mut (),
-            _: &mut RowBatch,
-        ) -> Result<bool, Error> {
+        fn next(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<bool, Error> {
             Ok(false)
         }
     }
@@ -459,7 +465,10 @@ mod tests {
     }
 
     impl Scannable for Counted<'_> {
-        type State = u8;
+        type State<'s>
+            = (u8, &'s [(u32, Forms)])
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -474,24 +483,26 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<u8, Error> {
-            Ok(0)
+        fn open<'s>(
+            &'s self,
+            _: &mut Context,
+            columns: &'s [(u32, Forms)],
+        ) -> Result<(u8, &'s [(u32, Forms)]), Error> {
+            Ok((0, columns))
         }
 
         fn next(
             &self,
-            columns: &[u32],
-            forms: &[Forms],
             context: &mut Context,
-            batches: &mut u8,
+            (batches, columns): &mut (u8, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             if *batches == 3 {
                 return Ok(false);
             }
             batch.reset(4);
-            for (i, &column) in columns.iter().enumerate() {
-                let column = if forms[i].contains(Forms::LAZY) {
+            for &(column, forms) in *columns {
+                let column = if forms.contains(Forms::LAZY) {
                     let handle = [u8::try_from(column).unwrap(), *batches];
                     ColumnView::lazy(context, DataType::Int64, &handle, 4).unwrap()
                 } else {

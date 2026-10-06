@@ -28,6 +28,7 @@ struct File<'a> {
 /// Where a scan is: a file, a row group in it, and, once the group is
 /// started, a reader for each column read and how many rows are left.
 pub struct ScanState<'a> {
+    columns: &'a [(u32, Forms)],
     file: usize,
     group: usize,
     readers: SlowVec<ChunkReader<'a>>,
@@ -75,8 +76,11 @@ fn check_same_columns(first: &ParquetFile, file: &ParquetFile) -> Result<(), Err
     if same { Ok(()) } else { Err(Error::Unsupported) }
 }
 
-impl<'a> Scannable for ParquetTable<'a> {
-    type State = ScanState<'a>;
+impl Scannable for ParquetTable<'_> {
+    type State<'s>
+        = ScanState<'s>
+    where
+        Self: 's;
     type Loader = ();
 
     fn column_count(&self) -> u32 {
@@ -98,17 +102,21 @@ impl<'a> Scannable for ParquetTable<'a> {
         data_type
     }
 
-    fn new_state(&self, context: &mut Context) -> Result<ScanState<'a>, Error> {
-        let readers = SlowVec::fixed(context.allocator(), BATCH_COLUMNS_MAX as usize)?;
-        Ok(ScanState { file: 0, group: 0, readers, started: false, left: 0 })
+    fn open<'s>(
+        &'s self,
+        context: &mut Context,
+        columns: &'s [(u32, Forms)],
+    ) -> Result<ScanState<'s>, Error> {
+        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
+        check!(columns.iter().all(|&(column, _)| column < self.column_count()));
+        let readers = SlowVec::fixed(context.allocator(), columns.len())?;
+        Ok(ScanState { columns, file: 0, group: 0, readers, started: false, left: 0 })
     }
 
-    fn next(
-        &self,
-        columns: &[u32],
-        _: &[Forms],
+    fn next<'s>(
+        &'s self,
         context: &mut Context,
-        state: &mut ScanState<'a>,
+        state: &mut ScanState<'s>,
         batch: &mut RowBatch,
     ) -> Result<bool, Error> {
         loop {
@@ -118,7 +126,7 @@ impl<'a> Scannable for ParquetTable<'a> {
                     (state.file, state.group) = (state.file + 1, 0);
                     continue;
                 }
-                for &column in columns {
+                for &(column, _) in state.columns {
                     let c = column as usize;
                     let chunk = file.footer.chunk(state.group, c);
                     let column = *at!(file.footer.columns(), c);
@@ -157,7 +165,6 @@ impl<'a> Scannable for ParquetTable<'a> {
 mod tests {
     extern crate std;
 
-    use std::vec;
     use std::vec::Vec;
 
     use pipit_kernel::allocator::Heap;
@@ -171,13 +178,11 @@ mod tests {
     /// Every batch's rows of `columns`: each row's `id`s, or -1 for nulls.
     fn scan(table: &ParquetTable, columns: &[u32]) -> (usize, Vec<i64>) {
         let mut context = Context::new(&Heap);
-        let mut state = table.new_state(&mut context).unwrap();
+        let read: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
+        let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
         let (mut rows, mut ids) = (0, Vec::new());
-        while table
-            .next(columns, &vec![Forms::FLAT; columns.len()], &mut context, &mut state, &mut batch)
-            .unwrap()
-        {
+        while table.next(&mut context, &mut state, &mut batch).unwrap() {
             assert_eq!(batch.column_count() as usize, columns.len());
             rows += batch.row_count() as usize;
             if let Some((i, _)) = (0..).zip(columns).find(|&(_, &c)| c == 0) {
@@ -221,13 +226,10 @@ mod tests {
     fn bounds_columns_by_their_row_groups_statistics() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
         let mut context = Context::new(&Heap);
-        let mut state = table.new_state(&mut context).unwrap();
+        let read = [(0, Forms::FLAT), (1, Forms::FLAT), (2, Forms::FLAT)];
+        let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
-        assert!(
-            table
-                .next(&[0, 1, 2], &[Forms::FLAT; 3], &mut context, &mut state, &mut batch)
-                .unwrap()
-        );
+        assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
         let bounds = |c: u32| batch.column(c).bounds().map(|b| (b.min, b.max));
         assert_eq!(bounds(0), Some((-2500, -453)));
         assert_eq!(bounds(1), Some((4_000_000_000, 4_000_002_047)));
@@ -238,10 +240,10 @@ mod tests {
     fn reads_unsigned_integers_above_31_bits() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
         let mut context = Context::new(&Heap);
-        let mut state = table.new_state(&mut context).unwrap();
+        let mut state = table.open(&mut context, &[(1, Forms::FLAT)]).unwrap();
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
-        while table.next(&[1], &[Forms::FLAT], &mut context, &mut state, &mut batch).unwrap() {
+        while table.next(&mut context, &mut state, &mut batch).unwrap() {
             let column = batch.column(0).flatten(&mut context).unwrap();
             values.extend_from_slice(column.int64s());
         }

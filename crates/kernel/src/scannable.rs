@@ -22,10 +22,13 @@ use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, DynTransform, NewState};
 
 /// Named, typed columns, read into batches. Where a read is lives in
-/// `State`, which each run creates, as for a step.
+/// `State`, which each run opens, as for a step.
 pub trait Scannable {
-    /// Where a read is, such as a row group and a row in it.
-    type State;
+    /// Where a read is, such as a row group and a row in it. It borrows the
+    /// scannable and the columns it was opened with, for `'s`.
+    type State<'s>
+    where
+        Self: 's;
 
     /// What loading lazy columns keeps between batches, such as a reader for
     /// each column and what it has read. A scannable none of whose columns
@@ -41,19 +44,23 @@ pub trait Scannable {
     /// What `column` holds. Every batch's `column` has this type.
     fn column_type(&self, column: u32) -> DataType;
 
-    /// The state of a read from the first row.
-    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
-
-    /// Fills `batch`, which is empty when called, with the next rows of
-    /// `columns`, in that order, or returns false when no rows are left.
-    /// `forms[i]` are the forms `columns[i]` may be written in, besides flat:
-    /// some of those `forms` says it can write it in.
-    fn next(
-        &self,
-        columns: &[u32],
-        forms: &[Forms],
+    /// A read of `columns`, in that order, from the first row, each with
+    /// the forms it may be written in besides flat, some of those `forms`
+    /// says it can write it in. What depends only on which columns are read
+    /// is worked out here, once, not for each batch.
+    fn open<'s>(
+        &'s self,
         context: &mut Context,
-        state: &mut Self::State,
+        columns: &'s [(u32, Forms)],
+    ) -> Result<Self::State<'s>, Error>;
+
+    /// Fills `batch`, which is empty when called, with the next rows of the
+    /// columns `state` was opened with, or returns false when no rows are
+    /// left.
+    fn next<'s>(
+        &'s self,
+        context: &mut Context,
+        state: &mut Self::State<'s>,
         batch: &mut RowBatch,
     ) -> Result<bool, Error>;
 
@@ -92,14 +99,11 @@ pub trait Catalog {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
 
-type ScannableNext = unsafe fn(
-    NonNull<()>,
-    &[u32],
-    &[Forms],
-    &mut Context,
-    NonNull<u8>,
-    &mut RowBatch,
-) -> Result<bool, Error>;
+type ScannableOpen =
+    unsafe fn(NonNull<()>, &mut Context, &[(u32, Forms)], NonNull<u8>) -> Result<(), Error>;
+
+type ScannableNext =
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
 type ScannableLoad = unsafe fn(
     NonNull<()>,
@@ -117,7 +121,7 @@ pub struct DynScannable<'a> {
     column_name: unsafe fn(NonNull<()>, u32) -> *const str,
     column_type: unsafe fn(NonNull<()>, u32) -> DataType,
     state_layout: Layout,
-    new_state: NewState,
+    open: ScannableOpen,
     drop_state: unsafe fn(NonNull<u8>),
     next: ScannableNext,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
@@ -133,7 +137,7 @@ impl<'a> DynScannable<'a> {
         allocator: &dyn Allocator,
         scannable: T,
     ) -> Result<DynScannable<'a>, AllocError> {
-        const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        const { assert!(align_of::<T::State<'a>>() <= BUFFER_ALIGNMENT_BYTES) };
         const { assert!(align_of::<T::Loader>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(DynScannable {
             scannable: Box::new(allocator, scannable)?.erase(),
@@ -147,18 +151,19 @@ impl<'a> DynScannable<'a> {
             column_type: |scannable, column| unsafe {
                 value_of::<T>(scannable).column_type(column)
             },
-            state_layout: Layout::new::<T::State>(),
-            // SAFETY: as above.
-            new_state: |scannable, context, state| unsafe {
-                let made = value_of::<T>(scannable).new_state(context)?;
+            state_layout: Layout::new::<T::State<'a>>(),
+            // SAFETY: as above. The state borrows the scan's columns, which
+            // outlive it, as the scan's step drops its state first.
+            open: |scannable, context, columns, state| unsafe {
+                let made = value_of::<T>(scannable).open(context, columns)?;
                 write_state(state, made);
                 Ok(())
             },
-            drop_state: drop_state::<T::State>,
+            drop_state: drop_state::<T::State<'a>>,
             // SAFETY: as above.
-            next: |scannable, columns, forms, context, state, batch| unsafe {
-                let state = state_of::<T::State>(state);
-                value_of::<T>(scannable).next(columns, forms, context, state, batch)
+            next: |scannable, context, state, batch| unsafe {
+                let state = state_of::<T::State<'a>>(state);
+                value_of::<T>(scannable).next(context, state, batch)
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
@@ -205,13 +210,14 @@ impl<'a> DynScannable<'a> {
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
-        columns: SlowVec<u32>,
-        forms: SlowVec<Forms>,
+        columns: impl ExactSizeIterator<Item = (u32, Forms)>,
     ) -> Result<DynSource<'_>, AllocError> {
-        check!(columns.len() <= BATCH_COLUMNS_MAX as usize && forms.len() == columns.len());
-        check!(columns.iter().all(|&column| column < self.column_count()));
-        check!(columns.iter().zip(forms.iter()).all(|(&c, &f)| self.forms(c).contains(f)));
-        let scan = Scan { scannable: NonNull::from(self).cast(), columns, forms };
+        let columns = SlowVec::fixed_from(allocator, columns)?;
+        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
+        let column_count = self.column_count();
+        let allowed = |&(c, f): &(u32, Forms)| c < column_count && self.forms(c).contains(f);
+        check!(columns.iter().all(allowed));
+        let scan = Scan { scannable: NonNull::from(self).cast(), columns };
         let step = Box::new(allocator, scan)?.erase();
         // SAFETY: the functions take a `Scan` and the scannable's state, and
         // the `Scan` borrows `self` for as long as the source lives.
@@ -254,10 +260,9 @@ impl<'a> DynScannable<'a> {
 struct Scan {
     /// What's read.
     scannable: NonNull<DynScannable<'static>>,
-    /// Which of its columns, in order.
-    columns: SlowVec<u32>,
-    /// The forms each may be written in, besides flat.
-    forms: SlowVec<Forms>,
+    /// Which of its columns, in order, each with the forms it may be
+    /// written in, besides flat.
+    columns: SlowVec<(u32, Forms)>,
 }
 
 /// A transform that loads lazy columns a `DynScannable` wrote.
@@ -272,9 +277,11 @@ unsafe fn scan_new_state(
     state: NonNull<u8>,
 ) -> Result<(), Error> {
     // SAFETY: `step` is a `Scan`, whose scannable outlives it.
-    let scannable = unsafe { step.cast::<Scan>().as_ref().scannable.as_ref() };
+    let scan = unsafe { step.cast::<Scan>().as_ref() };
+    // SAFETY: as above.
+    let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.new_state)(scannable.scannable.as_ptr(), context, state) }
+    unsafe { (scannable.open)(scannable.scannable.as_ptr(), context, &scan.columns, state) }
 }
 
 unsafe fn scan_next(
@@ -289,16 +296,7 @@ unsafe fn scan_next(
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
-    unsafe {
-        (scannable.next)(
-            scannable.scannable.as_ptr(),
-            &scan.columns,
-            &scan.forms,
-            context,
-            state,
-            batch,
-        )
-    }
+    unsafe { (scannable.next)(scannable.scannable.as_ptr(), context, state, batch) }
 }
 
 unsafe fn materialize_new_state(
@@ -356,7 +354,10 @@ mod tests {
     struct Columns;
 
     impl Scannable for Columns {
-        type State = bool;
+        type State<'s>
+            = (bool, &'s [(u32, Forms)])
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -371,23 +372,25 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
-            Ok(false)
+        fn open<'s>(
+            &'s self,
+            _: &mut Context,
+            columns: &'s [(u32, Forms)],
+        ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
+            Ok((false, columns))
         }
 
         fn next(
             &self,
-            columns: &[u32],
-            _: &[Forms],
             _: &mut Context,
-            done: &mut bool,
+            (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             if *done {
                 return Ok(false);
             }
             batch.reset(2);
-            for &column in columns {
+            for &(column, _) in *columns {
                 let mut values = Buffer::allocate(&Heap, 16).unwrap();
                 let value = i64::from(column);
                 values.as_mut_slice::<i64>().copy_from_slice(&[value, value + 10]);
@@ -421,17 +424,9 @@ mod tests {
     #[test]
     fn scans_chosen_columns_through_a_pipeline() {
         let scannable = DynScannable::new(&Heap, Columns).unwrap();
-        let columns = SlowVec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
-        let pipeline = Pipeline::new(
-            scannable
-                .scan(
-                    &Heap,
-                    columns,
-                    SlowVec::fixed_from(&Heap, [Forms::FLAT; 2].into_iter()).unwrap(),
-                )
-                .unwrap(),
-            SlowVec::new(&Heap, 1).unwrap(),
-        );
+        let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
+        let pipeline =
+            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), SlowVec::new(&Heap, 1).unwrap());
         let query = QueryAllocators::new(&Heap);
         let mut execution = pipeline.start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -449,7 +444,10 @@ mod tests {
     }
 
     impl Scannable for Counted<'_> {
-        type State = u8;
+        type State<'s>
+            = (u8, &'s [(u32, Forms)])
+        where
+            Self: 's;
         type Loader = ();
 
         fn column_count(&self) -> u32 {
@@ -464,22 +462,24 @@ mod tests {
             DataType::Int64
         }
 
-        fn new_state(&self, _: &mut Context) -> Result<u8, Error> {
-            Ok(0)
+        fn open<'s>(
+            &'s self,
+            _: &mut Context,
+            columns: &'s [(u32, Forms)],
+        ) -> Result<(u8, &'s [(u32, Forms)]), Error> {
+            Ok((0, columns))
         }
 
         fn next(
             &self,
-            _: &[u32],
-            forms: &[Forms],
             context: &mut Context,
-            batches: &mut u8,
+            (batches, columns): &mut (u8, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             if *batches == 2 {
                 return Ok(false);
             }
-            assert!(forms[0].contains(Forms::LAZY));
+            assert!(columns[0].1.contains(Forms::LAZY));
             batch.reset(4);
             let column = ColumnView::lazy(context, DataType::Int64, &[*batches], 4).unwrap();
             assert!(batch.push_column(column).is_ok());
@@ -538,9 +538,7 @@ mod tests {
     fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
         let loads = RefCell::new(StdVec::new());
         let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
-        let columns = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
-        let forms = SlowVec::fixed_from(&Heap, [Forms::LAZY].into_iter()).unwrap();
-        let source = scannable.scan(&Heap, columns, forms).unwrap();
+        let source = scannable.scan(&Heap, [(0, Forms::LAZY)].into_iter()).unwrap();
         let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
         let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
         let load = Step::Transform(scannable.materialize(&Heap, positions).unwrap());

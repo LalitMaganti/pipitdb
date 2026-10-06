@@ -27,11 +27,12 @@ fn main() -> Result<(), String> {
     let start = Instant::now();
     for column in 0..table.column_count() {
         let mut context = Context::new(&Heap);
-        let mut state = table.new_state(&mut context).map_err(|e| format!("{e:?}"))?;
+        let read = [(column, Forms::FLAT)];
+        let mut state = table.open(&mut context, &read).map_err(|e| format!("{e:?}"))?;
         let mut batch = RowBatch::new();
         let (mut count, mut sum) = (0_u64, 0_i128);
         while table
-            .next(&[column], &[Forms::FLAT], &mut context, &mut state, &mut batch)
+            .next(&mut context, &mut state, &mut batch)
             .map_err(|e| format!("{}: {e:?}", table.column_name(column)))?
         {
             let values = batch.column(0).flatten(&mut context).map_err(|e| format!("{e:?}"))?;

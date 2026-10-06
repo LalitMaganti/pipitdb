@@ -260,11 +260,8 @@ impl<'c> Op<'c> for ScanOp<'c> {
         for column in self.columns.iter() {
             lowering.define(column.binding.id)?;
         }
-        let read = self.columns.iter().map(|column| column.column);
-        let read = SlowVec::fixed_from(lowering.allocator(), read)?;
-        let forms = self.columns.iter().map(|column| column.forms);
-        let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read, forms)?);
+        let read = self.columns.iter().map(|column| (column.column, column.forms));
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
         Ok(())
     }
 
