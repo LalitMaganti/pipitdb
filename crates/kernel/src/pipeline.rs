@@ -101,9 +101,11 @@ struct Slot {
 /// What a segment did when run.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Made {
+    /// A batch with rows.
     Batch,
     /// A batch with no rows, which is dropped.
     Nothing,
+    /// No more batches.
     End,
 }
 
@@ -114,16 +116,20 @@ pub struct Execution<'p> {
 
 /// A run's memory, and where it is in it.
 struct Run<'p> {
+    /// What's run.
     pipeline: &'p Pipeline<'p>,
+    /// The segments, steps' slots and states, laid out as `layout` says.
     memory: NonNull<u8>,
+    /// Where the slots start in `memory`.
     slots: usize,
+    /// Where the source's state starts in `memory`.
     source_state: usize,
     /// How many states are made: the source's, then each step's, in order.
     made: usize,
     /// Why a step failed, if one has. Its segment then reports that it
     /// ended, so the loop pays for failures only where segments end.
     failed: Cell<Option<Error>>,
-    // Frees `memory`.
+    /// Frees `memory`.
     _buffer: Buffer,
 }
 
@@ -280,6 +286,11 @@ impl Run<'_> {
             // SAFETY: the transform's state was made by `Execution::new`.
             if let Err(error) = unsafe { transform.process(context, self.state(Some(i)), batch) } {
                 return self.fail(error);
+            }
+            // Later steps would do nothing with it, or load values no one
+            // reads.
+            if batch.selection().is_empty() {
+                return Made::Nothing;
             }
             i += 1;
         }
@@ -751,6 +762,10 @@ mod tests {
         let none = pipeline(Numbers { batches: 3 }, [transform(KeepNone)]);
         let query = QueryAllocators::new(&Heap);
         assert!(!none.start(&query).unwrap().next(&mut batch).unwrap());
+        // Steps after one that keeps no rows don't run: this one would fail.
+        let stopped =
+            pipeline(Numbers { batches: 3 }, [transform(KeepNone), transform(FailSecond)]);
+        assert_eq!(stopped.start(&query).unwrap().next(&mut batch), Ok(false));
     }
 
     #[test]
