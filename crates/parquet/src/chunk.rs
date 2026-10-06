@@ -55,6 +55,10 @@ const SCRATCH_BYTES: usize = BATCH_ROWS_MAX as usize * 4;
 pub struct Position {
     /// Where the next page's header starts.
     next: u64,
+    /// Where the page being read's header starts.
+    header: u64,
+    /// How many rows the page being read has.
+    rows: usize,
     /// The body of the page being read.
     body: Body,
     /// How many rows the page has left.
@@ -112,6 +116,8 @@ impl<'s> ChunkReader<'s> {
         let data_type = column.data_type().ok_or(Error::Unsupported)?;
         let position = Position {
             next: chunk.start,
+            header: chunk.start,
+            rows: 0,
             body: Body { at: 0, len: 0, size: 0 },
             left: 0,
             indexed: false,
@@ -149,6 +155,11 @@ impl<'s> ChunkReader<'s> {
         Ok(self.position.left)
     }
 
+    /// What the column reads as.
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+
     /// Where reading is now.
     pub fn position(&self) -> Position {
         self.position
@@ -157,6 +168,42 @@ impl<'s> ChunkReader<'s> {
     /// Goes back, or on, to `position`, which this reader gave.
     pub fn seek(&mut self, position: Position) {
         self.position = position;
+    }
+
+    /// Where reading is, to come back to with `go_to`: where the page being
+    /// read's header starts, and how many of its rows are read or passed.
+    pub fn place(&self) -> (u64, usize) {
+        (self.position.header, self.position.rows - self.position.left)
+    }
+
+    /// Goes to row `row` of the page whose header starts at `header`, which
+    /// `place` gave, on from where reading is if that's in the same page and
+    /// not past it. Reads the page's header again otherwise.
+    pub fn go_to(&mut self, context: &mut Context, header: u64, row: usize) -> Result<(), Error> {
+        let (at, read) = self.place();
+        if at != header || read > row {
+            if header >= self.end {
+                return Err(Error::Corrupt);
+            }
+            (self.position.next, self.position.left) = (header, 0);
+            self.next_page(context)?;
+            if self.position.header != header || self.position.left == 0 {
+                return Err(Error::Corrupt);
+            }
+        }
+        let (_, read) = self.place();
+        if row - read > self.position.left {
+            return Err(Error::Corrupt);
+        }
+        self.skip(context, row - read)
+    }
+
+    /// Passes over the next `rows` rows of the page being read, which
+    /// hasn't been read from, only counting them: it can't be read from
+    /// after, but can be gone back to.
+    pub fn pass(&mut self, rows: usize) {
+        check!(rows <= self.position.left && !self.position.started);
+        self.position.left -= rows;
     }
 
     /// Passes over the next `rows` rows, which must be in the page being
@@ -408,6 +455,7 @@ impl<'s> ChunkReader<'s> {
 
     /// Moves to the next page, reading only its header.
     fn next_page(&mut self, context: &mut Context) -> Result<(), Error> {
+        let header_at = self.position.next;
         let (header, at) = self.header(context)?;
         let (len, left) = (header.len, header.values);
         let body = Body { at, len, size: header.size };
@@ -436,6 +484,8 @@ impl<'s> ChunkReader<'s> {
         }
         self.position = Position {
             next,
+            header: header_at,
+            rows: left,
             body,
             left,
             indexed,
@@ -765,6 +815,45 @@ mod tests {
                 row += skip + rows;
             }
             assert_eq!(row, 2048);
+        }
+    }
+
+    #[test]
+    fn goes_to_places_passed() {
+        goes_to_places_passed_in(NULLS, nulls);
+        goes_to_places_passed_in(DICT, dict);
+    }
+
+    /// Passes over each column's first chunk of `bytes` noting places, as a
+    /// scan of lazy columns does, then reads from them out of order, as
+    /// loads do: on, back within a page, and again.
+    fn goes_to_places_passed_in(mut bytes: &[u8], expected: fn(usize, i64) -> Cell) {
+        let source: &dyn ByteSource = &mut bytes;
+        let file = ParquetFile::open(&Heap, source).unwrap();
+        let mut context = Context::new(&Heap);
+        for c in 0..3 {
+            let reader = || {
+                ChunkReader::new(source, &Uncompressed, file.columns()[c], file.chunk(0, c))
+                    .unwrap()
+            };
+            let (mut passing, mut places, mut row) = (reader(), Vec::new(), 0);
+            while passing.page_left(&mut context).unwrap() > 0 {
+                let rows = passing.page_left(&mut context).unwrap().min(300);
+                places.push((passing.place(), row, rows.min(50)));
+                passing.pass(rows);
+                row += rows;
+            }
+            assert_eq!(row, 2048);
+            assert!(places.len() > 2);
+            let mut loading = reader();
+            loading.page_left(&mut context).unwrap();
+            let order = [2, 0, 1, 1, places.len() - 1, 0];
+            for &((header, at), row, rows) in order.iter().map(|&i| &places[i]) {
+                loading.go_to(&mut context, header, at).unwrap();
+                let from = i64::try_from(row).unwrap();
+                let expected: Vec<_> = (from..).take(rows).map(|i| expected(c, i)).collect();
+                assert_eq!(cells(&loading.read(&mut context, rows, ANY).unwrap()), expected);
+            }
         }
     }
 
