@@ -38,10 +38,26 @@ pub fn slice_query(
     slices: &'static DynScannable<'static>,
     query: &str,
 ) -> Option<PhysicalPlan<'static>> {
-    let catalog: &'static Slices = Box::leak(Box::new(Slices(slices)));
+    plan(Box::leak(Box::new(Slices(slices))), query)
+}
+
+/// `query` over the tables in `catalog`, compiled, optimized and lowered,
+/// ready to run.
+pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
     let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
     optimize(&Heap, &mut plan).ok()?;
     lower(&Heap, &plan).ok()
+}
+
+/// The PipeSQL of the query called `name` in `clickbench/queries.tsv`, if
+/// pipitdb can run it yet.
+pub fn clickbench_query(name: &str) -> Option<&'static str> {
+    let queries = include_str!("../clickbench/queries.tsv");
+    let pipesql = queries.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        if fields.next() == Some(name) { fields.next() } else { None }
+    });
+    pipesql.filter(|pipesql| !pipesql.is_empty())
 }
 
 struct Slices(&'static DynScannable<'static>);
