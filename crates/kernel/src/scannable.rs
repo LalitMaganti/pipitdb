@@ -184,6 +184,7 @@ mod tests {
     use crate::column::ColumnView;
     use crate::context::Context;
     use crate::pipeline::Pipeline;
+    use crate::query_allocators::QueryAllocators;
 
     /// One batch, with column `i` holding `i` and `i + 10`.
     struct Columns;
@@ -255,7 +256,8 @@ mod tests {
         let columns = SlowVec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
         let pipeline =
             Pipeline::new(scannable.scan(&Heap, columns).unwrap(), SlowVec::new(&Heap, 1).unwrap());
-        let mut execution = pipeline.start(&Heap).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = pipeline.start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();

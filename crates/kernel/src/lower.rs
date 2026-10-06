@@ -153,6 +153,7 @@ mod tests {
     use crate::filter::{Comparison, Value};
     use crate::plan::{DynOp, FilterOp, ScanColumn, ScanOp};
     use crate::predicate::{Leaf, Node, Predicate};
+    use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable};
     use crate::selection::Kept;
@@ -231,7 +232,8 @@ mod tests {
         let names: StdVec<&str> = physical.columns().iter().map(|&c| physical.name(c)).collect();
         assert_eq!(names, ["b", "a"]);
 
-        let mut execution = physical.pipeline().start(&Heap).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
@@ -259,7 +261,8 @@ mod tests {
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
         let physical = lower(&Heap, &plan).unwrap();
-        let mut execution = physical.pipeline().start(&Heap).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
@@ -357,7 +360,8 @@ mod tests {
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
         let physical = lower(&Heap, &plan).unwrap();
-        let mut execution = physical.pipeline().start(&Heap).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);

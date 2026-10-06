@@ -43,7 +43,7 @@ pub struct Bounds {
 /// (constant), or each through an index (dictionary).
 ///
 /// It's a handle, small to move: the buffers and what they hold are in a
-/// header it shares with its clones and slices, from the run's pool.
+/// header it shares with its clones and slices.
 #[derive(Clone)]
 pub struct ColumnView {
     /// A `Header`, written in it.
@@ -205,14 +205,14 @@ impl ColumnView {
         }
     }
 
-    /// A view of all `row_count` rows of `header`, written into memory from
-    /// the run's pool.
+    /// A view of all `row_count` rows of `header`, written into a column
+    /// buffer.
     fn with_header(
         context: &mut Context,
         header: Header,
         row_count: u32,
     ) -> Result<ColumnView, AllocError> {
-        let mut block = context.column_buffer(size_of::<Header>())?;
+        let mut block = context.small_buffer(size_of::<Header>())?;
         // SAFETY: the block is the size of a `Header`, aligned for any, and
         // only this view has it; what it held was a header already dropped,
         // or nothing.
@@ -284,7 +284,7 @@ impl ColumnView {
         let validity = match values.validity() {
             None => None,
             Some(valid) => {
-                let mut bits = context.column_buffer(rows.div_ceil(8))?;
+                let mut bits = context.small_buffer(rows.div_ceil(8))?;
                 let out = bits.as_mut_slice::<u8>();
                 out.fill(0);
                 for row in 0..self.row_count {
@@ -301,8 +301,8 @@ impl ColumnView {
             let strings = values.strings();
             let total: usize =
                 (0..self.row_count).map(|row| strings.get(index(row) as usize).len()).sum();
-            let mut offsets = context.column_buffer((rows + 1) * 4)?;
-            let mut bytes = context.column_buffer(total)?;
+            let mut offsets = context.indices_buffer((rows + 1) * 4)?;
+            let mut bytes = context.bytes_buffer(total)?;
             let (ends, out) = (offsets.as_mut_slice::<u32>(), bytes.as_mut_slice::<u8>());
             let mut to = 0;
             *at_mut!(ends, 0) = 0;
@@ -316,7 +316,7 @@ impl ColumnView {
             return ColumnView::strings(context, offsets, bytes, validity);
         }
         let words = values.slice_of::<i64>();
-        let mut out = context.column_buffer(rows * 8)?;
+        let mut out = context.values_buffer(rows * 8)?;
         for (row, word) in (0..).zip(out.as_mut_slice::<i64>()) {
             *word = *at!(words, index(row) as usize);
         }

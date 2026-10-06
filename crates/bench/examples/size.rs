@@ -5,12 +5,13 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use pipit_kernel::allocator::{Budget, Heap};
+use pipit_kernel::allocator::{Heap, LimitAllocator};
 use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
+use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::chunk::ChunkReader;
 use pipit_parquet::footer::ParquetFile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
@@ -50,14 +51,14 @@ pub extern "C" fn box_double(value: u64) -> u64 {
     *boxed
 }
 
-/// The most bytes a `Box` of `value` takes from a budget of `limit` bytes,
-/// or 0 if it doesn't fit.
+/// The most bytes a `Box` of `value` takes from an allocator limited to
+/// `limit` bytes, or 0 if it doesn't fit.
 #[unsafe(no_mangle)]
-pub extern "C" fn budget_peak(value: u64, limit: usize) -> usize {
-    let budget = Budget::new(&Heap, limit);
-    let Ok(boxed) = Box::new(&budget, value) else { return 0 };
+pub extern "C" fn limit_peak(value: u64, limit: usize) -> usize {
+    let limited = LimitAllocator::new(&Heap, limit);
+    let Ok(boxed) = Box::new(&limited, value) else { return 0 };
     drop(boxed);
-    budget.peak()
+    limited.peak()
 }
 
 /// One log, in a fixed array.
@@ -124,6 +125,19 @@ pub extern "C" fn spill_round_trip(value: i64) -> i64 {
     }
     let Ok(read) = read_column(&mut context, &store, log, &spilled) else { return 0 };
     read.int64s()[0]
+}
+
+/// `value`, in a column filled as a run's are, or 0 if that fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn run_column(value: i64) -> i64 {
+    let query = QueryAllocators::new(&Heap);
+    let mut context = Context::for_query(&query);
+    let Ok(mut values) = context.values_buffer(8) else { return 0 };
+    values.as_mut_slice::<i64>()[0] = value;
+    let Ok(column) = ColumnView::new(&mut context, DataType::Int64, values, None) else {
+        return 0;
+    };
+    column.int64s()[0]
 }
 
 /// The length of the second of two strings, of `first` and `second` bytes.

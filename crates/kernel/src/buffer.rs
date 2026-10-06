@@ -37,13 +37,11 @@ pub struct Buffer {
 #[repr(C, align(64))]
 struct Header {
     references: Cell<u32>,
-    /// Whether the last drop keeps the bytes for a `ColumnPool`.
-    pooled: Cell<bool>,
     size_bytes: usize,
     allocator: NonNull<dyn Allocator>,
 }
 
-const HEADER_BYTES: usize = size_of::<Header>();
+pub(crate) const HEADER_BYTES: usize = size_of::<Header>();
 
 impl Buffer {
     /// Allocates `size_bytes` zeroed bytes from `allocator`, which must
@@ -92,12 +90,7 @@ impl Buffer {
         };
         // SAFETY: the allocation fits a header followed by `size_bytes` bytes.
         let data = unsafe {
-            header.write(Header {
-                references: Cell::new(1),
-                pooled: Cell::new(false),
-                size_bytes,
-                allocator,
-            });
+            header.write(Header { references: Cell::new(1), size_bytes, allocator });
             header.cast::<u8>().add(HEADER_BYTES)
         };
         Ok(Buffer { data })
@@ -170,58 +163,14 @@ impl Buffer {
         unsafe { header(self.data) }
     }
 
-    /// Allocates `size_bytes` zeroed bytes, as `allocate`, whose last drop
-    /// keeps them for the `ColumnPool` that holds `as_non_null` of them, to
-    /// hand out again, until it gives them up.
-    pub(crate) fn allocate_pooled(
-        allocator: &dyn Allocator,
-        size_bytes: usize,
-    ) -> Result<Buffer, AllocError> {
-        let buffer = Buffer::allocate(allocator, size_bytes)?;
-        buffer.header().pooled.set(true);
-        Ok(buffer)
-    }
-
     /// Whether this is the only reference to the bytes.
     pub(crate) fn is_unique(&self) -> bool {
         self.header().references.get() == 1
     }
 
-    /// Where the bytes are, for a `ColumnPool` to find them again.
+    /// Where the bytes are.
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.data
-    }
-
-    /// The pooled buffer at `data`, if nothing references it and it has
-    /// `size_bytes` bytes.
-    ///
-    /// # Safety
-    ///
-    /// `data` must be from a pooled buffer's `as_non_null`, not yet given up.
-    pub(crate) unsafe fn reuse(data: NonNull<u8>, size_bytes: usize) -> Option<Buffer> {
-        // SAFETY: pooled bytes live until given up.
-        let header = unsafe { header(data) };
-        (header.references.get() == 0 && header.size_bytes == size_bytes).then(|| {
-            header.references.set(1);
-            Buffer { data }
-        })
-    }
-
-    /// Gives up the pooled buffer at `data`: it's freed now if nothing
-    /// references it, and by its last drop if something does.
-    ///
-    /// # Safety
-    ///
-    /// As for `reuse`; `data` mustn't be used again.
-    pub(crate) unsafe fn unpool(data: NonNull<u8>) {
-        // SAFETY: pooled bytes live until given up.
-        let header = unsafe { header(data) };
-        header.pooled.set(false);
-        if header.references.get() == 0 {
-            // SAFETY: nothing references the bytes, and they're no longer
-            // pooled.
-            unsafe { deallocate(data) };
-        }
     }
 }
 
@@ -272,7 +221,7 @@ impl Drop for Buffer {
         let header = self.header();
         let references = header.references.get() - 1;
         header.references.set(references);
-        if references == 0 && !header.pooled.get() {
+        if references == 0 {
             // SAFETY: that was the last reference.
             unsafe { deallocate(self.data) };
         }
