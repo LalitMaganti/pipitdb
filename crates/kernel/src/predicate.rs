@@ -36,6 +36,14 @@ pub enum Leaf {
         comparison: Comparison,
         value: Value,
     },
+    /// The string column at `column` in a batch, compared byte by byte with
+    /// bytes `start..start + len` of the predicate's strings.
+    CompareString {
+        column: u32,
+        comparison: Comparison,
+        start: u32,
+        len: u32,
+    },
     IsNull {
         column: u32,
     },
@@ -44,13 +52,28 @@ pub enum Leaf {
 /// Its root is its last node.
 pub struct Predicate {
     nodes: SlowVec<Node>,
+    /// The bytes of the strings its comparisons compare with, if any.
+    strings: Option<SlowVec<u8>>,
     depth: u32,
 }
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
     pub fn new(nodes: SlowVec<Node>) -> Predicate {
+        Predicate::with_strings(nodes, None)
+    }
+
+    /// A predicate of `nodes`, whose string comparisons compare with bytes
+    /// of `strings`.
+    pub fn with_strings(nodes: SlowVec<Node>, strings: Option<SlowVec<u8>>) -> Predicate {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
+        let bytes = strings.as_ref().map_or(0, |strings| strings.len());
+        check!(nodes.iter().all(|node| match *node {
+            Node::Leaf(Leaf::CompareString { start, len, .. }) => {
+                (start as usize).checked_add(len as usize).is_some_and(|end| end <= bytes)
+            }
+            _ => true,
+        }));
         // Each node's depth: how many selections it holds at once, at most.
         let mut depths = [0_u32; PREDICATE_NODES_MAX];
         for (i, node) in (0..).zip(nodes.iter()) {
@@ -69,7 +92,7 @@ impl Predicate {
             };
         }
         let depth = *at!(depths, nodes.len() - 1);
-        Predicate { nodes, depth }
+        Predicate { nodes, strings, depth }
     }
 
     /// How many scratch selections `select` needs.
@@ -80,7 +103,11 @@ impl Predicate {
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.
     pub fn columns(&self) -> impl Iterator<Item = u32> + '_ {
         self.nodes.iter().filter_map(|node| match *node {
-            Node::Leaf(Leaf::Compare { column, .. } | Leaf::IsNull { column }) => Some(column),
+            Node::Leaf(
+                Leaf::Compare { column, .. }
+                | Leaf::CompareString { column, .. }
+                | Leaf::IsNull { column },
+            ) => Some(column),
             Node::And(..) | Node::Or(..) | Node::Not(_) => None,
         })
     }
@@ -96,13 +123,21 @@ impl Predicate {
             Node::Leaf(Leaf::Compare { column, comparison, value }) => {
                 Node::Leaf(Leaf::Compare { column: renumber(column), comparison, value })
             }
+            Node::Leaf(Leaf::CompareString { column, comparison, start, len }) => {
+                let column = renumber(column);
+                Node::Leaf(Leaf::CompareString { column, comparison, start, len })
+            }
             Node::Leaf(Leaf::IsNull { column }) => {
                 Node::Leaf(Leaf::IsNull { column: renumber(column) })
             }
             node => node,
         });
         let nodes = SlowVec::fixed_from(allocator, nodes)?;
-        Ok(Predicate { nodes, depth: self.depth })
+        let strings = match &self.strings {
+            Some(strings) => Some(SlowVec::fixed_from(allocator, strings.iter().copied())?),
+            None => None,
+        };
+        Ok(Predicate { nodes, strings, depth: self.depth })
     }
 
     /// Narrows `batch`'s selection to the rows this is true for, working in
@@ -127,7 +162,7 @@ impl Predicate {
         selection: &mut Selection,
     ) {
         match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => leaf.narrow(None, want, columns, selection),
+            Node::Leaf(leaf) => leaf.narrow(self.strings(), None, want, columns, selection),
             Node::Not(child) => self.narrow(scratch, child, !want, columns, selection),
             // True for both, or false for both: each narrows what the other left.
             Node::And(a, b) if want => self.both(scratch, a, b, true, columns, selection),
@@ -140,7 +175,7 @@ impl Predicate {
                 };
                 if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
                     // In one pass.
-                    leaf.narrow(Some(rest), want, columns, selection);
+                    leaf.narrow(self.strings(), Some(rest), want, columns, selection);
                 } else {
                     rest.clone_from(selection);
                     self.narrow(scratch, a, want, columns, selection);
@@ -150,6 +185,11 @@ impl Predicate {
                 selection.union(rest);
             }
         }
+    }
+
+    /// The bytes its string comparisons compare with.
+    fn strings(&self) -> &[u8] {
+        self.strings.as_deref().unwrap_or(&[])
     }
 
     fn both(
@@ -171,6 +211,7 @@ impl Leaf {
     /// drops to `dropped`, if given.
     fn narrow(
         self,
+        strings: &[u8],
         dropped: Option<&mut Selection>,
         want: bool,
         columns: &[ColumnView],
@@ -181,6 +222,17 @@ impl Leaf {
                 let comparison = if want { comparison } else { negated(comparison) };
                 let column = at!(columns, column as usize);
                 filter::compare(column, comparison, value, selection, dropped);
+            }
+            Leaf::CompareString { column, comparison, start, len } => {
+                let comparison = if want { comparison } else { negated(comparison) };
+                let string = at!(strings, start as usize..(start + len) as usize);
+                filter::compare_string(
+                    at!(columns, column as usize),
+                    comparison,
+                    string,
+                    selection,
+                    dropped,
+                );
             }
             Leaf::IsNull { column } => {
                 filter::is_null(at!(columns, column as usize), want, selection, dropped);

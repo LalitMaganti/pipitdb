@@ -89,9 +89,11 @@ fn filter(c: &mut Criterion) {
     let nullable = pipitdb_bench::filter_column(true);
     let mut group = c.benchmark_group("filter");
     group.throughput(Throughput::Elements(1000 * 2048));
-    let cases: [(&str, &_, fn(&_, &mut _)); 2] = [
+    let strings = pipitdb_bench::string_column();
+    let cases: [(&str, &_, fn(&_, &mut _)); 3] = [
         ("greater", &plain, pipitdb_bench::greater),
         ("greater_nulls", &nullable, pipitdb_bench::greater),
+        ("string_equal", &strings, pipitdb_bench::string_equal),
     ];
     for (name, column, filter) in cases {
         group.bench_function(name, |b| {

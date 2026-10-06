@@ -1,7 +1,8 @@
 //! Conditions, such as `WHERE`'s, compiled to a `Predicate`.
 //!
-//! A condition is comparisons of a column with an integer, combined with
-//! `AND`, `OR`, `NOT` and parentheses. Anything else is `Unsupported`.
+//! A condition is comparisons of a column with an integer, or of a string
+//! column with a string, combined with `AND`, `OR`, `NOT` and parentheses.
+//! Anything else is `Unsupported`.
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::filter::{Comparison, Value};
@@ -12,11 +13,16 @@ use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
 
+/// The most bytes a condition's strings can have, together.
+const STRINGS_MAX: usize = 1 << 16;
+
 /// `node`, a condition, as a predicate over the plan's columns.
 pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Predicate, Error> {
     let mut nodes = SlowVec::new(compiler.allocator(), PREDICATE_NODES_MAX)?;
-    add(compiler, &mut nodes, node)?;
-    Ok(Predicate::new(nodes))
+    let mut strings = SlowVec::new(compiler.allocator(), STRINGS_MAX)?;
+    add(compiler, &mut nodes, &mut strings, node)?;
+    let strings = (!strings.is_empty()).then_some(strings);
+    Ok(Predicate::with_strings(nodes, strings))
 }
 
 /// Adds `node`'s predicate nodes, children first, and returns the index of
@@ -24,20 +30,20 @@ pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Pred
 fn add(
     compiler: &Compiler<'_, '_>,
     nodes: &mut SlowVec<PredicateNode>,
+    strings: &mut SlowVec<u8>,
     node: Node,
 ) -> Result<u32, Error> {
     let child = |i: u32| compiler.node(node.first_child() + i);
+    let mut add = |node: Node| add(compiler, nodes, strings, node);
     let added = match node.tag() {
-        Tag::Unary if node.operator() == Operator::Not => {
-            PredicateNode::Not(add(compiler, nodes, child(0))?)
-        }
+        Tag::Unary if node.operator() == Operator::Not => PredicateNode::Not(add(child(0))?),
         Tag::Binary if node.operator() == Operator::And => {
-            PredicateNode::And(add(compiler, nodes, child(0))?, add(compiler, nodes, child(1))?)
+            PredicateNode::And(add(child(0))?, add(child(1))?)
         }
         Tag::Binary if node.operator() == Operator::Or => {
-            PredicateNode::Or(add(compiler, nodes, child(0))?, add(compiler, nodes, child(1))?)
+            PredicateNode::Or(add(child(0))?, add(child(1))?)
         }
-        Tag::Binary => PredicateNode::Leaf(compare(compiler, node)?),
+        Tag::Binary => PredicateNode::Leaf(compare(compiler, strings, node)?),
         _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(node))),
     };
     if nodes.len() == PREDICATE_NODES_MAX {
@@ -48,8 +54,13 @@ fn add(
     Ok(nodes.len() as u32 - 1)
 }
 
-/// A comparison of a column with a number, either way round.
-fn compare(compiler: &Compiler<'_, '_>, node: Node) -> Result<Leaf, Error> {
+/// A comparison of a column with a number, or of a string column with a
+/// string, whose bytes go in `strings`, either way round.
+fn compare(
+    compiler: &Compiler<'_, '_>,
+    strings: &mut SlowVec<u8>,
+    node: Node,
+) -> Result<Leaf, Error> {
     let comparison = match node.operator() {
         Operator::Equal => Comparison::Equal,
         Operator::NotEqual => Comparison::NotEqual,
@@ -60,7 +71,7 @@ fn compare(compiler: &Compiler<'_, '_>, node: Node) -> Result<Leaf, Error> {
         _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(node))),
     };
     let (left, right) = (compiler.node(node.first_child()), compiler.node(node.first_child() + 1));
-    let (column, number, comparison) = match (left.tag(), right.tag()) {
+    let (column, literal, comparison) = match (left.tag(), right.tag()) {
         (Tag::Name, _) => (left, right, comparison),
         // `1 < x` is `x > 1`.
         (_, Tag::Name) => (right, left, flipped(comparison)),
@@ -68,8 +79,38 @@ fn compare(compiler: &Compiler<'_, '_>, node: Node) -> Result<Leaf, Error> {
     };
     let column = compiler.find_column(column)?;
     let data_type = at!(compiler.plan.columns, column.id as usize).data_type;
-    let value = value(compiler, number, false, data_type)?;
+    if data_type == DataType::String && literal.tag() == Tag::String {
+        let (start, len) = string(compiler, strings, literal)?;
+        return Ok(Leaf::CompareString { column: column.id, comparison, start, len });
+    }
+    let value = value(compiler, literal, false, data_type)?;
     Ok(Leaf::Compare { column: column.id, comparison, value })
+}
+
+/// Adds the bytes of `node`, a string literal, to `strings`, a quote for
+/// each `''`, and returns where they start and how many there are.
+fn string(
+    compiler: &Compiler<'_, '_>,
+    strings: &mut SlowVec<u8>,
+    node: Node,
+) -> Result<(u32, u32), Error> {
+    let quoted = compiler.bytes(node.span());
+    // Between its quotes, which the lexer checked are there.
+    let inside = at!(quoted, 1..quoted.len() - 1);
+    if strings.len() + inside.len() > STRINGS_MAX {
+        return Err(Error::new(ErrorCode::ConditionTooLarge, node.span()));
+    }
+    let start = strings.len();
+    let mut quote = false;
+    for &byte in inside {
+        // The second quote of each `''` is the one kept.
+        quote = byte == b'\'' && !quote;
+        if !quote {
+            strings.push(byte)?;
+        }
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `STRINGS_MAX`")]
+    Ok((start as u32, (strings.len() - start) as u32))
 }
 
 /// The comparison with its sides swapped.
