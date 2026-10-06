@@ -1,0 +1,32 @@
+# datafusion 54.0.0, default threads, best of 2 after a warm-up, ms
+# Apple M3, 8 cores, macOS 26.6.2, 2026-10-06, 100 files
+0	0.5
+1	12.3
+2	47.8
+3	44.5
+6	0.6
+40	8.4
+41	8.1
+41all	322.1
+pAdv	70.6
+pRefresh	89.8
+4	482.8
+s1	145.1
+s2	41.5
+s3	902.7
+s4	318.3
+s5	1025.4
+gAdv	202.3
+gCounter	189.5
+gRegion	214.1
+gWindow	567.7
+gUser	923.0
+gEngineIp	1297.2
+gUrlDate	1529.6
+f1	19.8
+fAdv	123.7
+f40	13.0
+f41	11.8
+fPhone	140.1
+fIpad	130.1
+fSearch	280.8

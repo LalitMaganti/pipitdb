@@ -1,0 +1,32 @@
+# duckdb 1.5.6, one thread, best of 2 after a warm-up, ms
+# Apple M3, 8 cores, macOS 26.6.2, 2026-10-06, 100 files
+0	77.8
+1	113.2
+2	339.0
+3	477.2
+6	185.8
+40	49.2
+41	48.5
+41all	1429.0
+pAdv	335.5
+pRefresh	550.5
+4	2532.6
+s1	1430.7
+s2	168.4
+s3	9689.5
+s4	1593.1
+s5	3863.0
+gAdv	655.9
+gCounter	647.2
+gRegion	734.6
+gWindow	1653.3
+gUser	2502.9
+gEngineIp	2835.7
+gUrlDate	3765.0
+f1	103.6
+fAdv	354.7
+f40	41.5
+f41	41.9
+fPhone	446.7
+fIpad	381.6
+fSearch	1890.1
