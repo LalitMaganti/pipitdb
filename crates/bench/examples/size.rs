@@ -143,12 +143,11 @@ pub extern "C" fn run_column(value: i64) -> i64 {
 /// The length of the second of two strings, of `first` and `second` bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn second_string_len(first: u32, second: u32) -> usize {
-    let Ok(mut offsets) = Buffer::allocate(&Heap, 3 * 4) else { return 0 };
-    let ends = offsets.as_mut_slice::<u32>();
-    (ends[1], ends[2]) = (first, first + second);
+    let Ok(mut views) = Buffer::allocate(&Heap, 2 * 8) else { return 0 };
+    views.as_mut_slice::<u32>().copy_from_slice(&[0, first, first, second]);
     let Ok(bytes) = Buffer::allocate(&Heap, (first + second) as usize) else { return 0 };
     let mut context = Context::new(&Heap);
-    let Ok(column) = ColumnView::strings(&mut context, offsets, bytes, None) else { return 0 };
+    let Ok(column) = ColumnView::strings(&mut context, views, bytes, None) else { return 0 };
     column.string_values().get(1).len()
 }
 

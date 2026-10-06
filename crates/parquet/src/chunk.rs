@@ -40,9 +40,8 @@ pub struct ChunkReader<'s> {
     bounds: Option<Bounds>,
 }
 
-/// A batch's worth of `u32`s for levels or indices, and then for strings'
-/// starts and lengths.
-const SCRATCH_BYTES: usize = 3 * BATCH_ROWS_MAX as usize * 4;
+/// A batch's worth of `u32`s, for levels or indices.
+const SCRATCH_BYTES: usize = BATCH_ROWS_MAX as usize * 4;
 
 /// Where reading is in a chunk. It's small and copied, so a lazy column can
 /// keep one and read its rows from it later, with `seek`.
@@ -156,7 +155,7 @@ impl<'s> ChunkReader<'s> {
         if self.column.optional {
             let levels = self.levels(page)?;
             let mut scratch = self.take_scratch(context)?;
-            let decoded = at_mut!(scratch.as_mut_slice::<u32>(), ..BATCH_ROWS_MAX as usize);
+            let decoded = scratch.as_mut_slice::<u32>();
             valid = 0;
             for start in (0..rows).step_by(decoded.len()) {
                 let chunk = at_mut!(decoded, ..(rows - start).min(BATCH_ROWS_MAX as usize));
@@ -188,10 +187,10 @@ impl<'s> ChunkReader<'s> {
     /// most `BATCH_ROWS_MAX`.
     pub fn read(&mut self, context: &mut Context, rows: usize) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
-        let (page, dictionary) = self.body(context)?;
-        let page = page.as_slice::<u8>();
+        let (body, dictionary) = self.body(context)?;
+        let page = body.as_slice::<u8>();
         let mut scratch = self.take_scratch(context)?;
-        let (decoded, places) = scratch.as_mut_slice::<u32>().split_at_mut(BATCH_ROWS_MAX as usize);
+        let decoded = scratch.as_mut_slice::<u32>();
         let (validity, valid) = self.validity(context, page, rows, decoded)?;
         if let Some(dictionary) = &dictionary {
             let column = self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
@@ -202,11 +201,15 @@ impl<'s> ChunkReader<'s> {
         let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
         let column = match self.data_type {
             DataType::String => {
-                let (starts, lens) = places.split_at_mut(BATCH_ROWS_MAX as usize);
-                let (starts, lens) = (at_mut!(starts, ..valid), at_mut!(lens, ..valid));
-                self.position.value = plain_strings(page, self.position.value, starts, lens)?;
-                let (offsets, bytes) = gather_strings(context, page, starts, lens, rows, bits)?;
-                ColumnView::strings(context, offsets, bytes, validity)?
+                // Views into the page, so no string is copied: the column
+                // holds the page.
+                let mut views = context.values_buffer(rows * 8)?;
+                let at = self.position.value;
+                self.position.value = plain_views(page, at, views.as_mut_slice::<u32>(), valid)?;
+                if let Some(bits) = bits {
+                    spread(views.as_mut_slice::<i64>(), valid, bits, 0);
+                }
+                ColumnView::strings(context, views, body.clone(), validity)?
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut out = context.values_buffer(rows * 8)?;
@@ -456,8 +459,8 @@ impl<'s> ChunkReader<'s> {
             return Ok(dictionary.clone());
         }
         let (body, len, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
-        let page = self.read_bytes(context, body, len)?;
-        let page = page.as_slice::<u8>();
+        let body = self.read_bytes(context, body, len)?;
+        let page = body.as_slice::<u8>();
         let count32 = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         // The values, then a null.
         let mut nulls = context.bytes_buffer((count + 1).div_ceil(8))?;
@@ -466,9 +469,12 @@ impl<'s> ChunkReader<'s> {
         *at_mut!(bits, count / 8) &= !(1 << (count % 8));
         let (values, nullable, words, mut bounds) = match self.data_type {
             DataType::String => {
-                let (offsets, bytes) = dictionary_strings(context, page, count)?;
-                let values = ColumnView::strings(context, offsets.clone(), bytes.clone(), None)?;
-                (values, ColumnView::strings(context, offsets, bytes, Some(nulls))?, None, None)
+                // Views into the page, then an empty string, for nulls.
+                let mut views = context.bytes_buffer((count + 1) * 8)?;
+                plain_views(page, 0, views.as_mut_slice::<u32>(), count)?;
+                *at_mut!(views.as_mut_slice::<i64>(), count) = 0;
+                let values = ColumnView::strings(context, views.clone(), body.clone(), None)?;
+                (values, ColumnView::strings(context, views, body, Some(nulls))?, None, None)
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut values = context.bytes_buffer((count + 1) * 8)?;
@@ -551,56 +557,27 @@ fn plain_words(column: Column, bytes: &[u8], at: usize, out: &mut [i64]) -> Resu
     Ok(end)
 }
 
-/// Finds the plain strings in `bytes` from `at`, filling `starts` and
-/// `lens` with where each starts and how long it is, and returns where they
-/// end.
-fn plain_strings(
+/// Finds the first `valid` plain strings in `bytes` from `at`, writing
+/// where each starts and how long it is to `views`, two `u32`s each, and
+/// returns where they end.
+fn plain_views(
     bytes: &[u8],
     mut at: usize,
-    starts: &mut [u32],
-    lens: &mut [u32],
+    views: &mut [u32],
+    valid: usize,
 ) -> Result<usize, Error> {
-    for (start, len_out) in starts.iter_mut().zip(lens) {
+    for view in at_mut!(views, ..2 * valid).as_chunks_mut::<2>().0 {
         let len = length(bytes, at)?;
         let first = at + 4;
         if first + len > bytes.len() {
             return Err(Error::Corrupt);
         }
-        let span32 = (u32::try_from(first), u32::try_from(len));
-        let (Ok(start32), Ok(len32)) = span32 else { return Err(Error::Unsupported) };
-        (*start, *len_out) = (start32, len32);
+        let span = (u32::try_from(first), u32::try_from(len));
+        let (Ok(start), Ok(len32)) = span else { return Err(Error::Unsupported) };
+        *view = [start, len32];
         at = first + len;
     }
     Ok(at)
-}
-
-/// Copies the strings of `bytes` at `starts`, of `lens`, which are the values
-/// of the rows `validity` says aren't null, into a column's offsets and bytes.
-fn gather_strings(
-    context: &mut Context,
-    bytes: &[u8],
-    starts: &[u32],
-    lens: &[u32],
-    rows: usize,
-    validity: Option<&[u8]>,
-) -> Result<(Buffer, Buffer), Error> {
-    let total: usize = lens.iter().map(|&len| len as usize).sum();
-    let mut offsets = context.indices_buffer((rows + 1) * 4)?;
-    let mut copied = context.bytes_buffer(total)?;
-    let (ends, out) = (offsets.as_mut_slice::<u32>(), copied.as_mut_slice::<u8>());
-    let (mut to, mut next) = (0, starts.iter().zip(lens));
-    *at_mut!(ends, 0) = 0;
-    for row in 0..rows {
-        if validity.is_none_or(|bits| *at!(bits, row / 8) >> (row % 8) & 1 != 0) {
-            let Some((&start, &len)) = next.next() else { return Err(Error::Corrupt) };
-            let (start, len) = (start as usize, len as usize);
-            let value = bytes.get(start..start + len).ok_or(Error::Corrupt)?;
-            at_mut!(out, to..to + len).copy_from_slice(value);
-            to += len;
-        }
-        *at_mut!(ends, row + 1) = u32::try_from(to).map_err(|_| Error::Unsupported)?;
-    }
-    Ok((offsets, copied))
 }
 
 /// Sets bits `start..start + count` of `bits`.
@@ -634,35 +611,6 @@ fn spread<T: Copy>(values: &mut [T], mut valid: usize, validity: &[u8], null: T)
         };
         *at_mut!(values, row) = value;
     }
-}
-
-/// A dictionary page's `count` plain strings, and then an empty one, as
-/// offsets and bytes.
-fn dictionary_strings(
-    context: &mut Context,
-    page: &[u8],
-    count: usize,
-) -> Result<(Buffer, Buffer), Error> {
-    // Walked once to size the bytes, then again to copy them.
-    let (mut at, mut total) = (0, 0);
-    for _ in 0..count {
-        let len = length(page, at)?;
-        (at, total) = (at + 4 + len, total + len);
-    }
-    let mut offsets = context.bytes_buffer((count + 2) * 4)?;
-    let mut bytes = context.bytes_buffer(total)?;
-    let (ends, out) = (offsets.as_mut_slice::<u32>(), bytes.as_mut_slice::<u8>());
-    let (mut from, mut to) = (0, 0);
-    *at_mut!(ends, 0) = 0;
-    *at_mut!(ends, count + 1) = u32::try_from(total).map_err(|_| Error::Unsupported)?;
-    for end in at_mut!(ends, 1..=count) {
-        let len = length(page, from)?;
-        let value = page.get(from + 4..from + 4 + len).ok_or(Error::Corrupt)?;
-        at_mut!(out, to..to + len).copy_from_slice(value);
-        (from, to) = (from + 4 + len, to + len);
-        *end = u32::try_from(to).map_err(|_| Error::Unsupported)?;
-    }
-    Ok((offsets, bytes))
 }
 
 /// `column`, with `bounds` if known.
