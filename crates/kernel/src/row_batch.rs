@@ -11,16 +11,20 @@ pub const BATCH_COLUMNS_MAX: u32 = 64;
 
 /// The row count is set separately from the columns, so a batch can have
 /// rows but no columns, e.g. for `COUNT(*)`. Its selection says which of the
-/// rows are kept: whoever reads a batch reads only those. Its columns may
-/// view what lives for `'a`, so it can't outlive that.
+/// rows are kept: whoever reads a batch reads only those. Its columns can
+/// borrow what they view for `'a`, which costs nothing to add or drop; a
+/// clone of one is its own, to keep.
 pub struct RowBatch<'a> {
     row_count: u32,
     column_count: u32,
     // The first `column_count` are initialized.
     columns: [MaybeUninit<ColumnView>; BATCH_COLUMNS_MAX as usize],
+    // A bit for each column that's a copy of a view it borrows, holding no
+    // reference, so never dropped.
+    borrowed: u64,
     selection: Selection,
-    // What the columns may view, and for how long.
-    views: PhantomData<&'a ColumnView>,
+    // What the columns may borrow, and for how long.
+    borrows: PhantomData<&'a ColumnView>,
 }
 
 impl<'a> RowBatch<'a> {
@@ -30,7 +34,8 @@ impl<'a> RowBatch<'a> {
             column_count: 0,
             selection: Selection::all(0),
             columns: [const { MaybeUninit::uninit() }; _],
-            views: PhantomData,
+            borrowed: 0,
+            borrows: PhantomData,
         }
     }
 
@@ -46,6 +51,7 @@ impl<'a> RowBatch<'a> {
         unsafe {
             (&raw mut (*batch).row_count).write(0);
             (&raw mut (*batch).column_count).write(0);
+            (&raw mut (*batch).borrowed).write(0);
             Selection::init(&raw mut (*batch).selection, 0);
         }
     }
@@ -90,6 +96,31 @@ impl<'a> RowBatch<'a> {
         Ok(())
     }
 
+    /// Adds a column that borrows each of `columns`, which outlive the
+    /// batch, so nothing is counted to add or drop them. Fails a check if
+    /// they don't fit.
+    #[inline]
+    pub fn push_borrowed(&mut self, columns: impl IntoIterator<Item = &'a ColumnView>) {
+        let mut columns = columns.into_iter();
+        let (start, rows) = (self.column_count as usize, self.row_count);
+        let mut count = start;
+        for (slot, column) in at_mut!(self.columns, start..).iter_mut().zip(&mut columns) {
+            check!(column.row_count() == rows);
+            // SAFETY: a copy of a view that lives for `'a`, longer than the
+            // batch, holding no reference of its own: `borrowed` says so,
+            // so it's never dropped, and the batch only lends it out.
+            slot.write(unsafe { core::ptr::read(column) });
+            count += 1;
+        }
+        check!(columns.next().is_none());
+        #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
+        let count = count as u32;
+        // The columns added are together, after those there were.
+        let added = u64::MAX.checked_shr(64 - (count - self.column_count)).unwrap_or(0);
+        self.borrowed |= added << self.column_count;
+        self.column_count = count;
+    }
+
     pub fn row_count(&self) -> u32 {
         self.row_count
     }
@@ -104,21 +135,34 @@ impl<'a> RowBatch<'a> {
         unsafe { at!(self.columns, index as usize).assume_init_ref() }
     }
 
-    /// Replaces column `index` with `column`, of as many rows. Columns are
-    /// only replaced, never moved out, so a batch decides what it holds.
+    /// Replaces column `index` with `column`, of as many rows.
     pub fn set_column(&mut self, index: u32, column: ColumnView) {
         check!(index < self.column_count && column.row_count() == self.row_count);
-        // SAFETY: as in `column`.
-        *unsafe { at_mut!(self.columns, index as usize).assume_init_mut() } = column;
+        let slot = at_mut!(self.columns, index as usize);
+        let bit = 1 << index;
+        if self.borrowed & bit == 0 {
+            // SAFETY: as in `column`, and it's the batch's own, to drop.
+            unsafe { slot.assume_init_drop() };
+        }
+        self.borrowed &= !bit;
+        slot.write(column);
     }
 
+    /// Drops the batch's own columns; borrowed ones are just forgotten.
+    #[inline]
     fn drop_columns(&mut self) {
-        let count = self.column_count as usize;
-        self.column_count = 0;
-        let columns = at_mut!(self.columns, ..count).as_mut_ptr().cast::<ColumnView>();
-        // SAFETY: the first `count` columns are initialized, and the count is
-        // reset first, so each is dropped once.
-        unsafe { core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(columns, count)) };
+        let count = self.column_count;
+        let all = u64::MAX.checked_shr(64 - count).unwrap_or(0);
+        let mut owned = all & !self.borrowed;
+        (self.column_count, self.borrowed) = (0, 0);
+        while owned != 0 {
+            let i = owned.trailing_zeros() as usize;
+            owned &= owned - 1;
+            // SAFETY: the first `count` columns are initialized, and this one
+            // is the batch's own; the count is reset first, so it's dropped
+            // once.
+            unsafe { at_mut!(self.columns, i).assume_init_drop() };
+        }
     }
 }
 

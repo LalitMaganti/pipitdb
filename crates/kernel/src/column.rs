@@ -780,4 +780,22 @@ mod tests {
             (&b"cde"[..], &b"cde"[..], &b"ab"[..])
         );
     }
+
+    #[test]
+    fn batches_borrow_views_without_a_reference() {
+        let (a, b) = (int64s(&[1, 2], &[]), int64s(&[3, 4], &[]));
+        let mut batch = crate::row_batch::RowBatch::new();
+        batch.reset(2);
+        batch.push_borrowed([&a, &b]);
+        assert!(a.header.is_unique() && b.header.is_unique());
+        // A clone holds a reference, so it can outlive the batch.
+        let clone = batch.column(1).clone();
+        assert!(!b.header.is_unique());
+        // Replacing or dropping borrowed columns leaves the views alone.
+        batch.set_column(0, int64s(&[5, 6], &[]));
+        drop(batch);
+        assert!(a.header.is_unique());
+        drop(b);
+        assert_eq!(clone.int64s(), [3, 4]);
+    }
 }
