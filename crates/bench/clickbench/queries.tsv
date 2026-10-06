@@ -1,0 +1,30 @@
+0		SELECT COUNT(*) FROM hits
+1		SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
+2		SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+3		SELECT AVG(UserID) FROM hits
+6		SELECT MIN(EventDate), MAX(EventDate) FROM hits
+40		SELECT URLHash, EventDate, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate
+41		SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight
+41all		SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID >= 0 GROUP BY WindowClientWidth, WindowClientHeight
+pAdv		SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE AdvEngineID <> 0
+pRefresh		SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE IsRefresh <> 0
+4		SELECT COUNT(DISTINCT UserID) FROM hits
+s1		SELECT COUNT(*) FROM hits WHERE SearchPhrase <> ''
+s2		SELECT COUNT(*) FROM hits WHERE MobilePhoneModel = 'iPad'
+s3		SELECT COUNT(*) FROM hits WHERE Title <> ''
+s4		SELECT SUM(ResolutionWidth), COUNT(*) FROM hits WHERE SearchPhrase <> ''
+s5		SELECT COUNT(*) FROM hits WHERE URL <> '' AND MobilePhoneModel <> 'iPad'
+gAdv		SELECT AdvEngineID, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY AdvEngineID
+gCounter		SELECT CounterID, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY CounterID
+gRegion		SELECT RegionID, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY RegionID
+gWindow		SELECT WindowClientWidth, WindowClientHeight, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY WindowClientWidth, WindowClientHeight
+gUser		SELECT UserID, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY UserID
+gEngineIp		SELECT SearchEngineID, ClientIP, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY SearchEngineID, ClientIP
+gUrlDate		SELECT URLHash, EventDate, COUNT(*), SUM(ResolutionWidth) FROM hits GROUP BY URLHash, EventDate
+f1	FROM hits |> WHERE AdvEngineID != 0 |> SELECT AdvEngineID	SELECT AdvEngineID FROM hits WHERE AdvEngineID <> 0
+fAdv	FROM hits |> WHERE AdvEngineID != 0 |> SELECT ResolutionWidth, UserID	SELECT ResolutionWidth, UserID FROM hits WHERE AdvEngineID <> 0
+f40	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND (TraficSourceID = -1 OR TraficSourceID = 6) AND RefererHash = 3594120000172545465 |> SELECT URLHash, EventDate	SELECT URLHash, EventDate FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465
+f41	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 |> SELECT WindowClientWidth, WindowClientHeight	SELECT WindowClientWidth, WindowClientHeight FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622
+fPhone	FROM hits |> WHERE MobilePhoneModel != '' |> SELECT MobilePhoneModel, UserID	SELECT MobilePhoneModel, UserID FROM hits WHERE MobilePhoneModel <> ''
+fIpad	FROM hits |> WHERE MobilePhoneModel = 'iPad' |> SELECT UserID	SELECT UserID FROM hits WHERE MobilePhoneModel = 'iPad'
+fSearch	FROM hits |> WHERE SearchPhrase != '' |> SELECT SearchPhrase	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> ''

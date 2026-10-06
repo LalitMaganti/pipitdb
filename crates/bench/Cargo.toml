@@ -18,6 +18,8 @@ pipitdb-pipesql = { path = "../pipesql" }
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 gungraun = "0.20"
+pipitdb-file = { path = "../file" }
+pipitdb-parquet-full = { path = "../parquet-full", features = ["snappy-cpp"] }
 
 [features]
 # Builds the size example, which `cargo test` can't: it has no unwinding.
