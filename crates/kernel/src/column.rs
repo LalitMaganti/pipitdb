@@ -85,6 +85,22 @@ pub struct Bounds {
     pub max: i64,
 }
 
+impl Bounds {
+    /// Every value.
+    pub const ALL: Bounds = Bounds { min: i64::MIN, max: i64::MAX };
+
+    /// The values within both: none if `min > max`.
+    #[must_use]
+    pub fn intersect(self, other: Bounds) -> Bounds {
+        Bounds { min: self.min.max(other.min), max: self.max.min(other.max) }
+    }
+
+    /// Whether a value may be within both.
+    pub fn overlaps(self, other: Bounds) -> bool {
+        self.min <= other.max && other.min <= self.max
+    }
+}
+
 /// Rows of values in Arrow's layout: values, and an optional validity bitmap
 /// with one bit per value, set if it isn't null. As DuckDB's vectors, rows
 /// map to values in one of three forms: each to its own (flat), all to one

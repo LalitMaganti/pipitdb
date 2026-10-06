@@ -6,7 +6,7 @@
 //! and every node keeps SQL's three-valued logic without building booleans.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{ColumnView, Form};
+use crate::column::{Bounds, ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Comparison, Value};
@@ -98,6 +98,35 @@ impl Predicate {
     /// How many scratch selections `select` needs.
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Values of `column` every row this is true for has, from comparisons
+    /// of it with integers that must all hold, as in `a > 1 AND a < 5`: a
+    /// row whose value is outside them isn't kept. Others keep all values.
+    pub fn kept(&self, column: u32) -> Bounds {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
+        self.kept_by(self.nodes.len() as u32 - 1, column)
+    }
+
+    fn kept_by(&self, node: u32, column: u32) -> Bounds {
+        match *at!(self.nodes, node as usize) {
+            Node::Leaf(Leaf::Compare { column: c, comparison, value: Value::Int64(value) })
+                if c == column =>
+            {
+                // Saturating, `a < i64::MIN` gives `i64::MIN`: more than it
+                // keeps, which is still true of every row kept.
+                match comparison {
+                    Comparison::Equal => Bounds { min: value, max: value },
+                    Comparison::NotEqual => Bounds::ALL,
+                    Comparison::Less => Bounds { max: value.saturating_sub(1), ..Bounds::ALL },
+                    Comparison::LessEqual => Bounds { max: value, ..Bounds::ALL },
+                    Comparison::Greater => Bounds { min: value.saturating_add(1), ..Bounds::ALL },
+                    Comparison::GreaterEqual => Bounds { min: value, ..Bounds::ALL },
+                }
+            }
+            Node::And(a, b) => self.kept_by(a, column).intersect(self.kept_by(b, column)),
+            Node::Leaf(_) | Node::Or(..) | Node::Not(_) => Bounds::ALL,
+        }
     }
 
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.
@@ -409,6 +438,40 @@ mod tests {
                 (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
             assert_eq!(kept(expr), expected);
         }
+    }
+
+    #[test]
+    fn keeps_the_values_comparisons_that_must_hold_allow() {
+        const A2: Expr = Expr::Greater(0, 2);
+        const B2: Expr = Expr::Greater(1, 2);
+        const NARROWER: Expr = Expr::And(&A2, &Expr::Not(&Expr::IsNull(0)));
+        let kept = |expr: &Expr, column| {
+            let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+            build(expr, &mut nodes);
+            Predicate::new(nodes).kept(column)
+        };
+        assert_eq!(kept(&A2, 0), Bounds { min: 3, ..Bounds::ALL });
+        assert_eq!(kept(&A2, 1), Bounds::ALL);
+        assert_eq!(kept(&Expr::And(&NARROWER, &Expr::Greater(0, 4)), 0).min, 5);
+        assert_eq!(kept(&Expr::And(&A2, &B2), 1), Bounds { min: 3, ..Bounds::ALL });
+        // Either side of an `OR` could hold, and a `NOT` keeps the others.
+        assert_eq!(kept(&Expr::Or(&A2, &A2), 0), Bounds::ALL);
+        assert_eq!(kept(&Expr::Not(&A2), 0), Bounds::ALL);
+
+        let compared = |comparison, value| {
+            let leaf = Leaf::Compare { column: 0, comparison, value: Value::Int64(value) };
+            let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
+            Predicate::new(nodes).kept(0)
+        };
+        let (min, max) = (i64::MIN, i64::MAX);
+        assert_eq!(compared(Comparison::Equal, 7), Bounds { min: 7, max: 7 });
+        assert_eq!(compared(Comparison::NotEqual, 7), Bounds::ALL);
+        assert_eq!(compared(Comparison::Less, 7), Bounds { min, max: 6 });
+        assert_eq!(compared(Comparison::LessEqual, 7), Bounds { min, max: 7 });
+        assert_eq!(compared(Comparison::GreaterEqual, 7), Bounds { min: 7, max });
+        // Keeping more than `a < i64::MIN` does is still right.
+        assert_eq!(compared(Comparison::Less, min), Bounds { min, max: min });
+        assert_eq!(compared(Comparison::Greater, max), Bounds { min: max, max });
     }
 
     #[test]

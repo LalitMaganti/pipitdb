@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
-use crate::column::{DataType, Forms};
+use crate::column::{Bounds, DataType, Forms};
 use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
@@ -77,6 +77,28 @@ pub trait Op<'c> {
         Forms::FLAT
     }
 
+    /// The values of `column` in the rows this passes on, if it passes on
+    /// its child's rows as they are but for leaving some out, as a filter
+    /// does: a row whose value is outside them could be left out below it.
+    /// `None` if it passes on other rows, so what's below must make them
+    /// all. By default, `None`.
+    fn keeps(&self, column: ColumnId) -> Option<Bounds> {
+        let _ = column;
+        None
+    }
+
+    /// Tells this, if it makes rows, the values everything above keeps of
+    /// each column in `ranges`, so it may leave out rows outside them: the
+    /// plan pushing down what its filters keep. By default, it makes all.
+    fn restrict(
+        &mut self,
+        allocator: &dyn Allocator,
+        ranges: &[(ColumnId, Bounds)],
+    ) -> Result<(), AllocError> {
+        let _ = (allocator, ranges);
+        Ok(())
+    }
+
     /// The op that loads `columns`, which this makes lazy, each in one of
     /// the forms given with it, to put above it. Only called for columns
     /// `allow` said it would make lazy.
@@ -89,6 +111,9 @@ pub trait Op<'c> {
         crate::check::check_failed(line!())
     }
 }
+
+type Restrict =
+    unsafe fn(NonNull<()>, &dyn Allocator, &[(ColumnId, Bounds)]) -> Result<(), AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -109,6 +134,8 @@ pub struct DynOp<'c> {
     reads: unsafe fn(NonNull<()>, &mut Needed),
     accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
+    keeps: unsafe fn(NonNull<()>, ColumnId) -> Option<Bounds>,
+    restrict: Restrict,
     materialize: Materialize<'c>,
     lifetime: PhantomData<&'c ()>,
 }
@@ -127,6 +154,12 @@ impl<'c> DynOp<'c> {
             accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
             // SAFETY: as for `prune`.
             allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
+            // SAFETY: as for `lower`.
+            keeps: |op, column| unsafe { value_of::<T>(op).keeps(column) },
+            // SAFETY: as for `prune`.
+            restrict: |op, allocator, ranges| unsafe {
+                value_mut_of::<T>(op).restrict(allocator, ranges)
+            },
             // SAFETY: as for `lower`.
             materialize: |op, allocator, columns| unsafe {
                 value_of::<T>(op).materialize(allocator, columns)
@@ -164,6 +197,21 @@ impl<'c> DynOp<'c> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
         unsafe { (self.allow)(self.op.as_ptr(), column, allowed) }
+    }
+
+    pub(crate) fn keeps(&self, column: ColumnId) -> Option<Bounds> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.keeps)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn restrict(
+        &mut self,
+        allocator: &dyn Allocator,
+        ranges: &[(ColumnId, Bounds)],
+    ) -> Result<(), AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.restrict)(self.op.as_ptr(), allocator, ranges) }
     }
 
     pub(crate) fn materialize(
@@ -235,15 +283,19 @@ impl<'c> LogicalPlan<'c> {
     }
 }
 
-/// Reads all the rows of a scannable, binding the columns in `columns`.
+/// Reads the rows of a scannable, binding the columns in `columns`: all, or
+/// at least those whose values are within `ranges`.
 pub struct ScanOp<'c> {
     scannable: &'c DynScannable<'c>,
     columns: SlowVec<ScanColumn>,
+    /// The values everything above keeps, by the scannable's column, if the
+    /// plan pushed any down.
+    ranges: Option<SlowVec<(u32, Bounds)>>,
 }
 
 impl<'c> ScanOp<'c> {
     pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
-        ScanOp { scannable, columns }
+        ScanOp { scannable, columns, ranges: None }
     }
 }
 
@@ -264,7 +316,8 @@ impl<'c> Op<'c> for ScanOp<'c> {
             lowering.define(column.binding.id)?;
         }
         let read = self.columns.iter().map(|column| (column.column, column.forms));
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
+        let ranges = self.ranges.as_deref().unwrap_or(&[]);
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read, ranges)?);
         Ok(())
     }
 
@@ -283,6 +336,27 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     /// Reads none: it makes them.
     fn reads(&self, _: &mut Needed) {}
+
+    /// Passes them on to the scannable, which may read fewer rows.
+    fn restrict(
+        &mut self,
+        allocator: &dyn Allocator,
+        ranges: &[(ColumnId, Bounds)],
+    ) -> Result<(), AllocError> {
+        let scanned = |&(id, bounds): &(ColumnId, Bounds)| {
+            let column = self.columns.iter().find(|column| column.binding.id == id)?;
+            Some((column.column, bounds))
+        };
+        let count = ranges.iter().filter_map(scanned).count();
+        if count > 0 {
+            let mut scanned_ranges = SlowVec::fixed(allocator, count)?;
+            for range in ranges.iter().filter_map(scanned) {
+                scanned_ranges.push(range)?;
+            }
+            self.ranges = Some(scanned_ranges);
+        }
+        Ok(())
+    }
 
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
         let found = self.columns.iter_mut().find(|c| c.binding.id == column);
@@ -372,5 +446,10 @@ impl<'c> Op<'c> for FilterOp {
     /// Flat, and constants, which it tests once. Not dictionaries yet.
     fn accepts(&self, _: ColumnId) -> Forms {
         Forms::FLAT | Forms::CONSTANT
+    }
+
+    /// What its predicate keeps.
+    fn keeps(&self, column: ColumnId) -> Option<Bounds> {
+        Some(self.predicate.kept(column))
     }
 }

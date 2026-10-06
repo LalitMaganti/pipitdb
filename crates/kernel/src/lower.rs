@@ -153,9 +153,9 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
-    use crate::allocator::Heap;
+    use crate::allocator::{AllocError, Allocator, Heap};
     use crate::buffer::Buffer;
-    use crate::column::{ColumnView, DataType, Forms};
+    use crate::column::{Bounds, ColumnView, DataType, Forms};
     use crate::context::Context;
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
@@ -458,10 +458,12 @@ mod tests {
     /// Three batches of four rows of `a`, `b` and `c`: row `r` of batch `n`
     /// holds `100 * k + 10 * n + r` in column `k`. Its columns can be lazy if
     /// `lazy`, with handles saying which column and batch; each load is noted
-    /// in `loads`, as the column, the batch and the rows it read.
+    /// in `loads`, as the column, the batch and the rows it read, and the
+    /// ranges of each scan pushed down in `ranges`.
     struct Counted<'a> {
         lazy: bool,
         loads: &'a RefCell<StdVec<(u8, u8, StdVec<u16>)>>,
+        ranges: &'a RefCell<StdVec<StdVec<(u32, Bounds)>>>,
     }
 
     impl Scannable for Counted<'_> {
@@ -516,6 +518,17 @@ mod tests {
             }
             *batches += 1;
             Ok(true)
+        }
+
+        /// Notes them, and reads with `open`.
+        fn scan_within<'s>(
+            &'s self,
+            _: &dyn Allocator,
+            _: &[(u32, Forms)],
+            ranges: &[(u32, Bounds)],
+        ) -> Result<Option<DynSource<'s>>, AllocError> {
+            self.ranges.borrow_mut().push(ranges.to_vec());
+            Ok(None)
         }
 
         fn forms(&self, _: u32) -> Forms {
@@ -605,8 +618,10 @@ mod tests {
 
     #[test]
     fn loads_lazy_columns_where_read_for_the_rows_kept() {
-        let loads = RefCell::new(StdVec::new());
-        let table = DynScannable::new(&Heap, Counted { lazy: true, loads: &loads }).unwrap();
+        let (loads, ranges) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table =
+            DynScannable::new(&Heap, Counted { lazy: true, loads: &loads, ranges: &ranges })
+                .unwrap();
         // `a > 11` keeps rows 2 and 3 of batch 1, and batch 2; `b < 122` then
         // drops rows 2 and 3 of batch 2.
         let filters = [(0, Comparison::Greater, 11), (1, Comparison::Less, 122)];
@@ -622,17 +637,38 @@ mod tests {
 
     #[test]
     fn never_loads_columns_nothing_reads() {
-        let loads = RefCell::new(StdVec::new());
-        let table = DynScannable::new(&Heap, Counted { lazy: true, loads: &loads }).unwrap();
+        let (loads, ranges) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table =
+            DynScannable::new(&Heap, Counted { lazy: true, loads: &loads, ranges: &ranges })
+                .unwrap();
         // With no output, a column is still scanned, for its rows.
         assert_eq!(counted(&table, &[], &[]), (vec![StdVec::new(); 12], 12));
         assert!(loads.borrow().is_empty());
     }
 
     #[test]
+    fn pushes_down_the_values_filters_keep() {
+        let (loads, ranges) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table = Counted { lazy: false, loads: &loads, ranges: &ranges };
+        let table = DynScannable::new(&Heap, table).unwrap();
+        let filters =
+            [(0, Comparison::Greater, 11), (1, Comparison::Less, 122), (0, Comparison::Less, 21)];
+        let (kept, _) = counted(&table, &filters, &[0]);
+        assert_eq!(kept, [[12], [13], [20]]);
+        // Each column's, from every filter above the scan.
+        let a = Bounds { min: 12, max: 20 };
+        assert_eq!(*ranges.borrow(), [vec![(0, a), (1, Bounds { max: 121, ..Bounds::ALL })]]);
+        // Without filters there's nothing to push down.
+        counted(&table, &[], &[0]);
+        assert_eq!(ranges.borrow().len(), 1);
+    }
+
+    #[test]
     fn reads_eagerly_from_tables_that_cant_be_lazy() {
-        let loads = RefCell::new(StdVec::new());
-        let table = DynScannable::new(&Heap, Counted { lazy: false, loads: &loads }).unwrap();
+        let (loads, ranges) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table =
+            DynScannable::new(&Heap, Counted { lazy: false, loads: &loads, ranges: &ranges })
+                .unwrap();
         let filters = [(0, Comparison::Greater, 11), (1, Comparison::Less, 122)];
         let (kept, _) = counted(&table, &filters, &[2, 0]);
         assert_eq!(kept, [[212, 12], [213, 13], [220, 20], [221, 21]]);
@@ -662,8 +698,10 @@ mod tests {
     /// How many nodes a plan has once its forms are chosen: a scan of
     /// `Counted`, a filter on `a`, and an op reading `b` in `accepts`.
     fn nodes_with(accepts: Forms) -> usize {
-        let loads = RefCell::new(StdVec::new());
-        let table = DynScannable::new(&Heap, Counted { lazy: true, loads: &loads }).unwrap();
+        let (loads, ranges) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table =
+            DynScannable::new(&Heap, Counted { lazy: true, loads: &loads, ranges: &ranges })
+                .unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
