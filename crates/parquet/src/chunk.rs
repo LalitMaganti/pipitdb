@@ -7,10 +7,10 @@ use pipit_kernel::column::{Bounds, ColumnView, DataType};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
-use crate::Error;
 use crate::footer::{Chunk, Column};
 use crate::hybrid::{Hybrid, Run};
 use crate::thrift::Cursor;
+use crate::{Codec, Error};
 use crate::{bits, bounds, page, plain};
 
 /// Page headers are read in windows of this size, larger if need be.
@@ -19,6 +19,10 @@ const HEADER_BYTES: usize = 256;
 pub struct ChunkReader<'s> {
     /// Where the file's bytes come from.
     source: &'s dyn ByteSource,
+    /// What decompresses pages.
+    codecs: &'s dyn Codec,
+    /// The chunk's codec, or 0 if it isn't compressed.
+    codec: u8,
     /// The column the chunk is of, as the footer describes it.
     column: Column,
     /// What the column reads as.
@@ -29,9 +33,9 @@ pub struct ChunkReader<'s> {
     position: Position,
     /// The body of the page last read, and where it starts in the file.
     page: Option<(u64, Buffer)>,
-    /// Where the chunk's dictionary page's body is, how long it is and how
-    /// many values it has, once its header is read.
-    dictionary_page: Option<(u64, u64, usize)>,
+    /// The chunk's dictionary page's body and how many values it has, once
+    /// its header is read.
+    dictionary_page: Option<(Body, usize)>,
     /// The dictionary's values, once a page needs them.
     dictionary: Option<Dictionary>,
     /// Room to decode a batch's levels or indices, made the first time it's
@@ -51,10 +55,8 @@ const SCRATCH_BYTES: usize = BATCH_ROWS_MAX as usize * 4;
 pub struct Position {
     /// Where the next page's header starts.
     next: u64,
-    /// Where the body of the page being read starts.
-    body: u64,
-    /// How many bytes the body takes.
-    len: u64,
+    /// The body of the page being read.
+    body: Body,
     /// How many rows the page has left.
     left: usize,
     /// Whether the page's values are indices into the dictionary.
@@ -69,6 +71,17 @@ pub struct Position {
     value: usize,
     /// How far the indices have been read.
     index: Hybrid,
+}
+
+/// Where a page's body is.
+#[derive(Clone, Copy)]
+struct Body {
+    /// Where it starts.
+    at: u64,
+    /// How many bytes it takes, as stored.
+    len: u64,
+    /// How many bytes it takes once decompressed.
+    size: u64,
 }
 
 /// A chunk's dictionary: words for fixed-width types, or views into its page
@@ -88,19 +101,18 @@ struct Dictionary {
 }
 
 impl<'s> ChunkReader<'s> {
+    /// A reader of `chunk`, of `column`, which decompresses pages with
+    /// `codecs`.
     pub fn new(
         source: &'s dyn ByteSource,
+        codecs: &'s dyn Codec,
         column: Column,
         chunk: &Chunk,
     ) -> Result<ChunkReader<'s>, Error> {
         let data_type = column.data_type().ok_or(Error::Unsupported)?;
-        if chunk.codec != 0 {
-            return Err(Error::Unsupported);
-        }
         let position = Position {
             next: chunk.start,
-            body: 0,
-            len: 0,
+            body: Body { at: 0, len: 0, size: 0 },
             left: 0,
             indexed: false,
             started: false,
@@ -113,6 +125,8 @@ impl<'s> ChunkReader<'s> {
         let (page, dictionary_page, dictionary) = (None, None, None);
         Ok(ChunkReader {
             source,
+            codecs,
+            codec: chunk.codec,
             bounds: bounds::of_chunk(column, chunk),
             column,
             data_type,
@@ -385,9 +399,10 @@ impl<'s> ChunkReader<'s> {
 
     /// Moves to the next page, reading only its header.
     fn next_page(&mut self, context: &mut Context) -> Result<(), Error> {
-        let (header, body) = self.header(context)?;
+        let (header, at) = self.header(context)?;
         let (len, left) = (header.len, header.values);
-        let next = body.checked_add(len).ok_or(Error::Corrupt)?;
+        let body = Body { at, len, size: header.size };
+        let next = at.checked_add(len).ok_or(Error::Corrupt)?;
         self.position.next = next;
         // Levels encoded otherwise than as the hybrid, as very old writers
         // did, would be misread.
@@ -400,7 +415,7 @@ impl<'s> ChunkReader<'s> {
             (0, 2 | 8) => true,
             // A dictionary page, of plain values, first in the chunk.
             (2, 0 | 2) if self.dictionary_page.is_none() => {
-                self.dictionary_page = Some((body, len, left));
+                self.dictionary_page = Some((body, left));
                 return Ok(());
             }
             (0 | 2 | 3, _) => return Err(Error::Unsupported),
@@ -413,7 +428,6 @@ impl<'s> ChunkReader<'s> {
         self.position = Position {
             next,
             body,
-            len,
             left,
             indexed,
             started: false,
@@ -430,12 +444,12 @@ impl<'s> ChunkReader<'s> {
     /// its values are indices into it.
     fn body(&mut self, context: &mut Context) -> Result<(Buffer, Option<Dictionary>), Error> {
         let dictionary = if self.position.indexed { Some(self.dictionary(context)?) } else { None };
-        let (body, len) = (self.position.body, self.position.len);
+        let body = self.position.body;
         let page = match &self.page {
-            Some((at, page)) if *at == body => page.clone(),
+            Some((at, page)) if *at == body.at => page.clone(),
             _ => {
-                let page = self.read_bytes(context, body, len)?;
-                self.page = Some((body, page.clone()));
+                let page = self.read_body(context, body)?;
+                self.page = Some((body.at, page.clone()));
                 page
             }
         };
@@ -466,8 +480,8 @@ impl<'s> ChunkReader<'s> {
         if let Some(dictionary) = &self.dictionary {
             return Ok(dictionary.clone());
         }
-        let (body, len, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
-        let body = self.read_bytes(context, body, len)?;
+        let (body, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
+        let body = self.read_body(context, body)?;
         let page = body.as_slice::<u8>();
         let count32 = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         // The values, then a null.
@@ -506,6 +520,19 @@ impl<'s> ChunkReader<'s> {
         bounds = bounds.or(self.bounds);
         let dictionary = Dictionary { values, bounds, words, nullable, count };
         Ok(self.dictionary.insert(dictionary).clone())
+    }
+
+    /// A page's body, decompressed if it's stored compressed.
+    fn read_body(&self, context: &Context, body: Body) -> Result<Buffer, Error> {
+        let stored = self.read_bytes(context, body.at, body.len)?;
+        if self.codec == 0 {
+            return Ok(stored);
+        }
+        let size = usize::try_from(body.size).map_err(|_| Error::Corrupt)?;
+        // SAFETY: decompressing writes every byte, or fails.
+        let mut page = unsafe { Buffer::allocate_uninit(context.allocator(), size)? };
+        self.codecs.decompress(self.codec, stored.as_slice(), page.as_mut_slice())?;
+        Ok(page)
     }
 
     /// `len` bytes of the chunk from `at`.
@@ -547,6 +574,7 @@ mod tests {
     use pipit_kernel::column::Form;
 
     use super::*;
+    use crate::Uncompressed;
     use crate::footer::ParquetFile;
 
     /// 5000 rows: `id` is the row, `half` half of it, `name` "row" and it,
@@ -618,7 +646,8 @@ mod tests {
         let column = file.columns()[c];
         let mut all = Vec::new();
         for group in 0..file.row_groups() {
-            let mut reader = ChunkReader::new(source, column, file.chunk(group, c)).unwrap();
+            let mut reader =
+                ChunkReader::new(source, &Uncompressed, column, file.chunk(group, c)).unwrap();
             loop {
                 let rows = reader.page_left(&mut context).unwrap().min(1000);
                 if rows == 0 {
@@ -660,7 +689,8 @@ mod tests {
         let mut context = Context::new(&Heap);
         for c in 0..3 {
             let column = file.columns()[c];
-            let mut reader = ChunkReader::new(source, column, file.chunk(0, c)).unwrap();
+            let mut reader =
+                ChunkReader::new(source, &Uncompressed, column, file.chunk(0, c)).unwrap();
             reader.page_left(&mut context).unwrap();
             let view = reader.read(&mut context, 100).unwrap();
             if c == 2 {
@@ -699,7 +729,9 @@ mod tests {
         let file = ParquetFile::open(&Heap, source).unwrap();
         let mut context = Context::new(&Heap);
         for c in 0..3 {
-            let mut reader = ChunkReader::new(source, file.columns()[c], file.chunk(0, c)).unwrap();
+            let mut reader =
+                ChunkReader::new(source, &Uncompressed, file.columns()[c], file.chunk(0, c))
+                    .unwrap();
             let mut row = 0;
             loop {
                 let left = reader.page_left(&mut context).unwrap();
@@ -743,7 +775,8 @@ mod tests {
         let file = ParquetFile::open(&Heap, &source).unwrap();
         let mut context = Context::new(&Heap);
         let chunk = file.chunk(0, 0);
-        let mut reader = ChunkReader::new(&source, file.columns()[0], chunk).unwrap();
+        let mut reader =
+            ChunkReader::new(&source, &Uncompressed, file.columns()[0], chunk).unwrap();
         source.1.set(0);
         loop {
             let left = reader.page_left(&mut context).unwrap();
@@ -761,11 +794,13 @@ mod tests {
         let source: &dyn ByteSource = &mut bytes;
         let file = ParquetFile::open(&Heap, source).unwrap();
         let mut context = Context::new(&Heap);
-        let mut reader = ChunkReader::new(source, file.columns()[2], file.chunk(0, 2)).unwrap();
+        let mut reader =
+            ChunkReader::new(source, &Uncompressed, file.columns()[2], file.chunk(0, 2)).unwrap();
         let left = reader.page_left(&mut context).unwrap();
         reader.skip(&mut context, left).unwrap();
         assert!(reader.dictionary.is_none());
-        let mut reader = ChunkReader::new(source, file.columns()[2], file.chunk(1, 2)).unwrap();
+        let mut reader =
+            ChunkReader::new(source, &Uncompressed, file.columns()[2], file.chunk(1, 2)).unwrap();
         reader.page_left(&mut context).unwrap();
         assert_eq!(cells(&reader.read(&mut context, 1).unwrap()), [dict(2, 2048)]);
         assert!(reader.dictionary.is_some());
