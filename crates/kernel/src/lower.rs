@@ -147,7 +147,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
-    use crate::column::{ColumnView, DataType};
+    use crate::column::{ColumnView, DataType, Forms};
     use crate::context::Context;
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
@@ -163,6 +163,7 @@ mod tests {
 
     impl Scannable for Ab {
         type State = bool;
+        type Loader = ();
 
         fn column_count(&self) -> u32 {
             2
@@ -183,6 +184,7 @@ mod tests {
         fn next(
             &self,
             columns: &[u32],
+            _: &[Forms],
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
@@ -282,6 +284,7 @@ mod tests {
 
     impl Scannable for Nullable {
         type State = bool;
+        type Loader = ();
 
         fn column_count(&self) -> u32 {
             2
@@ -302,6 +305,7 @@ mod tests {
         fn next(
             &self,
             columns: &[u32],
+            _: &[Forms],
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
@@ -382,6 +386,7 @@ mod tests {
 
     impl Scannable for Wide {
         type State = ();
+        type Loader = ();
 
         fn column_count(&self) -> u32 {
             self.0
@@ -402,6 +407,7 @@ mod tests {
         fn next(
             &self,
             _: &[u32],
+            _: &[Forms],
             _: &mut Context,
             (): &mut (),
             _: &mut RowBatch,

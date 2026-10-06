@@ -1,5 +1,9 @@
 //! `Scannable`: data a pipeline can read, such as a table, and `DynScannable`,
 //! the form a `Catalog` hands out.
+//!
+//! A scannable can write some columns lazily, with a handle saying where
+//! their values are, and load them later, for the rows still kept, when
+//! something reads them. The optimizer says which, and where they're loaded.
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
@@ -8,19 +12,25 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
-use crate::column::DataType;
+use crate::column::{ColumnView, DataType, Forms};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
+use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
-use crate::step::{DynSource, NewState};
+use crate::step::{DynSource, DynTransform, NewState};
 
 /// Named, typed columns, read into batches. Where a read is lives in
 /// `State`, which each run creates, as for a step.
 pub trait Scannable {
     /// Where a read is, such as a row group and a row in it.
     type State;
+
+    /// What loading lazy columns keeps between batches, such as a reader for
+    /// each column and what it has read. A scannable none of whose columns
+    /// can be lazy has `()`.
+    type Loader;
 
     /// How many columns there are, numbered from 0.
     fn column_count(&self) -> u32;
@@ -36,13 +46,44 @@ pub trait Scannable {
 
     /// Fills `batch`, which is empty when called, with the next rows of
     /// `columns`, in that order, or returns false when no rows are left.
+    /// `forms[i]` are the forms `columns[i]` may be written in, besides flat:
+    /// some of those `forms` says it can write it in.
     fn next(
         &self,
         columns: &[u32],
+        forms: &[Forms],
         context: &mut Context,
         state: &mut Self::State,
         batch: &mut RowBatch,
     ) -> Result<bool, Error>;
+
+    /// The forms `column` can be written in, besides flat. By default, none.
+    fn forms(&self, column: u32) -> Forms {
+        let _ = column;
+        Forms::FLAT
+    }
+
+    /// A loader, made for each run that loads columns. Only called if
+    /// `forms` says a column can be lazy.
+    fn new_loader(&self, context: &mut Context) -> Result<Self::Loader, Error> {
+        let _ = context;
+        crate::check::check_failed(line!())
+    }
+
+    /// The values of `lazy`, which this wrote, for the rows `selection`
+    /// keeps: a flat, constant or dictionary column of as many rows. The rows
+    /// it doesn't keep hold any values. Only called if `forms` says a column
+    /// can be lazy.
+    fn load(
+        &self,
+        context: &mut Context,
+        loader: &mut Self::Loader,
+        lazy: &ColumnView,
+        selection: &Selection,
+    ) -> Result<ColumnView, Error> {
+        let _ = (context, loader, lazy, selection);
+        crate::check::check_failed(line!())
+    }
 }
 
 /// The tables a frontend can read, provided by the embedder.
@@ -51,8 +92,22 @@ pub trait Catalog {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
 
-type ScannableNext =
-    unsafe fn(NonNull<()>, &[u32], &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
+type ScannableNext = unsafe fn(
+    NonNull<()>,
+    &[u32],
+    &[Forms],
+    &mut Context,
+    NonNull<u8>,
+    &mut RowBatch,
+) -> Result<bool, Error>;
+
+type ScannableLoad = unsafe fn(
+    NonNull<()>,
+    &mut Context,
+    NonNull<u8>,
+    &ColumnView,
+    &Selection,
+) -> Result<ColumnView, Error>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
 /// allocator, and functions that know its type.
@@ -65,6 +120,11 @@ pub struct DynScannable<'a> {
     new_state: NewState,
     drop_state: unsafe fn(NonNull<u8>),
     next: ScannableNext,
+    forms: unsafe fn(NonNull<()>, u32) -> Forms,
+    loader_layout: Layout,
+    new_loader: NewState,
+    drop_loader: unsafe fn(NonNull<u8>),
+    load: ScannableLoad,
     lifetime: PhantomData<&'a ()>,
 }
 
@@ -74,6 +134,7 @@ impl<'a> DynScannable<'a> {
         scannable: T,
     ) -> Result<DynScannable<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        const { assert!(align_of::<T::Loader>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(DynScannable {
             scannable: Box::new(allocator, scannable)?.erase(),
             // SAFETY: only called with this scannable and its state, as is each below.
@@ -95,9 +156,24 @@ impl<'a> DynScannable<'a> {
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
-            next: |scannable, columns, context, state, batch| unsafe {
+            next: |scannable, columns, forms, context, state, batch| unsafe {
                 let state = state_of::<T::State>(state);
-                value_of::<T>(scannable).next(columns, context, state, batch)
+                value_of::<T>(scannable).next(columns, forms, context, state, batch)
+            },
+            // SAFETY: as above.
+            forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
+            loader_layout: Layout::new::<T::Loader>(),
+            // SAFETY: as above.
+            new_loader: |scannable, context, loader| unsafe {
+                let made = value_of::<T>(scannable).new_loader(context)?;
+                write_state(loader, made);
+                Ok(())
+            },
+            drop_loader: drop_state::<T::Loader>,
+            // SAFETY: as above.
+            load: |scannable, context, loader, lazy, selection| unsafe {
+                let loader = state_of::<T::Loader>(loader);
+                value_of::<T>(scannable).load(context, loader, lazy, selection)
             },
             lifetime: PhantomData,
         })
@@ -118,15 +194,24 @@ impl<'a> DynScannable<'a> {
         unsafe { (self.column_type)(self.scannable.as_ptr(), column) }
     }
 
-    /// A source of `columns` of this, in that order.
+    /// The forms `column` can be written in, besides flat.
+    pub fn forms(&self, column: u32) -> Forms {
+        // SAFETY: as above.
+        unsafe { (self.forms)(self.scannable.as_ptr(), column) }
+    }
+
+    /// A source of `columns` of this, in that order, writing each in the
+    /// forms of `forms` it says, besides flat.
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
         columns: SlowVec<u32>,
+        forms: SlowVec<Forms>,
     ) -> Result<DynSource<'_>, AllocError> {
-        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
+        check!(columns.len() <= BATCH_COLUMNS_MAX as usize && forms.len() == columns.len());
         check!(columns.iter().all(|&column| column < self.column_count()));
-        let scan = Scan { scannable: NonNull::from(self).cast(), columns };
+        check!(columns.iter().zip(forms.iter()).all(|(&c, &f)| self.forms(c).contains(f)));
+        let scan = Scan { scannable: NonNull::from(self).cast(), columns, forms };
         let step = Box::new(allocator, scan)?.erase();
         // SAFETY: the functions take a `Scan` and the scannable's state, and
         // the `Scan` borrows `self` for as long as the source lives.
@@ -140,12 +225,45 @@ impl<'a> DynScannable<'a> {
             )
         })
     }
+
+    /// A transform that loads the lazy columns at `positions` in batches,
+    /// which this wrote, for the rows each batch keeps.
+    pub fn materialize(
+        &self,
+        allocator: &dyn Allocator,
+        positions: SlowVec<u32>,
+    ) -> Result<DynTransform<'_>, AllocError> {
+        let materialize = Materialize { scannable: NonNull::from(self).cast(), positions };
+        let step = Box::new(allocator, materialize)?.erase();
+        // SAFETY: the functions take a `Materialize` and the scannable's
+        // loader, and the `Materialize` borrows `self` for as long as the
+        // transform lives.
+        Ok(unsafe {
+            DynTransform::from_parts(
+                step,
+                self.loader_layout,
+                materialize_new_state,
+                self.drop_loader,
+                materialize_process,
+            )
+        })
+    }
 }
 
 /// A source's step that reads a `DynScannable`.
 struct Scan {
+    /// What's read.
     scannable: NonNull<DynScannable<'static>>,
+    /// Which of its columns, in order.
     columns: SlowVec<u32>,
+    /// The forms each may be written in, besides flat.
+    forms: SlowVec<Forms>,
+}
+
+/// A transform that loads lazy columns a `DynScannable` wrote.
+struct Materialize {
+    scannable: NonNull<DynScannable<'static>>,
+    positions: SlowVec<u32>,
 }
 
 unsafe fn scan_new_state(
@@ -171,12 +289,58 @@ unsafe fn scan_next(
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
-    unsafe { (scannable.next)(scannable.scannable.as_ptr(), &scan.columns, context, state, batch) }
+    unsafe {
+        (scannable.next)(
+            scannable.scannable.as_ptr(),
+            &scan.columns,
+            &scan.forms,
+            context,
+            state,
+            batch,
+        )
+    }
+}
+
+unsafe fn materialize_new_state(
+    step: NonNull<()>,
+    context: &mut Context,
+    loader: NonNull<u8>,
+) -> Result<(), Error> {
+    // SAFETY: `step` is a `Materialize`, whose scannable outlives it.
+    let scannable = unsafe { step.cast::<Materialize>().as_ref().scannable.as_ref() };
+    // SAFETY: the function matches the scannable's type.
+    unsafe { (scannable.new_loader)(scannable.scannable.as_ptr(), context, loader) }
+}
+
+unsafe fn materialize_process(
+    step: NonNull<()>,
+    context: &mut Context,
+    loader: NonNull<u8>,
+    batch: &mut RowBatch,
+) -> Result<(), Error> {
+    // SAFETY: as in `materialize_new_state`.
+    let materialize = unsafe { step.cast::<Materialize>().as_ref() };
+    // SAFETY: as in `materialize_new_state`.
+    let scannable = unsafe { materialize.scannable.as_ref() };
+    for &position in materialize.positions.iter() {
+        let lazy = batch.column(position);
+        check!(lazy.is_lazy());
+        // SAFETY: the function matches the scannable's type, and `loader`
+        // holds its loader.
+        let column = unsafe {
+            (scannable.load)(scannable.scannable.as_ptr(), context, loader, lazy, batch.selection())
+        }?;
+        check!(!column.is_lazy() && column.row_count() == batch.row_count());
+        *at_mut!(batch.columns_mut(), position as usize) = column;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use alloc::vec::Vec as StdVec;
+    use core::cell::RefCell;
 
     use super::*;
     use crate::allocator::Heap;
@@ -185,12 +349,15 @@ mod tests {
     use crate::context::Context;
     use crate::pipeline::Pipeline;
     use crate::query_allocators::QueryAllocators;
+    use crate::selection::Kept;
+    use crate::step::{Step, Transform};
 
     /// One batch, with column `i` holding `i` and `i + 10`.
     struct Columns;
 
     impl Scannable for Columns {
         type State = bool;
+        type Loader = ();
 
         fn column_count(&self) -> u32 {
             3
@@ -211,6 +378,7 @@ mod tests {
         fn next(
             &self,
             columns: &[u32],
+            _: &[Forms],
             _: &mut Context,
             done: &mut bool,
             batch: &mut RowBatch,
@@ -254,8 +422,16 @@ mod tests {
     fn scans_chosen_columns_through_a_pipeline() {
         let scannable = DynScannable::new(&Heap, Columns).unwrap();
         let columns = SlowVec::fixed_from(&Heap, [2, 0].into_iter()).unwrap();
-        let pipeline =
-            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), SlowVec::new(&Heap, 1).unwrap());
+        let pipeline = Pipeline::new(
+            scannable
+                .scan(
+                    &Heap,
+                    columns,
+                    SlowVec::fixed_from(&Heap, [Forms::FLAT; 2].into_iter()).unwrap(),
+                )
+                .unwrap(),
+            SlowVec::new(&Heap, 1).unwrap(),
+        );
         let query = QueryAllocators::new(&Heap);
         let mut execution = pipeline.start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -263,5 +439,125 @@ mod tests {
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();
         assert_eq!(rows, [[2, 12], [0, 10]]);
         assert!(!execution.next(&mut batch).unwrap());
+    }
+
+    /// Two batches of four rows, of one column, `10 * batch + row`, which can
+    /// be lazy, with the batch as its handle. Notes each load: its batch
+    /// and the rows it keeps.
+    struct Counted<'a> {
+        loads: &'a RefCell<StdVec<(u8, StdVec<u16>)>>,
+    }
+
+    impl Scannable for Counted<'_> {
+        type State = u8;
+        type Loader = ();
+
+        fn column_count(&self) -> u32 {
+            1
+        }
+
+        fn column_name(&self, _: u32) -> &'static str {
+            "a"
+        }
+
+        fn column_type(&self, _: u32) -> DataType {
+            DataType::Int64
+        }
+
+        fn new_state(&self, _: &mut Context) -> Result<u8, Error> {
+            Ok(0)
+        }
+
+        fn next(
+            &self,
+            _: &[u32],
+            forms: &[Forms],
+            context: &mut Context,
+            batches: &mut u8,
+            batch: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            if *batches == 2 {
+                return Ok(false);
+            }
+            assert!(forms[0].contains(Forms::LAZY));
+            batch.reset(4);
+            let column = ColumnView::lazy(context, DataType::Int64, &[*batches], 4).unwrap();
+            assert!(batch.push_column(column).is_ok());
+            *batches += 1;
+            Ok(true)
+        }
+
+        fn forms(&self, _: u32) -> Forms {
+            Forms::LAZY
+        }
+
+        fn new_loader(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            context: &mut Context,
+            (): &mut (),
+            lazy: &ColumnView,
+            selection: &Selection,
+        ) -> Result<ColumnView, Error> {
+            let (handle, _) = lazy.handle();
+            let rows: StdVec<u16> = match selection.kept() {
+                Kept::All => (0..4).collect(),
+                Kept::None => StdVec::new(),
+                Kept::Select(rows) => rows.into(),
+            };
+            let mut values = context.values_buffer(4 * 8).unwrap();
+            for &row in &rows {
+                values.as_mut_slice::<i64>()[usize::from(row)] =
+                    10 * i64::from(handle[0]) + i64::from(row);
+            }
+            self.loads.borrow_mut().push((handle[0], rows));
+            Ok(ColumnView::new(context, DataType::Int64, values, None)?)
+        }
+    }
+
+    /// Keeps a batch's odd rows.
+    struct KeepOdd;
+
+    impl Transform for KeepOdd {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
+            batch.selection_mut().retain(|row| row % 2 == 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
+        let loads = RefCell::new(StdVec::new());
+        let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
+        let columns = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
+        let forms = SlowVec::fixed_from(&Heap, [Forms::LAZY].into_iter()).unwrap();
+        let source = scannable.scan(&Heap, columns, forms).unwrap();
+        let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
+        let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
+        let load = Step::Transform(scannable.materialize(&Heap, positions).unwrap());
+        let pipeline =
+            Pipeline::new(source, SlowVec::fixed_from(&Heap, [keep, load].into_iter()).unwrap());
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = pipeline.start(&query).unwrap();
+        let mut batch = RowBatch::new();
+        let mut kept = StdVec::new();
+        while execution.next(&mut batch).unwrap() {
+            let column = batch.column(0);
+            assert!(!column.is_lazy());
+            let Kept::Select(rows) = batch.selection().kept() else { panic!() };
+            kept.extend(rows.iter().map(|&row| column.int64s()[usize::from(row)]));
+        }
+        assert_eq!(kept, [1, 3, 11, 13]);
+        // Each batch is loaded once, for the rows it keeps.
+        assert_eq!(*loads.borrow(), [(0, vec![1, 3]), (1, vec![1, 3])]);
     }
 }

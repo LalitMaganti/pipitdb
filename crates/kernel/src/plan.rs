@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
-use crate::column::DataType;
+use crate::column::{DataType, Forms};
 use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
@@ -178,7 +178,9 @@ impl<'c> Op<'c> for ScanOp<'c> {
         }
         let read = self.columns.iter().map(|column| column.column);
         let read = SlowVec::fixed_from(lowering.allocator(), read)?;
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
+        let flat = core::iter::repeat_n(Forms::FLAT, self.columns.len());
+        let forms = SlowVec::fixed_from(lowering.allocator(), flat)?;
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read, forms)?);
         Ok(())
     }
 

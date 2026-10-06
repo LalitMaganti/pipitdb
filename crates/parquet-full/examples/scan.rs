@@ -9,7 +9,7 @@ use std::time::Instant;
 use pipit_file::source::FileSource;
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::DataType;
+use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::Scannable;
@@ -31,7 +31,7 @@ fn main() -> Result<(), String> {
         let mut batch = RowBatch::new();
         let (mut count, mut sum) = (0_u64, 0_i128);
         while table
-            .next(&[column], &mut context, &mut state, &mut batch)
+            .next(&[column], &[Forms::FLAT], &mut context, &mut state, &mut batch)
             .map_err(|e| format!("{}: {e:?}", table.column_name(column)))?
         {
             let values = batch.column(0).flatten(&mut context).map_err(|e| format!("{e:?}"))?;

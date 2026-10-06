@@ -9,7 +9,7 @@ use pipit_kernel::allocator::{Heap, LimitAllocator};
 use pipit_kernel::boxed::Box;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::Uncompressed;
@@ -195,7 +195,7 @@ pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     let Ok(mut state) = table.new_state(&mut context) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
-    while let Ok(true) = table.next(&[0], &mut context, &mut state, &mut batch) {
+    while let Ok(true) = table.next(&[0], &[Forms::FLAT], &mut context, &mut state, &mut batch) {
         rows += batch.row_count() as usize;
     }
     rows
