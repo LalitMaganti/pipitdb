@@ -91,11 +91,11 @@ enum Status {
 }
 
 /// What a run keeps for a step.
-struct Slot {
+struct Slot<'p> {
     /// Where the step's state is in the run's memory.
     state: usize,
     /// For operators: their input.
-    input: RowBatch,
+    input: RowBatch<'p>,
 }
 
 /// What a segment did when run.
@@ -203,7 +203,7 @@ impl<'p> Execution<'p> {
     /// Fills `output` with the next batch, or returns false when there are
     /// none left. Fails if a step does, such as if it can't allocate what it
     /// needs; the run can't go on after that, so later calls fail too.
-    pub fn next(&mut self, output: &mut RowBatch) -> Result<bool, Error> {
+    pub fn next(&mut self, output: &mut RowBatch<'p>) -> Result<bool, Error> {
         if let Some(error) = self.run.failed.get() {
             return Err(error);
         }
@@ -211,13 +211,13 @@ impl<'p> Execution<'p> {
     }
 }
 
-impl Run<'_> {
+impl<'p> Run<'p> {
     /// As `Execution::next`.
     ///
     /// Starting from the last segment, it moves to the one before when a
     /// segment's operator needs input, and to the one after when a segment
     /// makes a batch or ends.
-    fn next(&mut self, context: &mut Context, output: &mut RowBatch) -> Result<bool, Error> {
+    fn next(&mut self, context: &mut Context, output: &mut RowBatch<'p>) -> Result<bool, Error> {
         let last = self.pipeline.segment_count - 1;
         let mut k = self.ready(last);
         loop {
@@ -260,7 +260,7 @@ impl Run<'_> {
 
     /// Runs segment `k` once. Its batch goes to the next operator's input, or
     /// to `output` if it is the last segment.
-    fn make(&self, context: &mut Context, k: usize, output: &mut RowBatch) -> Made {
+    fn make(&self, context: &mut Context, k: usize, output: &mut RowBatch<'p>) -> Made {
         // SAFETY: the segments were written by `Execution::new`.
         let segment = unsafe { &mut *self.segment(k) };
         let end = segment.end;
@@ -297,7 +297,7 @@ impl Run<'_> {
         if batch.selection().is_empty() { Made::Nothing } else { Made::Batch }
     }
 
-    fn read_source(&self, context: &mut Context, batch: &mut RowBatch) -> Made {
+    fn read_source(&self, context: &mut Context, batch: &mut RowBatch<'p>) -> Made {
         batch.reset(0);
         // SAFETY: the source's state was made by `Execution::new`.
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
@@ -315,7 +315,12 @@ impl Run<'_> {
     }
 
     /// Runs the operator heading `segment` once.
-    fn execute(&self, context: &mut Context, segment: &mut Segment, output: &mut RowBatch) -> Made {
+    fn execute(
+        &self,
+        context: &mut Context,
+        segment: &mut Segment,
+        output: &mut RowBatch<'p>,
+    ) -> Made {
         let op = segment.head;
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
             crate::check::check_failed(line!());
@@ -355,7 +360,7 @@ impl Run<'_> {
         unsafe { self.memory.cast::<Segment>().as_ptr().add(k) }
     }
 
-    fn slot(&self, i: usize) -> *mut Slot {
+    fn slot(&self, i: usize) -> *mut Slot<'p> {
         check!(i < self.pipeline.steps.len());
         // SAFETY: the slots are at `self.slots`.
         unsafe { self.memory.add(self.slots).cast::<Slot>().as_ptr().add(i) }
@@ -766,11 +771,11 @@ mod tests {
 
         let none = pipeline(Numbers { batches: 3 }, [transform(KeepNone)]);
         let query = QueryAllocators::new(&Heap);
-        assert!(!none.start(&query).unwrap().next(&mut batch).unwrap());
+        assert!(!none.start(&query).unwrap().next(&mut RowBatch::new()).unwrap());
         // Steps after one that keeps no rows don't run: this one would fail.
         let stopped =
             pipeline(Numbers { batches: 3 }, [transform(KeepNone), transform(FailSecond)]);
-        assert_eq!(stopped.start(&query).unwrap().next(&mut batch), Ok(false));
+        assert_eq!(stopped.start(&query).unwrap().next(&mut RowBatch::new()), Ok(false));
     }
 
     #[test]

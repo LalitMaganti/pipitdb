@@ -1,5 +1,6 @@
 //! `RowBatch`: up to `BATCH_ROWS_MAX` rows, as columns of the same length.
 
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 
 use crate::column::ColumnView;
@@ -10,22 +11,26 @@ pub const BATCH_COLUMNS_MAX: u32 = 64;
 
 /// The row count is set separately from the columns, so a batch can have
 /// rows but no columns, e.g. for `COUNT(*)`. Its selection says which of the
-/// rows are kept: whoever reads a batch reads only those.
-pub struct RowBatch {
+/// rows are kept: whoever reads a batch reads only those. Its columns may
+/// view what lives for `'a`, so it can't outlive that.
+pub struct RowBatch<'a> {
     row_count: u32,
     column_count: u32,
     // The first `column_count` are initialized.
     columns: [MaybeUninit<ColumnView>; BATCH_COLUMNS_MAX as usize],
     selection: Selection,
+    // What the columns may view, and for how long.
+    views: PhantomData<&'a ColumnView>,
 }
 
-impl RowBatch {
-    pub fn new() -> RowBatch {
+impl<'a> RowBatch<'a> {
+    pub fn new() -> RowBatch<'a> {
         RowBatch {
             row_count: 0,
             column_count: 0,
             selection: Selection::all(0),
             columns: [const { MaybeUninit::uninit() }; _],
+            views: PhantomData,
         }
     }
 
@@ -35,7 +40,7 @@ impl RowBatch {
     /// # Safety
     ///
     /// `batch` must be valid for writes of a `RowBatch`, and is then one.
-    pub(crate) unsafe fn init(batch: *mut RowBatch) {
+    pub(crate) unsafe fn init(batch: *mut RowBatch<'a>) {
         // SAFETY: upheld by the caller. The column array needs no writing, as
         // none are counted.
         unsafe {
@@ -117,13 +122,13 @@ impl RowBatch {
     }
 }
 
-impl Default for RowBatch {
-    fn default() -> RowBatch {
+impl Default for RowBatch<'_> {
+    fn default() -> Self {
         RowBatch::new()
     }
 }
 
-impl Drop for RowBatch {
+impl Drop for RowBatch<'_> {
     fn drop(&mut self) {
         self.drop_columns();
     }

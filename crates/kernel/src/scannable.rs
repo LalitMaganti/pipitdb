@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
-use crate::step::{DynSource, DynTransform, NewState};
+use crate::step::{DynSource, DynTransform, ErasedBatch, NewState};
 
 /// Named, typed columns, read into batches. Where a read is lives in
 /// `State`, which each run opens, as for a step.
@@ -56,12 +56,12 @@ pub trait Scannable {
 
     /// Fills `batch`, which is empty when called, with the next rows of the
     /// columns `state` was opened with, or returns false when no rows are
-    /// left.
+    /// left. Its columns may view what the scannable holds.
     fn next<'s>(
         &'s self,
         context: &mut Context,
         state: &mut Self::State<'s>,
-        batch: &mut RowBatch,
+        batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error>;
 
     /// The forms `column` can be written in, besides flat. By default, none.
@@ -103,7 +103,7 @@ type ScannableOpen =
     unsafe fn(NonNull<()>, &mut Context, &[(u32, Forms)], NonNull<u8>) -> Result<(), Error>;
 
 type ScannableNext =
-    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, ErasedBatch) -> Result<bool, Error>;
 
 type ScannableLoad = unsafe fn(
     NonNull<()>,
@@ -161,8 +161,11 @@ impl<'a> DynScannable<'a> {
             },
             drop_state: drop_state::<T::State<'a>>,
             // SAFETY: as above.
+            // The batch's columns may view the scannable, which lives for
+            // `'a`.
             next: |scannable, context, state, batch| unsafe {
                 let state = state_of::<T::State<'a>>(state);
+                let batch = batch.cast::<RowBatch<'a>>().as_mut();
                 value_of::<T>(scannable).next(context, state, batch)
             },
             // SAFETY: as above.
@@ -288,7 +291,7 @@ unsafe fn scan_next(
     step: NonNull<()>,
     context: &mut Context,
     state: NonNull<u8>,
-    batch: &mut RowBatch,
+    batch: ErasedBatch,
 ) -> Result<bool, Error> {
     // SAFETY: as in `scan_new_state`.
     let scan = unsafe { step.cast::<Scan>().as_ref() };

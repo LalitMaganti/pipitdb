@@ -27,12 +27,12 @@ pub trait Source {
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
 
     /// Fills `batch`, which is empty when called, or returns false when no
-    /// batches are left.
-    fn next(
-        &self,
+    /// batches are left. Its columns may view what the source holds.
+    fn next<'s>(
+        &'s self,
         context: &mut Context,
         state: &mut Self::State,
-        batch: &mut RowBatch,
+        batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error>;
 }
 
@@ -153,13 +153,17 @@ pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
 pub(crate) type TransformProcess =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>;
 
+/// A source's batch: erased, as its columns may view what the source holds,
+/// for as long as the source lives.
+pub(crate) type ErasedBatch = NonNull<RowBatch<'static>>;
+
 // TODO: `Result<bool, Error>` and `Result<Progress, Error>` take two bytes,
 // where `Result<bool, AllocError>` took one, which costs the pipeline's loop
 // a few instructions a batch. Converting to one-byte enums such as
 // `enum Next { Batch, End, Failed(Error) }` here, at the function-pointer
 // boundary, would win them back while steps keep `?`.
 pub(crate) type SourceNext =
-    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, ErasedBatch) -> Result<bool, Error>;
 
 type Executed = Result<Progress, Error>;
 
@@ -202,7 +206,9 @@ impl<'a> DynSource<'a> {
             },
             drop_state: drop_state::<T::State>,
             // SAFETY: as above.
+            // The batch's columns may view the source, which lives for `'a`.
             run: |source, context, state, batch| unsafe {
+                let batch = batch.cast::<RowBatch<'a>>().as_mut();
                 value_of::<T>(source).next(context, state_of::<T::State>(state), batch)
             },
             lifetime: PhantomData,
@@ -216,11 +222,11 @@ impl<'a> DynSource<'a> {
         &self,
         context: &mut Context,
         state: NonNull<u8>,
-        batch: &mut RowBatch,
+        batch: &mut RowBatch<'a>,
     ) -> Result<bool, Error> {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
-        unsafe { (self.run)(self.step.as_ptr(), context, state, batch) }
+        unsafe { (self.run)(self.step.as_ptr(), context, state, NonNull::from(batch).cast()) }
     }
 }
 
