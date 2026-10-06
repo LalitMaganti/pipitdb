@@ -57,7 +57,41 @@ pub trait Op<'c> {
         needed.need_all();
         Pruned::Keep
     }
+
+    /// Marks the columns whose values this reads. By default, all of them.
+    fn reads(&self, reads: &mut Needed) {
+        reads.need_all();
+    }
+
+    /// Of the columns this reads, the forms it takes `column` in, besides
+    /// flat. By default, none.
+    fn accepts(&self, column: ColumnId) -> Forms {
+        let _ = column;
+        Forms::FLAT
+    }
+
+    /// Tells this, if it makes `column`, the forms the plan allows it in,
+    /// besides flat, and returns those of them it will make it in. By
+    /// default, none.
+    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        let _ = (column, allowed);
+        Forms::FLAT
+    }
+
+    /// The op that loads `columns`, which this makes lazy, to put above it.
+    /// Only called for columns `allow` said it would make lazy.
+    fn materialize(
+        &self,
+        allocator: &dyn Allocator,
+        columns: SlowVec<ColumnId>,
+    ) -> Result<DynOp<'c>, AllocError> {
+        let _ = (allocator, columns);
+        crate::check::check_failed(line!())
+    }
 }
+
+type Materialize<'c> =
+    unsafe fn(NonNull<()>, &dyn Allocator, SlowVec<ColumnId>) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
 /// allocator, and the function that knows its type.
@@ -69,6 +103,10 @@ pub struct DynOp<'c> {
         &mut Lowering<'l, 'c>,
     ) -> Result<(), LowerError>,
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
+    reads: unsafe fn(NonNull<()>, &mut Needed),
+    accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
+    allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
+    materialize: Materialize<'c>,
     lifetime: PhantomData<&'c ()>,
 }
 
@@ -80,6 +118,16 @@ impl<'c> DynOp<'c> {
             lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
             // SAFETY: as above, and the caller has the op mutably.
             prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
+            // SAFETY: as for `lower`.
+            reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
+            // SAFETY: as for `lower`.
+            accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
+            // SAFETY: as for `prune`.
+            allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
+            // SAFETY: as for `lower`.
+            materialize: |op, allocator, columns| unsafe {
+                value_of::<T>(op).materialize(allocator, columns)
+            },
             lifetime: PhantomData,
         })
     }
@@ -98,6 +146,31 @@ impl<'c> DynOp<'c> {
         // mutably.
         unsafe { (self.prune)(self.op.as_ptr(), needed) }
     }
+
+    pub(crate) fn reads(&self, reads: &mut Needed) {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.reads)(self.op.as_ptr(), reads) }
+    }
+
+    pub(crate) fn accepts(&self, column: ColumnId) -> Forms {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.accepts)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.allow)(self.op.as_ptr(), column, allowed) }
+    }
+
+    pub(crate) fn materialize(
+        &self,
+        allocator: &dyn Allocator,
+        columns: SlowVec<ColumnId>,
+    ) -> Result<DynOp<'c>, AllocError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.materialize)(self.op.as_ptr(), allocator, columns) }
+    }
 }
 
 /// An operation, and the nodes whose rows it reads.
@@ -108,9 +181,11 @@ pub struct PlanNode<'c> {
 
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
+    /// The columns' names.
     pub names: Names,
     /// Indexed by `ColumnId`.
     pub columns: SlowVec<ColumnSchema>,
+    /// Indexed by `PlanNodeId`.
     pub nodes: SlowVec<PlanNode<'c>>,
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
@@ -159,8 +234,14 @@ impl<'c> LogicalPlan<'c> {
 
 /// Reads all the rows of a scannable, binding the columns in `columns`.
 pub struct ScanOp<'c> {
-    pub scannable: &'c DynScannable<'c>,
-    pub columns: SlowVec<ScanColumn>,
+    scannable: &'c DynScannable<'c>,
+    columns: SlowVec<ScanColumn>,
+}
+
+impl<'c> ScanOp<'c> {
+    pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
+        ScanOp { scannable, columns }
+    }
 }
 
 /// A column a scan reads, and what it's bound to in the plan.
@@ -168,7 +249,10 @@ pub struct ScanOp<'c> {
 pub struct ScanColumn {
     /// Which of the scannable's columns.
     pub column: u32,
+    /// What it's bound to.
     pub binding: NamedColumn,
+    /// The forms it's read in, besides flat, which the plan chooses.
+    pub forms: Forms,
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
@@ -178,8 +262,8 @@ impl<'c> Op<'c> for ScanOp<'c> {
         }
         let read = self.columns.iter().map(|column| column.column);
         let read = SlowVec::fixed_from(lowering.allocator(), read)?;
-        let flat = core::iter::repeat_n(Forms::FLAT, self.columns.len());
-        let forms = SlowVec::fixed_from(lowering.allocator(), flat)?;
+        let forms = self.columns.iter().map(|column| column.forms);
+        let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
         lowering.set_source(self.scannable.scan(lowering.allocator(), read, forms)?);
         Ok(())
     }
@@ -188,14 +272,66 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
-        let mut first = true;
+        let mut i = 0;
         self.columns.retain(|column| {
-            let keep = needed.is_needed(column.binding.id) || (!any && first);
-            first = false;
+            let keep = needed.is_needed(column.binding.id) || (!any && i == 0);
+            i += 1;
             keep
         });
         Pruned::Keep
     }
+
+    /// Reads none: it makes them.
+    fn reads(&self, _: &mut Needed) {}
+
+    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        let found = self.columns.iter_mut().find(|c| c.binding.id == column);
+        // Chosen once: a column chosen already is loaded already.
+        let Some(scanned) = found.filter(|scanned| scanned.forms == Forms::FLAT) else {
+            return Forms::FLAT;
+        };
+        scanned.forms = allowed & self.scannable.forms(scanned.column);
+        scanned.forms
+    }
+
+    fn materialize(
+        &self,
+        allocator: &dyn Allocator,
+        columns: SlowVec<ColumnId>,
+    ) -> Result<DynOp<'c>, AllocError> {
+        DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
+    }
+}
+
+/// Loads `columns` of its one child's batches, which a scan of `scannable`
+/// made lazy, for the rows each keeps.
+pub struct MaterializeOp<'c> {
+    scannable: &'c DynScannable<'c>,
+    columns: SlowVec<ColumnId>,
+}
+
+impl<'c> Op<'c> for MaterializeOp<'c> {
+    fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
+        check!(node.children.len() == 1);
+        lowering.lower(*at!(node.children, 0))?;
+        let positions = self.columns.iter().map(|&column| lowering.position(column));
+        let positions = SlowVec::fixed_from(lowering.allocator(), positions)?;
+        let transform = self.scannable.materialize(lowering.allocator(), positions)?;
+        lowering.add_step(Step::Transform(transform))
+    }
+
+    /// Keeps loading the needed columns, if any.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        self.columns.retain(|&column| needed.is_needed(column));
+        if self.columns.is_empty() { Pruned::Child(0) } else { Pruned::Keep }
+    }
+
+    /// Reads none: it loads them.
+    fn reads(&self, _: &mut Needed) {}
 }
 
 /// Keeps the rows of its one child that `predicate` is true for, as `WHERE`
@@ -218,11 +354,16 @@ impl<'c> Op<'c> for FilterOp {
         lowering.add_step(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
     }
 
-    /// Makes no columns, and reads its predicate's.
+    /// Makes no columns.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        for column in self.predicate.columns() {
-            needed.need(column);
-        }
+        self.reads(needed);
         Pruned::Keep
+    }
+
+    /// Its predicate's columns.
+    fn reads(&self, reads: &mut Needed) {
+        for column in self.predicate.columns() {
+            reads.need(column);
+        }
     }
 }

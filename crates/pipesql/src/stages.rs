@@ -1,6 +1,7 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
+use pipit_kernel::column::Forms;
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -46,10 +47,10 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..count {
         let binding = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
-        columns.push(ScanColumn { column: i, binding })?;
+        columns.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
         scope.push(binding)?;
     }
-    let scan = DynOp::new(allocator, ScanOp { scannable: table, columns })?;
+    let scan = DynOp::new(allocator, ScanOp::new(table, columns))?;
     let children = SlowVec::fixed(allocator, 0)?;
     compiler.plan.add_node(scan, children)?;
     compiler.scope = scope;

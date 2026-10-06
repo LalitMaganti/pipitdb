@@ -150,14 +150,14 @@ pub type DynSource<'a> = Erased<'a, SourceNext>;
 pub type DynTransform<'a> = Erased<'a, TransformProcess>;
 pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
 
+pub(crate) type TransformProcess =
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>;
+
 // TODO: `Result<bool, Error>` and `Result<Progress, Error>` take two bytes,
 // where `Result<bool, AllocError>` took one, which costs the pipeline's loop
 // a few instructions a batch. Converting to one-byte enums such as
 // `enum Next { Batch, End, Failed(Error) }` here, at the function-pointer
 // boundary, would win them back while steps keep `?`.
-pub(crate) type TransformProcess =
-    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>;
-
 pub(crate) type SourceNext =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
