@@ -6,3 +6,9 @@ CXXFLAGS_aarch64_apple_darwin = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EX
 CXXFLAGS_aarch64_unknown_linux_gnu = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1 -DSNAPPY_HAVE_NEON=1"
 CXXFLAGS_x86_64_unknown_linux_gnu = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1"
 CXXFLAGS_x86_64_apple_darwin = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXPECT=1"
+
+# Hot loops aligned to 64 bytes, so where the code before them ends doesn't
+# decide whether one straddles a page or cache line: #117 moved the filter's
+# eight-instruction loop across a 4 KB boundary and made f1 35% slower.
+[build]
+rustflags = ["-C", "llvm-args=-align-loops=64"]
