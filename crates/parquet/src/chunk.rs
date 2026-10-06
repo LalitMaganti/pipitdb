@@ -3,7 +3,7 @@
 
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{Bounds, ColumnView, DataType};
+use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
@@ -203,8 +203,13 @@ impl<'s> ChunkReader<'s> {
     }
 
     /// The next `rows` rows, which must be in the page being read and are at
-    /// most `BATCH_ROWS_MAX`.
-    pub fn read(&mut self, context: &mut Context, rows: usize) -> Result<ColumnView, Error> {
+    /// most `BATCH_ROWS_MAX`: a column in one of `forms`.
+    pub fn read(
+        &mut self,
+        context: &mut Context,
+        rows: usize,
+        forms: Forms,
+    ) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
         let (body, dictionary) = self.body(context)?;
         let page = body.as_slice::<u8>();
@@ -212,7 +217,11 @@ impl<'s> ChunkReader<'s> {
         let decoded = scratch.as_mut_slice::<u32>();
         let (validity, valid) = self.validity(context, page, rows, decoded)?;
         if let Some(dictionary) = &dictionary {
-            let column = self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
+            let mut column =
+                self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
+            // Strings' dictionaries are kept, and a run of one entry is a
+            // constant, unless `forms` rules them out.
+            column.make_in(context, forms)?;
             self.scratch = Some(scratch);
             self.position.left -= rows;
             return Ok(column);
@@ -575,6 +584,9 @@ mod tests {
 
     use super::*;
     use crate::Uncompressed;
+
+    /// Every form a reader can read in.
+    const ANY: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
     use crate::footer::ParquetFile;
 
     /// 5000 rows: `id` is the row, `half` half of it, `name` "row" and it,
@@ -622,7 +634,8 @@ mod tests {
     }
 
     fn cells(view: &ColumnView) -> Vec<Cell> {
-        let view = &view.flatten(&mut Context::new(&Heap)).unwrap();
+        let mut view = view.clone();
+        view.make_in(&mut Context::new(&Heap), Forms::FLAT).unwrap();
         (0..view.row_count())
             .map(|row| {
                 let r = row as usize;
@@ -653,7 +666,7 @@ mod tests {
                 if rows == 0 {
                     break;
                 }
-                all.extend(cells(&reader.read(&mut context, rows).unwrap()));
+                all.extend(cells(&reader.read(&mut context, rows, ANY).unwrap()));
             }
         }
         all
@@ -692,7 +705,7 @@ mod tests {
             let mut reader =
                 ChunkReader::new(source, &Uncompressed, column, file.chunk(0, c)).unwrap();
             reader.page_left(&mut context).unwrap();
-            let view = reader.read(&mut context, 100).unwrap();
+            let view = reader.read(&mut context, 100, ANY).unwrap();
             if c == 2 {
                 // Strings: none copied out of the dictionary.
                 assert!(matches!(view.form(), Form::Dictionary(_)));
@@ -742,13 +755,13 @@ mod tests {
                 reader.skip(&mut context, skip).unwrap();
                 let rows = (left - skip).min(50);
                 let start = reader.position();
-                let read = cells(&reader.read(&mut context, rows).unwrap());
+                let read = cells(&reader.read(&mut context, rows, ANY).unwrap());
                 let from = i64::try_from(row + skip).unwrap();
                 let expected: Vec<_> =
                     (from..from + 50).take(rows).map(|i| expected(c, i)).collect();
                 assert_eq!(read, expected);
                 reader.seek(start);
-                assert_eq!(cells(&reader.read(&mut context, rows).unwrap()), expected);
+                assert_eq!(cells(&reader.read(&mut context, rows, ANY).unwrap()), expected);
                 row += skip + rows;
             }
             assert_eq!(row, 2048);
@@ -802,7 +815,7 @@ mod tests {
         let mut reader =
             ChunkReader::new(source, &Uncompressed, file.columns()[2], file.chunk(1, 2)).unwrap();
         reader.page_left(&mut context).unwrap();
-        assert_eq!(cells(&reader.read(&mut context, 1).unwrap()), [dict(2, 2048)]);
+        assert_eq!(cells(&reader.read(&mut context, 1, ANY).unwrap()), [dict(2, 2048)]);
         assert!(reader.dictionary.is_some());
     }
 }

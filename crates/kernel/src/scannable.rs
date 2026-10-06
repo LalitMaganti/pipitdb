@@ -45,8 +45,8 @@ pub trait Scannable {
     fn column_type(&self, column: u32) -> DataType;
 
     /// A read of `columns`, in that order, from the first row, each with
-    /// the forms it may be written in besides flat, some of those `forms`
-    /// says it can write it in. What depends only on which columns are read
+    /// the forms it may be written in, some of those `forms` says it can
+    /// write it in. What depends only on which columns are read
     /// is worked out here, once, not for each batch.
     fn open<'s>(
         &'s self,
@@ -65,7 +65,7 @@ pub trait Scannable {
         batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error>;
 
-    /// The forms `column` can be written in, besides flat. By default, none.
+    /// The forms `column` can be written in. By default, flat only.
     fn forms(&self, column: u32) -> Forms {
         let _ = column;
         Forms::FLAT
@@ -79,7 +79,7 @@ pub trait Scannable {
     }
 
     /// The values of `lazy`, which this wrote, for the rows `selection`
-    /// keeps: a flat, constant or dictionary column of as many rows. The rows
+    /// keeps: a column of as many rows, in one of `forms`. The rows
     /// it doesn't keep hold any values. Only called if `forms` says a column
     /// can be lazy.
     fn load(
@@ -88,8 +88,9 @@ pub trait Scannable {
         loader: &mut Self::Loader,
         lazy: &ColumnView,
         selection: &Selection,
+        forms: Forms,
     ) -> Result<ColumnView, Error> {
-        let _ = (context, loader, lazy, selection);
+        let _ = (context, loader, lazy, selection, forms);
         crate::check::check_failed(line!())
     }
 }
@@ -112,6 +113,7 @@ type ScannableLoad = unsafe fn(
     NonNull<u8>,
     &ColumnView,
     &Selection,
+    Forms,
 ) -> Result<ColumnView, Error>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
@@ -180,9 +182,9 @@ impl<'a> DynScannable<'a> {
             },
             drop_loader: drop_state::<T::Loader>,
             // SAFETY: as above.
-            load: |scannable, context, loader, lazy, selection| unsafe {
+            load: |scannable, context, loader, lazy, selection, forms| unsafe {
                 let loader = state_of::<T::Loader>(loader);
-                value_of::<T>(scannable).load(context, loader, lazy, selection)
+                value_of::<T>(scannable).load(context, loader, lazy, selection, forms)
             },
             lifetime: PhantomData,
         })
@@ -203,14 +205,14 @@ impl<'a> DynScannable<'a> {
         unsafe { (self.column_type)(self.scannable.as_ptr(), column) }
     }
 
-    /// The forms `column` can be written in, besides flat.
+    /// The forms `column` can be written in.
     pub fn forms(&self, column: u32) -> Forms {
         // SAFETY: as above.
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }
     }
 
     /// A source of `columns` of this, in that order, writing each in the
-    /// forms of `forms` it says, besides flat.
+    /// one of the forms at its place in `forms`.
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
@@ -219,7 +221,11 @@ impl<'a> DynScannable<'a> {
         let columns = SlowVec::fixed_from(allocator, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         let column_count = self.column_count();
-        let allowed = |&(c, f): &(u32, Forms)| c < column_count && self.forms(c).contains(f);
+        // Each set holds flat, which every scannable can write, so checked
+        // here, once, not for every column of every batch.
+        let allowed = |&(c, f): &(u32, Forms)| {
+            c < column_count && f.contains(Forms::FLAT) && self.forms(c).contains(f)
+        };
         check!(columns.iter().all(allowed));
         let scan = Scan { scannable: NonNull::from(self).cast(), columns };
         let step = Box::new(allocator, scan)?.erase();
@@ -237,13 +243,16 @@ impl<'a> DynScannable<'a> {
     }
 
     /// A transform that loads the lazy columns at `positions` in batches,
-    /// which this wrote, for the rows each batch keeps.
+    /// which this wrote, for the rows each batch keeps, each in one of its
+    /// `forms`.
     pub fn materialize(
         &self,
         allocator: &dyn Allocator,
         positions: SlowVec<u32>,
+        forms: SlowVec<Forms>,
     ) -> Result<DynTransform<'_>, AllocError> {
-        let materialize = Materialize { scannable: NonNull::from(self).cast(), positions };
+        check!(forms.len() == positions.len() && forms.iter().all(|f| f.contains(Forms::FLAT)));
+        let materialize = Materialize { scannable: NonNull::from(self).cast(), positions, forms };
         let step = Box::new(allocator, materialize)?.erase();
         // SAFETY: the functions take a `Materialize` and the scannable's
         // loader, and the `Materialize` borrows `self` for as long as the
@@ -265,14 +274,18 @@ struct Scan {
     /// What's read.
     scannable: NonNull<DynScannable<'static>>,
     /// Which of its columns, in order, each with the forms it may be
-    /// written in, besides flat.
+    /// written in.
     columns: SlowVec<(u32, Forms)>,
 }
 
 /// A transform that loads lazy columns a `DynScannable` wrote.
 struct Materialize {
+    /// What wrote the lazy columns.
     scannable: NonNull<DynScannable<'static>>,
+    /// Where they are in batches.
     positions: SlowVec<u32>,
+    /// The forms each may be loaded in.
+    forms: SlowVec<Forms>,
 }
 
 unsafe fn scan_new_state(
@@ -324,13 +337,14 @@ unsafe fn materialize_process(
     let materialize = unsafe { step.cast::<Materialize>().as_ref() };
     // SAFETY: as in `materialize_new_state`.
     let scannable = unsafe { materialize.scannable.as_ref() };
-    for &position in materialize.positions.iter() {
+    for (&position, &forms) in materialize.positions.iter().zip(materialize.forms.iter()) {
         let lazy = batch.column(position);
         check!(lazy.is_lazy());
+        let selection = batch.selection();
         // SAFETY: the function matches the scannable's type, and `loader`
         // holds its loader.
         let column = unsafe {
-            (scannable.load)(scannable.scannable.as_ptr(), context, loader, lazy, batch.selection())
+            (scannable.load)(scannable.scannable.as_ptr(), context, loader, lazy, selection, forms)
         }?;
         check!(!column.is_lazy() && column.row_count() == batch.row_count());
         batch.set_column(position, column);
@@ -492,7 +506,7 @@ mod tests {
         }
 
         fn forms(&self, _: u32) -> Forms {
-            Forms::LAZY
+            Forms::FLAT | Forms::LAZY
         }
 
         fn new_loader(&self, _: &mut Context) -> Result<(), Error> {
@@ -505,6 +519,7 @@ mod tests {
             (): &mut (),
             lazy: &ColumnView,
             selection: &Selection,
+            _: Forms,
         ) -> Result<ColumnView, Error> {
             let (handle, _) = lazy.handle();
             let rows: StdVec<u16> = match selection.kept() {
@@ -542,10 +557,11 @@ mod tests {
     fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
         let loads = RefCell::new(StdVec::new());
         let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
-        let source = scannable.scan(&Heap, [(0, Forms::LAZY)].into_iter()).unwrap();
+        let source = scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter()).unwrap();
         let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
         let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
-        let load = Step::Transform(scannable.materialize(&Heap, positions).unwrap());
+        let flat = SlowVec::fixed_from(&Heap, [Forms::FLAT].into_iter()).unwrap();
+        let load = Step::Transform(scannable.materialize(&Heap, positions, flat).unwrap());
         let pipeline =
             Pipeline::new(source, SlowVec::fixed_from(&Heap, [keep, load].into_iter()).unwrap());
         let query = QueryAllocators::new(&Heap);

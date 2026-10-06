@@ -63,35 +63,38 @@ pub trait Op<'c> {
         reads.need_all();
     }
 
-    /// Of the columns this reads, the forms it takes `column` in, besides
-    /// flat. By default, none.
+    /// Of the columns this reads, the forms it takes `column` in. By default,
+    /// flat only.
     fn accepts(&self, column: ColumnId) -> Forms {
         let _ = column;
         Forms::FLAT
     }
 
     /// Tells this, if it makes `column`, the forms the plan allows it in,
-    /// besides flat, and returns those of them it will make it in. By
-    /// default, none.
+    /// and returns those of them it will make it in. By default, flat only.
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
         let _ = (column, allowed);
         Forms::FLAT
     }
 
-    /// The op that loads `columns`, which this makes lazy, to put above it.
-    /// Only called for columns `allow` said it would make lazy.
+    /// The op that loads `columns`, which this makes lazy, each in one of
+    /// the forms given with it, to put above it. Only called for columns
+    /// `allow` said it would make lazy.
     fn materialize(
         &self,
         allocator: &dyn Allocator,
-        columns: SlowVec<ColumnId>,
+        columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         let _ = (allocator, columns);
         crate::check::check_failed(line!())
     }
 }
 
-type Materialize<'c> =
-    unsafe fn(NonNull<()>, &dyn Allocator, SlowVec<ColumnId>) -> Result<DynOp<'c>, AllocError>;
+type Materialize<'c> = unsafe fn(
+    NonNull<()>,
+    &dyn Allocator,
+    SlowVec<(ColumnId, Forms)>,
+) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
 /// allocator, and the function that knows its type.
@@ -166,7 +169,7 @@ impl<'c> DynOp<'c> {
     pub(crate) fn materialize(
         &self,
         allocator: &dyn Allocator,
-        columns: SlowVec<ColumnId>,
+        columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.materialize)(self.op.as_ptr(), allocator, columns) }
@@ -251,7 +254,7 @@ pub struct ScanColumn {
     pub column: u32,
     /// What it's bound to.
     pub binding: NamedColumn,
-    /// The forms it's read in, besides flat, which the plan chooses.
+    /// The forms it's read in, which the plan chooses.
     pub forms: Forms,
 }
 
@@ -294,17 +297,17 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn materialize(
         &self,
         allocator: &dyn Allocator,
-        columns: SlowVec<ColumnId>,
+        columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
     }
 }
 
 /// Loads `columns` of its one child's batches, which a scan of `scannable`
-/// made lazy, for the rows each keeps.
+/// made lazy, for the rows each keeps, each in one of the forms with it.
 pub struct MaterializeOp<'c> {
     scannable: &'c DynScannable<'c>,
-    columns: SlowVec<ColumnId>,
+    columns: SlowVec<(ColumnId, Forms)>,
 }
 
 impl<'c> Op<'c> for MaterializeOp<'c> {
@@ -315,15 +318,17 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
-        let positions = self.columns.iter().map(|&column| lowering.position(column));
+        let positions = self.columns.iter().map(|&(column, _)| lowering.position(column));
         let positions = SlowVec::fixed_from(lowering.allocator(), positions)?;
-        let transform = self.scannable.materialize(lowering.allocator(), positions)?;
+        let forms = self.columns.iter().map(|&(_, forms)| forms);
+        let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
+        let transform = self.scannable.materialize(lowering.allocator(), positions, forms)?;
         lowering.add_step(Step::Transform(transform))
     }
 
     /// Keeps loading the needed columns, if any.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        self.columns.retain(|&column| needed.is_needed(column));
+        self.columns.retain(|&(column, _)| needed.is_needed(column));
         if self.columns.is_empty() { Pruned::Child(0) } else { Pruned::Keep }
     }
 
@@ -362,5 +367,10 @@ impl<'c> Op<'c> for FilterOp {
         for column in self.predicate.columns() {
             reads.need(column);
         }
+    }
+
+    /// Flat, and constants, which it tests once. Not dictionaries yet.
+    fn accepts(&self, _: ColumnId) -> Forms {
+        Forms::FLAT | Forms::CONSTANT
     }
 }

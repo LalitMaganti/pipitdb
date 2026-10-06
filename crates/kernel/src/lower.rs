@@ -519,7 +519,7 @@ mod tests {
         }
 
         fn forms(&self, _: u32) -> Forms {
-            if self.lazy { Forms::LAZY } else { Forms::FLAT }
+            if self.lazy { Forms::FLAT | Forms::LAZY } else { Forms::FLAT }
         }
 
         fn new_loader(&self, _: &mut Context) -> Result<(), Error> {
@@ -532,6 +532,7 @@ mod tests {
             (): &mut (),
             lazy: &ColumnView,
             selection: &Selection,
+            _: Forms,
         ) -> Result<ColumnView, Error> {
             let (handle, start) = lazy.handle();
             let (column, batch) = (handle[0], handle[1]);
