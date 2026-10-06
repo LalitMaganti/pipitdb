@@ -1,5 +1,10 @@
-//! Validity bitmaps: setting runs of bits, and moving values to the rows
-//! that aren't null.
+//! Validity bitmaps: reading bits, setting runs of them, and moving values
+//! to the rows that aren't null.
+
+/// Whether bit `at` of `bits` is set.
+pub(crate) fn get(bits: &[u8], at: usize) -> bool {
+    *at!(bits, at / 8) >> (at % 8) & 1 == 1
+}
 
 /// Sets bits `start..start + count` of `bits`.
 pub(crate) fn set(bits: &mut [u8], start: usize, count: usize) {

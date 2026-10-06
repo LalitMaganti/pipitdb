@@ -6,7 +6,7 @@ use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
-use pipit_kernel::selection::Selection;
+use pipit_kernel::selection::{Kept, Selection};
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{DynSource, Source};
 
@@ -16,6 +16,10 @@ use crate::{Codec, Error, bounds};
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
+
+/// A batch keeps few rows if fewer than one in this many: then `load`
+/// decodes only those.
+const KEPT_FEW: usize = 8;
 
 /// The most row groups a pruned scan reads, in all files.
 const ROW_GROUPS_MAX: usize = 1 << 24;
@@ -274,14 +278,15 @@ impl<'a> Scannable for ParquetTable<'a> {
         Ok(Loader { readers: SlowVec::fixed(context.allocator(), BATCH_COLUMNS_MAX as usize)? })
     }
 
-    /// Reads all the rows of `lazy`, whichever are kept, keeping a reader
-    /// for each column from batch to batch.
+    /// Reads the rows of `lazy` `selection` keeps, keeping a reader for each
+    /// column from batch to batch. Only those rows' values are decoded when
+    /// few are kept; all are otherwise, which is faster per row.
     fn load(
         &self,
         context: &mut Context,
         loader: &mut Loader<'a>,
         lazy: &ColumnView,
-        _: &Selection,
+        selection: &Selection,
         forms: Forms,
     ) -> Result<ColumnView, Error> {
         let (bytes, start) = lazy.handle();
@@ -313,7 +318,13 @@ impl<'a> Scannable for ParquetTable<'a> {
         };
         let reader = &mut at_mut!(loader.readers, at).1;
         reader.go_to(context, handle.header, handle.row as usize + start as usize)?;
-        reader.read(context, lazy.row_count() as usize, forms)
+        let rows = lazy.row_count() as usize;
+        match selection.kept() {
+            Kept::Select(kept) if kept.len() < rows / KEPT_FEW => {
+                reader.read_kept(context, rows, kept, forms)
+            }
+            _ => reader.read(context, rows, forms),
+        }
     }
 
     fn open<'s>(
