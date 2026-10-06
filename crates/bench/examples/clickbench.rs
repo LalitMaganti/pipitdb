@@ -14,8 +14,7 @@ use std::time::Instant;
 use pipit_file::source::FileSource;
 use pipit_kernel::allocator::{Heap, LimitAllocator};
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{ColumnView, DataType, Forms};
-use pipit_kernel::context::Context;
+use pipit_kernel::column::{ColumnView, DataType, Form};
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::query_allocators::QueryAllocators;
@@ -122,10 +121,11 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// A batch's columns, made flat, and its kept rows.
+/// A batch's columns, in the forms the plan made them, and its kept rows.
 type Batch = (Vec<ColumnView>, Vec<u32>);
 
-/// The batches `query` makes: their columns, made flat, and kept rows.
+/// The batches `query` makes: their columns, as made, and kept rows. As
+/// another engine's results, they're columns, read only for the rows kept.
 /// Runs it with memory from `allocators`, which must outlive the batches.
 fn run(hits: &Hits, query: &str, allocators: &QueryAllocators) -> Result<Vec<Batch>, String> {
     let mut plan =
@@ -141,24 +141,23 @@ fn run(hits: &Hits, query: &str, allocators: &QueryAllocators) -> Result<Vec<Bat
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| u32::from(row)).collect(),
         };
-        let mut context = Context::new(&Heap);
-        let mut columns = Vec::new();
-        for c in physical.columns() {
-            let mut column = batch.column(c.position).clone();
-            column.make_in(&mut context, Forms::FLAT).map_err(|e| format!("{e:?}"))?;
-            columns.push(column);
-        }
-        rows.push((columns, kept));
+        let columns = physical.columns().iter().map(|c| batch.column(c.position).clone());
+        rows.push((columns.collect(), kept));
     }
     Ok(rows)
 }
 
 fn text(column: &ColumnView, row: u32) -> String {
-    let r = row as usize;
+    let values = column.values();
+    let value = match column.form() {
+        Form::Flat => row as usize,
+        Form::Constant => 0,
+        Form::Dictionary(indices) => indices[row as usize] as usize,
+    };
     match column.data_type() {
         _ if column.is_null(row) => "NULL".into(),
-        DataType::Int64 => column.int64s()[r].to_string(),
-        DataType::Float64 => column.float64s()[r].to_string(),
-        DataType::String => String::from_utf8_lossy(column.string_values().get(r)).into(),
+        DataType::Int64 => values.int64s()[value].to_string(),
+        DataType::Float64 => values.float64s()[value].to_string(),
+        DataType::String => String::from_utf8_lossy(values.strings().get(value)).into(),
     }
 }
