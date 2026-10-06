@@ -12,7 +12,8 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
-use crate::column::{Bounds, ColumnView, DataType, Forms};
+use crate::column::{ColumnView, DataType, Forms};
+use crate::condition::{CONDITIONS_MAX, Condition};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
@@ -66,18 +67,18 @@ pub trait Scannable {
     ) -> Result<bool, Error>;
 
     /// A source of `columns`, read as `open` would, that may leave out rows
-    /// whose values are outside `ranges`, given by column: what the plan
-    /// pushes down, as the values of each column everything above keeps.
-    /// It's of whatever type suits, such as one that skips what statistics
-    /// rule out, or `None` to read with `open`. Its lazy columns are loaded
-    /// by this, as `open`'s are. By default, `None`.
+    /// failing `conditions`, which the plan pushed down from filters: the
+    /// filters still test every row. It's of whatever type suits, such as
+    /// one that skips what statistics rule out, or `None` to read with
+    /// `open`. Its lazy columns are loaded by this, as `open`'s are. By
+    /// default, `None`.
     fn scan_within<'s>(
         &'s self,
         allocator: &dyn Allocator,
         columns: &[(u32, Forms)],
-        ranges: &[(u32, Bounds)],
+        conditions: &[Condition],
     ) -> Result<Option<DynSource<'s>>, AllocError> {
-        let _ = (allocator, columns, ranges);
+        let _ = (allocator, columns, conditions);
         Ok(None)
     }
 
@@ -124,7 +125,7 @@ type ScannableScanWithin<'a> = unsafe fn(
     NonNull<()>,
     &dyn Allocator,
     &[(u32, Forms)],
-    &[(u32, Bounds)],
+    &[Condition],
 ) -> Result<Option<DynSource<'a>>, AllocError>;
 
 type ScannableNext =
@@ -197,8 +198,8 @@ impl<'a> DynScannable<'a> {
             },
             // SAFETY: as above. The source borrows the scannable, for as
             // long as `scan` says.
-            scan_within: |scannable, allocator, columns, ranges| unsafe {
-                value_of::<T>(scannable).scan_within(allocator, columns, ranges)
+            scan_within: |scannable, allocator, columns, conditions| unsafe {
+                value_of::<T>(scannable).scan_within(allocator, columns, conditions)
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
@@ -241,13 +242,13 @@ impl<'a> DynScannable<'a> {
     }
 
     /// A source of `columns` of this, in that order, each written in one of
-    /// the forms with it. It may leave out rows whose values are outside
-    /// `ranges`, given by column, if `scan_within` gives one that does.
+    /// the forms with it, maybe skipping rows failing `conditions`, on those
+    /// columns.
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
         columns: impl ExactSizeIterator<Item = (u32, Forms)>,
-        ranges: &[(u32, Bounds)],
+        conditions: &[Condition],
     ) -> Result<DynSource<'_>, AllocError> {
         let columns = SlowVec::fixed_from(allocator, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
@@ -258,12 +259,14 @@ impl<'a> DynScannable<'a> {
             c < column_count && f.contains(Forms::FLAT) && self.forms(c).contains(f)
         };
         check!(columns.iter().all(allowed));
-        check!(ranges.iter().all(|&(column, _)| column < column_count));
-        if !ranges.is_empty() {
+        check!(conditions.len() <= CONDITIONS_MAX);
+        let read = |condition: &Condition| columns.iter().any(|&(c, _)| c == condition.column());
+        check!(conditions.iter().all(read));
+        if !conditions.is_empty() {
             // SAFETY: the function matches the scannable's type, and the
             // source borrows `self`.
             let within = unsafe {
-                (self.scan_within)(self.scannable.as_ptr(), allocator, &columns, ranges)?
+                (self.scan_within)(self.scannable.as_ptr(), allocator, &columns, conditions)?
             };
             if let Some(source) = within {
                 return Ok(source);
@@ -273,7 +276,7 @@ impl<'a> DynScannable<'a> {
         let step = Box::new(allocator, scan)?.erase();
         // SAFETY: the functions take a `Scan` and the scannable's state, and
         // the `Scan` borrows `self` for as long as the source lives.
-        Ok(unsafe {
+        let source = unsafe {
             DynSource::from_parts(
                 step,
                 self.state_layout,
@@ -281,7 +284,8 @@ impl<'a> DynScannable<'a> {
                 self.drop_state,
                 scan_next,
             )
-        })
+        };
+        Ok(source)
     }
 
     /// A transform that loads the lazy columns at `positions` in batches,

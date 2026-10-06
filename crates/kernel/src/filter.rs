@@ -251,14 +251,14 @@ pub fn is_null(
 /// The keys `lo` to `lo + span`, wrapping from `i64::MAX` to `i64::MIN`, so
 /// one test covers every comparison: `!= v` is `v + 1` round to `v - 1`.
 #[derive(Clone, Copy)]
-struct Range {
-    lo: i64,
-    span: u64,
+pub(crate) struct Range {
+    pub(crate) lo: i64,
+    pub(crate) span: u64,
 }
 
 impl Range {
     /// The keys `key <comparison> value` is true for, or `None` if none.
-    fn of(comparison: Comparison, value: i64) -> Option<Range> {
+    pub(crate) fn of(comparison: Comparison, value: i64) -> Option<Range> {
         let (lo, hi) = match comparison {
             Comparison::Equal => (value, value),
             Comparison::NotEqual => (value.wrapping_add(1), value.wrapping_sub(1)),
@@ -267,12 +267,18 @@ impl Range {
             Comparison::Greater => (value.checked_add(1)?, i64::MAX),
             Comparison::GreaterEqual => (value, i64::MAX),
         };
-        Some(Range { lo, span: hi.wrapping_sub(lo).cast_unsigned() })
+        Some(Range::between(lo, hi))
+    }
+
+    /// The keys `lo` to `hi`, round from `i64::MAX` to `i64::MIN` if `hi`
+    /// is below `lo`.
+    pub(crate) fn between(lo: i64, hi: i64) -> Range {
+        Range { lo, span: hi.wrapping_sub(lo).cast_unsigned() }
     }
 
     /// One subtraction and one comparison, with no branch.
     #[inline]
-    fn contains(self, key: i64) -> bool {
+    pub(crate) fn contains(self, key: i64) -> bool {
         key.wrapping_sub(self.lo).cast_unsigned() <= self.span
     }
 }

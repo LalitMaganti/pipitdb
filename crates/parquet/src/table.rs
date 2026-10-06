@@ -2,7 +2,8 @@
 
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
+use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::condition::Condition;
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
@@ -360,19 +361,19 @@ impl<'a> Scannable for ParquetTable<'a> {
         }
     }
 
-    /// Skips the row groups whose footer statistics rule out a range.
+    /// Skips the row groups whose footer statistics rule out a condition.
     fn scan_within<'s>(
         &'s self,
         allocator: &dyn Allocator,
         columns: &[(u32, Forms)],
-        ranges: &[(u32, Bounds)],
+        conditions: &[Condition],
     ) -> Result<Option<DynSource<'s>>, AllocError> {
         let may_keep = |file: &File, group: usize| {
-            ranges.iter().all(|&(column, range)| {
-                let c = column as usize;
+            conditions.iter().all(|condition| {
+                let c = condition.column() as usize;
                 let chunk = file.footer.chunk(group, c);
                 let bounds = bounds::of_chunk(*at!(file.footer.columns(), c), chunk);
-                bounds.is_none_or(|bounds| bounds.overlaps(range))
+                bounds.is_none_or(|bounds| condition.may_keep(bounds))
             })
         };
         let mut groups = SlowVec::new(allocator, ROW_GROUPS_MAX)?;
@@ -402,7 +403,9 @@ mod tests {
     use std::vec::Vec;
 
     use pipit_kernel::allocator::Heap;
+    use pipit_kernel::filter::{Comparison, Value};
     use pipit_kernel::pipeline::Pipeline;
+    use pipit_kernel::predicate::{Leaf, Node, Predicate};
     use pipit_kernel::query_allocators::QueryAllocators;
     use pipit_kernel::scannable::DynScannable;
 
@@ -542,6 +545,19 @@ mod tests {
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 
+    /// `min <= column 0 AND column 0 <= max`.
+    fn between(min: i64, max: i64) -> Predicate {
+        let compare = |comparison, value| {
+            Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
+        };
+        let nodes = [
+            compare(Comparison::GreaterEqual, min),
+            compare(Comparison::LessEqual, max),
+            Node::And(0, 1),
+        ];
+        Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap())
+    }
+
     #[test]
     fn skips_row_groups_statistics_rule_out() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
@@ -549,8 +565,9 @@ mod tests {
         // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
         // to 4999.
         let ids = |min, max| {
-            let ranges = [(0, Bounds { min, max })];
-            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &ranges).unwrap();
+            // Not exact: it only skips.
+            let conditions = [Condition::new(0, &between(min, max))];
+            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions).unwrap();
             let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
             let query = QueryAllocators::new(&Heap);
             let mut execution = pipeline.start(&query).unwrap();

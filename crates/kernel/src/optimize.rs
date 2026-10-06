@@ -3,14 +3,16 @@
 //! are optimized too.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{Bounds, Forms};
-use crate::plan::{ColumnId, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId};
+use crate::column::Forms;
+use crate::plan::{
+    ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
+};
 use crate::slow_vec::SlowVec;
 
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
-    push_down_ranges(allocator, plan)?;
+    push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
 
@@ -101,33 +103,30 @@ fn parents(
     Ok(parents)
 }
 
-/// Pushes down what filters keep: tells each node the values of each column
-/// that every node above it keeps, up to the first that passes on other
-/// rows, so a source can leave out rows outside them. The filters still
-/// test every row they're given.
-pub fn push_down_ranges(
+/// Pushes conditions down: for each column a node makes and takes
+/// conditions on, copies of the parts of filters' predicates above it that
+/// read only that column, up to the first op that passes on other rows, so
+/// it can skip rows failing them. The filters still test every row.
+pub fn push_down_conditions(
     allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     let parents = parents(allocator, plan)?;
-    for id in 0..plan.nodes.len() {
-        let mut ranges = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    for maker in 0..plan.nodes.len() {
         for column in (0..).take(plan.columns.len()) {
-            let mut kept = Bounds::ALL;
-            let mut at = *at!(parents, id);
+            if !at!(plan.nodes, maker).op.takes_condition(column) {
+                continue;
+            }
+            let mut at = *at!(parents, maker);
             while let Some((parent, _)) = at {
-                let Some(keeps) = at!(plan.nodes, parent as usize).op.keeps(column) else {
-                    break;
-                };
-                kept = kept.intersect(keeps);
+                let parent_op = &mut at_mut!(plan.nodes, parent as usize).op;
+                let given = parent_op.give_condition(allocator, column)?;
+                let Given::Passed(condition) = given else { break };
+                if let Some(condition) = condition {
+                    at_mut!(plan.nodes, maker).op.take_condition(allocator, column, condition)?;
+                }
                 at = *at!(parents, parent as usize);
             }
-            if kept != Bounds::ALL {
-                ranges.push((column, kept))?;
-            }
-        }
-        if !ranges.is_empty() {
-            at_mut!(plan.nodes, id).op.restrict(allocator, &ranges)?;
         }
     }
     Ok(())
