@@ -28,7 +28,7 @@ fn main() -> Result<(), String> {
     for column in 0..table.column_count() {
         let mut context = Context::new(&Heap);
         let read = [(column, Forms::FLAT)];
-        let mut state = table.open(&mut context, &read).map_err(|e| format!("{e:?}"))?;
+        let mut state = table.open(&mut context, &read, None).map_err(|e| format!("{e:?}"))?;
         let mut batch = RowBatch::new();
         let (mut count, mut sum) = (0_u64, 0_i128);
         while table

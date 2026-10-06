@@ -2,7 +2,7 @@
 
 use pipit_kernel::allocator::Allocator;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{DataType, Forms};
+use pipit_kernel::column::{Bounds, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
@@ -10,13 +10,19 @@ use pipit_kernel::slow_vec::SlowVec;
 
 use crate::chunk::ChunkReader;
 use crate::footer::ParquetFile;
-use crate::{Codec, Error};
+use crate::{Codec, Error, bounds};
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
 
+/// The most row groups a table can have, in all its files.
+const ROW_GROUPS_MAX: usize = 1 << 24;
+
 pub struct ParquetTable<'a> {
     files: SlowVec<File<'a>>,
+    /// Each row group, numbered across the files in order: its file, and
+    /// which of the file's it is.
+    row_groups: SlowVec<(u32, u32)>,
     codecs: &'a dyn Codec,
 }
 
@@ -25,12 +31,13 @@ struct File<'a> {
     footer: ParquetFile,
 }
 
-/// Where a scan is: a file, a row group in it, and, once the group is
-/// started, a reader for each column read and how many rows are left.
+/// Where a scan is: how many of the row groups it reads are read, and,
+/// once one is started, a reader for each column read and how many rows are
+/// left.
 pub struct ScanState<'a> {
     columns: &'a [(u32, Forms)],
-    file: usize,
-    group: usize,
+    row_groups: Option<&'a [u32]>,
+    read: usize,
     readers: SlowVec<ChunkReader<'a>>,
     started: bool,
     left: u64,
@@ -58,7 +65,14 @@ impl<'a> ParquetTable<'a> {
         if files.is_empty() {
             return Err(Error::Unsupported);
         }
-        Ok(ParquetTable { files, codecs })
+        let mut row_groups = SlowVec::new(allocator, ROW_GROUPS_MAX)?;
+        for (file, footer) in (0..).zip(files.iter().map(|file| &file.footer)) {
+            for group in 0..footer.row_groups() {
+                let group = u32::try_from(group).map_err(|_| Error::Unsupported)?;
+                row_groups.push((file, group)).map_err(|_| Error::Unsupported)?;
+            }
+        }
+        Ok(ParquetTable { files, row_groups, codecs })
     }
 
     fn first(&self) -> &ParquetFile {
@@ -108,15 +122,29 @@ impl Scannable for ParquetTable<'_> {
         Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "at most `ROW_GROUPS_MAX`")]
+    fn row_group_count(&self) -> u32 {
+        self.row_groups.len() as u32
+    }
+
+    /// From the footer's statistics, and the column's type.
+    fn bounds(&self, row_group: u32, column: u32) -> Option<Bounds> {
+        let &(file, group) = at!(self.row_groups, row_group as usize);
+        let footer = &at!(self.files, file as usize).footer;
+        let chunk = footer.chunk(group as usize, column as usize);
+        bounds::of_chunk(*at!(footer.columns(), column as usize), chunk)
+    }
+
     fn open<'s>(
         &'s self,
         context: &mut Context,
         columns: &'s [(u32, Forms)],
+        row_groups: Option<&'s [u32]>,
     ) -> Result<ScanState<'s>, Error> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
         let readers = SlowVec::fixed(context.allocator(), columns.len())?;
-        Ok(ScanState { columns, file: 0, group: 0, readers, started: false, left: 0 })
+        Ok(ScanState { columns, row_groups, read: 0, readers, started: false, left: 0 })
     }
 
     fn next<'s>(
@@ -127,19 +155,23 @@ impl Scannable for ParquetTable<'_> {
     ) -> Result<bool, Error> {
         loop {
             if !state.started {
-                let Some(file) = self.files.get(state.file) else { return Ok(false) };
-                if state.group == file.footer.row_groups() {
-                    (state.file, state.group) = (state.file + 1, 0);
-                    continue;
-                }
+                let next = match state.row_groups {
+                    Some(row_groups) => row_groups.get(state.read).map(|&group| group as usize),
+                    None => Some(state.read),
+                };
+                let Some(&(file, group)) = next.and_then(|next| self.row_groups.get(next)) else {
+                    return Ok(false);
+                };
+                state.read += 1;
+                let (file, group) = (at!(self.files, file as usize), group as usize);
                 for &(column, _) in state.columns {
                     let c = column as usize;
-                    let chunk = file.footer.chunk(state.group, c);
+                    let chunk = file.footer.chunk(group, c);
                     let column = *at!(file.footer.columns(), c);
                     let reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
                     state.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
                 }
-                (state.started, state.left) = (true, file.footer.group_rows(state.group));
+                (state.started, state.left) = (true, file.footer.group_rows(group));
             }
             // A batch stays within each column's page, so pages are read
             // whole.
@@ -152,7 +184,7 @@ impl Scannable for ParquetTable<'_> {
                     return Err(Error::Corrupt);
                 }
                 state.readers.retain(|_| false);
-                (state.started, state.group) = (false, state.group + 1);
+                state.started = false;
                 continue;
             }
             batch.reset(rows);
@@ -185,7 +217,7 @@ mod tests {
     fn scan(table: &ParquetTable, columns: &[u32]) -> (usize, Vec<i64>) {
         let mut context = Context::new(&Heap);
         let read: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
-        let mut state = table.open(&mut context, &read).unwrap();
+        let mut state = table.open(&mut context, &read, None).unwrap();
         let mut batch = RowBatch::new();
         let (mut rows, mut ids) = (0, Vec::new());
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
@@ -233,7 +265,7 @@ mod tests {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
         let mut context = Context::new(&Heap);
         let read = [(0, Forms::FLAT), (1, Forms::FLAT), (2, Forms::FLAT)];
-        let mut state = table.open(&mut context, &read).unwrap();
+        let mut state = table.open(&mut context, &read, None).unwrap();
         let mut batch = RowBatch::new();
         assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
         let bounds = |c: u32| batch.column(c).bounds().map(|b| (b.min, b.max));
@@ -246,7 +278,7 @@ mod tests {
     fn reads_unsigned_integers_above_31_bits() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
         let mut context = Context::new(&Heap);
-        let mut state = table.open(&mut context, &[(1, Forms::FLAT)]).unwrap();
+        let mut state = table.open(&mut context, &[(1, Forms::FLAT)], None).unwrap();
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
@@ -272,7 +304,7 @@ mod tests {
         let first = |forms: Forms| {
             let mut context = Context::new(&Heap);
             let read = [(2, forms)];
-            let mut state = table.open(&mut context, &read).unwrap();
+            let mut state = table.open(&mut context, &read, None).unwrap();
             let mut batch = RowBatch::new();
             assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
             let column = batch.column(0).clone();
@@ -286,5 +318,29 @@ mod tests {
         let (kept, values) = first(Forms::FLAT | Forms::DICTIONARY);
         assert!(kept);
         assert_eq!(first(Forms::FLAT), (false, values));
+    }
+
+    #[test]
+    fn numbers_row_groups_across_files_and_reads_those_given() {
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES, &TYPES]).unwrap();
+        let per_file = table.row_group_count() / 2;
+        assert!(per_file >= 1 && table.row_group_count() == 2 * per_file);
+        // From the footer: the same for the same row group of the same file.
+        assert!(table.bounds(0, 0).is_some());
+        assert_eq!(table.bounds(per_file, 0), table.bounds(0, 0));
+        let read = [(0, Forms::FLAT)];
+        let rows = |row_groups: Option<&[u32]>| {
+            let mut context = Context::new(&Heap);
+            let mut state = table.open(&mut context, &read, row_groups).unwrap();
+            let mut batch = RowBatch::new();
+            let mut rows = 0;
+            while table.next(&mut context, &mut state, &mut batch).unwrap() {
+                rows += batch.row_count();
+            }
+            rows
+        };
+        let each: u32 = (0..table.row_group_count()).map(|group| rows(Some(&[group]))).sum();
+        assert_eq!(each, rows(None));
+        assert_eq!(rows(Some(&[])), 0);
     }
 }

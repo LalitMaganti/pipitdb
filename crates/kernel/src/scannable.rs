@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
-use crate::column::{ColumnView, DataType, Forms};
+use crate::column::{Bounds, ColumnView, DataType, Forms};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
@@ -46,12 +46,14 @@ pub trait Scannable {
 
     /// A read of `columns`, in that order, from the first row, each with
     /// the forms it may be written in, some of those `forms` says it can
-    /// write it in. What depends only on which columns are read
-    /// is worked out here, once, not for each batch.
+    /// write it in, of `row_groups`, in increasing order, or of every row
+    /// group if `None`. What depends only on what's read is worked out here,
+    /// once, not for each batch.
     fn open<'s>(
         &'s self,
         context: &mut Context,
         columns: &'s [(u32, Forms)],
+        row_groups: Option<&'s [u32]>,
     ) -> Result<Self::State<'s>, Error>;
 
     /// Resets `batch`, which holds the last batch, and fills it with the
@@ -69,6 +71,20 @@ pub trait Scannable {
     fn forms(&self, column: u32) -> Forms {
         let _ = column;
         Forms::FLAT
+    }
+
+    /// How many row groups it has: rows stored together, which a read takes
+    /// in order, and can skip. By default, one.
+    fn row_group_count(&self) -> u32 {
+        1
+    }
+
+    /// Bounds every value of `column` in row group `row_group` that isn't
+    /// null is within, if known before reading it, as from a Parquet
+    /// footer's statistics. By default, unknown.
+    fn bounds(&self, row_group: u32, column: u32) -> Option<Bounds> {
+        let _ = (row_group, column);
+        None
     }
 
     /// A loader, made for each run that loads columns. Only called if
@@ -101,8 +117,13 @@ pub trait Catalog {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>>;
 }
 
-type ScannableOpen =
-    unsafe fn(NonNull<()>, &mut Context, &[(u32, Forms)], NonNull<u8>) -> Result<(), Error>;
+type ScannableOpen = unsafe fn(
+    NonNull<()>,
+    &mut Context,
+    &[(u32, Forms)],
+    Option<&[u32]>,
+    NonNull<u8>,
+) -> Result<(), Error>;
 
 type ScannableNext =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, ErasedBatch) -> Result<bool, Error>;
@@ -128,6 +149,8 @@ pub struct DynScannable<'a> {
     drop_state: unsafe fn(NonNull<u8>),
     next: ScannableNext,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
+    row_group_count: unsafe fn(NonNull<()>) -> u32,
+    bounds: unsafe fn(NonNull<()>, u32, u32) -> Option<Bounds>,
     loader_layout: Layout,
     new_loader: NewState,
     drop_loader: unsafe fn(NonNull<u8>),
@@ -157,8 +180,8 @@ impl<'a> DynScannable<'a> {
             state_layout: Layout::new::<T::State<'a>>(),
             // SAFETY: as above. The state borrows the scan's columns, which
             // outlive it, as the scan's step drops its state first.
-            open: |scannable, context, columns, state| unsafe {
-                let made = value_of::<T>(scannable).open(context, columns)?;
+            open: |scannable, context, columns, row_groups, state| unsafe {
+                let made = value_of::<T>(scannable).open(context, columns, row_groups)?;
                 write_state(state, made);
                 Ok(())
             },
@@ -173,6 +196,12 @@ impl<'a> DynScannable<'a> {
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
+            // SAFETY: as above.
+            row_group_count: |scannable| unsafe { value_of::<T>(scannable).row_group_count() },
+            // SAFETY: as above.
+            bounds: |scannable, row_group, column| unsafe {
+                value_of::<T>(scannable).bounds(row_group, column)
+            },
             loader_layout: Layout::new::<T::Loader>(),
             // SAFETY: as above.
             new_loader: |scannable, context, loader| unsafe {
@@ -211,13 +240,33 @@ impl<'a> DynScannable<'a> {
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }
     }
 
-    /// A source of `columns` of this, in that order, writing each in the
-    /// one of the forms at its place in `forms`.
+    /// How many row groups it has.
+    pub fn row_group_count(&self) -> u32 {
+        // SAFETY: as above.
+        unsafe { (self.row_group_count)(self.scannable.as_ptr()) }
+    }
+
+    /// Bounds every value of `column` in row group `row_group` that isn't
+    /// null is within, if known.
+    pub fn bounds(&self, row_group: u32, column: u32) -> Option<Bounds> {
+        // SAFETY: as above.
+        unsafe { (self.bounds)(self.scannable.as_ptr(), row_group, column) }
+    }
+
+    /// A source of `columns` of this, in that order, each written in one of
+    /// the forms with it, from `row_groups`, in increasing order, or from
+    /// every row group if `None`.
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
         columns: impl ExactSizeIterator<Item = (u32, Forms)>,
+        row_groups: Option<SlowVec<u32>>,
     ) -> Result<DynSource<'_>, AllocError> {
+        if let Some(row_groups) = &row_groups {
+            let count = self.row_group_count();
+            check!(row_groups.iter().all(|&group| group < count));
+            check!(row_groups.windows(2).all(|pair| pair[0] < pair[1]));
+        }
         let columns = SlowVec::fixed_from(allocator, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         let column_count = self.column_count();
@@ -227,7 +276,7 @@ impl<'a> DynScannable<'a> {
             c < column_count && f.contains(Forms::FLAT) && self.forms(c).contains(f)
         };
         check!(columns.iter().all(allowed));
-        let scan = Scan { scannable: NonNull::from(self).cast(), columns };
+        let scan = Scan { scannable: NonNull::from(self).cast(), columns, row_groups };
         let step = Box::new(allocator, scan)?.erase();
         // SAFETY: the functions take a `Scan` and the scannable's state, and
         // the `Scan` borrows `self` for as long as the source lives.
@@ -276,6 +325,8 @@ struct Scan {
     /// Which of its columns, in order, each with the forms it may be
     /// written in.
     columns: SlowVec<(u32, Forms)>,
+    /// Which of its row groups, in order, or all.
+    row_groups: Option<SlowVec<u32>>,
 }
 
 /// A transform that loads lazy columns a `DynScannable` wrote.
@@ -297,8 +348,11 @@ unsafe fn scan_new_state(
     let scan = unsafe { step.cast::<Scan>().as_ref() };
     // SAFETY: as above.
     let scannable = unsafe { scan.scannable.as_ref() };
+    let row_groups = scan.row_groups.as_deref();
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.open)(scannable.scannable.as_ptr(), context, &scan.columns, state) }
+    unsafe {
+        (scannable.open)(scannable.scannable.as_ptr(), context, &scan.columns, row_groups, state)
+    }
 }
 
 unsafe fn scan_next(
@@ -394,6 +448,7 @@ mod tests {
             &'s self,
             _: &mut Context,
             columns: &'s [(u32, Forms)],
+            _: Option<&[u32]>,
         ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
             Ok((false, columns))
         }
@@ -443,8 +498,10 @@ mod tests {
     fn scans_chosen_columns_through_a_pipeline() {
         let scannable = DynScannable::new(&Heap, Columns).unwrap();
         let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
-        let pipeline =
-            Pipeline::new(scannable.scan(&Heap, columns).unwrap(), SlowVec::new(&Heap, 1).unwrap());
+        let pipeline = Pipeline::new(
+            scannable.scan(&Heap, columns, None).unwrap(),
+            SlowVec::new(&Heap, 1).unwrap(),
+        );
         let query = QueryAllocators::new(&Heap);
         let mut execution = pipeline.start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -484,6 +541,7 @@ mod tests {
             &'s self,
             _: &mut Context,
             columns: &'s [(u32, Forms)],
+            _: Option<&[u32]>,
         ) -> Result<(u8, &'s [(u32, Forms)]), Error> {
             Ok((0, columns))
         }
@@ -557,7 +615,8 @@ mod tests {
     fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
         let loads = RefCell::new(StdVec::new());
         let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
-        let source = scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter()).unwrap();
+        let source =
+            scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), None).unwrap();
         let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
         let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
         let flat = SlowVec::fixed_from(&Heap, [Forms::FLAT].into_iter()).unwrap();
@@ -577,5 +636,13 @@ mod tests {
         assert_eq!(kept, [1, 3, 11, 13]);
         // Each batch is loaded once, for the rows it keeps.
         assert_eq!(*loads.borrow(), [(0, vec![1, 3]), (1, vec![1, 3])]);
+    }
+
+    #[test]
+    #[should_panic(expected = "windows")]
+    fn scans_check_their_row_groups_are_in_order() {
+        let scannable = DynScannable::new(&Heap, Columns).unwrap();
+        let row_groups = SlowVec::fixed_from(&Heap, [0, 0].into_iter()).unwrap();
+        let _ = scannable.scan(&Heap, [(0, Forms::FLAT)].into_iter(), Some(row_groups));
     }
 }

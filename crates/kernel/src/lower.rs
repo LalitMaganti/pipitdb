@@ -155,7 +155,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
-    use crate::column::{ColumnView, DataType, Forms};
+    use crate::column::{Bounds, ColumnView, DataType, Forms};
     use crate::context::Context;
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
@@ -193,6 +193,7 @@ mod tests {
             &'s self,
             _: &mut Context,
             columns: &'s [(u32, Forms)],
+            _: Option<&[u32]>,
         ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
             Ok((false, columns))
         }
@@ -319,6 +320,7 @@ mod tests {
             &'s self,
             _: &mut Context,
             columns: &'s [(u32, Forms)],
+            _: Option<&[u32]>,
         ) -> Result<(bool, &'s [(u32, Forms)]), Error> {
             Ok((false, columns))
         }
@@ -422,7 +424,12 @@ mod tests {
             DataType::Int64
         }
 
-        fn open(&self, _: &mut Context, _: &[(u32, Forms)]) -> Result<(), Error> {
+        fn open(
+            &self,
+            _: &mut Context,
+            _: &[(u32, Forms)],
+            _: Option<&[u32]>,
+        ) -> Result<(), Error> {
             Ok(())
         }
 
@@ -466,7 +473,7 @@ mod tests {
 
     impl Scannable for Counted<'_> {
         type State<'s>
-            = (u8, &'s [(u32, Forms)])
+            = (u8, Option<&'s [u32]>, &'s [(u32, Forms)])
         where
             Self: 's;
         type Loader = ();
@@ -487,35 +494,49 @@ mod tests {
             &'s self,
             _: &mut Context,
             columns: &'s [(u32, Forms)],
-        ) -> Result<(u8, &'s [(u32, Forms)]), Error> {
-            Ok((0, columns))
+            row_groups: Option<&'s [u32]>,
+        ) -> Result<(u8, Option<&'s [u32]>, &'s [(u32, Forms)]), Error> {
+            Ok((0, row_groups, columns))
         }
 
         fn next(
             &self,
             context: &mut Context,
-            (batches, columns): &mut (u8, &[(u32, Forms)]),
+            (read, row_groups, columns): &mut (u8, Option<&[u32]>, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
-            if *batches == 3 {
+            let group = match row_groups {
+                Some(row_groups) => row_groups.get(usize::from(*read)).copied(),
+                None => Some(u32::from(*read)).filter(|&group| group < 3),
+            };
+            let Some(group) = group.map(|group| u8::try_from(group).unwrap()) else {
                 return Ok(false);
-            }
+            };
             batch.reset(4);
             for &(column, forms) in *columns {
                 let column = if forms.contains(Forms::LAZY) {
-                    let handle = [u8::try_from(column).unwrap(), *batches];
+                    let handle = [u8::try_from(column).unwrap(), group];
                     ColumnView::lazy(context, DataType::Int64, &handle, 4).unwrap()
                 } else {
                     let mut values = context.values_buffer(4 * 8).unwrap();
                     for (row, value) in (0..).zip(values.as_mut_slice::<i64>()) {
-                        *value = 100 * i64::from(column) + 10 * i64::from(*batches) + row;
+                        *value = 100 * i64::from(column) + 10 * i64::from(group) + row;
                     }
                     ColumnView::new(context, DataType::Int64, values, None).unwrap()
                 };
                 assert!(batch.push_column(column).is_ok());
             }
-            *batches += 1;
+            *read += 1;
             Ok(true)
+        }
+
+        fn row_group_count(&self) -> u32 {
+            3
+        }
+
+        fn bounds(&self, row_group: u32, column: u32) -> Option<Bounds> {
+            let min = 100 * i64::from(column) + 10 * i64::from(row_group);
+            Some(Bounds { min, max: min + 3 })
         }
 
         fn forms(&self, _: u32) -> Forms {
@@ -618,6 +639,21 @@ mod tests {
         let b = [(1, 1, vec![2, 3]), (1, 2, vec![0, 1, 2, 3])];
         let c = [(2, 1, vec![2, 3]), (2, 2, vec![0, 1])];
         assert_eq!(*loads.borrow(), [b[0].clone(), c[0].clone(), b[1].clone(), c[1].clone()]);
+    }
+
+    #[test]
+    fn skips_row_groups_filters_rule_out() {
+        let loads = RefCell::new(StdVec::new());
+        let table = DynScannable::new(&Heap, Counted { lazy: false, loads: &loads }).unwrap();
+        // `a > 11` rules out batch 0, whose `a` is 0 to 3, and `b > 115`
+        // batch 1, whose `b` is 110 to 113: only batch 2 is read.
+        let filters = [(0, Comparison::Greater, 11), (1, Comparison::Greater, 115)];
+        assert_eq!(
+            counted(&table, &filters, &[0]),
+            (vec![vec![20], vec![21], vec![22], vec![23]], 4)
+        );
+        // Bounds that rule nothing out read every batch.
+        assert_eq!(counted(&table, &[(0, Comparison::Less, 100)], &[]).1, 12);
     }
 
     #[test]

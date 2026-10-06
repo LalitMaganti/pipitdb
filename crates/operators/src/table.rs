@@ -2,7 +2,7 @@
 //! footer, which pipelines can scan.
 
 use pipit_kernel::allocator::{AllocError, Allocator};
-use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
@@ -35,7 +35,7 @@ impl Table {
         columns: &[(&str, DataType)],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
-        check!(u32::try_from(columns.len()).is_ok());
+        check!(u32::try_from(columns.len()).is_ok() && u32::try_from(row_groups.len()).is_ok());
         let mut groups = SlowVec::fixed(allocator, row_groups.len())?;
         for &views in row_groups {
             check!(views.len() == columns.len());
@@ -86,8 +86,10 @@ pub struct ScanState<'s> {
     /// Whether each column read is stored only in forms allowed, so all are
     /// lent as they are; known when opened.
     lend: bool,
-    /// The next row group.
-    row_group: usize,
+    /// The row groups read, in order, or all.
+    row_groups: Option<&'s [u32]>,
+    /// How many of them are read already.
+    read: usize,
 }
 
 /// Reads each row group as one batch. Nothing is copied, and the batch
@@ -113,15 +115,26 @@ impl Scannable for Table {
         at!(self.columns, column as usize).2
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
+    fn row_group_count(&self) -> u32 {
+        self.row_groups.len() as u32
+    }
+
+    /// Its stored views' bounds.
+    fn bounds(&self, row_group: u32, column: u32) -> Option<Bounds> {
+        at!(at!(self.row_groups, row_group as usize).columns, column as usize).bounds()
+    }
+
     fn open<'s>(
         &'s self,
         _: &mut Context,
         columns: &'s [(u32, Forms)],
+        row_groups: Option<&'s [u32]>,
     ) -> Result<ScanState<'s>, Error> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
         let lend = columns.iter().all(|&(column, forms)| forms.contains(self.forms(column)));
-        Ok(ScanState { columns, lend, row_group: 0 })
+        Ok(ScanState { columns, lend, row_groups, read: 0 })
     }
 
     fn next<'s>(
@@ -131,8 +144,14 @@ impl Scannable for Table {
         batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error> {
         loop {
-            let Some(row_group) = self.row_groups.get(at.row_group) else { return Ok(false) };
-            at.row_group += 1;
+            let next = match at.row_groups {
+                Some(row_groups) => row_groups.get(at.read).map(|&group| group as usize),
+                None => Some(at.read),
+            };
+            let Some(row_group) = next.and_then(|group| self.row_groups.get(group)) else {
+                return Ok(false);
+            };
+            at.read += 1;
             // A batch with no rows would be dropped anyway.
             if row_group.row_count == 0 {
                 continue;
@@ -191,10 +210,10 @@ mod tests {
     }
 
     /// Each batch's row count, and its first row.
-    fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
+    fn scan(table: &Table, columns: &[u32], row_groups: Option<&[u32]>) -> Vec<(u32, Vec<i64>)> {
         let mut context = Context::new(&Heap);
         let columns: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
-        let mut state = table.open(&mut context, &columns).unwrap();
+        let mut state = table.open(&mut context, &columns, row_groups).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
@@ -213,14 +232,31 @@ mod tests {
         let table = Table::new(&Heap, &columns, &[&first, &empty, &second]).unwrap();
 
         let expected = [(2048, vec![0, 0]), (500, vec![-2048, 2048])];
-        assert_eq!(scan(&table, &[1, 0]), expected);
+        assert_eq!(scan(&table, &[1, 0], None), expected);
+    }
+
+    #[test]
+    fn reads_only_the_row_groups_given() {
+        // Four row groups of three rows: 0 to 2, 10 to 12, and so on.
+        let groups: Vec<[ColumnView; 1]> = (0..4)
+            .map(|g| {
+                let bounds = Bounds { min: g * 10, max: g * 10 + 2 };
+                [int64s(g * 10..g * 10 + 3).with_bounds(bounds)]
+            })
+            .collect();
+        let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+        let table = Table::new(&Heap, &[("a", DataType::Int64)], &groups).unwrap();
+        assert_eq!(table.row_group_count(), 4);
+        assert_eq!(table.bounds(2, 0), Some(Bounds { min: 20, max: 22 }));
+        assert_eq!(scan(&table, &[0], Some(&[1, 3])), [(3, vec![10]), (3, vec![30])]);
+        assert_eq!(scan(&table, &[0], Some(&[])), []);
     }
 
     #[test]
     fn counts_rows_without_columns() {
         let (first, second) = ([int64s(0..2048)], [int64s(0..904)]);
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
-        let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
+        let counts: Vec<u32> = scan(&table, &[], None).iter().map(|(rows, _)| *rows).collect();
         assert_eq!(counts, [2048, 904]);
     }
 
@@ -251,7 +287,7 @@ mod tests {
     #[should_panic(expected = "column_count")]
     fn checks_columns_read_when_opened() {
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
-        let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
+        let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)], None);
     }
 
     #[test]
@@ -263,7 +299,7 @@ mod tests {
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
         for forms in [Forms::FLAT | Forms::DICTIONARY, Forms::FLAT] {
             let read = [(0, forms)];
-            let mut state = table.open(&mut context, &read).unwrap();
+            let mut state = table.open(&mut context, &read, None).unwrap();
             let mut batch = RowBatch::new();
             assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
             let mut column = batch.column(0).clone();

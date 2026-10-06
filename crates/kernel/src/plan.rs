@@ -77,6 +77,24 @@ pub trait Op<'c> {
         Forms::FLAT
     }
 
+    /// A condition every row this passes on meets, as a filter's: what's
+    /// below it can skip what can't meet it. By default, none.
+    fn condition(&self) -> Option<&Predicate> {
+        None
+    }
+
+    /// Tells this, if it makes rows, conditions every row the plan keeps of
+    /// them meets, so it can skip row groups whose bounds rule one out. By
+    /// default, it skips none.
+    fn skip_row_groups(
+        &mut self,
+        allocator: &dyn Allocator,
+        conditions: &[&Predicate],
+    ) -> Result<(), AllocError> {
+        let _ = (allocator, conditions);
+        Ok(())
+    }
+
     /// The op that loads `columns`, which this makes lazy, each in one of
     /// the forms given with it, to put above it. Only called for columns
     /// `allow` said it would make lazy.
@@ -89,6 +107,9 @@ pub trait Op<'c> {
         crate::check::check_failed(line!())
     }
 }
+
+type SkipRowGroups =
+    unsafe fn(NonNull<()>, &dyn Allocator, &[&Predicate]) -> Result<(), AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -109,6 +130,8 @@ pub struct DynOp<'c> {
     reads: unsafe fn(NonNull<()>, &mut Needed),
     accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
+    condition: unsafe fn(NonNull<()>) -> Option<NonNull<Predicate>>,
+    skip_row_groups: SkipRowGroups,
     materialize: Materialize<'c>,
     lifetime: PhantomData<&'c ()>,
 }
@@ -127,6 +150,12 @@ impl<'c> DynOp<'c> {
             accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
             // SAFETY: as for `prune`.
             allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
+            // SAFETY: as for `lower`.
+            condition: |op| unsafe { value_of::<T>(op).condition().map(NonNull::from) },
+            // SAFETY: as for `prune`.
+            skip_row_groups: |op, allocator, conditions| unsafe {
+                value_mut_of::<T>(op).skip_row_groups(allocator, conditions)
+            },
             // SAFETY: as for `lower`.
             materialize: |op, allocator, columns| unsafe {
                 value_of::<T>(op).materialize(allocator, columns)
@@ -164,6 +193,22 @@ impl<'c> DynOp<'c> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
         unsafe { (self.allow)(self.op.as_ptr(), column, allowed) }
+    }
+
+    pub(crate) fn condition(&self) -> Option<&Predicate> {
+        // SAFETY: the function matches the op's type, and the condition is
+        // the op's, borrowed with it.
+        unsafe { (self.condition)(self.op.as_ptr()).map(|condition| condition.as_ref()) }
+    }
+
+    pub(crate) fn skip_row_groups(
+        &mut self,
+        allocator: &dyn Allocator,
+        conditions: &[&Predicate],
+    ) -> Result<(), AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.skip_row_groups)(self.op.as_ptr(), allocator, conditions) }
     }
 
     pub(crate) fn materialize(
@@ -235,15 +280,17 @@ impl<'c> LogicalPlan<'c> {
     }
 }
 
-/// Reads all the rows of a scannable, binding the columns in `columns`.
+/// Reads the rows of a scannable, binding the columns in `columns`: those
+/// of `row_groups`, or all if `None`.
 pub struct ScanOp<'c> {
     scannable: &'c DynScannable<'c>,
     columns: SlowVec<ScanColumn>,
+    row_groups: Option<SlowVec<u32>>,
 }
 
 impl<'c> ScanOp<'c> {
     pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
-        ScanOp { scannable, columns }
+        ScanOp { scannable, columns, row_groups: None }
     }
 }
 
@@ -264,7 +311,13 @@ impl<'c> Op<'c> for ScanOp<'c> {
             lowering.define(column.binding.id)?;
         }
         let read = self.columns.iter().map(|column| (column.column, column.forms));
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read)?);
+        let row_groups = match &self.row_groups {
+            Some(row_groups) => {
+                Some(SlowVec::fixed_from(lowering.allocator(), row_groups.iter().copied())?)
+            }
+            None => None,
+        };
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read, row_groups)?);
         Ok(())
     }
 
@@ -292,6 +345,30 @@ impl<'c> Op<'c> for ScanOp<'c> {
         };
         scanned.forms = allowed & self.scannable.forms(scanned.column);
         scanned.forms
+    }
+
+    /// Skips the row groups whose bounds, the scannable's, rule a condition
+    /// out, if any: worked out from statistics, before any row is read.
+    fn skip_row_groups(
+        &mut self,
+        allocator: &dyn Allocator,
+        conditions: &[&Predicate],
+    ) -> Result<(), AllocError> {
+        let bounds = |group: u32, id: ColumnId| {
+            let scanned = self.columns.iter().find(|scanned| scanned.binding.id == id)?;
+            self.scannable.bounds(group, scanned.column)
+        };
+        let count = self.scannable.row_group_count();
+        let mut row_groups = SlowVec::fixed(allocator, count as usize)?;
+        for group in 0..count {
+            if conditions.iter().all(|condition| condition.may_hold(|id| bounds(group, id))) {
+                row_groups.push(group)?;
+            }
+        }
+        if row_groups.len() < count as usize {
+            self.row_groups = Some(row_groups);
+        }
+        Ok(())
     }
 
     fn materialize(
@@ -367,6 +444,10 @@ impl<'c> Op<'c> for FilterOp {
         for column in self.predicate.columns() {
             reads.need(column);
         }
+    }
+
+    fn condition(&self) -> Option<&Predicate> {
+        Some(&self.predicate)
     }
 
     /// Flat, and constants, which it tests once. Not dictionaries yet.

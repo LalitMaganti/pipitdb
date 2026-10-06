@@ -6,7 +6,7 @@
 //! and every node keeps SQL's three-valued logic without building booleans.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{ColumnView, Form};
+use crate::column::{Bounds, ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Comparison, Value};
@@ -98,6 +98,39 @@ impl Predicate {
     /// How many scratch selections `select` needs.
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Whether a row whose values are within `bounds(column)` for each
+    /// column whose bounds are known may make this true: false only where
+    /// bounds rule it out, as a row group's statistics can, so the row group
+    /// can be skipped. Comparisons of floats and strings, and `IS NULL`, may
+    /// always hold.
+    #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX` nodes")]
+    pub fn may_hold(&self, bounds: impl Fn(u32) -> Option<Bounds>) -> bool {
+        self.may_be(&bounds, self.nodes.len() as u32 - 1, true)
+    }
+
+    /// Whether node `node` may be `want` for a row within `bounds`. A null
+    /// value makes a comparison neither, so only values within bounds count.
+    fn may_be(&self, bounds: &impl Fn(u32) -> Option<Bounds>, node: u32, want: bool) -> bool {
+        match *at!(self.nodes, node as usize) {
+            Node::Leaf(Leaf::Compare { column, comparison, value: Value::Int64(value) }) => {
+                let Some(bounds) = bounds(column) else { return true };
+                let comparison = if want { comparison } else { negated(comparison) };
+                any_within(bounds, comparison, value)
+            }
+            Node::Leaf(_) => true,
+            Node::Not(child) => self.may_be(bounds, child, !want),
+            // True for both, or false for both: each must be.
+            Node::And(a, b) if want => self.may_be(bounds, a, true) && self.may_be(bounds, b, true),
+            Node::Or(a, b) if !want => {
+                self.may_be(bounds, a, false) && self.may_be(bounds, b, false)
+            }
+            // False for either, or true for either.
+            Node::And(a, b) | Node::Or(a, b) => {
+                self.may_be(bounds, a, want) || self.may_be(bounds, b, want)
+            }
+        }
     }
 
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.
@@ -241,6 +274,18 @@ impl Leaf {
     }
 }
 
+/// Whether some value within `bounds` is `<comparison> value`.
+fn any_within(bounds: Bounds, comparison: Comparison, value: i64) -> bool {
+    match comparison {
+        Comparison::Equal => bounds.min <= value && value <= bounds.max,
+        Comparison::NotEqual => !(bounds.min == value && bounds.max == value),
+        Comparison::Less => bounds.min < value,
+        Comparison::LessEqual => bounds.min <= value,
+        Comparison::Greater => bounds.max > value,
+        Comparison::GreaterEqual => bounds.max >= value,
+    }
+}
+
 /// The comparison true for exactly the non-null rows `comparison` is false
 /// for. Floats are ordered totally, so this holds for them too.
 fn negated(comparison: Comparison) -> Comparison {
@@ -306,6 +351,11 @@ mod tests {
     const A: [Option<i64>; 6] = [Some(1), None, Some(3), None, Some(5), Some(3)];
     const B: [Option<i64>; 6] = [None, Some(2), None, Some(4), Some(5), Some(1)];
 
+    /// Row `row`'s cell of `a` (column 0) or `b`.
+    fn cells(column: u32, row: usize) -> Option<i64> {
+        if column == 0 { A[row] } else { B[row] }
+    }
+
     fn column(cells: [Option<i64>; 6]) -> ColumnView {
         let mut values = Buffer::allocate(&Heap, 48).unwrap();
         let mut validity = Buffer::allocate(&Heap, 1).unwrap();
@@ -325,23 +375,23 @@ mod tests {
         Not(&'static Expr),
     }
 
-    /// SQL's three-valued logic, row by row: `None` is null.
-    fn reference(expr: &Expr, row: usize) -> Option<bool> {
-        let cell = |column: u32| if column == 0 { A[row] } else { B[row] };
+    /// SQL's three-valued logic, for a row whose cells `cell` gives: `None`
+    /// is null.
+    fn reference(expr: &Expr, cell: &impl Fn(u32) -> Option<i64>) -> Option<bool> {
         match *expr {
             Expr::Greater(column, value) => cell(column).map(|cell| cell > value),
             Expr::IsNull(column) => Some(cell(column).is_none()),
-            Expr::And(a, b) => match (reference(a, row), reference(b, row)) {
+            Expr::And(a, b) => match (reference(a, cell), reference(b, cell)) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             },
-            Expr::Or(a, b) => match (reference(a, row), reference(b, row)) {
+            Expr::Or(a, b) => match (reference(a, cell), reference(b, cell)) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
             },
-            Expr::Not(a) => reference(a, row).map(|value| !value),
+            Expr::Not(a) => reference(a, cell).map(|value| !value),
         }
     }
 
@@ -379,36 +429,65 @@ mod tests {
         }
     }
 
+    const A2: Expr = Expr::Greater(0, 2);
+    const B2: Expr = Expr::Greater(1, 2);
+    const BOTH: Expr = Expr::And(&A2, &B2);
+    const EITHER: Expr = Expr::Or(&A2, &B2);
+    const NULL_OR_B: Expr = Expr::Or(&Expr::IsNull(0), &B2);
+    /// Predicates over `a` and `b` that nest each kind of node in each.
+    const EXPRS: [&Expr; 9] = [
+        &A2,
+        &Expr::Not(&A2),
+        &BOTH,
+        &EITHER,
+        &Expr::Not(&BOTH),
+        &Expr::Not(&EITHER),
+        &NULL_OR_B,
+        &Expr::Not(&NULL_OR_B),
+        &Expr::Not(&Expr::Not(&Expr::And(&EITHER, &Expr::Not(&BOTH)))),
+    ];
+
+    fn predicate(expr: &Expr) -> Predicate {
+        let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+        build(expr, &mut nodes);
+        Predicate::new(nodes)
+    }
+
     #[test]
     fn keeps_what_sql_does_with_nulls() {
-        const A2: Expr = Expr::Greater(0, 2);
-        const B2: Expr = Expr::Greater(1, 2);
-        const BOTH: Expr = Expr::And(&A2, &B2);
-        const EITHER: Expr = Expr::Or(&A2, &B2);
-        const NULL_OR_B: Expr = Expr::Or(&Expr::IsNull(0), &B2);
-        let exprs: [&Expr; 9] = [
-            &A2,
-            &Expr::Not(&A2),
-            &BOTH,
-            &EITHER,
-            &Expr::Not(&BOTH),
-            &Expr::Not(&EITHER),
-            &NULL_OR_B,
-            &Expr::Not(&NULL_OR_B),
-            &Expr::Not(&Expr::Not(&Expr::And(&EITHER, &Expr::Not(&BOTH)))),
-        ];
         // One scratch selection per `AND` or `OR` nested in another.
-        let depth = |expr: &Expr| {
-            let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
-            build(expr, &mut nodes);
-            Predicate::new(nodes).depth()
-        };
-        assert_eq!([&A2, &BOTH, exprs[8]].map(depth), [0, 1, 2]);
-        for expr in exprs {
-            let expected: StdVec<usize> =
-                (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
+        let depth = |expr: &Expr| predicate(expr).depth();
+        assert_eq!([&A2, &BOTH, EXPRS[8]].map(depth), [0, 1, 2]);
+        for expr in EXPRS {
+            let expected =
+                (0..6).filter(|&row| reference(expr, &|column| cells(column, row)) == Some(true));
+            let expected: StdVec<usize> = expected.collect();
             assert_eq!(kept(expr), expected);
         }
+    }
+
+    #[test]
+    fn may_hold_where_a_row_within_bounds_is_kept() {
+        let ranges = (0..5).flat_map(|min| (min..5).map(move |max| Bounds { min, max }));
+        let values =
+            |bounds: Bounds| core::iter::once(None).chain((bounds.min..=bounds.max).map(Some));
+        for expr in EXPRS {
+            let predicate = predicate(expr);
+            for a in ranges.clone() {
+                for b in ranges.clone() {
+                    let bounds = |column| Some(if column == 0 { a } else { b });
+                    let kept = values(a).any(|x| {
+                        values(b)
+                            .any(|y| reference(expr, &|c| if c == 0 { x } else { y }) == Some(true))
+                    });
+                    assert!(predicate.may_hold(bounds) || !kept);
+                }
+            }
+            assert!(predicate.may_hold(|_| None));
+        }
+        // Each comparison, either way, rules out bounds all on one side.
+        assert!(!predicate(&A2).may_hold(|_| Some(Bounds { min: 0, max: 2 })));
+        assert!(!predicate(&Expr::Not(&A2)).may_hold(|_| Some(Bounds { min: 3, max: 4 })));
     }
 
     #[test]

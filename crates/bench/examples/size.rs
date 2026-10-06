@@ -192,7 +192,7 @@ pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
     let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
     let Ok(table) = ParquetTable::open(&Heap, &Uncompressed, &[&bytes]) else { return 0 };
     let mut context = Context::new(&Heap);
-    let Ok(mut state) = table.open(&mut context, &[(0, Forms::FLAT)]) else { return 0 };
+    let Ok(mut state) = table.open(&mut context, &[(0, Forms::FLAT)], None) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while let Ok(true) = table.next(&mut context, &mut state, &mut batch) {

@@ -63,7 +63,8 @@ mod tests {
     fn reads_snappy_pages() {
         let table = ParquetTable::open(&Heap, &Codecs, &[&SNAPPY_FILE]).unwrap();
         let mut context = Context::new(&Heap);
-        let mut state = table.open(&mut context, &[(0, Forms::FLAT), (1, Forms::FLAT)]).unwrap();
+        let mut state =
+            table.open(&mut context, &[(0, Forms::FLAT), (1, Forms::FLAT)], None).unwrap();
         let mut batch = RowBatch::new();
         let mut row = 0;
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
@@ -90,7 +91,7 @@ mod tests {
     fn needs_codecs_for_compressed_pages() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&SNAPPY_FILE]).unwrap();
         let mut context = Context::new(&Heap);
-        let mut state = table.open(&mut context, &[(0, Forms::FLAT)]).unwrap();
+        let mut state = table.open(&mut context, &[(0, Forms::FLAT)], None).unwrap();
         let mut batch = RowBatch::new();
         let read = table.next(&mut context, &mut state, &mut batch);
         assert_eq!(read, Err(Error::Unsupported));

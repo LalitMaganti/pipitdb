@@ -206,7 +206,7 @@ pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
     let columns = [(3, Forms::FLAT), (1, Forms::FLAT)].into_iter();
-    let source = table.scan(&Heap, columns).expect("allocates");
+    let source = table.scan(&Heap, columns, None).expect("allocates");
     Pipeline::new(source, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
 }
 
