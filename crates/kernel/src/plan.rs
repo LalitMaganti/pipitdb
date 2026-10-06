@@ -64,7 +64,12 @@ pub trait Op<'c> {
     }
 
     /// Of the columns this reads, the forms it takes `column` in. By default,
-    /// flat only.
+    /// flat only. Accept a form only where it gains, not just where it can be
+    /// read: a dictionary pays where testing an entry costs much more than
+    /// looking a row's entry up, as comparing strings, hashing into a group
+    /// or adding to a set do, and not where it costs about as much, as
+    /// comparing an integer does (ClickBench's integer filters were 11-63%
+    /// slower through dictionaries).
     fn accepts(&self, column: ColumnId) -> Forms {
         let _ = column;
         Forms::FLAT
@@ -443,9 +448,15 @@ impl<'c> Op<'c> for FilterOp {
         }
     }
 
-    /// Flat, and constants, which it tests once. Not dictionaries yet.
-    fn accepts(&self, _: ColumnId) -> Forms {
-        Forms::FLAT | Forms::CONSTANT
+    /// Constants, which it tests once, and dictionaries of columns it only
+    /// compares with strings, whose entries it tests once each: see
+    /// `Op::accepts`.
+    fn accepts(&self, column: ColumnId) -> Forms {
+        if self.predicate.compares_only_strings(column) {
+            Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
+        } else {
+            Forms::FLAT | Forms::CONSTANT
+        }
     }
 
     /// What its predicate keeps.
