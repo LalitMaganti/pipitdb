@@ -1,9 +1,9 @@
-# pipitdb, build at 7a317af, one thread, best of 3, ms
+# pipitdb, build at 39f03c5, one thread, best of 3, ms
 # Apple M3, 8 cores, macOS 26.6.2, 2026-10-06, 100 files
-f1	39.9
-fAdv	297.2
-f40	9.6
-f41	8.0
-fPhone	357.3
-fIpad	255.1
-fSearch	696.9
+f1	25.9
+fAdv	162.1
+f40	8.3
+f41	7.7
+fPhone	285.0
+fIpad	237.9
+fSearch	837.4
