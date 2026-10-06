@@ -105,8 +105,18 @@ jobs:
           key: ${{ hashFiles('Cargo.toml') }}
       # Must match the gungraun version in Cargo.lock.
       - run: cargo install gungraun-runner --version 0.20.0 --locked
+      # ClickBench's first file, for its queries' benchmarks: downloaded from
+      # ClickBench once, checked, then cached by its checksum. Outside
+      # target, which rust-cache prunes.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/clickbench
+          key: clickbench-${{ hashFiles('crates/bench/clickbench/hits_0.sha256') }}
+      - run: crates/bench/clickbench/fetch.sh "${{ runner.temp }}/clickbench"
       # Clear summaries the cache may have restored from earlier runs.
       - run: rm -rf target/gungraun && cargo bench -p pipitdb-bench --bench instructions -- --save-summary=json
+        env:
+          PIPIT_CLICKBENCH: ${{ runner.temp }}/clickbench
       - run: crates/bench/check_instructions.py | tee -a "$GITHUB_STEP_SUMMARY"
         shell: bash
 
