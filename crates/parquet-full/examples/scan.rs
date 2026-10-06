@@ -35,7 +35,8 @@ fn main() -> Result<(), String> {
             .next(&mut context, &mut state, &mut batch)
             .map_err(|e| format!("{}: {e:?}", table.column_name(column)))?
         {
-            let values = batch.column(0).flatten(&mut context).map_err(|e| format!("{e:?}"))?;
+            let mut values = batch.column(0).clone();
+            values.make_in(&mut context, Forms::FLAT).map_err(|e| format!("{e:?}"))?;
             for row in (0..values.row_count()).filter(|&row| !values.is_null(row)) {
                 count += 1;
                 let r = row as usize;

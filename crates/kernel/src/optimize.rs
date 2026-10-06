@@ -117,6 +117,10 @@ fn first_read(
     }
 }
 
+/// The forms the plan's output columns may come in: whoever takes the
+/// output can make them flat.
+const OUTPUT_FORMS: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
+
 /// Chooses the forms each column is made in. A column may be made in any
 /// form the op that first reads it accepts, as ops between pass a column
 /// they don't read on as it is; its maker is told which, and says which it
@@ -158,7 +162,8 @@ pub fn choose_forms(
             let (load, above_parent) = first_read(&parents, &reads, &output, maker, column);
             let accepted = match load {
                 Load::Below(reader, _) => at!(plan.nodes, reader as usize).op.accepts(column),
-                Load::AtRoot | Load::Never => Forms::FLAT,
+                Load::AtRoot => OUTPUT_FORMS,
+                Load::Never => Forms::FLAT,
             };
             // A column nothing reads may be lazy too, and isn't loaded.
             let worth = above_parent || load == Load::Never;
@@ -166,20 +171,20 @@ pub fn choose_forms(
             let made = at_mut!(plan.nodes, maker).op.allow(column, allowed);
             if made.contains(Forms::LAZY) && !accepted.contains(Forms::LAZY) && load != Load::Never
             {
-                lazy.push((maker, load, column)).map_err(|_| AllocError)?;
+                lazy.push((maker, load, column, accepted)).map_err(|_| AllocError)?;
             }
         }
     }
     // One op loads the columns one node made lazy that are loaded at one
     // place.
-    for (i, &(maker, load, _)) in lazy.iter().enumerate() {
-        let same = |&&(m, l, _): &&(usize, Load, ColumnId)| (m, l) == (maker, load);
+    for (i, &(maker, load, ..)) in lazy.iter().enumerate() {
+        let same = |&&(m, l, ..): &&(usize, Load, ColumnId, Forms)| (m, l) == (maker, load);
         if at!(lazy, ..i).iter().any(|entry| same(&entry)) {
             continue;
         }
         let mut loaded = SlowVec::fixed(allocator, at!(lazy, i..).iter().filter(same).count())?;
-        for &(_, _, column) in at!(lazy, i..).iter().filter(same) {
-            loaded.push(column).map_err(|_| AllocError)?;
+        for &(_, _, column, forms) in at!(lazy, i..).iter().filter(same) {
+            loaded.push((column, forms)).map_err(|_| AllocError)?;
         }
         let op = at!(plan.nodes, maker).op.materialize(allocator, loaded)?;
         let below = match load {

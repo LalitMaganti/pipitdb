@@ -221,9 +221,8 @@ impl Transform for Filter {
         (): &mut (),
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
-        // Filters test flat and constant columns. Dictionary ones, which
-        // only strings are read as so far, aren't filtered yet: refused
-        // rather than made flat, which would copy every value.
+        // Filters test flat and constant columns, the forms `FilterOp`
+        // accepts, so a scan never gives them a dictionary.
         //
         // TODO: filter a dictionary column by testing each of its entries
         // once, with the flat column's test on its values, into a bit for
@@ -232,9 +231,9 @@ impl Transform for Filter {
         // dictionary, so a dictionary of a few strings over millions of rows
         // costs a few tests. This is what DuckDB does.
         let mut columns = self.predicate.columns();
-        if columns.any(|position| matches!(batch.column(position).form(), Form::Dictionary(_))) {
-            return Err(Error::Unsupported);
-        }
+        check!(
+            !columns.any(|position| matches!(batch.column(position).form(), Form::Dictionary(_)))
+        );
         self.predicate.select(context.selections(), batch);
         Ok(())
     }
@@ -361,7 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn filters_refuse_dictionary_columns() {
+    #[should_panic(expected = "Dictionary")]
+    fn filters_check_they_get_no_dictionary() {
         let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
         build(&Expr::Greater(0, 2), &mut nodes);
         let filter = Filter { predicate: Predicate::new(nodes) };
@@ -374,6 +374,6 @@ mod tests {
         let dictionary =
             ColumnView::dictionary(&mut Context::new(&Heap), &column(A), indices).unwrap();
         assert!(batch.push_column(dictionary).is_ok());
-        assert_eq!(filter.process(&mut context, &mut (), &mut batch), Err(Error::Unsupported));
+        let _ = filter.process(&mut context, &mut (), &mut batch);
     }
 }

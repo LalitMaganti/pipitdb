@@ -7,22 +7,31 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 
-/// Forms a column may come in besides flat: what a plan lets a producer make
-/// a column in, and what a consumer takes it in. Every producer can make
-/// flat columns and every consumer takes them, so an empty set allows flat
-/// only.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+/// A set of the forms a column may come in: what a plan lets a producer
+/// make a column in, and what a consumer takes it in. Every producer can
+/// make flat columns and every consumer takes them, so every set a plan
+/// gives holds `FLAT`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Forms(u8);
 
 impl Forms {
-    /// Flat only.
-    pub const FLAT: Forms = Forms(0);
+    /// Row `i` is value `i`.
+    pub const FLAT: Forms = Forms(1);
     /// Not read yet: read when loaded, for the rows still kept.
-    pub const LAZY: Forms = Forms(1);
+    pub const LAZY: Forms = Forms(2);
+    /// Every row the same value.
+    pub const CONSTANT: Forms = Forms(4);
+    /// Each row an index into a column of values.
+    pub const DICTIONARY: Forms = Forms(8);
 
     /// Whether every form in `other` is in this.
     pub fn contains(self, other: Forms) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// The forms in this or `other`, as `|` gives, for constants.
+    pub const fn union(self, other: Forms) -> Forms {
+        Forms(self.0 | other.0)
     }
 }
 
@@ -30,7 +39,7 @@ impl core::ops::BitOr for Forms {
     type Output = Forms;
 
     fn bitor(self, other: Forms) -> Forms {
-        Forms(self.0 | other.0)
+        self.union(other)
     }
 }
 
@@ -112,12 +121,14 @@ struct Header {
     bounds: Cell<Bounds>,
 }
 
+/// Each is its bit in `Forms`.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum Kind {
-    Flat,
-    Constant,
-    Dictionary,
-    Lazy,
+    Flat = Forms::FLAT.0,
+    Lazy = Forms::LAZY.0,
+    Constant = Forms::CONSTANT.0,
+    Dictionary = Forms::DICTIONARY.0,
 }
 
 /// Bounds no value is within, for when they aren't known.
@@ -355,12 +366,34 @@ impl ColumnView {
         }
     }
 
-    /// A flat view of the same rows, copying values unless it's flat already.
-    pub fn flatten(&self, context: &mut Context) -> Result<ColumnView, AllocError> {
-        let form = self.form();
-        if matches!(form, Form::Flat) {
-            return Ok(self.clone());
+    /// Makes this view one of `forms`, which holds `FLAT`: as it is if its
+    /// form is one, or else flat, copying values. A lazy view can't be made
+    /// flat without loading, so `forms` must hold `LAZY` for it.
+    #[inline]
+    pub fn make_in(&mut self, context: &mut Context, forms: Forms) -> Result<(), AllocError> {
+        if !self.is_in(forms) {
+            *self = self.flatten(context)?;
         }
+        Ok(())
+    }
+
+    /// Whether this view's form is one of `forms`.
+    #[inline]
+    pub fn is_in(&self, forms: Forms) -> bool {
+        forms.contains(self.forms())
+    }
+
+    /// The form this view is in, as a set of one.
+    pub fn forms(&self) -> Forms {
+        Forms(self.header().kind as u8)
+    }
+
+    /// A flat copy of this view. Out of line, so `make_in` stays small
+    /// where, as usually, the view is in a form allowed.
+    #[cold]
+    #[inline(never)]
+    fn flatten(&self, context: &mut Context) -> Result<ColumnView, AllocError> {
+        let form = self.form();
         let index = |row: u32| match form {
             Form::Dictionary(indices) => *at!(indices, row as usize),
             Form::Flat | Form::Constant => 0,

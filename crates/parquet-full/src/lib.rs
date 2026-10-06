@@ -67,8 +67,9 @@ mod tests {
         let mut batch = RowBatch::new();
         let mut row = 0;
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
-            let ids = batch.column(0).flatten(&mut context).unwrap();
-            let names = batch.column(1).flatten(&mut context).unwrap();
+            let (mut ids, mut names) = (batch.column(0).clone(), batch.column(1).clone());
+            ids.make_in(&mut context, Forms::FLAT).unwrap();
+            names.make_in(&mut context, Forms::FLAT).unwrap();
             for r in 0..batch.row_count() {
                 assert_eq!(ids.is_null(r), row % 7 == 3);
                 if !ids.is_null(r) {

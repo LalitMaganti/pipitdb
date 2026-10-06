@@ -11,9 +11,11 @@ use pipit_kernel::slow_vec::SlowVec;
 
 use pipit_kernel::names::{Name, Names};
 
+/// Each column has a name, a type, and the forms its row groups store it
+/// in, which, with flat, are the forms a scan can make it in.
 pub struct Table {
     names: Names,
-    columns: SlowVec<(Name, DataType)>,
+    columns: SlowVec<(Name, DataType, Forms)>,
     row_groups: SlowVec<RowGroup>,
 }
 
@@ -48,8 +50,9 @@ impl Table {
         let name_bytes = columns.iter().map(|(name, _)| name.len()).sum();
         let mut names = Names::fixed(allocator, name_bytes)?;
         let mut schema = SlowVec::fixed(allocator, columns.len())?;
-        for &(name, data_type) in columns {
-            schema.push((names.add(name)?, data_type))?;
+        for (i, &(name, data_type)) in columns.iter().enumerate() {
+            let stored = groups.iter().map(|group| at!(group.columns, i).forms());
+            schema.push((names.add(name)?, data_type, stored.fold(Forms::FLAT, Forms::union)))?;
         }
         Ok(Table { names, columns: schema, row_groups: groups })
     }
@@ -57,7 +60,7 @@ impl Table {
     /// The column called `name`, if any.
     #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
     pub fn find_column(&self, name: &str) -> Option<u32> {
-        let found = self.columns.iter().position(|&(column, _)| self.names.get(column) == name);
+        let found = self.columns.iter().position(|&(column, ..)| self.names.get(column) == name);
         found.map(|i| i as u32)
     }
 
@@ -80,6 +83,9 @@ impl RowGroup {
 pub struct ScanState<'s> {
     /// The columns read, in order, each checked to be one of the table's.
     columns: &'s [(u32, Forms)],
+    /// Whether each column read is stored only in forms allowed, so all are
+    /// lent as they are; known when opened.
+    lend: bool,
     /// The next row group.
     row_group: usize,
 }
@@ -103,6 +109,10 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
+    fn forms(&self, column: u32) -> Forms {
+        at!(self.columns, column as usize).2
+    }
+
     fn open<'s>(
         &'s self,
         _: &mut Context,
@@ -110,12 +120,13 @@ impl Scannable for Table {
     ) -> Result<ScanState<'s>, Error> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
-        Ok(ScanState { columns, row_group: 0 })
+        let lend = columns.iter().all(|&(column, forms)| forms.contains(self.forms(column)));
+        Ok(ScanState { columns, lend, row_group: 0 })
     }
 
     fn next<'s>(
         &'s self,
-        _: &mut Context,
+        context: &mut Context,
         at: &mut ScanState<'s>,
         batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error> {
@@ -127,13 +138,33 @@ impl Scannable for Table {
                 continue;
             }
             batch.reset(row_group.row_count);
-            // Borrowed: the table outlives the batch.
-            let views: &[ColumnView] = &row_group.columns;
-            batch.push_borrowed(at.columns.iter().map(|&(i, _)| {
+            if at.lend {
+                // Borrowed: the table outlives the batch.
+                let views: &[ColumnView] = &row_group.columns;
+                batch.push_borrowed(at.columns.iter().map(|&(i, _)| {
+                    // SAFETY: `open` checked `i` is one of the table's
+                    // columns, and `new` that each row group has a view of
+                    // each.
+                    unsafe { views.get_unchecked(i as usize) }
+                }));
+                return Ok(true);
+            }
+            for &(i, forms) in at.columns {
                 // SAFETY: `open` checked `i` is one of the table's columns,
                 // and `new` that each row group has a view of each.
-                unsafe { views.get_unchecked(i as usize) }
-            }));
+                let view = unsafe { row_group.columns.get_unchecked(i as usize) };
+                if view.is_in(forms) {
+                    // Borrowed: the table outlives the batch.
+                    batch.push_borrowed([view]);
+                } else {
+                    // A form `forms` rules out: a flat copy instead.
+                    let mut flat = view.clone();
+                    flat.make_in(context, forms)?;
+                    let Ok(()) = batch.push_column(flat) else {
+                        pipit_kernel::check::check_failed(line!());
+                    };
+                }
+            }
             return Ok(true);
         }
     }
@@ -148,6 +179,7 @@ mod tests {
 
     use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
+    use pipit_kernel::column::Form;
 
     use super::*;
 
@@ -220,5 +252,25 @@ mod tests {
     fn checks_columns_read_when_opened() {
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
         let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
+    }
+
+    #[test]
+    fn keeps_stored_forms_only_where_allowed() {
+        let mut context = Context::new(&Heap);
+        let mut indices = Buffer::allocate(&Heap, 3 * 4).unwrap();
+        indices.as_mut_slice::<u32>().copy_from_slice(&[1, 0, 1]);
+        let dictionary = ColumnView::dictionary(&mut context, &int64s(5..7), indices).unwrap();
+        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
+        for forms in [Forms::FLAT | Forms::DICTIONARY, Forms::FLAT] {
+            let read = [(0, forms)];
+            let mut state = table.open(&mut context, &read).unwrap();
+            let mut batch = RowBatch::new();
+            assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
+            let mut column = batch.column(0).clone();
+            let kept = matches!(column.form(), Form::Dictionary(_));
+            assert_eq!(kept, forms.contains(Forms::DICTIONARY));
+            column.make_in(&mut context, Forms::FLAT).unwrap();
+            assert_eq!(column.int64s(), [6, 5, 6]);
+        }
     }
 }

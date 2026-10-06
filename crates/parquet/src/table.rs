@@ -150,8 +150,8 @@ impl Scannable for ParquetTable<'_> {
                 continue;
             }
             batch.reset(rows);
-            for reader in state.readers.iter_mut() {
-                let Ok(()) = batch.push_column(reader.read(context, rows as usize)?) else {
+            for (reader, &(_, forms)) in state.readers.iter_mut().zip(state.columns) {
+                let Ok(()) = batch.push_column(reader.read(context, rows as usize, forms)?) else {
                     pipit_kernel::check::check_failed(line!());
                 };
             }
@@ -244,7 +244,8 @@ mod tests {
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
         while table.next(&mut context, &mut state, &mut batch).unwrap() {
-            let column = batch.column(0).flatten(&mut context).unwrap();
+            let mut column = batch.column(0).clone();
+            column.make_in(&mut context, Forms::FLAT).unwrap();
             values.extend_from_slice(column.int64s());
         }
         assert!(values.iter().copied().eq((0..5000).map(|i| 4_000_000_000 + i)));
