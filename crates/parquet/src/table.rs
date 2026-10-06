@@ -2,7 +2,7 @@
 
 use pipit_kernel::allocator::Allocator;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::DataType;
+use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
@@ -74,6 +74,7 @@ fn check_same_columns(first: &ParquetFile, file: &ParquetFile) -> Result<(), Err
 
 impl<'a> Scannable for ParquetTable<'a> {
     type State = ScanState<'a>;
+    type Loader = ();
 
     fn column_count(&self) -> u32 {
         let Ok(count) = u32::try_from(self.first().columns().len()) else {
@@ -102,6 +103,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     fn next(
         &self,
         columns: &[u32],
+        _: &[Forms],
         context: &mut Context,
         state: &mut ScanState<'a>,
         batch: &mut RowBatch,
@@ -152,6 +154,7 @@ impl<'a> Scannable for ParquetTable<'a> {
 mod tests {
     extern crate std;
 
+    use std::vec;
     use std::vec::Vec;
 
     use pipit_kernel::allocator::Heap;
@@ -167,7 +170,10 @@ mod tests {
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let (mut rows, mut ids) = (0, Vec::new());
-        while table.next(columns, &mut context, &mut state, &mut batch).unwrap() {
+        while table
+            .next(columns, &vec![Forms::FLAT; columns.len()], &mut context, &mut state, &mut batch)
+            .unwrap()
+        {
             assert_eq!(batch.column_count() as usize, columns.len());
             rows += batch.row_count() as usize;
             if let Some((i, _)) = (0..).zip(columns).find(|&(_, &c)| c == 0) {
@@ -213,7 +219,11 @@ mod tests {
         let mut context = Context::new(&Heap);
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
-        assert!(table.next(&[0, 1, 2], &mut context, &mut state, &mut batch).unwrap());
+        assert!(
+            table
+                .next(&[0, 1, 2], &[Forms::FLAT; 3], &mut context, &mut state, &mut batch)
+                .unwrap()
+        );
         let bounds = |c: u32| batch.column(c).bounds().map(|b| (b.min, b.max));
         assert_eq!(bounds(0), Some((-2500, -453)));
         assert_eq!(bounds(1), Some((4_000_000_000, 4_000_002_047)));
@@ -227,7 +237,7 @@ mod tests {
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
-        while table.next(&[1], &mut context, &mut state, &mut batch).unwrap() {
+        while table.next(&[1], &[Forms::FLAT], &mut context, &mut state, &mut batch).unwrap() {
             let column = batch.column(0).flatten(&mut context).unwrap();
             values.extend_from_slice(column.int64s());
         }

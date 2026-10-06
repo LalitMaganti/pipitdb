@@ -7,6 +7,41 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 
+/// Forms a column may come in besides flat: what a plan lets a producer make
+/// a column in, and what a consumer takes it in. Every producer can make
+/// flat columns and every consumer takes them, so an empty set allows flat
+/// only.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Forms(u8);
+
+impl Forms {
+    /// Flat only.
+    pub const FLAT: Forms = Forms(0);
+    /// Not read yet: read when loaded, for the rows still kept.
+    pub const LAZY: Forms = Forms(1);
+
+    /// Whether every form in `other` is in this.
+    pub fn contains(self, other: Forms) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl core::ops::BitOr for Forms {
+    type Output = Forms;
+
+    fn bitor(self, other: Forms) -> Forms {
+        Forms(self.0 | other.0)
+    }
+}
+
+impl core::ops::BitAnd for Forms {
+    type Output = Forms;
+
+    fn bitand(self, other: Forms) -> Forms {
+        Forms(self.0 & other.0)
+    }
+}
+
 /// A column's type. Strings are bytes, as stored: usually UTF-8 text, but
 /// not checked to be, as nothing reads them as text. They're compared,
 /// hashed and grouped byte by byte; what shows them to people decides what
@@ -44,7 +79,9 @@ pub struct Bounds {
 /// Rows of values in Arrow's layout: values, and an optional validity bitmap
 /// with one bit per value, set if it isn't null. As DuckDB's vectors, rows
 /// map to values in one of three forms: each to its own (flat), all to one
-/// (constant), or each through an index (dictionary).
+/// (constant), or each through an index (dictionary). Or the values aren't
+/// read yet (lazy): a handle says where they are, for whoever wrote it to
+/// load them.
 ///
 /// It's a handle, small to move: the buffers and what they hold are in a
 /// header it shares with its clones and slices.
@@ -61,7 +98,8 @@ pub struct ColumnView {
 /// A column's buffers and what they hold, shared by its views. Its values
 /// are `len` of `values`, and of `bytes` and `validity` if any, from
 /// `value_start`. A flat header's rows are its values, a dictionary one's its
-/// `indices`, and a constant one's as many as its views say.
+/// `indices`, and a constant or lazy one's as many as its views say. A lazy
+/// header's `values` hold its handle, `len` bytes of it.
 struct Header {
     data_type: DataType,
     kind: Kind,
@@ -79,6 +117,7 @@ enum Kind {
     Flat,
     Constant,
     Dictionary,
+    Lazy,
 }
 
 /// Bounds no value is within, for when they aren't known.
@@ -191,6 +230,45 @@ impl ColumnView {
         ColumnView::with_header(context, header, row_count)
     }
 
+    /// `row_count` rows of `data_type` whose values aren't read yet: a copy
+    /// of `handle`, which says where they are, for whoever wrote it to load
+    /// them.
+    pub fn lazy(
+        context: &mut Context,
+        data_type: DataType,
+        handle: &[u8],
+        row_count: u32,
+    ) -> Result<ColumnView, AllocError> {
+        let Ok(len) = u32::try_from(handle.len()) else { return Err(AllocError) };
+        let mut values = context.small_buffer(handle.len())?;
+        values.as_mut_slice::<u8>().copy_from_slice(handle);
+        let header = Header {
+            data_type,
+            kind: Kind::Lazy,
+            values,
+            bytes: None,
+            validity: None,
+            indices: None,
+            value_start: 0,
+            len,
+            bounds: Cell::new(UNKNOWN),
+        };
+        ColumnView::with_header(context, header, row_count)
+    }
+
+    /// Whether the view's values aren't read yet. Nothing but loading them
+    /// reads a lazy view.
+    pub fn is_lazy(&self) -> bool {
+        self.header().kind == Kind::Lazy
+    }
+
+    /// A lazy view's handle, and where its rows start among the handle's.
+    pub fn handle(&self) -> (&[u8], u32) {
+        let header = self.header();
+        check!(header.kind == Kind::Lazy);
+        (header.values.as_slice::<u8>(), self.start)
+    }
+
     /// A header for a new view of this one's values: those of its rows, for
     /// a flat one, or all of them.
     fn shared(&self, indices: Option<Buffer>) -> Header {
@@ -234,6 +312,7 @@ impl ColumnView {
     /// which whoever says so must be sure of. Views made from it keep them.
     pub fn with_bounds(self, bounds: Bounds) -> ColumnView {
         check!(self.data_type() == DataType::Int64 && bounds.min <= bounds.max);
+        check!(!self.is_lazy());
         self.header().bounds.set(bounds);
         self
     }
@@ -258,6 +337,7 @@ impl ColumnView {
                     start..start + self.row_count as usize
                 ))
             }
+            Kind::Lazy => crate::check::check_failed(line!()),
         }
     }
 
@@ -271,6 +351,7 @@ impl ColumnView {
             Kind::Constant | Kind::Dictionary => {
                 Values { header, start: header.value_start, len: header.len }
             }
+            Kind::Lazy => crate::check::check_failed(line!()),
         }
     }
 
@@ -350,6 +431,7 @@ impl ColumnView {
 
     /// Whether any row may be null.
     pub fn has_nulls(&self) -> bool {
+        check!(!self.is_lazy());
         self.header().validity.is_some()
     }
 
@@ -446,6 +528,7 @@ impl<'a> Values<'a> {
 pub struct Strings<'a> {
     /// A start and length into `bytes` for each value.
     views: &'a [u32],
+    /// What the views are into.
     bytes: &'a [u8],
 }
 
@@ -663,6 +746,24 @@ mod tests {
         assert_eq!(constant.slice(1, 2).flatten(&mut context).unwrap().int64s(), [7, 7]);
         let nulls = ColumnView::constant(&mut Context::new(&Heap), &int64s(&[0], &[0]), 3).unwrap();
         assert!((0..3).all(|row| nulls.is_null(row)));
+    }
+
+    #[test]
+    fn keeps_a_lazy_views_handle() {
+        let column =
+            ColumnView::lazy(&mut Context::new(&Heap), DataType::Int64, &[1, 2, 3], 10).unwrap();
+        assert!(column.is_lazy());
+        assert_eq!(column.handle(), (&[1, 2, 3][..], 0));
+        let sliced = column.slice(4, 3);
+        assert_eq!((sliced.handle(), sliced.row_count()), ((&[1, 2, 3][..], 4), 3));
+        assert!(!int64s(&[1], &[]).is_lazy());
+    }
+
+    #[test]
+    #[should_panic(expected = "check failed")]
+    fn lazy_views_have_no_values() {
+        let column = ColumnView::lazy(&mut Context::new(&Heap), DataType::Int64, &[1], 2).unwrap();
+        let _ = column.values();
     }
 
     #[test]

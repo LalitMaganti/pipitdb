@@ -2,7 +2,7 @@
 
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
-use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::filter::{self, Comparison, Value};
@@ -207,7 +207,9 @@ pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
 pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
     let columns =
         pipit_kernel::slow_vec::SlowVec::fixed_from(&Heap, [3, 1].into_iter()).expect("allocates");
-    let source = table.scan(&Heap, columns).expect("allocates");
+    let forms = pipit_kernel::slow_vec::SlowVec::fixed_from(&Heap, [Forms::FLAT; 2].into_iter())
+        .expect("allocates");
+    let source = table.scan(&Heap, columns, forms).expect("allocates");
     Pipeline::new(source, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
 }
 

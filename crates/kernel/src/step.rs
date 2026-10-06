@@ -147,10 +147,7 @@ pub struct Erased<'a, F> {
 pub(crate) type NewState = unsafe fn(NonNull<()>, &mut Context, NonNull<u8>) -> Result<(), Error>;
 
 pub type DynSource<'a> = Erased<'a, SourceNext>;
-pub type DynTransform<'a> = Erased<
-    'a,
-    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>,
->;
+pub type DynTransform<'a> = Erased<'a, TransformProcess>;
 pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
 
 // TODO: `Result<bool, Error>` and `Result<Progress, Error>` take two bytes,
@@ -158,6 +155,9 @@ pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
 // a few instructions a batch. Converting to one-byte enums such as
 // `enum Next { Batch, End, Failed(Error) }` here, at the function-pointer
 // boundary, would win them back while steps keep `?`.
+pub(crate) type TransformProcess =
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>;
+
 pub(crate) type SourceNext =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
@@ -225,6 +225,22 @@ impl<'a> DynSource<'a> {
 }
 
 impl<'a> DynTransform<'a> {
+    /// A transform from parts that already agree on its step's and state's
+    /// types.
+    ///
+    /// # Safety
+    ///
+    /// As for `DynSource::from_parts`.
+    pub(crate) unsafe fn from_parts(
+        step: ErasedBox,
+        state_layout: Layout,
+        new_state: NewState,
+        drop_state: unsafe fn(NonNull<u8>),
+        process: TransformProcess,
+    ) -> DynTransform<'a> {
+        Erased { step, state_layout, new_state, drop_state, run: process, lifetime: PhantomData }
+    }
+
     pub fn new<T: Transform + 'a>(
         allocator: &dyn Allocator,
         transform: T,
