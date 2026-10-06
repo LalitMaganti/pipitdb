@@ -298,7 +298,7 @@ impl<'p> Run<'p> {
     }
 
     fn read_source(&self, context: &mut Context, batch: &mut RowBatch<'p>) -> Made {
-        batch.reset(0);
+        // Not reset here: the source resets it as it fills it.
         // SAFETY: the source's state was made by `Execution::new`.
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Ok(true) => Made::Batch,

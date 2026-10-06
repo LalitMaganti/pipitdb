@@ -26,8 +26,9 @@ pub trait Source {
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
 
-    /// Fills `batch`, which is empty when called, or returns false when no
-    /// batches are left. Its columns may view what the source holds.
+    /// Resets `batch`, which holds the last batch, and fills it, or returns
+    /// false when no batches are left. Its columns may view what the source
+    /// holds.
     fn next<'s>(
         &'s self,
         context: &mut Context,
