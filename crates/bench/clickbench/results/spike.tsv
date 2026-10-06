@@ -1,0 +1,32 @@
+# spike, the prototype at 8284d6b in its bench worktree, with main's Snappy flags and the f queries added, one thread, best of 3, ms
+# Apple M3, 8 cores, macOS 26.6.2, 2026-10-06, 100 files
+0	0.0
+1	18.6
+2	135.0
+3	133.9
+6	0.0
+40	9.8
+41	8.5
+41all	1310.8
+pAdv	202.9
+pRefresh	357.8
+4	790.6
+s1	585.8
+s2	132.1
+s3	2935.2
+s4	735.7
+s5	2649.9
+gAdv	371.9
+gCounter	291.9
+gRegion	831.5
+gWindow	1778.1
+gUser	1801.7
+gEngineIp	2789.7
+gUrlDate	3093.8
+f1	65.7
+fAdv	232.5
+f40	8.4
+f41	6.9
+fPhone	665.2
+fIpad	275.9
+fSearch	934.8
