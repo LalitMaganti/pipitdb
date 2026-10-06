@@ -1,19 +1,23 @@
 //! `ParquetTable`: Parquet files with the same columns, scanned as one table.
 
-use pipit_kernel::allocator::Allocator;
+use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{DataType, Forms};
+use pipit_kernel::column::{Bounds, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::step::{DynSource, Source};
 
 use crate::chunk::ChunkReader;
 use crate::footer::ParquetFile;
-use crate::{Codec, Error};
+use crate::{Codec, Error, bounds};
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
+
+/// The most row groups a pruned scan reads, in all files.
+const ROW_GROUPS_MAX: usize = 1 << 24;
 
 pub struct ParquetTable<'a> {
     files: SlowVec<File<'a>>,
@@ -25,15 +29,113 @@ struct File<'a> {
     footer: ParquetFile,
 }
 
-/// Where a scan is: a file, a row group in it, and, once the group is
-/// started, a reader for each column read and how many rows are left.
+/// Where a scan is: the columns read, the next file and row group in it,
+/// and the rows of the one started.
 pub struct ScanState<'a> {
     columns: &'a [(u32, Forms)],
     file: usize,
     group: usize,
+    rows: Rows<'a>,
+}
+
+/// Reads a row group a batch at a time, once started: a reader for each
+/// column read, and how many rows are left.
+struct Rows<'a> {
     readers: SlowVec<ChunkReader<'a>>,
     started: bool,
     left: u64,
+}
+
+impl<'a> Rows<'a> {
+    fn new(allocator: &dyn Allocator, columns: usize) -> Result<Rows<'a>, Error> {
+        Ok(Rows { readers: SlowVec::fixed(allocator, columns)?, started: false, left: 0 })
+    }
+
+    /// Starts reading `columns` of row group `group` of `file`.
+    fn start(
+        &mut self,
+        file: &File<'a>,
+        codecs: &'a dyn Codec,
+        columns: &[(u32, Forms)],
+        group: usize,
+    ) -> Result<(), Error> {
+        for &(column, _) in columns {
+            let c = column as usize;
+            let chunk = file.footer.chunk(group, c);
+            let column = *at!(file.footer.columns(), c);
+            let reader = ChunkReader::new(file.source, codecs, column, chunk)?;
+            self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
+        }
+        (self.started, self.left) = (true, file.footer.group_rows(group));
+        Ok(())
+    }
+
+    /// Resets `batch` and fills it with the next rows of the row group
+    /// started, or stops and returns false when none are left.
+    fn next(
+        &mut self,
+        context: &mut Context,
+        columns: &[(u32, Forms)],
+        batch: &mut RowBatch,
+    ) -> Result<bool, Error> {
+        // A batch stays within each column's page, so pages are read whole.
+        let mut rows = u32::try_from(self.left).unwrap_or(u32::MAX).min(BATCH_ROWS_MAX);
+        for reader in self.readers.iter_mut() {
+            rows = rows.min(u32::try_from(reader.page_left(context)?).unwrap_or(u32::MAX));
+        }
+        if rows == 0 {
+            if self.left > 0 {
+                return Err(Error::Corrupt);
+            }
+            self.readers.retain(|_| false);
+            self.started = false;
+            return Ok(false);
+        }
+        batch.reset(rows);
+        for (reader, &(_, forms)) in self.readers.iter_mut().zip(columns) {
+            let Ok(()) = batch.push_column(reader.read(context, rows as usize, forms)?) else {
+                pipit_kernel::check::check_failed(line!());
+            };
+        }
+        self.left -= u64::from(rows);
+        Ok(true)
+    }
+}
+
+/// A scan of a `ParquetTable` that reads only `groups`, by file and row
+/// group in it: those whose statistics don't rule out the values kept.
+struct Pruned<'a> {
+    table: &'a ParquetTable<'a>,
+    columns: SlowVec<(u32, Forms)>,
+    groups: SlowVec<(usize, usize)>,
+}
+
+impl<'a> Source for Pruned<'a> {
+    /// How many of `groups` are started, and the rows of the last.
+    type State = (usize, Rows<'a>);
+
+    fn new_state(&self, context: &mut Context) -> Result<(usize, Rows<'a>), Error> {
+        Ok((0, Rows::new(context.allocator(), self.columns.len())?))
+    }
+
+    fn next<'s>(
+        &'s self,
+        context: &mut Context,
+        (started, rows): &mut (usize, Rows<'a>),
+        batch: &mut RowBatch<'s>,
+    ) -> Result<bool, Error> {
+        loop {
+            if !rows.started {
+                let Some(&(file, group)) = self.groups.get(*started) else { return Ok(false) };
+                let file = at!(self.table.files, file);
+                rows.start(file, self.table.codecs, &self.columns, group)?;
+                *started += 1;
+            }
+            if rows.next(context, &self.columns, batch)? {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 impl<'a> ParquetTable<'a> {
@@ -115,8 +217,8 @@ impl Scannable for ParquetTable<'_> {
     ) -> Result<ScanState<'s>, Error> {
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
-        let readers = SlowVec::fixed(context.allocator(), columns.len())?;
-        Ok(ScanState { columns, file: 0, group: 0, readers, started: false, left: 0 })
+        let rows = Rows::new(context.allocator(), columns.len())?;
+        Ok(ScanState { columns, file: 0, group: 0, rows })
     }
 
     fn next<'s>(
@@ -126,44 +228,52 @@ impl Scannable for ParquetTable<'_> {
         batch: &mut RowBatch,
     ) -> Result<bool, Error> {
         loop {
-            if !state.started {
+            if !state.rows.started {
                 let Some(file) = self.files.get(state.file) else { return Ok(false) };
                 if state.group == file.footer.row_groups() {
                     (state.file, state.group) = (state.file + 1, 0);
                     continue;
                 }
-                for &(column, _) in state.columns {
-                    let c = column as usize;
-                    let chunk = file.footer.chunk(state.group, c);
-                    let column = *at!(file.footer.columns(), c);
-                    let reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
-                    state.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
-                }
-                (state.started, state.left) = (true, file.footer.group_rows(state.group));
+                state.rows.start(file, self.codecs, state.columns, state.group)?;
+                state.group += 1;
             }
-            // A batch stays within each column's page, so pages are read
-            // whole.
-            let mut rows = u32::try_from(state.left).unwrap_or(u32::MAX).min(BATCH_ROWS_MAX);
-            for reader in state.readers.iter_mut() {
-                rows = rows.min(u32::try_from(reader.page_left(context)?).unwrap_or(u32::MAX));
+            if state.rows.next(context, state.columns, batch)? {
+                return Ok(true);
             }
-            if rows == 0 {
-                if state.left > 0 {
-                    return Err(Error::Corrupt);
-                }
-                state.readers.retain(|_| false);
-                (state.started, state.group) = (false, state.group + 1);
-                continue;
-            }
-            batch.reset(rows);
-            for (reader, &(_, forms)) in state.readers.iter_mut().zip(state.columns) {
-                let Ok(()) = batch.push_column(reader.read(context, rows as usize, forms)?) else {
-                    pipit_kernel::check::check_failed(line!());
-                };
-            }
-            state.left -= u64::from(rows);
-            return Ok(true);
         }
+    }
+
+    /// Skips the row groups whose footer statistics rule out a range.
+    fn scan_within<'s>(
+        &'s self,
+        allocator: &dyn Allocator,
+        columns: &[(u32, Forms)],
+        ranges: &[(u32, Bounds)],
+    ) -> Result<Option<DynSource<'s>>, AllocError> {
+        let may_keep = |file: &File, group: usize| {
+            ranges.iter().all(|&(column, range)| {
+                let c = column as usize;
+                let chunk = file.footer.chunk(group, c);
+                let bounds = bounds::of_chunk(*at!(file.footer.columns(), c), chunk);
+                bounds.is_none_or(|bounds| bounds.overlaps(range))
+            })
+        };
+        let mut groups = SlowVec::new(allocator, ROW_GROUPS_MAX)?;
+        let mut skipped = false;
+        for (f, file) in self.files.iter().enumerate() {
+            for group in 0..file.footer.row_groups() {
+                if may_keep(file, group) {
+                    groups.push((f, group))?;
+                } else {
+                    skipped = true;
+                }
+            }
+        }
+        if !skipped {
+            return Ok(None);
+        }
+        let columns = SlowVec::fixed_from(allocator, columns.iter().copied())?;
+        Ok(Some(DynSource::new(allocator, Pruned { table: self, columns, groups })?))
     }
 }
 
@@ -174,6 +284,9 @@ mod tests {
     use std::vec::Vec;
 
     use pipit_kernel::allocator::Heap;
+    use pipit_kernel::pipeline::Pipeline;
+    use pipit_kernel::query_allocators::QueryAllocators;
+    use pipit_kernel::scannable::DynScannable;
 
     use super::*;
     use crate::Uncompressed;
@@ -261,6 +374,31 @@ mod tests {
     fn doesnt_read_decimals_as_integers() {
         let opened = ParquetTable::open(&Heap, &Uncompressed, &[&DECIMAL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
+    }
+
+    #[test]
+    fn skips_row_groups_statistics_rule_out() {
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let table = DynScannable::new(&Heap, table).unwrap();
+        // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
+        // to 4999.
+        let ids = |min, max| {
+            let ranges = [(0, Bounds { min, max })];
+            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &ranges).unwrap();
+            let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
+            let query = QueryAllocators::new(&Heap);
+            let mut execution = pipeline.start(&query).unwrap();
+            let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
+            while execution.next(&mut batch).unwrap() {
+                let column = batch.column(0);
+                ids.extend((0..column.row_count()).map(|row| column.int64s()[row as usize]));
+            }
+            ids
+        };
+        let middle: Vec<i64> = (2048..4096).collect();
+        assert_eq!(ids(3000, 3000), [&middle[..], &middle[..]].concat());
+        assert_eq!(ids(5000, i64::MAX), []);
+        assert_eq!(ids(0, 4999).len(), 10000);
     }
 
     #[test]

@@ -3,13 +3,14 @@
 //! are optimized too.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::Forms;
+use crate::column::{Bounds, Forms};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId};
 use crate::slow_vec::SlowVec;
 
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
+    push_down_ranges(allocator, plan)?;
     choose_forms(allocator, plan)
 }
 
@@ -84,6 +85,54 @@ pub fn prune_columns(
     Ok(())
 }
 
+/// Each node's parent, and which of its children it is; `None` for the
+/// root.
+fn parents(
+    allocator: &dyn Allocator,
+    plan: &LogicalPlan<'_>,
+) -> Result<SlowVec<Option<(PlanNodeId, usize)>>, AllocError> {
+    let orphans = core::iter::repeat_n(None, plan.nodes.len());
+    let mut parents = SlowVec::fixed_from(allocator, orphans)?;
+    for (id, node) in (0..).zip(plan.nodes.iter()) {
+        for (slot, &child) in node.children.iter().enumerate() {
+            *at_mut!(parents, child as usize) = Some((id, slot));
+        }
+    }
+    Ok(parents)
+}
+
+/// Pushes down what filters keep: tells each node the values of each column
+/// that every node above it keeps, up to the first that passes on other
+/// rows, so a source can leave out rows outside them. The filters still
+/// test every row they're given.
+pub fn push_down_ranges(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    let parents = parents(allocator, plan)?;
+    for id in 0..plan.nodes.len() {
+        let mut ranges = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+        for column in (0..).take(plan.columns.len()) {
+            let mut kept = Bounds::ALL;
+            let mut at = *at!(parents, id);
+            while let Some((parent, _)) = at {
+                let Some(keeps) = at!(plan.nodes, parent as usize).op.keeps(column) else {
+                    break;
+                };
+                kept = kept.intersect(keeps);
+                at = *at!(parents, parent as usize);
+            }
+            if kept != Bounds::ALL {
+                ranges.push((column, kept))?;
+            }
+        }
+        if !ranges.is_empty() {
+            at_mut!(plan.nodes, id).op.restrict(allocator, &ranges)?;
+        }
+    }
+    Ok(())
+}
+
 /// Where a lazy column is loaded.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Load {
@@ -137,14 +186,7 @@ pub fn choose_forms(
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     let (nodes, columns) = (plan.nodes.len(), plan.columns.len());
-    // Each node's parent, and which of its children it is.
-    let orphans = core::iter::repeat_n(None::<(PlanNodeId, usize)>, nodes);
-    let mut parents = SlowVec::fixed_from(allocator, orphans)?;
-    for (id, node) in (0..).zip(plan.nodes.iter()) {
-        for (slot, &child) in node.children.iter().enumerate() {
-            *at_mut!(parents, child as usize) = Some((id, slot));
-        }
-    }
+    let parents = parents(allocator, plan)?;
     let mut reads = SlowVec::fixed(allocator, nodes)?;
     for node in plan.nodes.iter() {
         let mut read = Needed::none(allocator, columns)?;
