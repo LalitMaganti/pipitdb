@@ -104,14 +104,29 @@ pub trait Op<'c> {
     }
 
     /// Takes `condition`, from an op above, on the rows it makes of
-    /// `column`: pushdown. Only called if `takes_condition` says so.
+    /// `column`: pushdown. If `may_apply`, as nothing else reads the column,
+    /// returns whether it applies it, so the op can remove it. Only called
+    /// if `takes_condition` says so.
     fn take_condition(
         &mut self,
         allocator: &dyn Allocator,
         column: ColumnId,
         condition: Predicate,
-    ) -> Result<(), AllocError> {
-        let _ = (allocator, column, condition);
+        may_apply: bool,
+    ) -> Result<bool, AllocError> {
+        let _ = (allocator, column, condition, may_apply);
+        crate::check::check_failed(line!())
+    }
+
+    /// Stops testing its conjuncts that read only `column`, as the scan
+    /// below now applies them. Returns whether it tests nothing now, so the
+    /// plan can remove it. Only called once it's given them.
+    fn remove_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+    ) -> Result<bool, AllocError> {
+        let _ = (allocator, column);
         crate::check::check_failed(line!())
     }
 
@@ -142,7 +157,9 @@ pub enum Given {
 type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
 
 type TakeCondition =
-    unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
+    unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate, bool) -> Result<bool, AllocError>;
+
+type RemoveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<bool, AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -166,6 +183,7 @@ pub struct DynOp<'c> {
     give_condition: GiveCondition,
     takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
     take_condition: TakeCondition,
+    remove_condition: RemoveCondition,
     materialize: Materialize<'c>,
     lifetime: PhantomData<&'c ()>,
 }
@@ -191,8 +209,12 @@ impl<'c> DynOp<'c> {
             // SAFETY: as for `lower`.
             takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
             // SAFETY: as for `prune`.
-            take_condition: |op, allocator, column, condition| unsafe {
-                value_mut_of::<T>(op).take_condition(allocator, column, condition)
+            take_condition: |op, allocator, column, condition, may_apply| unsafe {
+                value_mut_of::<T>(op).take_condition(allocator, column, condition, may_apply)
+            },
+            // SAFETY: as for `prune`.
+            remove_condition: |op, allocator, column| unsafe {
+                value_mut_of::<T>(op).remove_condition(allocator, column)
             },
             // SAFETY: as for `lower`.
             materialize: |op, allocator, columns| unsafe {
@@ -253,10 +275,21 @@ impl<'c> DynOp<'c> {
         allocator: &dyn Allocator,
         column: ColumnId,
         condition: Predicate,
-    ) -> Result<(), AllocError> {
+        may_apply: bool,
+    ) -> Result<bool, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.take_condition)(self.op.as_ptr(), allocator, column, condition) }
+        unsafe { (self.take_condition)(self.op.as_ptr(), allocator, column, condition, may_apply) }
+    }
+
+    pub(crate) fn remove_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+    ) -> Result<bool, AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.remove_condition)(self.op.as_ptr(), allocator, column) }
     }
 
     pub(crate) fn materialize(
@@ -387,21 +420,28 @@ impl<'c> Op<'c> for ScanOp<'c> {
         self.columns.iter().any(|scanned| scanned.binding.id == column)
     }
 
+    /// Applies it, if it may, where the scannable says it does.
     fn take_condition(
         &mut self,
         allocator: &dyn Allocator,
         column: ColumnId,
         condition: Predicate,
-    ) -> Result<(), AllocError> {
+        may_apply: bool,
+    ) -> Result<bool, AllocError> {
         let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
             crate::check::check_failed(line!());
         };
-        let condition = Condition::new(scanned.column, &condition);
+        let mut condition = Condition::new(scanned.column, condition.renumbered(allocator, |_| 0)?);
+        let applied = may_apply && self.scannable.applies(&condition);
+        if applied {
+            condition.set_applied();
+        }
         let conditions = match &mut self.conditions {
             Some(conditions) => conditions,
             None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
         };
-        conditions.push(condition).map_err(|_| AllocError)
+        conditions.push(condition).map_err(|_| AllocError)?;
+        Ok(applied)
     }
 
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
@@ -493,19 +533,33 @@ impl<'c> Op<'c> for FilterOp {
     /// compares with strings, whose entries it tests once each: see
     /// `Op::accepts`.
     fn accepts(&self, column: ColumnId) -> Forms {
-        if self.predicate.compares_only_strings(column) {
-            Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
-        } else {
-            Forms::FLAT | Forms::CONSTANT
-        }
+        self.predicate.accepts(column)
     }
 
-    /// A copy of the conjuncts of its predicate that read only `column`.
+    /// A copy of the conjuncts of its predicate that read only `column`,
+    /// unless the others read it too: then it's tested here anyway.
     fn give_condition(
         &mut self,
         allocator: &dyn Allocator,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
+        let rest = self.predicate.without_conjuncts_on(allocator, column)?;
+        if rest.is_some_and(|rest| rest.columns().any(|read| read == column)) {
+            return Ok(Given::Passed(None));
+        }
         Ok(Given::Passed(self.predicate.conjuncts_on(allocator, column)?))
+    }
+
+    /// Keeps only its conjuncts that read more than `column`, if any.
+    fn remove_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+    ) -> Result<bool, AllocError> {
+        let Some(rest) = self.predicate.without_conjuncts_on(allocator, column)? else {
+            return Ok(true);
+        };
+        self.predicate = rest;
+        Ok(false)
     }
 }

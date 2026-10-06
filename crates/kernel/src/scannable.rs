@@ -66,12 +66,20 @@ pub trait Scannable {
         batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error>;
 
-    /// A source of `columns`, read as `open` would, that may leave out rows
-    /// failing `conditions`, which the plan pushed down from filters: the
-    /// filters still test every row. It's of whatever type suits, such as
-    /// one that skips what statistics rule out, or `None` to read with
-    /// `open`. Its lazy columns are loaded by this, as `open`'s are. By
-    /// default, `None`.
+    /// Whether it applies `condition` as it reads, so the filter it came
+    /// from no longer tests it. By default, no.
+    fn applies(&self, condition: &Condition) -> bool {
+        let _ = condition;
+        false
+    }
+
+    /// A source of `columns`, read as `open` would, given `conditions` the
+    /// plan pushed down from filters, on any of its columns. It must apply
+    /// those marked applied, reading their columns itself, and may use the
+    /// others to skip rows failing them, which the filters still test. It's
+    /// of whatever type suits, such as one that skips what statistics rule
+    /// out, or `None` to read with `open`, if none is applied. Its lazy
+    /// columns are loaded by this, as `open`'s are. By default, `None`.
     fn scan_within<'s>(
         &'s self,
         allocator: &dyn Allocator,
@@ -151,6 +159,7 @@ pub struct DynScannable<'a> {
     open: ScannableOpen,
     drop_state: unsafe fn(NonNull<u8>),
     next: ScannableNext,
+    applies: unsafe fn(NonNull<()>, &Condition) -> bool,
     scan_within: ScannableScanWithin<'a>,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
     loader_layout: Layout,
@@ -196,6 +205,8 @@ impl<'a> DynScannable<'a> {
                 let batch = batch.cast::<RowBatch<'a>>().as_mut();
                 value_of::<T>(scannable).next(context, state, batch)
             },
+            // SAFETY: as above.
+            applies: |scannable, condition| unsafe { value_of::<T>(scannable).applies(condition) },
             // SAFETY: as above. The source borrows the scannable, for as
             // long as `scan` says.
             scan_within: |scannable, allocator, columns, conditions| unsafe {
@@ -241,6 +252,12 @@ impl<'a> DynScannable<'a> {
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }
     }
 
+    /// Whether it applies `condition` as it reads.
+    pub fn applies(&self, condition: &Condition) -> bool {
+        // SAFETY: as above.
+        unsafe { (self.applies)(self.scannable.as_ptr(), condition) }
+    }
+
     /// A source of `columns` of this, in that order, each written in one of
     /// the forms with it, maybe skipping rows failing `conditions`, on those
     /// columns.
@@ -260,8 +277,7 @@ impl<'a> DynScannable<'a> {
         };
         check!(columns.iter().all(allowed));
         check!(conditions.len() <= CONDITIONS_MAX);
-        let read = |condition: &Condition| columns.iter().any(|&(c, _)| c == condition.column());
-        check!(conditions.iter().all(read));
+        check!(conditions.iter().all(|condition| condition.column() < column_count));
         if !conditions.is_empty() {
             // SAFETY: the function matches the scannable's type, and the
             // source borrows `self`.
@@ -271,6 +287,8 @@ impl<'a> DynScannable<'a> {
             if let Some(source) = within {
                 return Ok(source);
             }
+            // `open` applies none.
+            check!(!conditions.iter().any(Condition::is_applied));
         }
         let scan = Scan { scannable: NonNull::from(self).cast(), columns };
         let step = Box::new(allocator, scan)?.erase();

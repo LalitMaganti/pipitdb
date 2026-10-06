@@ -6,6 +6,7 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
+use pipit_kernel::selection::{Kept, Selection};
 
 use crate::footer::{Chunk, Column};
 use crate::hybrid::{Hybrid, Run};
@@ -247,6 +248,81 @@ impl<'s> ChunkReader<'s> {
         }
         self.position.left -= rows;
         Ok(())
+    }
+
+    /// The values of the dictionary the page being read indexes, if its
+    /// values are indices.
+    pub fn page_dictionary(&mut self, context: &mut Context) -> Result<Option<ColumnView>, Error> {
+        if !self.position.indexed {
+            return Ok(None);
+        }
+        Ok(Some(self.dictionary(context)?.values))
+    }
+
+    /// Narrows `selection`, which must keep all of the next `rows` rows, in
+    /// the page being read, to those whose dictionary entries' bits are set
+    /// in `kept_entries`, passing them: a run at a time, so a run of one
+    /// index is looked up once, and its rows aren't visited. False, passing
+    /// none, unless the page's values are indices and none of them is null.
+    pub fn select_kept_rows(
+        &mut self,
+        context: &mut Context,
+        rows: usize,
+        kept_entries: &[u64],
+        selection: &mut Selection,
+    ) -> Result<bool, Error> {
+        check!(rows <= self.position.left && rows == selection.rows() as usize);
+        check!(selection.kept() == Kept::All);
+        if !self.position.indexed {
+            return Ok(false);
+        }
+        let start = self.position;
+        let (body, _) = self.body(context)?;
+        let page = body.as_slice::<u8>();
+        let mut scratch = self.take_scratch(context)?;
+        let decoded = scratch.as_mut_slice::<u32>();
+        if self.validity(context, page, rows, decoded)?.0.is_some() {
+            (self.scratch, self.position) = (Some(scratch), start);
+            return Ok(false);
+        }
+        let bytes = page.get(self.position.value..).ok_or(Error::Corrupt)?;
+        // SAFETY: only given indices checked to be below `bound`.
+        let kept =
+            |i: u32| unsafe { *kept_entries.get_unchecked(i as usize / 64) } >> (i % 64) & 1 == 1;
+        let bound = kept_entries.len() * 64;
+        selection.clear();
+        let mut at = 0;
+        while at < rows {
+            // Packed indices land where their rows are.
+            let run = self.position.index.next_run(bytes, at_mut!(decoded, at..rows));
+            let run = run.ok_or(Error::Corrupt)?;
+            let (first, end) = (batch_row(at)?, batch_row(at + run.len())?);
+            match run {
+                Run::Repeat(i, _) => {
+                    if i as usize >= bound {
+                        return Err(Error::Corrupt);
+                    }
+                    if kept(i) {
+                        selection.push(first, end, |_| true);
+                    }
+                }
+                Run::Packed(n) => {
+                    let indices = at!(decoded, at..at + n);
+                    // Checked together, so no lookup fails.
+                    if indices.iter().fold(0, |max, &i| max.max(i)) as usize >= bound {
+                        return Err(Error::Corrupt);
+                    }
+                    // SAFETY: `push` gives only rows `first..end`, one an index.
+                    let index =
+                        |row: u16| unsafe { *indices.get_unchecked(usize::from(row - first)) };
+                    selection.push(first, end, |row| kept(index(row)));
+                }
+            }
+            at += run.len();
+        }
+        self.scratch = Some(scratch);
+        self.position.left -= rows;
+        Ok(true)
     }
 
     /// The next `rows` rows, as `read` gives them, but with values only for
@@ -692,6 +768,11 @@ impl<'s> ChunkReader<'s> {
             window *= 4;
         }
     }
+}
+
+/// Row `at` of a batch, which fits `u16`.
+fn batch_row(at: usize) -> Result<u16, Error> {
+    u16::try_from(at).map_err(|_| Error::Corrupt)
 }
 
 #[cfg(test)]

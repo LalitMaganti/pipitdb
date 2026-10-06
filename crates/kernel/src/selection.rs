@@ -97,6 +97,36 @@ impl Selection {
         self.len = kept as u32;
     }
 
+    /// Keeps no rows, for `push` to add those to keep: as a source finds
+    /// them, a run at a time.
+    pub fn clear(&mut self) {
+        (self.all, self.len) = (false, 0);
+    }
+
+    /// Keeps those of rows `start..end` that `keep` is true for too, which
+    /// must all be after the rows kept.
+    /// Never inlined, so each test's loop is in a small function of its
+    /// own, where it's aligned.
+    #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
+    #[inline(never)]
+    pub fn push(&mut self, start: u16, end: u16, mut keep: impl FnMut(u16) -> bool) {
+        let len = self.len as usize;
+        // SAFETY: the first `len` indices are written.
+        let after = len == 0 || unsafe { at!(self.indices, len - 1).assume_init() } < start;
+        check!(!self.all && after && start <= end && u32::from(end) <= self.rows);
+        let indices = self.indices.as_mut_ptr().cast::<u16>();
+        // The rows kept are below `start`, so `kept` never passes `row`,
+        // which is below `rows`: every index is in bounds.
+        let mut kept = len;
+        for row in start..end {
+            // SAFETY: see above.
+            unsafe { indices.add(kept).write(row) };
+            kept += usize::from(keep(row));
+        }
+        self.len = kept as u32;
+        self.all = self.len == self.rows;
+    }
+
     /// Drops the rows `removed` keeps, which must be among these.
     pub fn subtract(&mut self, removed: &Selection) {
         check!(removed.rows == self.rows);
@@ -248,6 +278,22 @@ mod tests {
             Kept::None => alloc::vec::Vec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }
+    }
+
+    #[test]
+    fn keeps_the_rows_pushed() {
+        let mut selection = Selection::all(10);
+        selection.clear();
+        assert_eq!(selection.kept(), Kept::None);
+        selection.push(1, 3, |_| true);
+        selection.push(4, 8, |row| row % 2 == 1);
+        assert_eq!(rows(&selection), [1, 2, 5, 7]);
+        // Pushing every row keeps them all.
+        let mut all = Selection::all(4);
+        all.clear();
+        all.push(0, 2, |_| true);
+        all.push(2, 4, |_| true);
+        assert_eq!(all.kept(), Kept::All);
     }
 
     #[test]
