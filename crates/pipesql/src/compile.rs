@@ -38,6 +38,12 @@ impl<'q, 'c> Compiler<'q, 'c> {
         unsafe { core::str::from_utf8_unchecked(bytes) }
     }
 
+    /// The bytes of `span`, such as a string literal's, which can hold any.
+    pub fn bytes(&self, span: Span) -> &'q [u8] {
+        let start = span.start as usize;
+        at!(self.source, start..start + span.len as usize)
+    }
+
     pub fn catalog(&self) -> &'c dyn Catalog {
         self.catalog
     }
@@ -114,7 +120,8 @@ mod tests {
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
 
-    /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5.
+    /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5,
+    /// `s` is `it's` and the empty string.
     struct OneTable(DynScannable<'static>);
 
     impl Catalog for OneTable {
@@ -130,12 +137,23 @@ mod tests {
             ColumnView::new(&mut Context::new(&Heap), data_type, buffer, None).unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
+        let mut views = Buffer::allocate(&Heap, 16).unwrap();
+        views.as_mut_slice::<u32>().copy_from_slice(&[0, 4, 4, 0]);
+        let mut bytes = Buffer::allocate(&Heap, 4).unwrap();
+        bytes.as_mut_slice::<u8>().copy_from_slice(b"it's");
+        let strings = ColumnView::strings(&mut Context::new(&Heap), views, bytes, None).unwrap();
         let columns = [
             column(DataType::Int64, [1, 2]),
             column(DataType::Int64, [10, 20]),
             column(DataType::Float64, floats),
+            strings,
         ];
-        let schema = [("a", DataType::Int64), ("b", DataType::Int64), ("f", DataType::Float64)];
+        let schema = [
+            ("a", DataType::Int64),
+            ("b", DataType::Int64),
+            ("f", DataType::Float64),
+            ("s", DataType::String),
+        ];
         let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
         OneTable(DynScannable::new(&Heap, table).unwrap())
     }
@@ -163,7 +181,10 @@ mod tests {
                     #[expect(clippy::cast_precision_loss, reason = "small test values")]
                     DataType::Int64 => column.int64s()[row] as f64,
                     DataType::Float64 => column.float64s()[row],
-                    DataType::String => f64::NAN,
+                    // A string's length, as the tests only need to tell
+                    // them apart.
+                    #[expect(clippy::cast_precision_loss, reason = "small test values")]
+                    DataType::String => column.string_values().get(row).len() as f64,
                 }));
             }
         }
@@ -186,7 +207,8 @@ mod tests {
         let a = (b"a".to_vec(), [1.0, 2.0].to_vec());
         let b = (b"b".to_vec(), [10.0, 20.0].to_vec());
         let f = (b"f".to_vec(), [0.5, 2.5].to_vec());
-        assert_eq!(run("FROM t"), [a.clone(), b.clone(), f]);
+        let s = (b"s".to_vec(), [4.0, 0.0].to_vec());
+        assert_eq!(run("FROM t"), [a.clone(), b.clone(), f, s]);
         assert_eq!(run("FROM t |> SELECT b, a"), [b.clone(), a.clone()]);
         assert_eq!(run("FROM t |> SELECT b |> SELECT b"), [b]);
     }
@@ -203,8 +225,20 @@ mod tests {
     }
 
     #[test]
+    fn filters_strings_with_where() {
+        // `''` in a string is a quote.
+        assert_eq!(kept("FROM t |> WHERE s = 'it''s' |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> WHERE s <> '' |> SELECT a"), [1.0]);
+        // Either way round, and byte by byte: `i` is after `I`.
+        assert_eq!(kept("FROM t |> WHERE 'I' < s |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> WHERE s >= '' AND NOT s > 'it' |> SELECT a"), [2.0]);
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
+        assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));

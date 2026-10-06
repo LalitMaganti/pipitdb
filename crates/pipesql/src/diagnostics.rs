@@ -83,7 +83,8 @@ fn describe(found: &str, error: &Error) -> Message {
                 ("only column names can be selected yet".into(), "not a column's name".into())
             }
             what if what == Unsupported::Where as u16 => (
-                "only comparisons of a column with a number can filter yet".into(),
+                "only comparisons of a column with a number, or of a string column with a string, can filter yet"
+                    .into(),
                 "can't filter on this yet".into(),
             ),
             what if what == Unsupported::NumberType as u16 => (

@@ -251,6 +251,35 @@ pub fn greater(column: &ColumnView, selection: &mut Selection) {
     filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
 }
 
+/// A batch of phone models, as `MobilePhoneModel` in `ClickBench`: eight, of 0
+/// to 12 bytes, spread evenly but out of order, so 1 in 8 is `iPad`.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn string_column() -> ColumnView {
+    const MODELS: [&[u8]; 8] =
+        [b"", b"iPad", b"iPhone", b"GT-I9300", b"Lumia 920", b"N8", b"iPod", b"Galaxy Nexus"];
+    let rows = BATCH_ROWS_MAX as usize;
+    let mut views = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+    let mut starts = [0_u32; 8];
+    let mut bytes = Vec::new();
+    for (start, model) in starts.iter_mut().zip(MODELS) {
+        *start = u32::try_from(bytes.len()).expect("small");
+        bytes.extend_from_slice(model);
+    }
+    for (row, view) in views.as_mut_slice::<u32>().chunks_mut(2).enumerate() {
+        let model = (row * 7919) % 8;
+        let len = u32::try_from(MODELS[model].len()).expect("small");
+        view.copy_from_slice(&[starts[model], len]);
+    }
+    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+    ColumnView::strings(&mut Context::new(&Heap), views, stored, None).expect("allocates")
+}
+
+/// Keeps `iPad`s: 1 in 8.
+pub fn string_equal(column: &ColumnView, selection: &mut Selection) {
+    filter::compare_string(column, Comparison::Equal, b"iPad", selection, None);
+}
+
 /// `x > 500 AND x < 900`, `x < 100 OR x > 900`, or `NOT (x > 500)`, over the
 /// first column.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]

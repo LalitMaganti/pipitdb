@@ -6,6 +6,8 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
+use core::cmp::Ordering;
+
 use crate::column::{ColumnView, DataType, Form};
 use crate::selection::Selection;
 
@@ -17,6 +19,20 @@ pub enum Comparison {
     LessEqual,
     Greater,
     GreaterEqual,
+}
+
+impl Comparison {
+    /// Whether it holds for a cell ordered `order` against the value.
+    fn holds(self, order: Ordering) -> bool {
+        match self {
+            Comparison::Equal => order.is_eq(),
+            Comparison::NotEqual => order.is_ne(),
+            Comparison::Less => order.is_lt(),
+            Comparison::LessEqual => order.is_le(),
+            Comparison::Greater => order.is_gt(),
+            Comparison::GreaterEqual => order.is_ge(),
+        }
+    }
 }
 
 /// A value to compare a column with, of the column's type.
@@ -52,6 +68,48 @@ pub fn compare(
             check!(column.data_type() == DataType::Float64);
             compare_form(column, column.values().float64s(), float_key, range, selection, dropped);
         }
+    }
+}
+
+/// Narrows `selection` to the rows where `column <comparison> string`, a
+/// string column compared byte by byte, writing the rows it drops to
+/// `dropped`, if given.
+pub fn compare_string(
+    column: &ColumnView,
+    comparison: Comparison,
+    string: &[u8],
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check_covers(column, selection);
+    check!(column.data_type() == DataType::String);
+    let strings = column.values().strings();
+    let holds = |cell: &[u8]| comparison.holds(cell.cmp(string));
+    match column.form() {
+        Form::Flat => {}
+        // One value for every row: kept or dropped together.
+        Form::Constant if !column.is_null(0) && holds(strings.get(0)) => {
+            return keep_all(selection, dropped);
+        }
+        Form::Constant => return drop_all(selection, dropped),
+        // `Filter` refuses dictionary columns.
+        Form::Dictionary(_) => crate::check::check_failed(line!()),
+    }
+    // A null row's view isn't read: it may not point at bytes.
+    let validity = column.validity();
+    let valid = move |row: u16| {
+        // SAFETY: `check_covers` checked every row is a row of `column`.
+        validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(u32::from(row)) })
+    };
+    let cell = move |row: u16| strings.get(usize::from(row));
+    match comparison {
+        // Equality needn't order: most cells differ in length, so aren't
+        // read. One test for both `=` and `<>`, so the loop isn't copied.
+        Comparison::Equal | Comparison::NotEqual => {
+            let equal = comparison == Comparison::Equal;
+            retain(selection, dropped, |row| valid(row) && (cell(row) == string) == equal);
+        }
+        _ => retain(selection, dropped, |row| valid(row) && holds(cell(row))),
     }
 }
 
@@ -399,5 +457,65 @@ mod tests {
         let mut selection = Selection::all(4);
         is_null(&nulls, true, &mut selection, None);
         assert_eq!(selection.len(), 4);
+    }
+
+    /// Ten strings, ordered as bytes, not as text: `B` is before `a`, and
+    /// `é`, two bytes from 0xc3, after `zz`. Row 3 is null, and its view
+    /// points past the bytes, so reading it would fail.
+    const STRINGS: [&[u8]; 10] =
+        [b"", b"a", b"ab", b"", b"B", "é".as_bytes(), b"ab", b"abc", b"\0", b"zz"];
+
+    fn strings() -> ColumnView {
+        let bytes: Vec<u8> = STRINGS.concat();
+        let mut views = Buffer::allocate(&Heap, 10 * 8).unwrap();
+        let mut start = 0;
+        for (row, string) in STRINGS.iter().enumerate() {
+            let len = u32::try_from(string.len()).unwrap();
+            let view = if row == 3 { [1000, 4] } else { [start, len] };
+            views.as_mut_slice::<u32>()[2 * row..2 * row + 2].copy_from_slice(&view);
+            start += len;
+        }
+        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+        let mut validity = Buffer::allocate(&Heap, 2).unwrap();
+        validity.as_mut_slice::<u8>().copy_from_slice(&[!(1 << 3), 0b11]);
+        ColumnView::strings(&mut Context::new(&Heap), views, stored, Some(validity)).unwrap()
+    }
+
+    #[test]
+    fn compares_strings_byte_by_byte() {
+        let column = strings();
+        for comparison in [
+            Comparison::Equal,
+            Comparison::NotEqual,
+            Comparison::Less,
+            Comparison::LessEqual,
+            Comparison::Greater,
+            Comparison::GreaterEqual,
+        ] {
+            let rows = kept(|s| compare_string(&column, comparison, b"ab", s, None));
+            let expected: Vec<u16> = (0..10)
+                .filter(|&row| row != 3)
+                .filter(|&row| comparison.holds(STRINGS[row as usize].cmp(b"ab".as_slice())))
+                .collect();
+            assert_eq!(rows, expected, "{comparison:?}");
+        }
+        // Bytes, not text: `B` and the empty string are below `a`, `é` above `zz`.
+        assert_eq!(kept(|s| compare_string(&column, Comparison::Less, b"a", s, None)), [0, 4, 8]);
+        assert_eq!(kept(|s| compare_string(&column, Comparison::Greater, b"zz", s, None)), [5]);
+    }
+
+    #[test]
+    fn filters_constant_strings_once() {
+        let mut views = Buffer::allocate(&Heap, 8).unwrap();
+        views.as_mut_slice::<u32>().copy_from_slice(&[0, 2]);
+        let mut bytes = Buffer::allocate(&Heap, 2).unwrap();
+        bytes.as_mut_slice::<u8>().copy_from_slice(b"ab");
+        let mut context = Context::new(&Heap);
+        let value = ColumnView::strings(&mut context, views, bytes, None).unwrap();
+        let column = ColumnView::constant(&mut context, &value, 10).unwrap();
+        let equal = kept(|s| compare_string(&column, Comparison::Equal, b"ab", s, None));
+        assert_eq!(equal, (0..10).collect::<Vec<u16>>());
+        assert!(kept(|s| compare_string(&column, Comparison::Less, b"ab", s, None)).is_empty());
     }
 }
