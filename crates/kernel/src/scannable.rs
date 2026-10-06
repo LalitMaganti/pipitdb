@@ -329,7 +329,7 @@ unsafe fn materialize_process(
             (scannable.load)(scannable.scannable.as_ptr(), context, loader, lazy, batch.selection())
         }?;
         check!(!column.is_lazy() && column.row_count() == batch.row_count());
-        *at_mut!(batch.columns_mut(), position as usize) = column;
+        batch.set_column(position, column);
     }
     Ok(())
 }
