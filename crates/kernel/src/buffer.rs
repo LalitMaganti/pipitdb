@@ -49,11 +49,8 @@ impl Buffer {
     /// Allocates `size_bytes` zeroed bytes from `allocator`, which must
     /// outlive the buffer and its clones.
     pub fn allocate(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
-        // SAFETY: the bytes are zeroed before anything can read them.
-        let buffer = unsafe { Buffer::allocate_uninit(allocator, size_bytes)? };
-        // SAFETY: the buffer holds `size_bytes` bytes.
-        unsafe { buffer.data.write_bytes(0, size_bytes) };
-        Ok(buffer)
+        // SAFETY: the bytes come zeroed.
+        unsafe { Buffer::allocate_with(allocator, size_bytes, true) }
     }
 
     /// Allocates `size_bytes` bytes without zeroing them.
@@ -66,8 +63,25 @@ impl Buffer {
         allocator: &dyn Allocator,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
+        // SAFETY: upheld by the caller.
+        unsafe { Buffer::allocate_with(allocator, size_bytes, false) }
+    }
+
+    /// Allocates `size_bytes` bytes, zeroed if `zeroed`.
+    ///
+    /// # Safety
+    ///
+    /// As for `allocate_uninit` unless `zeroed`.
+    unsafe fn allocate_with(
+        allocator: &dyn Allocator,
+        size_bytes: usize,
+        zeroed: bool,
+    ) -> Result<Buffer, AllocError> {
         const { assert!(align_of::<Header>() == BUFFER_ALIGNMENT_BYTES) };
-        let header = allocator.allocate(layout(size_bytes)?)?.cast::<Header>();
+        let layout = layout(size_bytes)?;
+        let header =
+            if zeroed { allocator.allocate_zeroed(layout) } else { allocator.allocate(layout) }?
+                .cast::<Header>();
         // The allocator outlives the buffer, as its callers promise, so its
         // lifetime can be forgotten.
         // SAFETY: only the lifetime changes.

@@ -12,13 +12,23 @@ pub struct AllocError;
 /// # Safety
 ///
 /// `allocate` must return memory valid for `layout` until it is passed to
-/// `deallocate`.
+/// `deallocate`, and `allocate_zeroed` such memory with every byte zero.
 pub unsafe trait Allocator {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
 
+    /// As `allocate`, with the bytes zeroed. An allocator whose fresh memory
+    /// is zero already, such as pages from the system, can skip writing.
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        let ptr = self.allocate(layout)?;
+        // SAFETY: the allocation holds `layout.size()` bytes.
+        unsafe { ptr.write_bytes(0, layout.size()) };
+        Ok(ptr)
+    }
+
     /// # Safety
     ///
-    /// `ptr` and `layout` must come from a matching call to `allocate`.
+    /// `ptr` and `layout` must come from a matching call to `allocate` or
+    /// `allocate_zeroed`.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
 }
 
@@ -31,6 +41,12 @@ unsafe impl Allocator for Heap {
         check!(layout.size() > 0);
         // SAFETY: the size is non-zero.
         NonNull::new(unsafe { alloc::alloc::alloc(layout) }).ok_or(AllocError)
+    }
+
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        check!(layout.size() > 0);
+        // SAFETY: the size is non-zero.
+        NonNull::new(unsafe { alloc::alloc::alloc_zeroed(layout) }).ok_or(AllocError)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
@@ -67,17 +83,33 @@ impl<'a> Budget<'a> {
     }
 }
 
-// SAFETY: forwards to the allocator it holds.
-unsafe impl Allocator for Budget<'_> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+impl Budget<'_> {
+    /// Allocates `layout`, zeroed if `zeroed`, if it fits within the limit,
+    /// and counts it.
+    fn charge(&self, layout: Layout, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
         let used = self.used.get().checked_add(layout.size()).ok_or(AllocError)?;
         if used > self.limit {
             return Err(AllocError);
         }
-        let ptr = self.allocator.allocate(layout)?;
+        let ptr = if zeroed {
+            self.allocator.allocate_zeroed(layout)
+        } else {
+            self.allocator.allocate(layout)
+        }?;
         self.used.set(used);
         self.peak.set(self.peak.get().max(used));
         Ok(ptr)
+    }
+}
+
+// SAFETY: forwards to the allocator it holds.
+unsafe impl Allocator for Budget<'_> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        self.charge(layout, false)
+    }
+
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        self.charge(layout, true)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
@@ -115,6 +147,20 @@ mod tests {
         let two = budget.used();
         drop(second);
         assert_eq!((budget.used(), budget.peak()), (0, two));
+    }
+
+    #[test]
+    fn zeroed_memory_is_zero_and_counted() {
+        let budget = Budget::new(&Heap, 1000);
+        let layout = Layout::from_size_align(256, 64).unwrap();
+        let ptr = budget.allocate_zeroed(layout).unwrap();
+        // SAFETY: the allocation holds 256 bytes.
+        assert!(unsafe { core::slice::from_raw_parts(ptr.as_ptr(), 256) }.iter().all(|&b| b == 0));
+        assert_eq!(budget.used(), 256);
+        assert!(budget.allocate_zeroed(Layout::from_size_align(800, 64).unwrap()).is_err());
+        // SAFETY: allocated just above with this layout.
+        unsafe { budget.deallocate(ptr, layout) };
+        assert_eq!(budget.used(), 0);
     }
 
     /// Hands out one static block, so what's allocated from it can be
