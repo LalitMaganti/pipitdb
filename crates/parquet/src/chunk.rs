@@ -34,17 +34,16 @@ pub struct ChunkReader<'s> {
     dictionary_page: Option<(u64, u64, usize)>,
     /// The dictionary's values, once a page needs them.
     dictionary: Option<Dictionary>,
-    /// Room to decode a batch's levels or indices, and find its strings,
-    /// made the first time it's needed.
+    /// Room to decode a batch's levels or indices, made the first time it's
+    /// needed.
     scratch: Option<Buffer>,
     /// Bounds of the chunk's values, if known, from their type and
     /// statistics.
     bounds: Option<Bounds>,
 }
 
-/// A batch's worth of `u32`s for levels or indices, and then for strings'
-/// starts and lengths.
-const SCRATCH_BYTES: usize = 3 * BATCH_ROWS_MAX as usize * 4;
+/// A batch's worth of `u32`s, for levels or indices.
+const SCRATCH_BYTES: usize = BATCH_ROWS_MAX as usize * 4;
 
 /// Where reading is in a chunk. It's small and copied, so a lazy column can
 /// keep one and read its rows from it later, with `seek`.
@@ -72,7 +71,7 @@ pub struct Position {
     index: Hybrid,
 }
 
-/// A chunk's dictionary: words for fixed-width types, or offsets into bytes
+/// A chunk's dictionary: words for fixed-width types, or views into its page
 /// for strings.
 #[derive(Clone)]
 struct Dictionary {
@@ -161,7 +160,7 @@ impl<'s> ChunkReader<'s> {
         if self.column.optional {
             let levels = self.levels(page)?;
             let mut scratch = self.take_scratch(context)?;
-            let decoded = at_mut!(scratch.as_mut_slice::<u32>(), ..BATCH_ROWS_MAX as usize);
+            let decoded = scratch.as_mut_slice::<u32>();
             valid = 0;
             for start in (0..rows).step_by(decoded.len()) {
                 let chunk = at_mut!(decoded, ..(rows - start).min(BATCH_ROWS_MAX as usize));
@@ -193,10 +192,10 @@ impl<'s> ChunkReader<'s> {
     /// most `BATCH_ROWS_MAX`.
     pub fn read(&mut self, context: &mut Context, rows: usize) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
-        let (page, dictionary) = self.body(context)?;
-        let page = page.as_slice::<u8>();
+        let (body, dictionary) = self.body(context)?;
+        let page = body.as_slice::<u8>();
         let mut scratch = self.take_scratch(context)?;
-        let (decoded, places) = scratch.as_mut_slice::<u32>().split_at_mut(BATCH_ROWS_MAX as usize);
+        let decoded = scratch.as_mut_slice::<u32>();
         let (validity, valid) = self.validity(context, page, rows, decoded)?;
         if let Some(dictionary) = &dictionary {
             let column = self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
@@ -207,12 +206,15 @@ impl<'s> ChunkReader<'s> {
         let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
         let column = match self.data_type {
             DataType::String => {
-                let (starts, lens) = places.split_at_mut(BATCH_ROWS_MAX as usize);
-                let (starts, lens) = (at_mut!(starts, ..valid), at_mut!(lens, ..valid));
-                self.position.value = plain::strings(page, self.position.value, starts, lens)?;
-                let (offsets, bytes) =
-                    plain::gather_strings(context, page, starts, lens, rows, bits)?;
-                ColumnView::strings(context, offsets, bytes, validity)?
+                // Views into the page, so no string is copied: the column
+                // holds the page.
+                let mut views = context.values_buffer(rows * 8)?;
+                let at = self.position.value;
+                self.position.value = plain::views(page, at, views.as_mut_slice::<u32>(), valid)?;
+                if let Some(bits) = bits {
+                    bits::spread(views.as_mut_slice::<i64>(), valid, bits, 0);
+                }
+                ColumnView::strings(context, views, body.clone(), validity)?
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut out = context.values_buffer(rows * 8)?;
@@ -465,8 +467,8 @@ impl<'s> ChunkReader<'s> {
             return Ok(dictionary.clone());
         }
         let (body, len, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
-        let page = self.read_bytes(context, body, len)?;
-        let page = page.as_slice::<u8>();
+        let body = self.read_bytes(context, body, len)?;
+        let page = body.as_slice::<u8>();
         let count32 = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         // The values, then a null.
         let mut nulls = context.bytes_buffer((count + 1).div_ceil(8))?;
@@ -475,9 +477,12 @@ impl<'s> ChunkReader<'s> {
         *at_mut!(bits, count / 8) &= !(1 << (count % 8));
         let (values, nullable, words, mut bounds) = match self.data_type {
             DataType::String => {
-                let (offsets, bytes) = plain::dictionary_strings(context, page, count)?;
-                let values = ColumnView::strings(context, offsets.clone(), bytes.clone(), None)?;
-                (values, ColumnView::strings(context, offsets, bytes, Some(nulls))?, None, None)
+                // Views into the page, then an empty string, for nulls.
+                let mut views = context.bytes_buffer((count + 1) * 8)?;
+                plain::views(page, 0, views.as_mut_slice::<u32>(), count)?;
+                *at_mut!(views.as_mut_slice::<i64>(), count) = 0;
+                let values = ColumnView::strings(context, views.clone(), body.clone(), None)?;
+                (values, ColumnView::strings(context, views, body, Some(nulls))?, None, None)
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut values = context.bytes_buffer((count + 1) * 8)?;

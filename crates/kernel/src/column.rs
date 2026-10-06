@@ -19,16 +19,16 @@ pub enum DataType {
 }
 
 impl DataType {
+    /// How many bytes a value takes: a word, or for a string, a view: where
+    /// its bytes start, and how many there are.
     pub fn width_bytes(self) -> usize {
         match self {
-            DataType::Int64 | DataType::Float64 => 8,
-            DataType::String => 4,
+            DataType::Int64 | DataType::Float64 | DataType::String => 8,
         }
     }
 
-    /// Whether a column's values are offsets into a buffer of bytes, with one
-    /// more offset than there are rows.
-    pub fn has_offsets(self) -> bool {
+    /// Whether a column's values are views into a buffer of bytes.
+    pub fn has_bytes(self) -> bool {
         matches!(self, DataType::String)
     }
 }
@@ -111,7 +111,7 @@ impl ColumnView {
         values: Buffer,
         validity: Option<Buffer>,
     ) -> Result<ColumnView, AllocError> {
-        check!(!data_type.has_offsets());
+        check!(!data_type.has_bytes());
         check!(values.size_bytes().is_multiple_of(data_type.width_bytes()));
         let Ok(len) = u32::try_from(values.size_bytes() / data_type.width_bytes()) else {
             crate::check::check_failed(line!());
@@ -119,22 +119,22 @@ impl ColumnView {
         ColumnView::flat(context, data_type, values, None, validity, len)
     }
 
-    /// Strings: value `i` is `bytes[offsets[i]..offsets[i + 1]]`, so
-    /// `offsets` holds one more `u32` than there are values.
+    /// Strings as views: value `i` is the `views[2i + 1]` bytes of `bytes`
+    /// from `views[2i]`, so `views` holds two `u32`s a value. The strings
+    /// needn't be in order or next to each other, so they can stay where they
+    /// were read, such as in a Parquet page, between other bytes.
     pub fn strings(
         context: &mut Context,
-        offsets: Buffer,
+        views: Buffer,
         bytes: Buffer,
         validity: Option<Buffer>,
     ) -> Result<ColumnView, AllocError> {
-        let count = offsets.size_bytes() / 4;
-        check!(count >= 1 && offsets.size_bytes().is_multiple_of(4));
-        let Ok(len) = u32::try_from(count - 1) else {
+        check!(views.size_bytes().is_multiple_of(8));
+        let Ok(len) = u32::try_from(views.size_bytes() / 8) else {
             crate::check::check_failed(line!());
         };
         // Each value's range is checked when it's read.
-        check!(*at!(offsets.as_slice::<u32>(), count - 1) as usize <= bytes.size_bytes());
-        ColumnView::flat(context, DataType::String, offsets, Some(bytes), validity, len)
+        ColumnView::flat(context, DataType::String, views, Some(bytes), validity, len)
     }
 
     fn flat(
@@ -301,28 +301,15 @@ impl ColumnView {
                 Some(bits)
             }
         };
-        if self.data_type().has_offsets() {
-            let strings = values.strings();
-            let total: usize =
-                (0..self.row_count).map(|row| strings.get(index(row) as usize).len()).sum();
-            let mut offsets = context.indices_buffer((rows + 1) * 4)?;
-            let mut bytes = context.bytes_buffer(total)?;
-            let (ends, out) = (offsets.as_mut_slice::<u32>(), bytes.as_mut_slice::<u8>());
-            let mut to = 0;
-            *at_mut!(ends, 0) = 0;
-            for row in 0..self.row_count {
-                let value = strings.get(index(row) as usize);
-                at_mut!(out, to..to + value.len()).copy_from_slice(value);
-                to += value.len();
-                let Ok(end) = u32::try_from(to) else { return Err(AllocError) };
-                *at_mut!(ends, row as usize + 1) = end;
-            }
-            return ColumnView::strings(context, offsets, bytes, validity);
-        }
+        // A string's view is a word too: the views are gathered, and keep
+        // their bytes, so no string is copied.
         let words = values.slice_of::<i64>();
         let mut out = context.values_buffer(rows * 8)?;
         for (row, word) in (0..).zip(out.as_mut_slice::<i64>()) {
             *word = *at!(words, index(row) as usize);
+        }
+        if let Some(bytes) = &values.header.bytes {
+            return ColumnView::strings(context, out, bytes.clone(), validity);
         }
         let flat = ColumnView::new(context, self.data_type(), out, validity)?;
         flat.header().bounds.set(self.header().bounds.get());
@@ -430,10 +417,8 @@ impl<'a> Values<'a> {
 
     pub fn strings(self) -> Strings<'a> {
         check!(self.header.data_type == DataType::String);
-        let start = self.start as usize;
-        let offsets = at!(self.header.values.as_slice::<u32>(), start..=start + self.len as usize);
         let Some(bytes) = &self.header.bytes else { crate::check::check_failed(line!()) };
-        Strings { offsets, bytes: bytes.as_slice() }
+        Strings { views: self.slice_of::<u32>(), bytes: bytes.as_slice() }
     }
 
     /// Which values aren't null, or `None` if none are, for reading in a loop.
@@ -456,37 +441,27 @@ impl<'a> Values<'a> {
     }
 }
 
-/// A string column's values: offsets into bytes.
+/// A string column's values: views into bytes.
 #[derive(Clone, Copy)]
 pub struct Strings<'a> {
-    offsets: &'a [u32],
+    /// A start and length into `bytes` for each value.
+    views: &'a [u32],
     bytes: &'a [u8],
 }
 
 impl<'a> Strings<'a> {
     pub fn len(self) -> usize {
-        self.offsets.len() - 1
+        self.views.len() / 2
     }
 
     pub fn is_empty(self) -> bool {
         self.len() == 0
     }
 
+    #[inline]
     pub fn get(self, row: usize) -> &'a [u8] {
-        let (start, end) = (*at!(self.offsets, row), *at!(self.offsets, row + 1));
-        at!(self.bytes, start as usize..end as usize)
-    }
-
-    /// The bytes the rows take, from the first's start to the last's end.
-    pub fn bytes(self) -> &'a [u8] {
-        let (first, last) = (*at!(self.offsets, 0), *at!(self.offsets, self.offsets.len() - 1));
-        at!(self.bytes, first as usize..last as usize)
-    }
-
-    /// Each row's start in `bytes`, then the last's end, as offsets into the
-    /// whole buffer: subtract the first to have them start at 0.
-    pub fn offsets(self) -> &'a [u32] {
-        self.offsets
+        let (start, len) = (*at!(self.views, 2 * row) as usize, *at!(self.views, 2 * row + 1));
+        at!(self.bytes, start..start + len as usize)
     }
 }
 
@@ -551,27 +526,25 @@ mod tests {
             .int64s();
     }
 
+    /// `values`, one after another in a buffer, as views.
     fn strings(values: &[&str]) -> ColumnView {
-        let mut offsets = Buffer::allocate(&Heap, (values.len() + 1) * 4).unwrap();
-        let total: usize = values.iter().map(|v| v.len()).sum();
-        let mut bytes = Buffer::allocate(&Heap, total.max(1)).unwrap();
+        let text: alloc::string::String = values.concat();
         let mut at = 0;
-        for (i, value) in values.iter().enumerate() {
-            bytes.as_mut_slice::<u8>()[at..at + value.len()].copy_from_slice(value.as_bytes());
-            at += value.len();
-            offsets.as_mut_slice::<u32>()[i + 1] = u32::try_from(at).unwrap();
-        }
-        ColumnView::strings(&mut Context::new(&Heap), offsets, bytes, None).unwrap()
+        let spans: alloc::vec::Vec<(u32, u32)> = values
+            .iter()
+            .map(|value| {
+                let span = (at, u32::try_from(value.len()).unwrap());
+                at += span.1;
+                span
+            })
+            .collect();
+        views(text.as_bytes(), &spans, None)
     }
 
     #[test]
     fn strings_are_bytes() {
         // Not UTF-8: a lone continuation byte, and an overlong encoding.
-        let mut offsets = Buffer::allocate(&Heap, 3 * 4).unwrap();
-        offsets.as_mut_slice::<u32>().copy_from_slice(&[0, 1, 3]);
-        let mut bytes = Buffer::allocate(&Heap, 3).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(&[0x80, 0xc0, 0x80]);
-        let column = ColumnView::strings(&mut Context::new(&Heap), offsets, bytes, None).unwrap();
+        let column = views(&[0x80, 0xc0, 0x80], &[(0, 1), (1, 2)], None);
         let values = column.string_values();
         assert_eq!((values.get(0), values.get(1)), (&[0x80][..], &[0xc0, 0x80][..]));
     }
@@ -588,11 +561,41 @@ mod tests {
         let sliced = column.slice(2, 2);
         let slice = sliced.string_values();
         assert_eq!((slice.get(0), slice.get(1)), (&b"cde"[..], &b"f"[..]));
-        assert_eq!((slice.bytes(), slice.offsets()), (&b"cdef"[..], &[2, 5, 6][..]));
+    }
+
+    /// `values`, each a start and length into `bytes`, as views.
+    fn views(bytes: &[u8], values: &[(u32, u32)], validity: Option<u8>) -> ColumnView {
+        let mut page = Buffer::allocate(&Heap, bytes.len().max(1)).unwrap();
+        page.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(bytes);
+        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
+            view.copy_from_slice(&[start, len]);
+        }
+        let validity = validity.map(|bits| {
+            let mut buffer = Buffer::allocate(&Heap, 1).unwrap();
+            buffer.as_mut_slice::<u8>()[0] = bits;
+            buffer
+        });
+        ColumnView::strings(&mut Context::new(&Heap), views, page, validity).unwrap()
     }
 
     #[test]
-    #[should_panic(expected = "has_offsets")]
+    fn reads_string_views_and_slices_of_them() {
+        // Out of order, sharing bytes, between other bytes, and a null.
+        let column = views(b"..hello..", &[(2, 5), (0, 0), (4, 3), (2, 2)], Some(0b1101));
+        let values = column.string_values();
+        assert_eq!(
+            (values.len(), values.get(0), values.get(2), values.get(3)),
+            (4, &b"hello"[..], &b"llo"[..], &b"he"[..])
+        );
+        assert!(column.is_null(1));
+        let sliced = column.slice(2, 2);
+        let slice = sliced.string_values();
+        assert_eq!((slice.len(), slice.get(0), slice.get(1)), (2, &b"llo"[..], &b"he"[..]));
+    }
+
+    #[test]
+    #[should_panic(expected = "has_bytes")]
     fn strings_need_their_bytes() {
         let _ = ColumnView::new(
             &mut Context::new(&Heap),
@@ -665,12 +668,7 @@ mod tests {
     #[test]
     fn flattens_strings() {
         let mut context = crate::context::Context::new(&Heap);
-        let mut offsets = Buffer::allocate(&Heap, 3 * 4).unwrap();
-        offsets.as_mut_slice::<u32>().copy_from_slice(&[0, 2, 5]);
-        let mut bytes = Buffer::allocate(&Heap, 5).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(b"abcde");
-        let dictionary =
-            ColumnView::strings(&mut Context::new(&Heap), offsets, bytes, None).unwrap();
+        let dictionary = strings(&["ab", "cde"]);
         let column =
             ColumnView::dictionary(&mut Context::new(&Heap), &dictionary, indices(&[1, 1, 0]))
                 .unwrap();
