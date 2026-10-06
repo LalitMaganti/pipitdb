@@ -141,6 +141,17 @@ pub extern "C" fn run_column(value: i64) -> i64 {
     column.int64s()[0]
 }
 
+/// How many rows a lazy column of `rows` rows has, its values unread, or 0
+/// if making it fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn lazy_rows(rows: u32) -> u32 {
+    let mut context = Context::new(&Heap);
+    let Ok(column) = ColumnView::lazy(&mut context, DataType::Int64, &[0; 8], rows) else {
+        return 0;
+    };
+    if column.is_lazy() { column.row_count() } else { 0 }
+}
+
 /// The length of the second of two strings, of `first` and `second` bytes.
 #[unsafe(no_mangle)]
 pub extern "C" fn second_string_len(first: u32, second: u32) -> usize {
