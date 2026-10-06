@@ -24,22 +24,43 @@ pub enum Physical {
     FixedLenByteArray,
 }
 
+/// What a column's values mean, beyond how they're stored, where that
+/// changes how they're read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Logical {
+    /// As stored: integers are signed.
+    Plain,
+    /// Unsigned integers.
+    Unsigned,
+    /// Something reading as stored would get wrong, such as decimals.
+    Other,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Column {
+    /// Its name, in the file's names.
     pub name: Name,
+    /// How its values are stored.
     pub physical: Physical,
+    /// What its stored values mean, as far as this reader cares.
+    pub logical: Logical,
     /// Whether rows can be null.
     pub optional: bool,
 }
 
 impl Column {
-    /// What the column reads as, if this reader can read it.
+    /// What the column reads as, if this reader can read it. Unsigned 64-bit
+    /// integers can't all be held.
     pub fn data_type(&self) -> Option<DataType> {
-        match self.physical {
-            Physical::Int32 | Physical::Int64 => Some(DataType::Int64),
-            Physical::Float | Physical::Double => Some(DataType::Float64),
-            Physical::ByteArray => Some(DataType::String),
-            Physical::Boolean | Physical::Int96 | Physical::FixedLenByteArray => None,
+        match (self.physical, self.logical) {
+            (_, Logical::Other)
+            | (Physical::Int64, Logical::Unsigned)
+            | (Physical::Boolean | Physical::Int96 | Physical::FixedLenByteArray, _) => None,
+            (Physical::Int32 | Physical::Int64, _) => Some(DataType::Int64),
+            (Physical::Float | Physical::Double, _) => Some(DataType::Float64),
+            // Whether annotated as text or not, as strings are bytes,
+            // which needn't be UTF-8.
+            (Physical::ByteArray, _) => Some(DataType::String),
         }
     }
 }
@@ -47,21 +68,26 @@ impl Column {
 /// A column's values in a row group.
 #[derive(Clone, Copy, Debug)]
 pub struct Chunk {
-    /// Where its first page starts, a dictionary page if it has one, and how
-    /// many bytes its pages take.
+    /// Where its first page starts, a dictionary page if it has one.
     pub start: u64,
+    /// How many bytes its pages take.
     pub len: u64,
     /// Parquet's number for how its pages are compressed: 0 for none.
     pub codec: u8,
+    /// How many values it has, nulls included.
     pub values: u64,
-    /// The smallest and largest value, for integer columns that record them.
+    /// The smallest value, for integer columns that record it.
     pub min: Option<i64>,
+    /// The largest value, likewise.
     pub max: Option<i64>,
 }
 
 pub struct ParquetFile {
+    /// The columns' names.
     names: Names,
+    /// The columns, in order.
     columns: SlowVec<Column>,
+    /// How many rows each row group has.
     group_rows: SlowVec<u64>,
     /// Row group by row group, a chunk for each column.
     chunks: SlowVec<Chunk>,
@@ -130,11 +156,12 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
     c.at(0).fields(&[2, 4], &mut file)?;
     let mut schema = c.at(file[0].at()?);
     let (_, len) = schema.list()?;
-    // `SchemaElement`s: its type, repetition, name and children's count. The
-    // first is the root; flat schemas have columns only under it.
-    let mut element = [Value::Missing; 4];
+    // `SchemaElement`s: its type, repetition, name, children's count, and
+    // converted and logical types. The first is the root; flat schemas have
+    // columns only under it.
+    let mut element = [Value::Missing; 6];
     for i in 0..len {
-        schema.fields(&[1, 3, 4, 5], &mut element)?;
+        schema.fields(&[1, 3, 4, 5, 6, 10], &mut element)?;
         if i == 0 {
             continue;
         }
@@ -149,14 +176,16 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
             Some(7) => Physical::FixedLenByteArray,
             _ => return Some(Err(Error::Unsupported)),
         };
-        if element[3].int().unwrap_or(0) != 0 {
+        // Nested and repeated columns need repetition levels.
+        if element[3].int().unwrap_or(0) != 0 || element[1].int() == Some(2) {
             return Some(Err(Error::Unsupported));
         }
         let optional = element[1].int() == Some(1);
+        let logical = logical(&c, element[4], element[5])?;
         let Ok(name) = names.add(core::str::from_utf8(element[2].bytes()?).ok()?) else {
             return Some(Err(Error::OutOfMemory));
         };
-        if columns.push(Column { name, physical, optional }).is_err() {
+        if columns.push(Column { name, physical, logical, optional }).is_err() {
             return Some(Err(Error::Unsupported));
         }
     }
@@ -171,7 +200,7 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
             return None;
         }
         for column in columns.iter() {
-            if chunks.push(column_chunk(&mut list, column.physical)?).is_err() {
+            if chunks.push(column_chunk(&mut list, *column)?).is_err() {
                 return Some(Err(Error::Unsupported));
             }
         }
@@ -183,8 +212,35 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
     Some(Ok(ParquetFile { names, columns, group_rows, chunks }))
 }
 
-/// A `ColumnChunk`, at `c`, of a column stored as `physical`.
-fn column_chunk(c: &mut Cursor<'_>, physical: Physical) -> Option<Chunk> {
+/// A column's `Logical` kind, from its converted type, and its logical type
+/// at `logical`, if any.
+fn logical(c: &Cursor<'_>, converted: Value<'_>, logical: Value<'_>) -> Option<Logical> {
+    // `ConvertedType`: 5 is a decimal, 11 to 14 unsigned integers.
+    match converted.int() {
+        Some(5) => return Some(Logical::Other),
+        Some(11..=14) => return Some(Logical::Unsigned),
+        _ => {}
+    }
+    let Some(at) = logical.at() else { return Some(Logical::Plain) };
+    // `LogicalType`, a union: 5 is a decimal, 10 an integer, with whether
+    // it's signed as its field 2.
+    let mut kind = [Value::Missing; 2];
+    c.at(at).fields(&[5, 10], &mut kind)?;
+    if kind[0].at().is_some() {
+        return Some(Logical::Other);
+    }
+    if let Some(at) = kind[1].at() {
+        let mut signed = [Value::Missing];
+        c.at(at).fields(&[2], &mut signed)?;
+        if signed[0].int() == Some(0) {
+            return Some(Logical::Unsigned);
+        }
+    }
+    Some(Logical::Plain)
+}
+
+/// A `ColumnChunk`, at `c`, of `column`.
+fn column_chunk(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
     let mut chunk = [Value::Missing];
     c.fields(&[3], &mut chunk)?;
     // `ColumnMetaData`: its codec, values, size, the offsets of its data and
@@ -196,13 +252,15 @@ fn column_chunk(c: &mut Cursor<'_>, physical: Physical) -> Option<Chunk> {
     let start = unsigned(meta[4]).map_or(data, |dictionary| dictionary.min(data));
     let (mut min, mut max) = (None, None);
     if let Some(at) = meta[5].at() {
-        // `Statistics`: the current max and min are fields 5 and 6; 1 and 2
-        // are older, and the same for signed integers.
+        // `Statistics`: the current max and min are fields 5 and 6, ordered
+        // as the column's values are. 1 and 2 are older and always ordered
+        // as signed, so are only right for signed integers.
         let mut stats = [Value::Missing; 4];
         c.at(at).fields(&[5, 6, 1, 2], &mut stats)?;
-        let integer = |value: Value<'_>| integer(value.bytes()?, physical);
-        max = integer(stats[0]).or_else(|| integer(stats[2]));
-        min = integer(stats[1]).or_else(|| integer(stats[3]));
+        let integer = |value: Value<'_>| integer(value.bytes()?, column);
+        let signed = column.logical == Logical::Plain;
+        max = integer(stats[0]).or_else(|| integer(stats[2]).filter(|_| signed));
+        min = integer(stats[1]).or_else(|| integer(stats[3]).filter(|_| signed));
     }
     Some(Chunk {
         start,
@@ -214,12 +272,16 @@ fn column_chunk(c: &mut Cursor<'_>, physical: Physical) -> Option<Chunk> {
     })
 }
 
-fn integer(bytes: &[u8], physical: Physical) -> Option<i64> {
-    match physical {
-        Physical::Int32 => Some(i64::from(i32::from_le_bytes(bytes.try_into().ok()?))),
-        Physical::Int64 => Some(i64::from_le_bytes(bytes.try_into().ok()?)),
-        _ => None,
-    }
+/// A statistic of `column`, an integer column it can read, as its value.
+fn integer(bytes: &[u8], column: Column) -> Option<i64> {
+    column.data_type().filter(|&data_type| data_type == DataType::Int64)?;
+    Some(match (column.physical, column.logical) {
+        (Physical::Int32, Logical::Unsigned) => {
+            i64::from(u32::from_le_bytes(bytes.try_into().ok()?))
+        }
+        (Physical::Int32, _) => i64::from(i32::from_le_bytes(bytes.try_into().ok()?)),
+        _ => i64::from_le_bytes(bytes.try_into().ok()?),
+    })
 }
 
 #[cfg(test)]

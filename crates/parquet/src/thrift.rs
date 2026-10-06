@@ -12,9 +12,11 @@ const DEPTH_MAX: u32 = 32;
 /// A field `Cursor::fields` read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Value<'a> {
+    /// The field isn't there.
     Missing,
     /// An integer, or a boolean as 0 or 1.
     Int(i64),
+    /// A string or binary field's bytes.
     Bytes(&'a [u8]),
     /// A struct or list, to read from here.
     At(usize),
