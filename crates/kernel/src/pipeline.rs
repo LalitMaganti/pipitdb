@@ -445,7 +445,12 @@ mod tests {
         }
 
         fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
-            batch.columns_mut().reverse();
+            let count = batch.column_count();
+            let reversed: Vec<ColumnView> =
+                (0..count).rev().map(|i| batch.column(i).clone()).collect();
+            for (i, column) in (0..).zip(reversed) {
+                batch.set_column(i, column);
+            }
             Ok(())
         }
     }

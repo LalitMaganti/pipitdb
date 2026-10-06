@@ -99,10 +99,12 @@ impl RowBatch {
         unsafe { at!(self.columns, index as usize).assume_init_ref() }
     }
 
-    pub fn columns_mut(&mut self) -> &mut [ColumnView] {
-        let columns = at_mut!(self.columns, ..self.column_count as usize);
+    /// Replaces column `index` with `column`, of as many rows. Columns are
+    /// only replaced, never moved out, so a batch decides what it holds.
+    pub fn set_column(&mut self, index: u32, column: ColumnView) {
+        check!(index < self.column_count && column.row_count() == self.row_count);
         // SAFETY: as in `column`.
-        unsafe { &mut *(core::ptr::from_mut(columns) as *mut [ColumnView]) }
+        *unsafe { at_mut!(self.columns, index as usize).assume_init_mut() } = column;
     }
 
     fn drop_columns(&mut self) {
