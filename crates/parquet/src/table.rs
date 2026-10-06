@@ -102,6 +102,12 @@ impl Scannable for ParquetTable<'_> {
         data_type
     }
 
+    /// Constant where a page's run of one entry covers a batch, and
+    /// dictionary for strings' dictionary pages.
+    fn forms(&self, _: u32) -> Forms {
+        Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
+    }
+
     fn open<'s>(
         &'s self,
         context: &mut Context,
@@ -255,5 +261,30 @@ mod tests {
     fn doesnt_read_decimals_as_integers() {
         let opened = ParquetTable::open(&Heap, &Uncompressed, &[&DECIMAL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
+    }
+
+    #[test]
+    fn makes_dictionaries_where_allowed() {
+        const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&DICT]).unwrap();
+        // `name`, a string column of dictionary pages.
+        assert!(table.forms(2).contains(Forms::DICTIONARY));
+        let first = |forms: Forms| {
+            let mut context = Context::new(&Heap);
+            let read = [(2, forms)];
+            let mut state = table.open(&mut context, &read).unwrap();
+            let mut batch = RowBatch::new();
+            assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
+            let column = batch.column(0).clone();
+            let dictionary = matches!(column.form(), pipit_kernel::column::Form::Dictionary(_));
+            let mut flat = column;
+            flat.make_in(&mut context, Forms::FLAT).unwrap();
+            let strings = flat.string_values();
+            let values: Vec<Vec<u8>> = (0..3).map(|row| strings.get(row).to_vec()).collect();
+            (dictionary, values)
+        };
+        let (kept, values) = first(Forms::FLAT | Forms::DICTIONARY);
+        assert!(kept);
+        assert_eq!(first(Forms::FLAT), (false, values));
     }
 }
