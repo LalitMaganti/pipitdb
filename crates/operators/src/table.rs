@@ -112,11 +112,11 @@ impl Scannable for Table {
         Ok(ScanState { columns, row_group: 0 })
     }
 
-    fn next(
-        &self,
+    fn next<'s>(
+        &'s self,
         _: &mut Context,
-        at: &mut ScanState<'_>,
-        batch: &mut RowBatch,
+        at: &mut ScanState<'s>,
+        batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error> {
         loop {
             let Some(row_group) = self.row_groups.get(at.row_group) else { return Ok(false) };
