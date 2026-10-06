@@ -7,6 +7,41 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 
+/// Forms a column may come in besides flat: what a plan lets a producer make
+/// a column in, and what a consumer takes it in. Every producer can make
+/// flat columns and every consumer takes them, so an empty set allows flat
+/// only.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Forms(u8);
+
+impl Forms {
+    /// Flat only.
+    pub const FLAT: Forms = Forms(0);
+    /// Not read yet: read when loaded, for the rows still kept.
+    pub const LAZY: Forms = Forms(1);
+
+    /// Whether every form in `other` is in this.
+    pub fn contains(self, other: Forms) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl core::ops::BitOr for Forms {
+    type Output = Forms;
+
+    fn bitor(self, other: Forms) -> Forms {
+        Forms(self.0 | other.0)
+    }
+}
+
+impl core::ops::BitAnd for Forms {
+    type Output = Forms;
+
+    fn bitand(self, other: Forms) -> Forms {
+        Forms(self.0 & other.0)
+    }
+}
+
 /// A column's type. Strings are bytes, as stored: usually UTF-8 text, but
 /// not checked to be, as nothing reads them as text. They're compared,
 /// hashed and grouped byte by byte; what shows them to people decides what

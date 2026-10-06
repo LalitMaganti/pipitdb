@@ -2,7 +2,7 @@
 //! footer, which pipelines can scan.
 
 use pipit_kernel::allocator::{AllocError, Allocator};
-use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
@@ -84,6 +84,7 @@ pub struct ScanState {
 /// Reads each row group as one batch. Nothing is copied.
 impl Scannable for Table {
     type State = ScanState;
+    type Loader = ();
 
     #[expect(clippy::cast_possible_truncation, reason = "checked by `new`")]
     fn column_count(&self) -> u32 {
@@ -105,6 +106,7 @@ impl Scannable for Table {
     fn next(
         &self,
         columns: &[u32],
+        _: &[Forms],
         _: &mut Context,
         at: &mut ScanState,
         batch: &mut RowBatch,
@@ -150,7 +152,10 @@ mod tests {
         let mut state = table.new_state(&mut context).unwrap();
         let mut batch = RowBatch::new();
         let mut batches = Vec::new();
-        while table.next(columns, &mut context, &mut state, &mut batch).unwrap() {
+        while table
+            .next(columns, &vec![Forms::FLAT; columns.len()], &mut context, &mut state, &mut batch)
+            .unwrap()
+        {
             let first = (0..batch.column_count()).map(|i| batch.column(i).int64s()[0]);
             batches.push((batch.row_count(), first.collect()));
         }
