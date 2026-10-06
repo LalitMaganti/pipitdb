@@ -2,10 +2,11 @@
 
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{Bounds, DataType, Forms};
+use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
+use pipit_kernel::selection::Selection;
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{DynSource, Source};
 
@@ -39,34 +40,42 @@ pub struct ScanState<'a> {
 }
 
 /// Reads a row group a batch at a time, once started: a reader for each
-/// column read, and how many rows are left.
+/// column read, which for a lazy column only counts its rows, how many rows
+/// are left, and which file and row group it is, for lazy columns' handles.
 struct Rows<'a> {
     readers: SlowVec<ChunkReader<'a>>,
     started: bool,
     left: u64,
+    file: u32,
+    group: u32,
 }
 
 impl<'a> Rows<'a> {
     fn new(allocator: &dyn Allocator, columns: usize) -> Result<Rows<'a>, Error> {
-        Ok(Rows { readers: SlowVec::fixed(allocator, columns)?, started: false, left: 0 })
+        let readers = SlowVec::fixed(allocator, columns)?;
+        Ok(Rows { readers, started: false, left: 0, file: 0, group: 0 })
     }
 
-    /// Starts reading `columns` of row group `group` of `file`.
+    /// Starts reading `columns` of row group `group` of file `file` of
+    /// `table`.
     fn start(
         &mut self,
-        file: &File<'a>,
-        codecs: &'a dyn Codec,
+        table: &ParquetTable<'a>,
         columns: &[(u32, Forms)],
+        file: usize,
         group: usize,
     ) -> Result<(), Error> {
+        let (index, file) = (file, at!(table.files, file));
         for &(column, _) in columns {
             let c = column as usize;
             let chunk = file.footer.chunk(group, c);
             let column = *at!(file.footer.columns(), c);
-            let reader = ChunkReader::new(file.source, codecs, column, chunk)?;
+            let reader = ChunkReader::new(file.source, table.codecs, column, chunk)?;
             self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
         }
         (self.started, self.left) = (true, file.footer.group_rows(group));
+        self.file = u32::try_from(index).map_err(|_| Error::Unsupported)?;
+        self.group = u32::try_from(group).map_err(|_| Error::Unsupported)?;
         Ok(())
     }
 
@@ -92,8 +101,19 @@ impl<'a> Rows<'a> {
             return Ok(false);
         }
         batch.reset(rows);
-        for (reader, &(_, forms)) in self.readers.iter_mut().zip(columns) {
-            let Ok(()) = batch.push_column(reader.read(context, rows as usize, forms)?) else {
+        for (reader, &(column, forms)) in self.readers.iter_mut().zip(columns) {
+            let view = if forms.contains(Forms::LAZY) {
+                // Where its rows are, for `load`: only counted here, so no
+                // page body is read.
+                let (header, row) = reader.place();
+                let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
+                let handle = Handle { file: self.file, group: self.group, column, row, header };
+                reader.pass(rows as usize);
+                ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
+            } else {
+                reader.read(context, rows as usize, forms)?
+            };
+            let Ok(()) = batch.push_column(view) else {
                 pipit_kernel::check::check_failed(line!());
             };
         }
@@ -127,8 +147,7 @@ impl<'a> Source for Pruned<'a> {
         loop {
             if !rows.started {
                 let Some(&(file, group)) = self.groups.get(*started) else { return Ok(false) };
-                let file = at!(self.table.files, file);
-                rows.start(file, self.table.codecs, &self.columns, group)?;
+                rows.start(self.table, &self.columns, file, group)?;
                 *started += 1;
             }
             if rows.next(context, &self.columns, batch)? {
@@ -178,12 +197,53 @@ fn check_same_columns(first: &ParquetFile, file: &ParquetFile) -> Result<(), Err
     if same { Ok(()) } else { Err(Error::Unsupported) }
 }
 
-impl Scannable for ParquetTable<'_> {
+/// Where a lazy column's rows are: column `column` of row group `group` of
+/// file `file`, from row `row` of the page whose header starts at `header`.
+struct Handle {
+    file: u32,
+    group: u32,
+    column: u32,
+    row: u32,
+    header: u64,
+}
+
+impl Handle {
+    const BYTES: usize = 24;
+
+    fn bytes(&self) -> [u8; Handle::BYTES] {
+        let mut bytes = [0; Handle::BYTES];
+        let words = [self.file, self.group, self.column, self.row];
+        for (to, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+            to.copy_from_slice(&word.to_le_bytes());
+        }
+        at_mut!(bytes, 16..).copy_from_slice(&self.header.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Handle, Error> {
+        let Some((words, header)) = bytes.split_first_chunk::<16>() else {
+            return Err(Error::Corrupt);
+        };
+        let header = u64::from_le_bytes(header.try_into().map_err(|_| Error::Corrupt)?);
+        let (words, _) = words.as_chunks::<4>();
+        let [file, group, column, row] =
+            core::array::from_fn(|i| u32::from_le_bytes(*at!(words, i)));
+        Ok(Handle { file, group, column, row, header })
+    }
+}
+
+/// What loading lazy columns keeps between batches: a reader for each
+/// column loaded, with the file and row group it reads.
+pub struct Loader<'a> {
+    readers: SlowVec<((u32, u32, u32), ChunkReader<'a>)>,
+}
+
+impl<'a> Scannable for ParquetTable<'a> {
     type State<'s>
         = ScanState<'s>
     where
         Self: 's;
-    type Loader = ();
+    type Loader = Loader<'a>;
 
     fn column_count(&self) -> u32 {
         let Ok(count) = u32::try_from(self.first().columns().len()) else {
@@ -204,10 +264,56 @@ impl Scannable for ParquetTable<'_> {
         data_type
     }
 
-    /// Constant where a page's run of one entry covers a batch, and
-    /// dictionary for strings' dictionary pages.
+    /// Constant where a page's run of one entry covers a batch, dictionary
+    /// for strings' dictionary pages, and lazy, loaded a batch at a time.
     fn forms(&self, _: u32) -> Forms {
-        Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
+        Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY | Forms::LAZY
+    }
+
+    fn new_loader(&self, context: &mut Context) -> Result<Loader<'a>, Error> {
+        Ok(Loader { readers: SlowVec::fixed(context.allocator(), BATCH_COLUMNS_MAX as usize)? })
+    }
+
+    /// Reads all the rows of `lazy`, whichever are kept, keeping a reader
+    /// for each column from batch to batch.
+    fn load(
+        &self,
+        context: &mut Context,
+        loader: &mut Loader<'a>,
+        lazy: &ColumnView,
+        _: &Selection,
+        forms: Forms,
+    ) -> Result<ColumnView, Error> {
+        let (bytes, start) = lazy.handle();
+        let handle = Handle::from_bytes(bytes)?;
+        let key = (handle.column, handle.file, handle.group);
+        let found = loader.readers.iter().position(|((column, ..), _)| *column == handle.column);
+        let at = match found {
+            Some(at) if at!(loader.readers, at).0 == key => at,
+            _ => {
+                let file = self.files.get(handle.file as usize).ok_or(Error::Corrupt)?;
+                let (group, c) = (handle.group as usize, handle.column as usize);
+                if group >= file.footer.row_groups() || c >= file.footer.columns().len() {
+                    return Err(Error::Corrupt);
+                }
+                let column = *at!(file.footer.columns(), c);
+                let chunk = file.footer.chunk(group, c);
+                let mut reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
+                // Past the dictionary page, if any, so data pages can be
+                // gone to.
+                reader.page_left(context)?;
+                if let Some(at) = found {
+                    *at_mut!(loader.readers, at) = (key, reader);
+                    at
+                } else {
+                    loader.readers.push((key, reader)).map_err(|_| Error::OutOfMemory)?;
+                    loader.readers.len() - 1
+                }
+            }
+        };
+        let reader = &mut at_mut!(loader.readers, at).1;
+        reader.go_to(context, handle.header, handle.row as usize + start as usize)?;
+        reader.read(context, lazy.row_count() as usize, forms)
     }
 
     fn open<'s>(
@@ -234,7 +340,7 @@ impl Scannable for ParquetTable<'_> {
                     (state.file, state.group) = (state.file + 1, 0);
                     continue;
                 }
-                state.rows.start(file, self.codecs, state.columns, state.group)?;
+                state.rows.start(self, state.columns, state.file, state.group)?;
                 state.group += 1;
             }
             if state.rows.next(context, state.columns, batch)? {
@@ -281,6 +387,7 @@ impl Scannable for ParquetTable<'_> {
 mod tests {
     extern crate std;
 
+    use std::string::{String, ToString};
     use std::vec::Vec;
 
     use pipit_kernel::allocator::Heap;
@@ -312,6 +419,54 @@ mod tests {
             }
         }
         (rows, ids)
+    }
+
+    /// Each row of `column`, as text, `-` for nulls.
+    fn cells(context: &mut Context, column: &ColumnView) -> Vec<String> {
+        let mut flat = column.clone();
+        flat.make_in(context, Forms::FLAT).unwrap();
+        (0..flat.row_count())
+            .map(|row| match flat.data_type() {
+                _ if flat.is_null(row) => "-".into(),
+                DataType::Int64 => flat.int64s()[row as usize].to_string(),
+                DataType::Float64 => flat.float64s()[row as usize].to_string(),
+                DataType::String => {
+                    String::from_utf8_lossy(flat.string_values().get(row as usize)).into()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn loads_lazy_columns_as_read_eagerly() {
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
+        let mut context = Context::new(&Heap);
+        let batches = |forms: Forms, context: &mut Context| {
+            let read = [(2, forms), (0, forms), (1, forms)];
+            let mut state = table.open(context, &read).unwrap();
+            let (mut batch, mut batches) = (RowBatch::new(), Vec::new());
+            while table.next(context, &mut state, &mut batch).unwrap() {
+                batches.push((0..3).map(|i| batch.column(i).clone()).collect::<Vec<_>>());
+            }
+            batches
+        };
+        let eager = batches(Forms::FLAT, &mut context);
+        let lazy = batches(Forms::FLAT | Forms::LAZY, &mut context);
+        assert_eq!(lazy.len(), eager.len());
+        assert!(lazy.iter().flatten().all(ColumnView::is_lazy));
+        // Every other batch, skipping some, then the rest backwards, going
+        // back within pages and to earlier row groups, and one twice.
+        let n = lazy.len();
+        let order = (0..n).step_by(2).chain((0..n).rev().filter(|b| b % 2 == 1)).chain([0]);
+        let mut loader = table.new_loader(&mut context).unwrap();
+        for b in order {
+            for (lazy, eager) in lazy[b].iter().zip(&eager[b]) {
+                let all = Selection::all(lazy.row_count());
+                let column =
+                    table.load(&mut context, &mut loader, lazy, &all, Forms::FLAT).unwrap();
+                assert_eq!(cells(&mut context, &column), cells(&mut context, eager), "batch {b}");
+            }
+        }
     }
 
     #[test]
