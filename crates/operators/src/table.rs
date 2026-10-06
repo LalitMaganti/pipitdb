@@ -84,7 +84,8 @@ pub struct ScanState<'s> {
     row_group: usize,
 }
 
-/// Reads each row group as one batch. Nothing is copied.
+/// Reads each row group as one batch. Nothing is copied, and the batch
+/// borrows the table's views, so nothing is counted.
 impl Scannable for Table {
     type State<'s> = ScanState<'s>;
     type Loader = ();
@@ -126,15 +127,13 @@ impl Scannable for Table {
                 continue;
             }
             batch.reset(row_group.row_count);
-            for &(i, _) in at.columns {
+            // Borrowed: the table outlives the batch.
+            let views: &[ColumnView] = &row_group.columns;
+            batch.push_borrowed(at.columns.iter().map(|&(i, _)| {
                 // SAFETY: `open` checked `i` is one of the table's columns,
                 // and `new` that each row group has a view of each.
-                let column = unsafe { row_group.columns.get_unchecked(i as usize) }.clone();
-                // At most `BATCH_COLUMNS_MAX`, checked by `open`.
-                let Ok(()) = batch.push_column(column) else {
-                    pipit_kernel::check::check_failed(line!());
-                };
-            }
+                unsafe { views.get_unchecked(i as usize) }
+            }));
             return Ok(true);
         }
     }
