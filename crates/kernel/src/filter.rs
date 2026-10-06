@@ -8,8 +8,10 @@
 
 use core::cmp::Ordering;
 
-use crate::column::{ColumnView, DataType, Form};
+use crate::allocator::{AllocError, Allocator};
+use crate::column::{ColumnView, DataType, Form, Values};
 use crate::selection::Selection;
+use crate::slow_vec::SlowVec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Comparison {
@@ -92,7 +94,7 @@ pub fn compare_string(
             return keep_all(selection, dropped);
         }
         Form::Constant => return drop_all(selection, dropped),
-        // `Filter` refuses dictionary columns.
+        // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => crate::check::check_failed(line!()),
     }
     // A null row's view isn't read: it may not point at bytes.
@@ -111,6 +113,85 @@ pub fn compare_string(
         }
         _ => retain(selection, dropped, |row| valid(row) && holds(cell(row))),
     }
+}
+
+/// Which entries of a dictionary a condition is `want` for, a bit for each:
+/// found once for each dictionary, and kept while batches share it, as a
+/// chunk's do, so a dictionary of a few strings over many rows costs a few
+/// tests.
+#[derive(Default)]
+pub struct Entries {
+    /// A column of the dictionary they're for, kept so its values aren't
+    /// freed, and their address reused, while the bits are.
+    dictionary: Option<ColumnView>,
+    /// What the condition is wanted to be for the entries with bits set.
+    want: bool,
+    /// Bit `e` is set if the condition is `want` for entry `e`.
+    bits: Option<SlowVec<u64>>,
+}
+
+impl Entries {
+    /// The bits for `column`'s dictionary and `want`, set by `set` for its
+    /// entries, unless found already.
+    pub fn find(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: &ColumnView,
+        want: bool,
+        set: impl FnOnce(Values<'_>, &mut [u64]),
+    ) -> Result<&[u64], AllocError> {
+        let found = self.want == want
+            && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));
+        if !found {
+            let values = column.values();
+            let mut bits = SlowVec::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
+            set(values, &mut bits);
+            (self.dictionary, self.want, self.bits) = (Some(column.clone()), want, Some(bits));
+        }
+        let Some(bits) = &self.bits else { crate::check::check_failed(line!()) };
+        Ok(bits)
+    }
+}
+
+/// Sets the bit of each of a dictionary's entries, `values`, where
+/// `entry <comparison> string`, as `compare_string` keeps rows.
+pub fn compare_string_bits(
+    values: Values<'_>,
+    comparison: Comparison,
+    string: &[u8],
+    bits: &mut [u64],
+) {
+    let strings = values.strings();
+    set(bits, values, |e| comparison.holds(strings.get(e as usize).cmp(string)));
+}
+
+/// Sets bit `e` of `bits` for each entry `e` of `values` that isn't null and
+/// that `test` is true for: a null's value isn't read.
+fn set(bits: &mut [u64], values: Values<'_>, test: impl Fn(u32) -> bool) {
+    for e in 0..values.len() {
+        let passes = !values.is_null(e) && test(e);
+        *at_mut!(bits, e as usize / 64) |= u64::from(passes) << (e % 64);
+    }
+}
+
+/// Narrows `selection` to the rows of `column`, a dictionary, whose entry's
+/// bit is set in `bits`, writing the rows it drops to `dropped`, if given.
+/// One test for every condition, so the loops it runs aren't copied for each.
+pub fn keep_entries(
+    column: &ColumnView,
+    bits: &[u64],
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check_covers(column, selection);
+    let Form::Dictionary(indices) = column.form() else { crate::check::check_failed(line!()) };
+    retain(selection, dropped, |row| {
+        // SAFETY: `check_covers` checked every row is a row of `column`, one
+        // index each.
+        let e = unsafe { cell(indices, row) };
+        // An index past the entries fails the check, as when read anywhere.
+        (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
+    });
 }
 
 /// `compare` for any form of `column`, whose values `cells` reads.
@@ -133,7 +214,7 @@ fn compare_form<T: Copy>(
                 drop_all(selection, dropped);
             }
         }
-        // `Filter` refuses dictionary columns.
+        // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => crate::check::check_failed(line!()),
     }
 }
@@ -152,7 +233,7 @@ pub fn is_null(
         // One value for every row: kept or dropped together.
         Form::Constant if column.is_null(0) == nulls => return keep_all(selection, dropped),
         Form::Constant => return drop_all(selection, dropped),
-        // `Filter` refuses dictionary columns.
+        // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => crate::check::check_failed(line!()),
     }
     match column.validity() {

@@ -20,6 +20,8 @@ unsafe impl Primitive for u8 {}
 // SAFETY: as above.
 unsafe impl Primitive for u32 {}
 // SAFETY: as above.
+unsafe impl Primitive for u64 {}
+// SAFETY: as above.
 unsafe impl Primitive for i64 {}
 // SAFETY: as above.
 unsafe impl Primitive for f64 {}

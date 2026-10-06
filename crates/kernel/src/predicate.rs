@@ -9,7 +9,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{Bounds, ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
-use crate::filter::{self, Comparison, Value};
+use crate::filter::{self, Comparison, Entries, Value};
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -129,14 +129,22 @@ impl Predicate {
         }
     }
 
+    /// Whether every condition it has on `column` compares it with a string,
+    /// and it has one.
+    pub fn compares_only_strings(&self, column: u32) -> bool {
+        let leaves = self.nodes.iter().filter_map(|node| match *node {
+            Node::Leaf(leaf) => Some(leaf),
+            Node::And(..) | Node::Or(..) | Node::Not(_) => None,
+        });
+        let mut on_column = leaves.filter(|leaf| leaf.column() == column).peekable();
+        on_column.peek().is_some()
+            && on_column.all(|leaf| matches!(leaf, Leaf::CompareString { .. }))
+    }
+
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.
     pub fn columns(&self) -> impl Iterator<Item = u32> + '_ {
         self.nodes.iter().filter_map(|node| match *node {
-            Node::Leaf(
-                Leaf::Compare { column, .. }
-                | Leaf::CompareString { column, .. }
-                | Leaf::IsNull { column },
-            ) => Some(column),
+            Node::Leaf(leaf) => Some(leaf.column()),
             Node::And(..) | Node::Or(..) | Node::Not(_) => None,
         })
     }
@@ -169,14 +177,29 @@ impl Predicate {
         Ok(Predicate { nodes, strings, depth: self.depth })
     }
 
+    /// Where each node keeps the dictionary entries it found, for `select`.
+    pub fn new_entries(&self, allocator: &dyn Allocator) -> Result<SlowVec<Entries>, AllocError> {
+        SlowVec::fixed_from(allocator, (0..self.nodes.len()).map(|_| Entries::default()))
+    }
+
     /// Narrows `batch`'s selection to the rows this is true for, working in
-    /// `scratch`, which holds at least `depth` selections.
+    /// `scratch`, which holds at least `depth` selections. Its leaves keep
+    /// the entries of dictionary columns they find in `entries`, made by
+    /// `new_entries`, allocating from `allocator`.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX` nodes")]
-    pub fn select(&self, scratch: &mut [Selection], batch: &mut RowBatch) {
-        check!(scratch.len() >= self.depth as usize);
+    pub fn select(
+        &self,
+        allocator: &dyn Allocator,
+        scratch: &mut [Selection],
+        entries: &mut [Entries],
+        batch: &mut RowBatch,
+    ) -> Result<(), AllocError> {
+        check!(scratch.len() >= self.depth as usize && entries.len() == self.nodes.len());
         let (columns, selection) = batch.columns_and_selection();
+        let strings = self.strings.as_deref().unwrap_or(&[]);
+        let mut inputs = Inputs { columns, strings, entries, allocator };
         let root = self.nodes.len() as u32 - 1;
-        self.narrow(scratch, root, true, columns, selection);
+        self.narrow(&mut inputs, scratch, root, true, selection)
     }
 
     /// Narrows `selection` to the rows node `node` is `want` for. A node that
@@ -184,18 +207,18 @@ impl Predicate {
     /// in the rest.
     fn narrow(
         &self,
+        inputs: &mut Inputs<'_>,
         scratch: &mut [Selection],
         node: u32,
         want: bool,
-        columns: &[ColumnView],
         selection: &mut Selection,
-    ) {
+    ) -> Result<(), AllocError> {
         match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => leaf.narrow(self.strings(), None, want, columns, selection),
-            Node::Not(child) => self.narrow(scratch, child, !want, columns, selection),
+            Node::Leaf(leaf) => leaf.narrow(inputs, node, None, want, selection)?,
+            Node::Not(child) => self.narrow(inputs, scratch, child, !want, selection)?,
             // True for both, or false for both: each narrows what the other left.
-            Node::And(a, b) if want => self.both(scratch, a, b, true, columns, selection),
-            Node::Or(a, b) if !want => self.both(scratch, a, b, false, columns, selection),
+            Node::And(a, b) if want => self.both(inputs, scratch, a, b, true, selection)?,
+            Node::Or(a, b) if !want => self.both(inputs, scratch, a, b, false, selection)?,
             // False for either, or true for either: the rows `a` is `want` for,
             // and those `b` is among the rest.
             Node::And(a, b) | Node::Or(a, b) => {
@@ -204,69 +227,92 @@ impl Predicate {
                 };
                 if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
                     // In one pass.
-                    leaf.narrow(self.strings(), Some(rest), want, columns, selection);
+                    leaf.narrow(inputs, a, Some(rest), want, selection)?;
                 } else {
                     rest.clone_from(selection);
-                    self.narrow(scratch, a, want, columns, selection);
+                    self.narrow(inputs, scratch, a, want, selection)?;
                     rest.subtract(selection);
                 }
-                self.narrow(scratch, b, want, columns, rest);
+                self.narrow(inputs, scratch, b, want, rest)?;
                 selection.union(rest);
             }
         }
-    }
-
-    /// The bytes its string comparisons compare with.
-    fn strings(&self) -> &[u8] {
-        self.strings.as_deref().unwrap_or(&[])
+        Ok(())
     }
 
     fn both(
         &self,
+        inputs: &mut Inputs<'_>,
         scratch: &mut [Selection],
         a: u32,
         b: u32,
         want: bool,
-        columns: &[ColumnView],
         selection: &mut Selection,
-    ) {
-        self.narrow(scratch, a, want, columns, selection);
-        self.narrow(scratch, b, want, columns, selection);
+    ) -> Result<(), AllocError> {
+        self.narrow(inputs, scratch, a, want, selection)?;
+        self.narrow(inputs, scratch, b, want, selection)
     }
 }
 
+/// What a predicate's nodes narrow a batch's selection with.
+struct Inputs<'b> {
+    /// The batch's columns.
+    columns: &'b [ColumnView],
+    /// The bytes its string comparisons compare with.
+    strings: &'b [u8],
+    /// Where each node keeps the dictionary entries it found.
+    entries: &'b mut [Entries],
+    /// What the entries' bits are allocated from.
+    allocator: &'b dyn Allocator,
+}
+
 impl Leaf {
-    /// Narrows `selection` to the rows this is `want` for, writing the rows it
-    /// drops to `dropped`, if given.
+    /// The column it reads.
+    fn column(self) -> u32 {
+        match self {
+            Leaf::Compare { column, .. }
+            | Leaf::CompareString { column, .. }
+            | Leaf::IsNull { column } => column,
+        }
+    }
+
+    /// Narrows `selection` to the rows this, node `node`, is `want` for,
+    /// writing the rows it drops to `dropped`, if given. A dictionary
+    /// column's entries, given only to string comparisons, are each tested
+    /// once, and the rows kept by their entry's.
     fn narrow(
         self,
-        strings: &[u8],
+        inputs: &mut Inputs<'_>,
+        node: u32,
         dropped: Option<&mut Selection>,
         want: bool,
-        columns: &[ColumnView],
         selection: &mut Selection,
-    ) {
+    ) -> Result<(), AllocError> {
         match self {
             Leaf::Compare { column, comparison, value } => {
                 let comparison = if want { comparison } else { negated(comparison) };
-                let column = at!(columns, column as usize);
+                let column = at!(inputs.columns, column as usize);
                 filter::compare(column, comparison, value, selection, dropped);
             }
             Leaf::CompareString { column, comparison, start, len } => {
                 let comparison = if want { comparison } else { negated(comparison) };
-                let string = at!(strings, start as usize..(start + len) as usize);
-                filter::compare_string(
-                    at!(columns, column as usize),
-                    comparison,
-                    string,
-                    selection,
-                    dropped,
-                );
+                let string = at!(inputs.strings, start as usize..(start + len) as usize);
+                let column = at!(inputs.columns, column as usize);
+                if !matches!(column.form(), Form::Dictionary(_)) {
+                    filter::compare_string(column, comparison, string, selection, dropped);
+                    return Ok(());
+                }
+                let entries = at_mut!(inputs.entries, node as usize);
+                let bits = entries.find(inputs.allocator, column, want, |values, bits| {
+                    filter::compare_string_bits(values, comparison, string, bits);
+                })?;
+                filter::keep_entries(column, bits, selection, dropped);
             }
             Leaf::IsNull { column } => {
-                filter::is_null(at!(columns, column as usize), want, selection, dropped);
+                filter::is_null(at!(inputs.columns, column as usize), want, selection, dropped);
             }
         }
+        Ok(())
     }
 }
 
@@ -290,33 +336,22 @@ pub struct Filter {
 }
 
 impl Transform for Filter {
-    type State = ();
+    /// Where each node keeps the dictionary entries it found.
+    type State = SlowVec<Entries>;
 
-    fn new_state(&self, context: &mut Context) -> Result<(), Error> {
-        Ok(context.reserve_selections(self.predicate.depth() as usize)?)
+    fn new_state(&self, context: &mut Context) -> Result<SlowVec<Entries>, Error> {
+        context.reserve_selections(self.predicate.depth() as usize)?;
+        Ok(self.predicate.new_entries(context.allocator())?)
     }
 
     fn process(
         &self,
         context: &mut Context,
-        (): &mut (),
+        entries: &mut SlowVec<Entries>,
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
-        // Filters test flat and constant columns, the forms `FilterOp`
-        // accepts, so a scan never gives them a dictionary.
-        //
-        // TODO: filter a dictionary column by testing each of its entries
-        // once, with the flat column's test on its values, into a bit for
-        // each, and then keeping the rows whose index's bit is set. The bits
-        // are kept between batches, as a chunk's batches share its
-        // dictionary, so a dictionary of a few strings over millions of rows
-        // costs a few tests. This is what DuckDB does.
-        let mut columns = self.predicate.columns();
-        check!(
-            !columns.any(|position| matches!(batch.column(position).form(), Form::Dictionary(_)))
-        );
-        self.predicate.select(context.selections(), batch);
-        Ok(())
+        let allocator = context.allocator();
+        Ok(self.predicate.select(allocator, context.selections(), entries, batch)?)
     }
 }
 
@@ -327,7 +362,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
-    use crate::column::DataType;
+    use crate::column::{DataType, Forms};
     use crate::context::Context;
     use crate::selection::Kept;
 
@@ -391,16 +426,18 @@ mod tests {
         u32::try_from(nodes.len() - 1).unwrap()
     }
 
+    /// The rows `expr` keeps of `a` and `b`.
     fn kept(expr: &Expr) -> StdVec<usize> {
         let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         let predicate = Predicate::new(nodes);
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
+        let mut entries = predicate.new_entries(&Heap).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(6);
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
-        predicate.select(&mut scratch, &mut batch);
+        predicate.select(&Heap, &mut scratch, &mut entries, &mut batch).unwrap();
         match batch.selection().kept() {
             Kept::All => (0..6).collect(),
             Kept::None => StdVec::new(),
@@ -474,21 +511,122 @@ mod tests {
         assert_eq!(compared(Comparison::Greater, max), Bounds { min: max, max });
     }
 
-    #[test]
-    #[should_panic(expected = "Dictionary")]
-    fn filters_check_they_get_no_dictionary() {
-        let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
-        build(&Expr::Greater(0, 2), &mut nodes);
-        let filter = Filter { predicate: Predicate::new(nodes) };
-        let mut context = Context::new(&Heap);
-        filter.new_state(&mut context).unwrap();
-        let mut indices = crate::buffer::Buffer::allocate(&Heap, 6 * 4).unwrap();
-        indices.as_mut_slice::<u32>().copy_from_slice(&[0, 1, 2, 3, 4, 5]);
+    /// `values` as a string column, `None` null.
+    fn strings(values: &[Option<&str>]) -> ColumnView {
+        let bytes: StdVec<u8> = values.iter().flatten().flat_map(|v| v.bytes()).collect();
+        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+        let mut start = 0;
+        for (i, value) in values.iter().enumerate() {
+            let len = u32::try_from(value.map_or(0, str::len)).unwrap();
+            views.as_mut_slice::<u32>()[2 * i..2 * i + 2].copy_from_slice(&[start, len]);
+            validity.as_mut_slice::<u8>()[0] |= u8::from(value.is_some()) << i;
+            start += len;
+        }
+        let mut stored = Buffer::allocate(&Heap, bytes.len().max(1)).unwrap();
+        stored.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(&bytes);
+        ColumnView::strings(&mut Context::new(&Heap), views, stored, Some(validity)).unwrap()
+    }
+
+    /// `values` with `indices` into them, as a dictionary column.
+    fn indexed(values: &ColumnView, indices: &[u32]) -> ColumnView {
+        let mut buffer = Buffer::allocate(&Heap, indices.len() * 4).unwrap();
+        buffer.as_mut_slice::<u32>().copy_from_slice(indices);
+        ColumnView::dictionary(&mut Context::new(&Heap), values, buffer).unwrap()
+    }
+
+    /// `x <comparison> 'b'`, or `NOT` that, over the first column.
+    fn compare_b(comparison: Comparison, not: bool) -> Predicate {
+        let leaf = Leaf::CompareString { column: 0, comparison, start: 0, len: 1 };
+        let nodes = [Node::Leaf(leaf), Node::Not(0)];
+        let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
+        Predicate::with_strings(
+            nodes.unwrap(),
+            Some(SlowVec::fixed_from(&Heap, b"b".iter().copied()).unwrap()),
+        )
+    }
+
+    /// The rows `predicate` keeps of a batch of `column`, its entries kept in
+    /// `entries` between batches.
+    fn kept_of(predicate: &Predicate, entries: &mut [Entries], column: &ColumnView) -> StdVec<u16> {
+        let mut scratch: StdVec<Selection> =
+            (0..predicate.depth()).map(|_| Selection::all(0)).collect();
         let mut batch = RowBatch::new();
-        batch.reset(6);
-        let dictionary =
-            ColumnView::dictionary(&mut Context::new(&Heap), &column(A), indices).unwrap();
-        assert!(batch.push_column(dictionary).is_ok());
-        let _ = filter.process(&mut context, &mut (), &mut batch);
+        batch.reset(column.row_count());
+        assert!(batch.push_column(column.clone()).is_ok());
+        predicate.select(&Heap, &mut scratch, entries, &mut batch).unwrap();
+        match batch.selection().kept() {
+            Kept::All => (0..u16::try_from(column.row_count()).unwrap()).collect(),
+            Kept::None => StdVec::new(),
+            Kept::Select(rows) => rows.to_vec(),
+        }
+    }
+
+    #[test]
+    fn filters_string_dictionaries_as_their_strings() {
+        // Entries out of order, one null, used in any order.
+        let entries = strings(&[Some("c"), None, Some("a"), Some("b"), Some("")]);
+        let indices = [3, 1, 0, 2, 4, 3, 0, 1];
+        let dictionary = indexed(&entries, &indices);
+        let mut flat = dictionary.clone();
+        flat.make_in(&mut Context::new(&Heap), Forms::FLAT).unwrap();
+        for comparison in [
+            Comparison::Equal,
+            Comparison::NotEqual,
+            Comparison::Less,
+            Comparison::LessEqual,
+            Comparison::Greater,
+            Comparison::GreaterEqual,
+        ] {
+            for not in [false, true] {
+                let predicate = compare_b(comparison, not);
+                let mut entries = predicate.new_entries(&Heap).unwrap();
+                let expected = kept_of(&predicate, &mut entries, &flat);
+                assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_a_dictionarys_entries_while_batches_share_it() {
+        let predicate = compare_b(Comparison::Greater, false);
+        let mut entries = predicate.new_entries(&Heap).unwrap();
+        let values = strings(&[Some("a"), Some("c"), None, Some("d")]);
+        let first = indexed(&values, &[0, 1, 2, 3]);
+        let second = indexed(&values, &[3, 3, 0, 1]);
+        // Another chunk's batch: its dictionary is its own.
+        let other = indexed(&strings(&[Some("z"), Some("b")]), &[1, 0, 0, 1]);
+        assert!(first.shares_values(&second) && !first.shares_values(&other));
+        assert_eq!(kept_of(&predicate, &mut entries, &first), [1, 3]);
+        // The second batch reuses the first's entries' bits.
+        assert_eq!(kept_of(&predicate, &mut entries, &second), [0, 1, 3]);
+        assert_eq!(kept_of(&predicate, &mut entries, &other), [1, 2]);
+        assert_eq!(kept_of(&predicate, &mut entries, &first), [1, 3]);
+    }
+
+    #[test]
+    fn takes_dictionaries_only_of_columns_it_compares_with_strings() {
+        let leaves = [
+            Leaf::CompareString { column: 0, comparison: Comparison::Equal, start: 0, len: 1 },
+            Leaf::Compare { column: 1, comparison: Comparison::Equal, value: Value::Int64(1) },
+            Leaf::CompareString { column: 2, comparison: Comparison::Equal, start: 0, len: 1 },
+            Leaf::IsNull { column: 2 },
+        ];
+        let nodes = [
+            Node::Leaf(leaves[0]),
+            Node::Leaf(leaves[1]),
+            Node::Leaf(leaves[2]),
+            Node::Leaf(leaves[3]),
+            Node::And(0, 1),
+            Node::And(2, 3),
+            Node::And(4, 5),
+        ];
+        let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
+        let strings = Some(SlowVec::fixed_from(&Heap, b"b".iter().copied()).unwrap());
+        let predicate = Predicate::with_strings(nodes, strings);
+        // A string column, an integer one, one also tested for nulls, and one
+        // it doesn't read.
+        let only: StdVec<bool> = (0..4).map(|c| predicate.compares_only_strings(c)).collect();
+        assert_eq!(only, [true, false, false, false]);
     }
 }

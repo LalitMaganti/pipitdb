@@ -12,6 +12,7 @@ use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::selection::Selection;
+use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
@@ -251,12 +252,19 @@ pub fn greater(column: &ColumnView, selection: &mut Selection) {
     filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
 }
 
+/// The phone models `string_column` holds.
+const MODELS: [&[u8]; 8] =
+    [b"", b"iPad", b"iPhone", b"GT-I9300", b"Lumia 920", b"N8", b"iPod", b"Galaxy Nexus"];
+
+/// Which of `MODELS` row `row` holds: spread evenly but out of order.
+fn model(row: usize) -> usize {
+    (row * 7919) % 8
+}
+
 /// A batch of phone models, as `MobilePhoneModel` in `ClickBench`: eight, of 0
-/// to 12 bytes, spread evenly but out of order, so 1 in 8 is `iPad`.
+/// to 12 bytes, so 1 in 8 is `iPad`.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn string_column() -> ColumnView {
-    const MODELS: [&[u8]; 8] =
-        [b"", b"iPad", b"iPhone", b"GT-I9300", b"Lumia 920", b"N8", b"iPod", b"Galaxy Nexus"];
     let rows = BATCH_ROWS_MAX as usize;
     let mut views = Buffer::allocate(&Heap, rows * 8).expect("allocates");
     let mut starts = [0_u32; 8];
@@ -266,13 +274,45 @@ pub fn string_column() -> ColumnView {
         bytes.extend_from_slice(model);
     }
     for (row, view) in views.as_mut_slice::<u32>().chunks_mut(2).enumerate() {
-        let model = (row * 7919) % 8;
+        let model = model(row);
         let len = u32::try_from(MODELS[model].len()).expect("small");
         view.copy_from_slice(&[starts[model], len]);
     }
     let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
     stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
     ColumnView::strings(&mut Context::new(&Heap), views, stored, None).expect("allocates")
+}
+
+/// `string_column`'s rows as a dictionary of the eight models, as Parquet
+/// reads them.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn string_dictionary() -> ColumnView {
+    let mut views = Buffer::allocate(&Heap, MODELS.len() * 8).expect("allocates");
+    let mut bytes = Vec::new();
+    for (view, model) in views.as_mut_slice::<u32>().chunks_mut(2).zip(MODELS) {
+        let start = u32::try_from(bytes.len()).expect("small");
+        view.copy_from_slice(&[start, u32::try_from(model.len()).expect("small")]);
+        bytes.extend_from_slice(model);
+    }
+    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+    let mut context = Context::new(&Heap);
+    let entries = ColumnView::strings(&mut context, views, stored, None).expect("allocates");
+    let rows = BATCH_ROWS_MAX as usize;
+    let mut indices = Buffer::allocate(&Heap, rows * 4).expect("allocates");
+    for (row, index) in indices.as_mut_slice::<u32>().iter_mut().enumerate() {
+        *index = u32::try_from(model(row)).expect("small");
+    }
+    ColumnView::dictionary(&mut context, &entries, indices).expect("allocates")
+}
+
+/// `x = 'iPad'`, over the first column.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn ipad_predicate() -> Predicate {
+    let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, start: 0, len: 4 };
+    let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).expect("allocates");
+    let strings = SlowVec::fixed_from(&Heap, b"iPad".iter().copied()).expect("allocates");
+    Predicate::with_strings(nodes, Some(strings))
 }
 
 /// Keeps `iPad`s: 1 in 8.
@@ -307,12 +347,13 @@ pub fn predicate(shape: &str) -> Predicate {
 pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -> u64 {
     let mut context = Context::new(&Heap);
     context.reserve_selections(predicate.depth() as usize).expect("allocates");
+    let mut entries = predicate.new_entries(&Heap).expect("allocates");
     let mut batch = RowBatch::new();
     let mut kept = 0;
     for _ in 0..batches {
         batch.reset(column.row_count());
         let _ = batch.push_column(column.clone());
-        predicate.select(context.selections(), &mut batch);
+        predicate.select(&Heap, context.selections(), &mut entries, &mut batch).expect("allocates");
         kept += u64::from(batch.selection().len());
     }
     kept

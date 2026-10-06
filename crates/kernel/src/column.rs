@@ -393,6 +393,14 @@ impl ColumnView {
         Ok(())
     }
 
+    /// Whether this view's values are `other`'s: the same values of the same
+    /// buffer, as two batches of a dictionary column from one chunk share.
+    pub fn shares_values(&self, other: &ColumnView) -> bool {
+        let (mine, theirs) = (self.header(), other.header());
+        core::ptr::eq(mine.values.as_ptr::<u8>(), theirs.values.as_ptr::<u8>())
+            && (mine.value_start, mine.len) == (theirs.value_start, theirs.len)
+    }
+
     /// Whether this view's form is one of `forms`.
     #[inline]
     pub fn is_in(&self, forms: Forms) -> bool {
