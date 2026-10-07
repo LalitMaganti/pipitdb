@@ -6,7 +6,7 @@
 //! and every node keeps SQL's three-valued logic without building booleans.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{ColumnView, Form};
+use crate::column::{ColumnView, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Comparison, Entries, Value};
@@ -112,9 +112,36 @@ impl Predicate {
         allocator: &dyn Allocator,
         column: u32,
     ) -> Result<Option<Predicate>, AllocError> {
+        self.conjuncts(allocator, column, true)
+    }
+
+    /// This without the conjuncts that read only `column`: the others,
+    /// joined by `AND`, or `None` if there are none.
+    pub fn without_conjuncts_on(
+        &self,
+        allocator: &dyn Allocator,
+        column: u32,
+    ) -> Result<Option<Predicate>, AllocError> {
+        self.conjuncts(allocator, column, false)
+    }
+
+    /// The conjuncts that read only `column` if `reading_only`, or else
+    /// those that read more, joined by `AND`, or `None` if there are none.
+    fn conjuncts(
+        &self,
+        allocator: &dyn Allocator,
+        column: u32,
+        reading_only: bool,
+    ) -> Result<Option<Predicate>, AllocError> {
         let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
-        let root = self.copy_on(self.nodes.len() as u32 - 1, column, &mut nodes, None)?;
+        let root = self.copy_conjuncts(
+            self.nodes.len() as u32 - 1,
+            column,
+            reading_only,
+            &mut nodes,
+            None,
+        )?;
         if root.is_none() {
             return Ok(None);
         }
@@ -125,20 +152,22 @@ impl Predicate {
         Ok(Some(Predicate::with_strings(nodes, strings)))
     }
 
-    /// Copies node `node`'s conjuncts that read only `column` to `nodes`,
-    /// each joined to `root`, those so far, by `AND`: the new root.
-    fn copy_on(
+    /// Copies node `node`'s conjuncts that read only `column` if
+    /// `reading_only`, or else those that read more, to `nodes`, each joined
+    /// to `root`, those so far, by `AND`: the new root.
+    fn copy_conjuncts(
         &self,
         node: u32,
         column: u32,
+        reading_only: bool,
         nodes: &mut SlowVec<Node>,
         root: Option<u32>,
     ) -> Result<Option<u32>, AllocError> {
         if let Node::And(a, b) = *at!(self.nodes, node as usize) {
-            let root = self.copy_on(a, column, nodes, root)?;
-            return self.copy_on(b, column, nodes, root);
+            let root = self.copy_conjuncts(a, column, reading_only, nodes, root)?;
+            return self.copy_conjuncts(b, column, reading_only, nodes, root);
         }
-        if !self.reads_only(node, column) {
+        if self.reads_only(node, column) != reading_only {
             return Ok(root);
         }
         let copied = self.copy(node, nodes)?;
@@ -169,6 +198,17 @@ impl Predicate {
             Node::Not(a) => Node::Not(self.copy(a, nodes)?),
         };
         push(nodes, copied)
+    }
+
+    /// The forms it can test `column` in: constants, which it tests once,
+    /// and dictionaries of a column it only compares with strings, whose
+    /// entries it tests once each.
+    pub fn accepts(&self, column: u32) -> Forms {
+        if self.compares_only_strings(column) {
+            Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
+        } else {
+            Forms::FLAT | Forms::CONSTANT
+        }
     }
 
     /// Whether every condition it has on `column` compares it with a string,

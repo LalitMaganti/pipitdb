@@ -13,6 +13,9 @@ use crate::slow_vec::SlowVec;
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
+    // Columns only conditions read now leave the scans' outputs: a
+    // scannable reads them itself to apply them.
+    prune_columns(allocator, plan)?;
     choose_forms(allocator, plan)
 }
 
@@ -89,6 +92,31 @@ pub fn prune_columns(
 
 /// Each node's parent, and which of its children it is; `None` for the
 /// root.
+/// Whether anything but `filter` reads `column`: the plan's output, or an
+/// op above `maker`. Then `maker` makes the column anyway, so it leaves the
+/// filter to test it.
+fn read_elsewhere(
+    allocator: &dyn Allocator,
+    plan: &LogicalPlan<'_>,
+    parents: &[Option<(PlanNodeId, usize)>],
+    maker: usize,
+    filter: PlanNodeId,
+    column: ColumnId,
+) -> Result<bool, AllocError> {
+    if plan.output.iter().any(|output| output.id == column) {
+        return Ok(true);
+    }
+    let mut reads = Needed::none(allocator, plan.columns.len())?;
+    let mut at = *at!(parents, maker);
+    while let Some((node, _)) = at {
+        if node != filter {
+            at!(plan.nodes, node as usize).op.reads(&mut reads);
+        }
+        at = *at!(parents, node as usize);
+    }
+    Ok(reads.is_needed(column))
+}
+
 fn parents(
     allocator: &dyn Allocator,
     plan: &LogicalPlan<'_>,
@@ -106,12 +134,15 @@ fn parents(
 /// Pushes conditions down: for each column a node makes and takes
 /// conditions on, copies of the parts of filters' predicates above it that
 /// read only that column, up to the first op that passes on other rows, so
-/// it can skip rows failing them. The filters still test every row.
+/// it can skip rows failing them. Those it applies, the filters stop
+/// testing, and a filter left testing nothing is removed.
 pub fn push_down_conditions(
     allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     let parents = parents(allocator, plan)?;
+    // Filters left testing nothing, as the scans below them apply it all.
+    let mut empty_filters = SlowVec::new(allocator, PLAN_NODES_MAX)?;
     for maker in 0..plan.nodes.len() {
         for column in (0..).take(plan.columns.len()) {
             if !at!(plan.nodes, maker).op.takes_condition(column) {
@@ -119,14 +150,34 @@ pub fn push_down_conditions(
             }
             let mut at = *at!(parents, maker);
             while let Some((parent, _)) = at {
-                let parent_op = &mut at_mut!(plan.nodes, parent as usize).op;
-                let given = parent_op.give_condition(allocator, column)?;
-                let Given::Passed(condition) = given else { break };
-                if let Some(condition) = condition {
-                    at_mut!(plan.nodes, maker).op.take_condition(allocator, column, condition)?;
-                }
                 at = *at!(parents, parent as usize);
+                let parent_op = &mut at_mut!(plan.nodes, parent as usize).op;
+                let Given::Passed(condition) = parent_op.give_condition(allocator, column)? else {
+                    break;
+                };
+                let Some(condition) = condition else { continue };
+                let may_apply = !read_elsewhere(allocator, plan, &parents, maker, parent, column)?;
+                let maker_op = &mut at_mut!(plan.nodes, maker).op;
+                if maker_op.take_condition(allocator, column, condition, may_apply)?
+                    && at_mut!(plan.nodes, parent as usize)
+                        .op
+                        .remove_condition(allocator, column)?
+                {
+                    empty_filters.push(parent)?;
+                }
             }
+        }
+    }
+    // Each is removed, its child read in its place: children first, so
+    // one above another reads what replaced it.
+    empty_filters.sort_unstable();
+    for &filter in empty_filters.iter() {
+        let child = *at!(at!(plan.nodes, filter as usize).children, 0);
+        match *at!(parents, filter as usize) {
+            Some((parent, slot)) => {
+                *at_mut!(at_mut!(plan.nodes, parent as usize).children, slot) = child;
+            }
+            None => plan.root = child,
         }
     }
     Ok(())

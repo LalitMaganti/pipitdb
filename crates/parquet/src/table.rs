@@ -3,8 +3,9 @@
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
-use pipit_kernel::condition::Condition;
+use pipit_kernel::condition::{CONDITIONS_MAX, Condition};
 use pipit_kernel::context::Context;
+use pipit_kernel::filter::Entries;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::selection::{Kept, Selection};
@@ -92,7 +93,60 @@ impl<'a> Rows<'a> {
         columns: &[(u32, Forms)],
         batch: &mut RowBatch,
     ) -> Result<bool, Error> {
-        // A batch stays within each column's page, so pages are read whole.
+        let rows = self.next_batch_rows(context)?;
+        if rows == 0 {
+            return Ok(false);
+        }
+        batch.reset(rows);
+        self.fill(context, columns, rows, batch)?;
+        Ok(true)
+    }
+
+    /// As `next`, but of the rows meeting `conditions`, each on the reader
+    /// at its place after `outputs`', tested in turn. Once a batch has no
+    /// rows left, the rest aren't tested and the batch is passed over.
+    fn next_filtered(
+        &mut self,
+        context: &mut Context,
+        outputs: &[(u32, Forms)],
+        conditions: &[Condition],
+        states: &mut [ConditionState],
+        batch: &mut RowBatch,
+    ) -> Result<bool, Error> {
+        loop {
+            let rows = self.next_batch_rows(context)?;
+            if rows == 0 {
+                return Ok(false);
+            }
+            batch.reset(rows);
+            let tested = self.readers.iter_mut().skip(outputs.len());
+            for ((condition, state), reader) in conditions.iter().zip(states.iter_mut()).zip(tested)
+            {
+                if batch.selection().is_empty() {
+                    reader.skip(context, rows as usize)?;
+                } else {
+                    state.narrow(context, reader, condition, batch.selection_mut())?;
+                }
+            }
+            if !batch.selection().is_empty() {
+                self.fill(context, outputs, rows, batch)?;
+                return Ok(true);
+            }
+            for (reader, &(_, forms)) in self.readers.iter_mut().zip(outputs) {
+                if forms.contains(Forms::LAZY) {
+                    reader.pass(rows as usize);
+                } else {
+                    reader.skip(context, rows as usize)?;
+                }
+            }
+            self.left -= u64::from(rows);
+        }
+    }
+
+    /// How many rows the next batch has: up to the first end of a page of
+    /// any column, so pages are read whole. None, and the row group ended,
+    /// once none are left.
+    fn next_batch_rows(&mut self, context: &mut Context) -> Result<u32, Error> {
         let mut rows = u32::try_from(self.left).unwrap_or(u32::MAX).min(BATCH_ROWS_MAX);
         for reader in self.readers.iter_mut() {
             rows = rows.min(u32::try_from(reader.page_left(context)?).unwrap_or(u32::MAX));
@@ -103,9 +157,18 @@ impl<'a> Rows<'a> {
             }
             self.readers.retain(|_| false);
             self.started = false;
-            return Ok(false);
         }
-        batch.reset(rows);
+        Ok(rows)
+    }
+
+    /// Fills `batch`, reset to `rows` rows, with `columns`' next `rows` rows.
+    fn fill(
+        &mut self,
+        context: &mut Context,
+        columns: &[(u32, Forms)],
+        rows: u32,
+        batch: &mut RowBatch,
+    ) -> Result<(), Error> {
         for (reader, &(column, forms)) in self.readers.iter_mut().zip(columns) {
             let view = if forms.contains(Forms::LAZY) {
                 // Where its rows are, for `load`: only counted here, so no
@@ -123,39 +186,105 @@ impl<'a> Rows<'a> {
             };
         }
         self.left -= u64::from(rows);
-        Ok(true)
+        Ok(())
     }
 }
 
-/// A scan of a `ParquetTable` that reads only `groups`, by file and row
-/// group in it: those whose statistics don't rule out the values kept.
-struct Pruned<'a> {
-    table: &'a ParquetTable<'a>,
-    columns: SlowVec<(u32, Forms)>,
-    groups: SlowVec<(usize, usize)>,
+/// What applying a condition keeps between batches.
+struct ConditionState {
+    /// The dictionary entries its comparisons found, as a filter's.
+    entries: SlowVec<Entries>,
+    /// The last dictionary whose entries it tested.
+    dictionary: Option<ColumnView>,
+    /// A bit for each of `dictionary`'s entries: whether it keeps it.
+    kept_entries: SlowVec<u64>,
 }
 
-impl<'a> Source for Pruned<'a> {
-    /// How many of `groups` are started, and the rows of the last.
-    type State = (usize, Rows<'a>);
+impl ConditionState {
+    /// Narrows `selection`, of the next rows of `reader`, to those meeting
+    /// `condition`, passing them: tested from a dictionary's runs where the
+    /// page allows and no row is dropped yet, or else read and then tested.
+    fn narrow(
+        &mut self,
+        context: &mut Context,
+        reader: &mut ChunkReader,
+        condition: &Condition,
+        selection: &mut Selection,
+    ) -> Result<(), Error> {
+        let rows = selection.rows() as usize;
+        // From runs only while every row is kept: the first condition, which
+        // drops most.
+        let dictionary = match selection.kept() {
+            Kept::All => reader.page_dictionary(context)?,
+            _ => None,
+        };
+        if let Some(values) = dictionary {
+            if !self.dictionary.as_ref().is_some_and(|tested| tested.shares_values(&values)) {
+                let words = core::iter::repeat_n(0, (values.row_count() as usize).div_ceil(64));
+                self.kept_entries = SlowVec::fixed_from(context.allocator(), words)?;
+                let kept_entries = &mut self.kept_entries;
+                condition.kept_entries(context, &mut self.entries, &values, kept_entries)?;
+                self.dictionary = Some(values);
+            }
+            if reader.select_kept_rows(context, rows, &self.kept_entries, selection)? {
+                return Ok(());
+            }
+        }
+        let column = reader.read(context, rows, condition.accepts())?;
+        Ok(condition.select_column(context, &mut self.entries, &column, selection)?)
+    }
+}
 
-    fn new_state(&self, context: &mut Context) -> Result<(usize, Rows<'a>), Error> {
-        Ok((0, Rows::new(context.allocator(), self.columns.len())?))
+/// A scan of a `ParquetTable` given conditions: it reads only the row
+/// groups whose statistics don't rule a condition out, and only the rows
+/// meeting those it applies.
+struct Within<'a> {
+    table: &'a ParquetTable<'a>,
+    /// The columns it reads: the `output_count` it outputs, then the column
+    /// of each of `applied`, read only to test it.
+    columns: SlowVec<(u32, Forms)>,
+    output_count: usize,
+    /// The row groups it reads, by file and row group in it.
+    groups: SlowVec<(usize, usize)>,
+    /// The conditions it applies.
+    applied: SlowVec<Condition>,
+}
+
+impl<'a> Source for Within<'a> {
+    /// How many of `groups` are started, the rows of the last, and what
+    /// applying each of `applied` keeps.
+    type State = (usize, Rows<'a>, SlowVec<ConditionState>);
+
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
+        let mut states = SlowVec::fixed(context.allocator(), self.applied.len())?;
+        for condition in self.applied.iter() {
+            let entries = condition.new_entries(context)?;
+            let kept_entries = SlowVec::fixed(context.allocator(), 0)?;
+            let state = ConditionState { entries, dictionary: None, kept_entries };
+            states.push(state).map_err(|_| Error::OutOfMemory)?;
+        }
+        Ok((0, Rows::new(context.allocator(), self.columns.len())?, states))
     }
 
     fn next<'s>(
         &'s self,
         context: &mut Context,
-        (started, rows): &mut (usize, Rows<'a>),
+        (started, rows, states): &mut Self::State,
         batch: &mut RowBatch<'s>,
     ) -> Result<bool, Error> {
+        let outputs = at!(self.columns, ..self.output_count);
         loop {
             if !rows.started {
                 let Some(&(file, group)) = self.groups.get(*started) else { return Ok(false) };
                 rows.start(self.table, &self.columns, file, group)?;
                 *started += 1;
             }
-            if rows.next(context, &self.columns, batch)? {
+            let more = if self.applied.is_empty() {
+                rows.next(context, outputs, batch)?
+            } else {
+                rows.next_filtered(context, outputs, &self.applied, states, batch)?
+            };
+            if more {
                 return Ok(true);
             }
         }
@@ -387,11 +516,30 @@ impl<'a> Scannable for ParquetTable<'a> {
                 }
             }
         }
-        if !skipped {
+        let applied_count = conditions.iter().filter(|condition| condition.is_applied()).count();
+        if !skipped && applied_count == 0 {
             return Ok(None);
         }
-        let columns = SlowVec::fixed_from(allocator, columns.iter().copied())?;
-        Ok(Some(DynSource::new(allocator, Pruned { table: self, columns, groups })?))
+        // The columns read: those asked for, then those only tested, each
+        // with a reader of its own, even if it's also asked for.
+        let mut read = SlowVec::new(allocator, BATCH_COLUMNS_MAX as usize + CONDITIONS_MAX)?;
+        let mut applied = SlowVec::fixed(allocator, applied_count)?;
+        for &column in columns {
+            read.push(column)?;
+        }
+        for condition in conditions.iter().filter(|condition| condition.is_applied()) {
+            read.push((condition.column(), Forms::FLAT))?;
+            applied.push(condition.copy(allocator)?)?;
+        }
+        let output_count = columns.len();
+        let within = Within { table: self, columns: read, output_count, groups, applied };
+        Ok(Some(DynSource::new(allocator, within)?))
+    }
+
+    /// Every one: it tests them as it reads, from a dictionary's runs where
+    /// it can, and otherwise reads their columns and then tests them.
+    fn applies(&self, _: &Condition) -> bool {
+        true
     }
 }
 
@@ -413,6 +561,7 @@ mod tests {
     use crate::Uncompressed;
 
     const SMALL: &[u8] = include_bytes!("../tests/data/small.parquet");
+    const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
     const NULLS: &[u8] = include_bytes!("../tests/data/nulls.parquet");
 
     /// Every batch's rows of `columns`: each row's `id`s, or -1 for nulls.
@@ -558,6 +707,92 @@ mod tests {
         Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap())
     }
 
+    /// `id`s and `name`s of the rows of `file` meeting `id = 3`, applied by
+    /// the scan, with `id` read as well if `read_id`.
+    fn filtered_rows(file: &[u8], read_id: bool) -> Vec<(Option<i64>, String)> {
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&file]).unwrap();
+        let mut context = Context::new(&Heap);
+        let mut loader = table.new_loader(&mut context).unwrap();
+        let mut read = Vec::from([(2, Forms::FLAT | Forms::LAZY)]);
+        if read_id {
+            read.push((0, Forms::FLAT));
+        }
+        let mut condition = Condition::new(0, between(3, 3));
+        condition.set_applied();
+        let conditions = [condition];
+        let source = table.scan_within(&Heap, &read, &conditions).unwrap().unwrap();
+        let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = pipeline.start(&query).unwrap();
+        let (mut batch, mut rows) = (RowBatch::new(), Vec::new());
+        while execution.next(&mut batch).unwrap() {
+            let mut names = batch.column(0).clone();
+            if names.is_lazy() {
+                let selection = batch.selection();
+                names =
+                    table.load(&mut context, &mut loader, &names, selection, Forms::FLAT).unwrap();
+            }
+            let kept: Vec<u16> = match batch.selection().kept() {
+                Kept::All => (0..u16::try_from(names.row_count()).unwrap()).collect(),
+                Kept::None => Vec::new(),
+                Kept::Select(kept) => kept.to_vec(),
+            };
+            for row in kept {
+                let id = read_id.then(|| batch.column(1).int64s()[usize::from(row)]);
+                let name = names.string_values().get(usize::from(row));
+                rows.push((id, String::from_utf8_lossy(name).into_owned()));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn applies_conditions_as_it_reads() {
+        // `id` is plain in `small`, the row; and in `dict` a dictionary of
+        // the row mod 10, null every 7th row from the 3rd.
+        let in_dict = (0..5000).filter(|i| i % 10 == 3 && i % 7 != 3).count();
+        for (file, count) in [(SMALL, 1), (DICT, in_dict)] {
+            // Tested only, from its runs where it can be.
+            let tested = filtered_rows(file, false);
+            assert_eq!(tested.len(), count);
+            // Output too, from a reader of its own: the same rows.
+            let passed = filtered_rows(file, true);
+            assert!(passed.iter().all(|(id, _)| *id == Some(3)));
+            let names: Vec<_> = passed.into_iter().map(|(_, name)| (None, name)).collect();
+            assert_eq!(names, tested);
+        }
+        assert_eq!(filtered_rows(SMALL, false), [(None, "row3".to_string())]);
+    }
+
+    #[test]
+    fn applies_conditions_from_dictionary_runs() {
+        // `id` is the row; `kind` is 0 in runs of 900 rows of each 1000, then
+        // the row mod 7; `other` is the row mod 3: dictionary pages, without
+        // nulls. The first condition keeps whole runs; the second narrows
+        // the rows the first kept.
+        const RUNS: &[u8] = include_bytes!("../tests/data/runs.parquet");
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&RUNS]).unwrap();
+        let mut conditions = [Condition::new(1, between(1, 6)), Condition::new(2, between(1, 1))];
+        conditions.iter_mut().for_each(Condition::set_applied);
+        let source = table.scan_within(&Heap, &[(0, Forms::FLAT)], &conditions).unwrap().unwrap();
+        let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = pipeline.start(&query).unwrap();
+        let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
+        while execution.next(&mut batch).unwrap() {
+            let column = batch.column(0);
+            match batch.selection().kept() {
+                Kept::All => ids.extend(column.int64s()),
+                Kept::None => panic!("a batch keeping none is passed over"),
+                Kept::Select(kept) => {
+                    ids.extend(kept.iter().map(|&row| column.int64s()[usize::from(row)]));
+                }
+            }
+        }
+        let meets = |i: &i64| i % 1000 >= 900 && i % 7 != 0 && i % 3 == 1;
+        assert_eq!(ids, (0..5000).filter(meets).collect::<Vec<_>>());
+    }
+
     #[test]
     fn skips_row_groups_statistics_rule_out() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
@@ -565,8 +800,8 @@ mod tests {
         // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
         // to 4999.
         let ids = |min, max| {
-            // Not exact: it only skips.
-            let conditions = [Condition::new(0, &between(min, max))];
+            // Not applied: it only skips.
+            let conditions = [Condition::new(0, between(min, max))];
             let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions).unwrap();
             let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
             let query = QueryAllocators::new(&Heap);
@@ -586,7 +821,6 @@ mod tests {
 
     #[test]
     fn makes_dictionaries_where_allowed() {
-        const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&DICT]).unwrap();
         // `name`, a string column of dictionary pages.
         assert!(table.forms(2).contains(Forms::DICTIONARY));
