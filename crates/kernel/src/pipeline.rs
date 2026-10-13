@@ -420,7 +420,7 @@ mod tests {
     use crate::context::Context;
     use crate::query_allocators::QueryAllocators;
     use crate::selection::Kept;
-    use crate::step::{DynOperator, DynTransform, Operator, Source, Transform};
+    use crate::step::{Breaker, DynOperator, DynTransform, Operator, Source, Transform};
 
     fn int64s(values: &[i64]) -> ColumnView {
         let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
@@ -658,6 +658,62 @@ mod tests {
         }
     }
 
+    /// Outputs its input's first column backwards, two rows at a time.
+    struct Backwards;
+
+    impl Breaker for Backwards {
+        type State = Vec<i64>;
+
+        fn new_state(&self, _: &mut Context) -> Result<Vec<i64>, Error> {
+            Ok(Vec::new())
+        }
+
+        fn consume(
+            &self,
+            _: &mut Context,
+            values: &mut Vec<i64>,
+            input: &RowBatch,
+        ) -> Result<(), Error> {
+            let column = input.column(0).int64s();
+            match input.selection().kept() {
+                Kept::All => values.extend_from_slice(column),
+                Kept::None => {}
+                Kept::Select(rows) => {
+                    values.extend(rows.iter().map(|&row| column[usize::from(row)]));
+                }
+            }
+            Ok(())
+        }
+
+        fn merge(
+            &self,
+            _: &mut Context,
+            values: &mut Vec<i64>,
+            other: Vec<i64>,
+        ) -> Result<(), Error> {
+            values.extend(other);
+            Ok(())
+        }
+
+        fn finalize(&self, _: &mut Context, values: &mut Vec<i64>) -> Result<(), Error> {
+            values.reverse();
+            Ok(())
+        }
+
+        fn serve(
+            &self,
+            _: &mut Context,
+            values: &mut Vec<i64>,
+            output: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            let n = values.len().min(2);
+            output.reset(u32::try_from(n).unwrap());
+            assert!(output.push_column(int64s(&values[..n])).is_ok());
+            values.drain(..n);
+            Ok(!values.is_empty())
+        }
+    }
+
     /// Fails on its second batch, as a step reading damaged data would.
     struct FailSecond;
 
@@ -741,6 +797,35 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 3 }, steps);
         let query = QueryAllocators::new(&Heap);
         assert_eq!(batches(&mut pipeline.start(&query).unwrap()), [[[2 + 4]]]);
+    }
+
+    #[test]
+    fn breakers_output_once_their_input_ends() {
+        let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
+        assert_eq!(pipeline.describe(), "Numbers | Backwards");
+        let query = QueryAllocators::new(&Heap);
+        assert_eq!(
+            batches(&mut pipeline.start(&query).unwrap()),
+            [[[5], [4]], [[3], [2]], [[1], [0]]]
+        );
+    }
+
+    #[test]
+    fn merged_breakers_hold_every_copys_rows() {
+        let mut context = Context::new(&Heap);
+        let consumed = |context: &mut Context, values: &[i64]| {
+            let mut batch = RowBatch::new();
+            batch.reset(2);
+            assert!(batch.push_column(int64s(values)).is_ok());
+            let mut state = Breaker::new_state(&Backwards, context).unwrap();
+            Backwards.consume(context, &mut state, &batch).unwrap();
+            state
+        };
+        let (mut first, second) =
+            (consumed(&mut context, &[0, 1]), consumed(&mut context, &[2, 3]));
+        Backwards.merge(&mut context, &mut first, second).unwrap();
+        Backwards.finalize(&mut context, &mut first).unwrap();
+        assert_eq!(first, [3, 2, 1, 0]);
     }
 
     #[test]

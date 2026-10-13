@@ -77,6 +77,81 @@ pub trait Operator {
     ) -> Result<Progress, Error>;
 }
 
+/// Holds back every row of its input, then outputs rows made from them, such
+/// as a sort or an aggregation: an operator, which consumes each input, then
+/// finalizes and serves once the input ends.
+///
+/// Its state is mergeable, so the executor can run copies of the work before
+/// it, each consuming into a state of its own, and merge them before it
+/// finalizes. Run on one thread, nothing is merged.
+pub trait Breaker {
+    type State;
+
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
+
+    fn consume(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        input: &RowBatch,
+    ) -> Result<(), Error>;
+
+    /// Folds `other`, which consumed other rows of the same input, into
+    /// `state`. Neither is finalized.
+    fn merge(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        other: Self::State,
+    ) -> Result<(), Error>;
+
+    /// Called once, after every input is consumed and every state merged.
+    fn finalize(&self, context: &mut Context, state: &mut Self::State) -> Result<(), Error>;
+
+    /// Fills `output`, which is empty when called, with the next rows,
+    /// returning whether any are left after them.
+    fn serve(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        output: &mut RowBatch,
+    ) -> Result<bool, Error>;
+}
+
+impl<B: Breaker> Operator for B {
+    /// The breaker's state, and whether it's finalized.
+    type State = (B::State, bool);
+
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
+        Ok((Breaker::new_state(self, context)?, false))
+    }
+
+    fn execute(
+        &self,
+        context: &mut Context,
+        (state, _): &mut Self::State,
+        input: &RowBatch,
+        _: &mut RowBatch,
+    ) -> Result<Progress, Error> {
+        self.consume(context, state, input)?;
+        Ok(Progress::NeedInput)
+    }
+
+    fn finish(
+        &self,
+        context: &mut Context,
+        (state, finalized): &mut Self::State,
+        output: &mut RowBatch,
+    ) -> Result<Progress, Error> {
+        if !*finalized {
+            self.finalize(context, state)?;
+            *finalized = true;
+        }
+        let more = self.serve(context, state, output)?;
+        Ok(if more { Progress::MoreOutput } else { Progress::NeedInput })
+    }
+}
+
 /// What an operator did with its input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Progress {
