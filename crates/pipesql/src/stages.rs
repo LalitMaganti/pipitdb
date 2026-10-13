@@ -1,13 +1,15 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
+use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
+use pipit_kernel::column::DataType;
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;
 use crate::condition::compile_condition;
-use crate::error::{Error, Unsupported};
+use crate::error::{Error, ErrorCode, Unsupported};
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -31,8 +33,26 @@ pub const SELECT: Rule = Rule {
     compile: compile_select,
 };
 
+pub const AGGREGATE: Rule = Rule {
+    keyword: "aggregate",
+    point: Point::Stage,
+    items: &[Item::List(Shared::Expr), Item::Clause(&["group", "by"], Shared::Name)],
+    compile: compile_aggregate,
+};
+
 /// Selecting and filtering rows.
 pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
+
+/// Aggregating rows, apart, so a registry without it doesn't pay for it.
+pub const AGGREGATION: &[Rule] = &[AGGREGATE];
+
+/// The aggregate functions, by name.
+const FUNCTIONS: [(&str, Function); 4] = [
+    ("count", Function::Count),
+    ("sum", Function::Sum),
+    ("min", Function::Min),
+    ("max", Function::Max),
+];
 
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
@@ -67,6 +87,62 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
     Ok(())
 }
 
+/// `AGGREGATE COUNT(*), SUM(a) GROUP BY k`: a row for each group of rows
+/// with the same keys, or one for all rows with none, is the new scope: the
+/// keys, then the aggregates, named as `count(*)` and `sum(a)`.
+fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let list = compiler.node(stage.first_child());
+    let by = compiler.node(stage.first_child() + 1);
+    let allocator = compiler.allocator();
+    let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
+    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    for i in 0..by.child_count() {
+        let key = compiler.node(by.first_child() + i);
+        let column = compiler.find_column(key)?;
+        if at!(compiler.plan.columns, column.id as usize).data_type != DataType::Int64 {
+            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
+        }
+        keys.push(column.id)?;
+        scope.push(column)?;
+    }
+    let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    for i in 0..list.child_count() {
+        let item = compiler.node(list.first_child() + i);
+        let span = compiler.span(item);
+        let unsupported = Error::unsupported(Unsupported::Aggregate, span);
+        if item.tag() != Tag::Call || item.child_count() != 2 {
+            return Err(unsupported);
+        }
+        let name = compiler.node(item.first_child()).span();
+        let text = compiler.text(name);
+        let Some(&(function_name, function)) =
+            FUNCTIONS.iter().find(|(f, _)| f.eq_ignore_ascii_case(text))
+        else {
+            return Err(Error::new(ErrorCode::UnknownFunction, name));
+        };
+        let argument = compiler.node(item.first_child() + 1);
+        let (function, input) = match argument.tag() {
+            Tag::Star if function == Function::Count => (Function::CountStar, None),
+            Tag::Name => (function, Some(compiler.find_column(argument)?.id)),
+            _ => return Err(unsupported),
+        };
+        let input_type = input.map(|id| at!(compiler.plan.columns, id as usize).data_type);
+        if input_type.is_some_and(|data_type| data_type != DataType::Int64) {
+            return Err(Error::unsupported(Unsupported::AggregateType, span));
+        }
+        let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
+        let name = compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?;
+        let binding = compiler.plan.add_named_column(name, DataType::Int64)?;
+        aggregates.push(Aggregate { function, input, binding })?;
+        scope.push(binding)?;
+    }
+    let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(aggregate, children)?;
+    compiler.scope = scope;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -83,7 +159,7 @@ mod tests {
 
     use super::*;
 
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
 
     /// Renders the tree as an s-expression.
     fn render(source: &str, ast: &Ast, index: u32) -> String {
@@ -126,6 +202,14 @@ mod tests {
             "(Query (FROM slice) (WHERE (Greater dur 1000)) \
              (SELECT (List name (Divide dur 1000) (Call count *))))"
         );
+        assert_eq!(
+            parse("FROM t |> AGGREGATE count(*), sum(x) group by a, b"),
+            "(Query (FROM t) (AGGREGATE (List (Call count *) (Call sum x)) (List a b)))"
+        );
+        assert_eq!(
+            parse("FROM t |> AGGREGATE count(*)"),
+            "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
+        );
     }
 
     #[test]
@@ -135,5 +219,7 @@ mod tests {
         assert_eq!(error("FROM t |> ORDER x"), (ErrorCode::UnknownStage, 10));
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
+        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP a"), (ErrorCode::ExpectedWord, 35));
+        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY"), (ErrorCode::ExpectedToken, 37));
     }
 }
