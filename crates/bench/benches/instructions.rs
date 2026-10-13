@@ -36,6 +36,24 @@ fn query(source: String) -> u32 {
 
 library_benchmark_group!(name = parser_group, benchmarks = [parser, query]);
 
+/// Finds one row of a small table by its id, without and with planning it:
+/// what a query costs before any rows are read.
+const POINT: &str = "FROM t |> WHERE id = 42 |> SELECT a, b";
+
+#[library_benchmark]
+#[bench::point(pipitdb_bench::small_table(100), POINT)]
+fn small(catalog: &'static dyn Catalog, query: &str) -> u64 {
+    black_box(pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)))
+}
+
+#[library_benchmark]
+#[bench::point(pipitdb_bench::small_plan(100, POINT))]
+fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(plan.pipeline())))
+}
+
+library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
+
 #[library_benchmark]
 #[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
 #[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
@@ -102,11 +120,13 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
     let table = ParquetTable::open(&Heap, &Codecs, sources).expect("a Parquet file");
     let hits = Hits(DynScannable::new(&Heap, table).expect("allocates"));
     let query = pipitdb_bench::real::clickbench_query(name).expect("a query pipitdb runs");
-    Some(pipitdb_bench::real::plan(Box::leak(Box::new(hits)), query).expect("compiles"))
+    Some(pipitdb_bench::plan(Box::leak(Box::new(hits)), query).expect("compiles"))
 }
 
 // ClickBench's filters over its first file, a million rows. 0 without the
-// file, which CI fetches. (gungraun allows no doc comment here.)
+// file, which CI fetches. The file is sorted by `CounterID`, so `fCounter`'s
+// 78,186 rows and `fCounterFew`'s 10 are each one run. (gungraun allows no
+// doc comment here.)
 #[library_benchmark]
 #[bench::f1(hits_query("f1"))]
 #[bench::f_adv(hits_query("fAdv"))]
@@ -115,6 +135,8 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::f_phone(hits_query("fPhone"))]
 #[bench::f_ipad(hits_query("fIpad"))]
 #[bench::f_search(hits_query("fSearch"))]
+#[bench::f_counter(hits_query("fCounter"))]
+#[bench::f_counter_few(hits_query("fCounterFew"))]
 fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
     plan.map_or(0, |plan| black_box(pipitdb_bench::run(black_box(plan.pipeline()))))
 }
@@ -126,6 +148,7 @@ main!(
     config = LibraryBenchmarkConfig::default().pass_through_env("PIPIT_CLICKBENCH");
     library_benchmark_groups = lexer_group,
     parser_group,
+    small_group,
     pipeline_group,
     clickbench_group
 );

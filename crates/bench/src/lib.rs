@@ -6,17 +6,20 @@ use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::filter::{self, Comparison, Value};
+use pipit_kernel::lower::{PhysicalPlan, lower};
+use pipit_kernel::optimize::optimize;
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::scannable::DynScannable;
+use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Selection;
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
 use pipit_operators::table::Table;
+use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -166,6 +169,59 @@ pub fn run(pipeline: &Pipeline) -> u64 {
         rows += u64::from(batch.selection().len());
     }
     rows
+}
+
+/// `query` over the tables in `catalog`, compiled, optimized and lowered,
+/// ready to run.
+pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
+    let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
+    optimize(&Heap, &mut plan).ok()?;
+    lower(&Heap, &plan).ok()
+}
+
+/// Plans and runs `query` over `catalog`, as an embedder would each query,
+/// returning the rows out.
+pub fn plan_and_run(catalog: &'static dyn Catalog, query: &str) -> u64 {
+    plan(catalog, query).map_or(0, |plan| run(plan.pipeline()))
+}
+
+/// The table `t`.
+struct Small(DynScannable<'static>);
+
+impl Catalog for Small {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        (name == "t").then_some(&self.0)
+    }
+}
+
+/// A table `t` of `rows` rows, at most a batch's, in one row group: `id`,
+/// which counts from 0, and `a`, `b` and `c`. Kept for the rest of the run.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn small_table(rows: u32) -> &'static dyn Catalog {
+    assert!(rows <= BATCH_ROWS_MAX, "one row group");
+    let column = |value: fn(i64) -> i64| {
+        let mut values = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
+        for (i, slot) in (0_i64..).zip(values.as_mut_slice::<i64>()) {
+            *slot = value(i);
+        }
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).expect("allocates")
+    };
+    let columns = [column(|i| i), column(|i| i * 7), column(|i| i % 10), column(|i| -i)];
+    let schema = [
+        ("id", DataType::Int64),
+        ("a", DataType::Int64),
+        ("b", DataType::Int64),
+        ("c", DataType::Int64),
+    ];
+    let table = Table::new(&Heap, &schema, &[columns.as_slice()]).expect("allocates");
+    let small = Small(DynScannable::new(&Heap, table).expect("allocates"));
+    Box::leak(Box::new(small))
+}
+
+/// `query` over `small_table(rows)`, planned once.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn small_plan(rows: u32, query: &str) -> PhysicalPlan<'static> {
+    plan(small_table(rows), query).expect("compiles")
 }
 
 /// `batches` full batches through `steps` pass-through transforms, or

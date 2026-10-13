@@ -33,6 +33,21 @@ fn query(c: &mut Criterion) {
     group.finish();
 }
 
+/// Finds one row of a small table by its id, without and with planning it.
+fn small(c: &mut Criterion) {
+    let query = "FROM t |> WHERE id = 42 |> SELECT a, b";
+    let catalog = pipitdb_bench::small_table(100);
+    let plan = pipitdb_bench::small_plan(100, query);
+    let mut group = c.benchmark_group("small");
+    group.bench_function("point", |b| {
+        b.iter(|| pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)));
+    });
+    group.bench_function("point_planned", |b| {
+        b.iter(|| pipitdb_bench::run(black_box(plan.pipeline())));
+    });
+    group.finish();
+}
+
 /// What the pipeline costs per batch, with steps that do nothing.
 fn pipeline(c: &mut Criterion) {
     let batches = 10_000;
@@ -125,6 +140,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, pipeline, scan, slices, filter
+    targets = lexer, parser, query, small, pipeline, scan, slices, filter
 }
 criterion_main!(benches);
