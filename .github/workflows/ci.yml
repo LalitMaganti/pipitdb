@@ -89,8 +89,8 @@ jobs:
       - shell: bash
         run: crates/bench/check_size.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Fails if a benchmark's instruction count is more than 5% off
-  # crates/bench/instructions.
+  # Fails if a benchmark's instruction count is more than 1% off
+  # crates/bench/instructions/ci.json.
   instructions:
     runs-on: ubuntu-latest
     steps:
