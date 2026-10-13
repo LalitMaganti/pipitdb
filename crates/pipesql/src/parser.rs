@@ -413,6 +413,7 @@ impl Parser<'_> {
             *at_mut!(children, i) = match *item {
                 Item::One(shared) => self.shared(shared)?,
                 Item::List(shared) => self.list_of(shared)?,
+                Item::Clause(words, shared) => self.clause(words, shared)?,
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));
@@ -444,6 +445,32 @@ impl Parser<'_> {
             }
             self.advance()?;
         }
+    }
+
+    /// `words`, then one or more `shared`, or an empty list if the first word
+    /// isn't next.
+    fn clause(&mut self, words: &[&str], shared: Shared) -> Result<Node, Error> {
+        let Some((first, rest)) = words.split_first() else {
+            pipit_kernel::check::check_failed(line!())
+        };
+        if !self.at_word(first) {
+            return Ok(self.list(Tag::List, &[]));
+        }
+        self.advance()?;
+        for word in rest {
+            if !self.at_word(word) {
+                return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+            }
+            self.advance()?;
+        }
+        self.list_of(shared)
+    }
+
+    /// Whether the current token is `word`, ignoring case.
+    fn at_word(&self, word: &str) -> bool {
+        let current = self.current();
+        current.kind == TokenKind::Identifier
+            && self.text(current).eq_ignore_ascii_case(word.as_bytes())
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.

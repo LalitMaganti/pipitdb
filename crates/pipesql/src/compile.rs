@@ -116,9 +116,9 @@ mod tests {
 
     use super::*;
     use crate::error::ErrorCode;
-    use crate::stages::RELATIONAL;
+    use crate::stages::{AGGREGATION, RELATIONAL};
 
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
 
     /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5,
     /// `s` is `it's` and the empty string.
@@ -235,6 +235,21 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_with_and_without_keys() {
+        let count = (b"count(*)".to_vec(), [2.0].to_vec());
+        let sum = (b"sum(b)".to_vec(), [30.0].to_vec());
+        let avg = (b"avg(f)".to_vec(), [1.5].to_vec());
+        assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), avg(f)"), [count, sum, avg]);
+        // Each `a` is a group, of one row; the keys come first.
+        let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(f) GROUP BY a");
+        assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
+        assert_eq!(groups, [(b"max(f)".to_vec(), [2.5].to_vec())]);
+        let mut keys = kept("FROM t |> AGGREGATE count(*) GROUP BY a |> SELECT a");
+        keys.sort_by(f64::total_cmp);
+        assert_eq!(keys, [1.0, 2.0]);
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
@@ -255,6 +270,10 @@ mod tests {
         let wide = (0..40).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
+        assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
+        assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
     }
 
     #[test]
