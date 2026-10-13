@@ -658,15 +658,11 @@ fn fold<S: Copy, T>(
     op: impl Fn(S, T, bool) -> S,
 ) {
     let ids = match ids {
+        // One run, rather than loops of its own.
         Ids::One(group) => {
-            let state = at_mut!(states, group as usize);
-            let mut folded = *state;
-            for_kept(selection, |_, row| {
-                let (value, valid) = read(row);
-                folded = op(folded, value, valid);
-            });
-            *state = folded;
-            return;
+            #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+            let rows = selection.len() as u16;
+            return fold(states, Ids::Runs(&[group], &[0, rows]), selection, read, op);
         }
         Ids::Each(ids) => ids,
         Ids::Runs(ids, starts) => {
@@ -708,7 +704,7 @@ fn fold<S: Copy, T>(
     }
 }
 
-/// As `fold`, of `column`'s values, which are `T`s.
+/// As `fold`, of `column`'s values, which are `T`s: a flat column.
 #[inline]
 fn fold_column<S: Copy, T: Primitive>(
     states: &mut [S],
@@ -718,7 +714,7 @@ fn fold_column<S: Copy, T: Primitive>(
     op: impl Fn(S, T, bool) -> S,
 ) {
     match read(column, selection) {
-        Read::Constant(value, valid) => fold(states, ids, selection, |_| (value, valid), op),
+        Read::Constant(..) => crate::check::check_failed(line!()),
         Read::Flat(flat) if flat.validity.is_none() => {
             fold(states, ids, selection, |row| (flat.value(row), true), op);
         }
@@ -728,14 +724,36 @@ fn fold_column<S: Copy, T: Primitive>(
     }
 }
 
-/// The greatest magnitude of any value of `column`, an integer one, if
-/// known.
-fn magnitude(column: &ColumnView) -> Option<u64> {
-    let magnitude = |bounds: Bounds| bounds.min.unsigned_abs().max(bounds.max.unsigned_abs());
-    match column.form() {
-        Form::Constant => Some(at!(column.values().int64s(), 0).unsigned_abs()),
-        _ => column.bounds().map(magnitude),
+/// `column`, an aggregate's input of `data_type`, with a constant made
+/// flat, so it's folded by the same loops as any, or `None` if it's a
+/// constant null.
+fn flat_input(
+    context: &mut Context,
+    column: &ColumnView,
+    data_type: DataType,
+    selection: &Selection,
+) -> Result<Option<ColumnView>, AllocError> {
+    let (value, valid) = match read::<i64>(column, selection) {
+        Read::Flat(_) => return Ok(Some(column.clone())),
+        Read::Constant(value, valid) => (value, valid),
+    };
+    if !valid {
+        return Ok(None);
     }
+    let mut values = context.values_buffer(selection.rows() as usize * 8)?;
+    values.as_mut_slice::<i64>().fill(value);
+    let flat = ColumnView::new(context, data_type, values, None)?;
+    Ok(Some(match data_type {
+        DataType::Int64 => flat.with_bounds(Bounds { min: value, max: value }),
+        _ => flat,
+    }))
+}
+
+/// The greatest magnitude of any value of `column`, an integer one, if
+/// its bounds are known.
+fn magnitude(column: &ColumnView) -> Option<u64> {
+    let bounds = column.bounds()?;
+    Some(bounds.min.unsigned_abs().max(bounds.max.unsigned_abs()))
 }
 
 /// `sums`, in 128 bits.
@@ -1002,16 +1020,22 @@ impl HashAggregate {
     /// Folds `input`'s column for `aggregate` into `states`, given each
     /// group's row count before it, `counted`.
     fn update(
-        allocator: &dyn Allocator,
+        context: &mut Context,
         aggregate: Lowered,
         states: &mut States,
         counted: &[u64],
         input: &RowBatch,
         ids: Ids,
     ) -> Result<(), AllocError> {
-        let Some((position, _)) = aggregate.input else { return Ok(()) };
+        let Some((position, data_type)) = aggregate.input else { return Ok(()) };
+        let allocator = context.allocator();
         let selection = input.selection();
-        let column = input.column(position);
+        let column = flat_input(context, input.column(position), data_type, selection)?;
+        // A constant null adds no value, but counts are kept apart from rows.
+        let Some(column) = &column else {
+            states.counts(allocator, counted)?;
+            return Ok(());
+        };
         // Once a value's been null, counts are kept apart from rows.
         if column.has_nulls() || states.counts.is_some() {
             let counts = states.counts(allocator, counted)?;
@@ -1190,7 +1214,7 @@ impl Breaker for HashAggregate {
             Grouped::Runs(runs) => Ids::Runs(at!(ids, ..runs), at!(groups.scratch.starts, ..=runs)),
         };
         for (&aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
-            HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids)?;
+            HashAggregate::update(context, aggregate, states, &groups.rows, input, ids)?;
         }
         fold(&mut groups.rows, ids, selection, |_| ((), true), |count, (), _| count + 1);
         Ok(())
@@ -1536,12 +1560,37 @@ mod tests {
         }
     }
 
+    /// Each group of the rows of `k1`, `k2` and `x` in `batches`, but row
+    /// `dropped` of each: its keys, then its rows, values, and the values'
+    /// sum, least and greatest, sorted.
+    fn expected(batches: &[&[[Option<i64>; 3]]], dropped: usize) -> Vec<Vec<Option<i64>>> {
+        let mut expected: Vec<Vec<Option<i64>>> = Vec::new();
+        for (i, &[k1, k2, x]) in batches.iter().flat_map(|rows| rows.iter().enumerate()) {
+            if i == dropped {
+                continue;
+            }
+            if !expected.iter().any(|group| group[..2] == [k1, k2]) {
+                expected.push(alloc::vec![k1, k2, Some(0), Some(0), None, None, None]);
+            }
+            let group = expected.iter_mut().find(|group| group[..2] == [k1, k2]).unwrap();
+            group[2] = group[2].map(|n| n + 1);
+            if let Some(x) = x {
+                group[3] = group[3].map(|n| n + 1);
+                group[4] = Some(group[4].unwrap_or(0) + x);
+                group[5] = Some(group[5].map_or(x, |least| least.min(x)));
+                group[6] = Some(group[6].map_or(x, |greatest| greatest.max(x)));
+            }
+        }
+        expected.sort();
+        expected
+    }
+
     #[test]
     fn groups_by_keys_with_nulls_constants_and_runs() {
         // Rows of `k1`, `k2` and `x`, a batch each; in the second, `k1` is
-        // constant, and in the third, both keys are, and no `x` is null.
-        // Row 3 of each is dropped.
-        let batches: [&[[Option<i64>; 3]]; 3] = [
+        // constant; in the third, both keys are, and no `x` is null; in the
+        // last two, `x` is. Row 3 of each is dropped.
+        let batches: [&[[Option<i64>; 3]]; 5] = [
             &[
                 [Some(1), Some(10), Some(1)],
                 [Some(1), Some(10), Some(2)],
@@ -1567,8 +1616,16 @@ mod tests {
                 [None, Some(5), Some(300)],
                 [None, Some(5), Some(400)],
             ],
+            &[[Some(1), Some(10), Some(9)]; 5],
+            &[[Some(2), Some(11), None]; 4],
         ];
-        let constant = [[false, false], [true, false], [true, true]];
+        let constant = [
+            [false, false, false],
+            [true, false, false],
+            [true, true, false],
+            [false, false, true],
+            [false, false, true],
+        ];
         let mut context = Context::new(&Heap);
         let mut columns = Columns { batches: Vec::new(), dropped: alloc::vec![3] };
         for (rows, constant) in batches.iter().zip(constant) {
@@ -1584,26 +1641,7 @@ mod tests {
             });
             columns.batches.push(batch.collect());
         }
-        // Each group's keys, then its rows, values, and the values' sum,
-        // least and greatest.
-        let mut expected: Vec<Vec<Option<i64>>> = Vec::new();
-        for (i, &[k1, k2, x]) in batches.iter().flat_map(|rows| rows.iter().enumerate()) {
-            if i == 3 {
-                continue;
-            }
-            if !expected.iter().any(|group| group[..2] == [k1, k2]) {
-                expected.push(alloc::vec![k1, k2, Some(0), Some(0), None, None, None]);
-            }
-            let group = expected.iter_mut().find(|group| group[..2] == [k1, k2]).unwrap();
-            group[2] = group[2].map(|n| n + 1);
-            if let Some(x) = x {
-                group[3] = group[3].map(|n| n + 1);
-                group[4] = Some(group[4].unwrap_or(0) + x);
-                group[5] = Some(group[5].map_or(x, |least| least.min(x)));
-                group[6] = Some(group[6].map_or(x, |greatest| greatest.max(x)));
-            }
-        }
-        expected.sort();
+        let expected = expected(&batches, 3);
         let functions = [Function::Count, Function::Sum, Function::Min, Function::Max];
         for apart in [true, false] {
             assert_eq!(merged(by(&[0, 1], 2, &functions), &columns, apart), expected);
