@@ -52,6 +52,10 @@ pub enum ErrorCode {
     ListedTwice = 22,
     /// `DROP` would leave no columns.
     NoColumnsLeft = 23,
+    /// A call names no function there is.
+    UnknownFunction = 24,
+    /// A clause's first word isn't followed by the rest, as `GROUP` by `BY`.
+    ExpectedWord = 25,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -69,6 +73,13 @@ pub enum Unsupported {
     Decimal = 4,
     /// A `LIMIT` or `OFFSET` that isn't one integer.
     Limit = 5,
+    /// An aggregate that isn't a function of a column, or `COUNT(*)`.
+    Aggregate = 6,
+    /// An aggregate of a column whose type it can't take, such as a string's
+    /// sum.
+    AggregateType = 7,
+    /// A key to group by that isn't an `Int64` column.
+    GroupKey = 8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,7 +103,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::NoColumnsLeft;
+    pub const LAST: ErrorCode = ErrorCode::ExpectedWord;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {
