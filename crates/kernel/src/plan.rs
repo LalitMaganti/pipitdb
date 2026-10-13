@@ -358,7 +358,7 @@ pub struct ScanColumn {
 impl<'c> Op<'c> for ScanOp<'c> {
     fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
         for column in self.columns.iter() {
-            lowering.define(column.binding.id)?;
+            lowering.declare_column(column.binding.id)?;
         }
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
@@ -438,7 +438,7 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
-        let positions = self.columns.iter().map(|&(column, _)| lowering.position(column));
+        let positions = self.columns.iter().map(|&(column, _)| lowering.query_position(column));
         let positions = SlowVec::fixed_from(lowering.allocator(), positions)?;
         let forms = self.columns.iter().map(|&(_, forms)| forms);
         let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
@@ -472,7 +472,7 @@ impl<'c> Op<'c> for FilterOp {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
         let allocator = lowering.allocator();
-        let predicate = self.predicate.renumbered(allocator, |id| lowering.position(id))?;
+        let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
         lowering.add_step(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
     }
 
