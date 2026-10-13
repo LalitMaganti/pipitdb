@@ -243,7 +243,7 @@ enum Ids<'a> {
     One(u32),
     /// Each row's, in order.
     Each(&'a [u32]),
-    /// Each row's, in order, in runs of rows of the same group, each
+    /// Each run's, of runs of rows of the same group, in order, each
     /// starting at one of these and ending at the next, the first at 0 and
     /// the last at the number of rows.
     Runs(&'a [u32], &'a [u16]),
@@ -256,8 +256,8 @@ enum Grouped {
     One(u32),
     /// Each row's group is in `ids`.
     Each,
-    /// As `Each`, in this many runs of rows of the same group, each
-    /// starting at one of `starts`, and ending at the next.
+    /// This many runs of rows of the same group: each run's group is in
+    /// `ids`, and it starts at one of `starts` and ends at the next.
     Runs(usize),
 }
 
@@ -297,11 +297,12 @@ impl Table {
     }
 
     /// Finds the group of each of `ids`' rows, whose keys are `keys`, a
-    /// list for each key, and `nulls`, if any are, into `ids`, adding groups
-    /// for keys not seen before, with room for each row's hash in `hashes`.
-    /// Returns how many runs of rows of the same group there are, if it
-    /// found them, and where each starts, in `starts`. There must be room
-    /// for the groups.
+    /// list for each key, and `nulls`, if any are, adding groups for keys
+    /// not seen before, with room for each row's hash in `hashes`. There must
+    /// be room for the groups. Either it finds runs of rows of the same group
+    /// and returns how many, with each run's group in `ids` and where it
+    /// starts in `starts`, then where the last ends; or it returns `None`,
+    /// with each row's group in `ids`.
     fn assign(
         &mut self,
         keys: &[&[i64]],
@@ -335,8 +336,8 @@ impl Table {
         }
     }
 
-    /// As `assign`, for `N` keys, where no key is null in any row or group.
-    /// A row is hashed only if its keys aren't the last row's.
+    /// As `assign`, for `N` keys, where no key is null in any row or group,
+    /// finding runs: a row is hashed only if its keys aren't the last row's.
     fn assign_unnulled<const N: usize>(
         &mut self,
         keys: &[&[i64]; N],
@@ -348,19 +349,9 @@ impl Table {
             // `assign` checked there are as many keys.
             unsafe { *keys.get_unchecked(k).get_unchecked(row) }
         };
-        let (mut last, mut runs) = (None, 0);
-        for (row, id) in ids.iter_mut().enumerate() {
-            // Rows often come in runs of the same keys, as from sorted data.
-            if let Some(last) = last
-                && (0..N).all(|k| key(k, row) == key(k, row - 1))
-            {
-                *id = last;
-                continue;
-            }
-            #[expect(clippy::cast_possible_truncation, reason = "a row")]
-            let start = row as u16;
-            *at_mut!(starts, runs) = start;
-            runs += 1;
+        let rows = ids.len();
+        let (mut row, mut runs) = (0, 0);
+        while row < rows {
             let hash = (0..N).fold(SEED, |hash, k| mix(hash, key(k, row)));
             let found = self.find(hash, |group| {
                 (0..N).all(|k| {
@@ -370,14 +361,24 @@ impl Table {
                     ours == key(k, row)
                 })
             });
-            *id = match found {
+            // `runs` is at most `row`, so this writes over no row's id.
+            *at_mut!(ids, runs) = match found {
                 Ok(group) => group,
                 Err(slot) => self.insert_unnulled(slot, hash, keys, row),
             };
-            last = Some(*id);
+            #[expect(clippy::cast_possible_truncation, reason = "a row")]
+            let start = row as u16;
+            *at_mut!(starts, runs) = start;
+            runs += 1;
+            // Rows often come in runs of the same keys, as from sorted data.
+            let first = row;
+            row += 1;
+            while row < rows && (0..N).all(|k| key(k, row) == key(k, first)) {
+                row += 1;
+            }
         }
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
-        let end = ids.len() as u16;
+        let end = rows as u16;
         *at_mut!(starts, runs) = end;
         runs
     }
@@ -621,6 +622,18 @@ fn hash_rows(keys: &[&[i64]], nulls: Option<&[u64]>, hashes: &mut [u64]) {
     }
 }
 
+/// Turns `ids` from the group of each of `runs` runs, which start at
+/// `starts` and end at the next, into the group of each row.
+fn spread(ids: &mut [u32], starts: &[u16], runs: usize) {
+    // From the last run, so none's group is written over before it's read:
+    // a run starts at or after its place.
+    for run in (0..runs).rev() {
+        let (start, end) = (*at!(starts, run), *at!(starts, run + 1));
+        let id = *at!(ids, run);
+        at_mut!(ids, usize::from(start)..usize::from(end)).fill(id);
+    }
+}
+
 /// Calls `f` with each row `selection` keeps, and its place among them.
 #[inline]
 fn for_kept(selection: &Selection, mut f: impl FnMut(usize, usize)) {
@@ -657,12 +670,11 @@ fn fold<S: Copy, T>(
         }
         Ids::Each(ids) => ids,
         Ids::Runs(ids, starts) => {
-            check!(ids.len() == selection.len() as usize);
-            check!(starts.last().is_some_and(|&end| usize::from(end) == ids.len()));
-            for run in starts.windows(2) {
+            check!(starts.last().is_some_and(|&end| u32::from(end) == selection.len()));
+            for (&id, run) in ids.iter().zip(starts.windows(2)) {
                 let (start, end) = (usize::from(*at!(run, 0)), usize::from(*at!(run, 1)));
                 // SAFETY: each id is a group, which `states` has room for.
-                let state = unsafe { states.get_unchecked_mut(*at!(ids, start) as usize) };
+                let state = unsafe { states.get_unchecked_mut(id as usize) };
                 let mut folded = *state;
                 let mut fold_row = |row| {
                     let (value, valid) = read(row);
@@ -978,8 +990,12 @@ impl HashAggregate {
         match groups.table.assign(keys, nulls, hashes, ids, starts) {
             _ if constant => Grouped::One(*at!(ids, 0)),
             // Folding a run at a time pays where runs are long enough.
-            Some(runs) if runs * 8 <= rows => Grouped::Runs(runs),
-            _ => Grouped::Each,
+            Some(runs) if runs * 2 <= rows => Grouped::Runs(runs),
+            Some(runs) => {
+                spread(ids, starts, runs);
+                Grouped::Each
+            }
+            None => Grouped::Each,
         }
     }
 
@@ -1170,7 +1186,7 @@ impl Breaker for HashAggregate {
         let ids = match grouped {
             Grouped::One(group) => Ids::One(group),
             Grouped::Each => Ids::Each(ids),
-            Grouped::Runs(runs) => Ids::Runs(ids, at!(groups.scratch.starts, ..=runs)),
+            Grouped::Runs(runs) => Ids::Runs(at!(ids, ..runs), at!(groups.scratch.starts, ..=runs)),
         };
         for (&aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
             HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids)?;
@@ -1203,7 +1219,9 @@ impl Breaker for HashAggregate {
                 let nulls = Some(at!(other.table.nulls, theirs.clone()));
                 let Scratch { hashes, ids, starts, .. } = &mut groups.scratch;
                 let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
-                groups.table.assign(keys, nulls, hashes, ids, starts);
+                if let Some(runs) = groups.table.assign(keys, nulls, hashes, ids, starts) {
+                    spread(ids, starts, runs);
+                }
                 Ids::Each(ids)
             };
             let aggregates = self.grouping.aggregates.iter().map(|aggregate| aggregate.function);
