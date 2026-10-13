@@ -338,7 +338,7 @@ impl<'s> ChunkReader<'s> {
         let (validity, valid) = self.validity(context, page, rows, decoded)?;
         if let Some(dictionary) = &dictionary {
             let mut column =
-                self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
+                self.indexed(context, page, dictionary, rows, valid, validity, decoded, forms)?;
             // Strings' dictionaries are kept, and a run of one entry is a
             // constant, unless `forms` rules them out.
             column.make_in(context, forms)?;
@@ -393,10 +393,10 @@ impl<'s> ChunkReader<'s> {
 
     /// The next `rows` rows of a page of indices into `dictionary`, `valid`
     /// of them not null as `validity` says: a constant, if every row has one
-    /// value; else, for strings, a dictionary column, which copies none; else
-    /// flat values, looked up once here so operators read them plainly, as
-    /// DuckDB's reader does. Indices are decoded into `decoded`, a run at a
-    /// time.
+    /// value; else a dictionary column, which copies none, for strings or
+    /// if `forms` takes one; else flat values, looked up once here so
+    /// operators read them plainly, as DuckDB's reader does. Indices are
+    /// decoded into `decoded`, a run at a time.
     #[expect(clippy::too_many_arguments, reason = "a step of `read`")]
     fn indexed(
         &mut self,
@@ -407,6 +407,7 @@ impl<'s> ChunkReader<'s> {
         valid: usize,
         validity: Option<Buffer>,
         decoded: &mut [u32],
+        forms: Forms,
     ) -> Result<ColumnView, Error> {
         let bytes = page.get(self.position.value..).ok_or(Error::Corrupt)?;
         let rows32 = u32::try_from(rows).map_err(|_| Error::Corrupt)?;
@@ -426,7 +427,8 @@ impl<'s> ChunkReader<'s> {
         let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
         let null = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         let mut at = 0;
-        if let Some(words) = &dictionary.words {
+        let words = dictionary.words.as_ref().filter(|_| !forms.contains(Forms::DICTIONARY));
+        if let Some(words) = words {
             let entries = at!(words.as_slice::<i64>(), ..count);
             let entry = |i: u32| entries.get(i as usize).copied().ok_or(Error::Corrupt);
             let mut out = context.values_buffer(rows * 8)?;
@@ -475,13 +477,13 @@ impl<'s> ChunkReader<'s> {
         if at!(out, ..valid).iter().any(|&i| i >= null) {
             return Err(Error::Corrupt);
         }
-        Ok(match bits {
-            None => ColumnView::dictionary(context, &dictionary.values, indices)?,
-            Some(bits) => {
-                bits::spread(out, valid, bits, null);
-                ColumnView::dictionary(context, &dictionary.nullable, indices)?
-            }
-        })
+        if let Some(bits) = bits {
+            bits::spread(out, valid, bits, null);
+        }
+        // A nullable chunk's integers always view its null, to share values.
+        let nullable = bits.is_some() || dictionary.words.is_some() && self.column.optional;
+        let values = if nullable { &dictionary.nullable } else { &dictionary.values };
+        Ok(ColumnView::dictionary(context, values, indices)?)
     }
 
     /// The next `rows` rows' validity, from their definition levels, or
@@ -828,23 +830,24 @@ mod tests {
     }
 
     #[test]
-    fn reads_dictionaries_of_strings_as_dictionary_columns() {
+    fn reads_dictionaries_as_dictionary_columns_if_taken() {
         let mut bytes = DICT;
         let source: &dyn ByteSource = &mut bytes;
         let file = ParquetFile::open(&Heap, source).unwrap();
         let mut context = Context::new(&Heap);
-        for c in 0..3 {
+        for (c, forms) in [(0, ANY), (1, Forms::FLAT), (2, ANY)] {
             let column = file.columns()[c];
             let mut reader =
                 ChunkReader::new(source, &Uncompressed, column, file.chunk(0, c)).unwrap();
             reader.page_left(&mut context).unwrap();
-            let view = reader.read(&mut context, 100, ANY).unwrap();
-            if c == 2 {
-                // Strings: none copied out of the dictionary.
+            let view = reader.read(&mut context, 100, forms).unwrap();
+            if c == 1 {
+                // Integers are looked up unless a dictionary is taken.
+                assert!(matches!(view.form(), Form::Flat));
+            } else {
+                // None copied out of the dictionary.
                 assert!(matches!(view.form(), Form::Dictionary(_)));
                 assert!(view.values().len() <= 14);
-            } else {
-                assert!(matches!(view.form(), Form::Flat));
             }
             // An integer dictionary's own least and greatest bound its rows.
             if c == 0 {
