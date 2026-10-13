@@ -87,7 +87,8 @@ fn describe(found: &str, error: &Error) -> Message {
         | ErrorCode::AmbiguousColumn
         | ErrorCode::ListedTwice
         | ErrorCode::NoColumnsLeft
-        | ErrorCode::DuplicateColumn => named(found, error.code),
+        | ErrorCode::DuplicateColumn
+        | ErrorCode::UnknownFunction => named(found, error.code),
         ErrorCode::Unsupported => unsupported(found, error.detail),
     };
     Message { title, label }
@@ -111,6 +112,9 @@ fn named(found: &str, code: ErrorCode) -> (String, String) {
             format!("{found} has two columns of one name"),
             "a table's columns need their own names".into(),
         ),
+        ErrorCode::UnknownFunction => {
+            (format!("no function {found}"), "not a function there is".into())
+        }
         _ => pipit_kernel::failed!(),
     }
 }
@@ -137,6 +141,18 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
         what if what == Unsupported::Limit as u16 => {
             ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
         }
+        what if what == Unsupported::Aggregate as u16 => (
+            "only functions of a column, or `count(*)`, can be aggregated yet".into(),
+            "not a function of a column".into(),
+        ),
+        what if what == Unsupported::AggregateType as u16 => (
+            "only integer columns can be aggregated yet".into(),
+            "not an integer column".into(),
+        ),
+        what if what == Unsupported::GroupKey as u16 => (
+            "only integer columns can be grouped by yet".into(),
+            "not an integer column".into(),
+        ),
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }
 }

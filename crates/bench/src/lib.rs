@@ -26,7 +26,8 @@ use pipit_pipesql::registry::Registry;
 
 pub mod real;
 
-static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
+static REGISTRY: Registry =
+    Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION]);
 
 /// Queries shaped like real ones, repeated `count` times.
 pub fn typical_queries(count: usize) -> String {
