@@ -1273,6 +1273,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
+    use crate::column::Bounds;
     use crate::pipeline::Pipeline;
     use crate::query_allocators::QueryAllocators;
     use crate::step::Source;
@@ -1451,5 +1452,193 @@ mod tests {
         let expected: Vec<_> =
             (0..2000).map(|k| (k, if (1000..1500).contains(&k) { 2 } else { 1 })).collect();
         assert_eq!(counts, expected);
+    }
+
+    /// Batches of columns, each keeping all but the rows in `dropped`.
+    struct Columns {
+        batches: Vec<Vec<ColumnView>>,
+        dropped: Vec<u16>,
+    }
+
+    impl Source for Columns {
+        type State = usize;
+
+        fn new_state(&self, _: &mut Context) -> Result<usize, Error> {
+            Ok(0)
+        }
+
+        fn next(
+            &self,
+            _: &mut Context,
+            i: &mut usize,
+            batch: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            let Some(columns) = self.batches.get(*i) else { return Ok(false) };
+            *i += 1;
+            batch.reset(columns[0].row_count());
+            for column in columns {
+                assert!(batch.push_column(column.clone()).is_ok());
+            }
+            batch.selection_mut().retain(|row| !self.dropped.contains(&row));
+            Ok(true)
+        }
+    }
+
+    /// Each row out of `grouping` over `columns`, as `aggregated` gives
+    /// them, sorted. If `apart`, each batch is consumed into a state of its
+    /// own, and the states merged; if not, all into one, merged into an
+    /// empty one.
+    fn merged(grouping: Grouping, columns: &Columns, apart: bool) -> Vec<Vec<Option<i64>>> {
+        let breaker = HashAggregate { grouping };
+        let mut context = Context::new(&Heap);
+        let mut source = Source::new_state(columns, &mut context).unwrap();
+        let mut input = RowBatch::new();
+        let mut merged = Breaker::new_state(&breaker, &mut context).unwrap();
+        let mut state = Breaker::new_state(&breaker, &mut context).unwrap();
+        while columns.next(&mut context, &mut source, &mut input).unwrap() {
+            breaker.consume(&mut context, &mut state, &input).unwrap();
+            if apart {
+                let consumed = Breaker::new_state(&breaker, &mut context).unwrap();
+                let consumed = core::mem::replace(&mut state, consumed);
+                breaker.merge(&mut context, &mut merged, consumed).unwrap();
+            }
+        }
+        breaker.merge(&mut context, &mut merged, state).unwrap();
+        let mut output = RowBatch::new();
+        let mut out = Vec::new();
+        loop {
+            let more = breaker.serve(&mut context, &mut merged, &mut output).unwrap();
+            for row in 0..output.row_count() {
+                let values = (0..output.column_count()).map(|i| {
+                    let column = output.column(i);
+                    (!column.is_null(row)).then(|| column.int64s()[row as usize])
+                });
+                out.push(values.collect());
+            }
+            if !more {
+                break;
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A grouping by `keys` of `COUNT(*)`, then each of `functions` of `x`,
+    /// an integer column.
+    fn by(keys: &[u32], x: u32, functions: &[Function]) -> Grouping {
+        let x = Some((x, DataType::Int64));
+        let mut aggregates = alloc::vec![Lowered { function: Function::Count, input: None }];
+        aggregates.extend(functions.iter().map(|&function| Lowered { function, input: x }));
+        Grouping {
+            keys: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+            aggregates: SlowVec::fixed_from(&Heap, aggregates.into_iter()).unwrap(),
+        }
+    }
+
+    #[test]
+    fn groups_by_keys_with_nulls_constants_and_runs() {
+        // Rows of `k1`, `k2` and `x`, a batch each; in the second, `k1` is
+        // constant, and in the third, both keys are. Row 3 of each is
+        // dropped.
+        let batches: [&[[Option<i64>; 3]]; 3] = [
+            &[
+                [Some(1), Some(10), Some(1)],
+                [Some(1), Some(10), Some(2)],
+                [Some(1), None, Some(3)],
+                [Some(2), Some(10), Some(4)],
+                [Some(2), Some(10), None],
+                [None, Some(5), Some(6)],
+                [None, Some(5), Some(7)],
+                [Some(1), Some(10), Some(8)],
+            ],
+            &[
+                [Some(2), Some(10), Some(1)],
+                [Some(2), Some(11), Some(2)],
+                [Some(2), Some(10), Some(3)],
+                [Some(2), Some(11), Some(4)],
+                [Some(2), None, Some(5)],
+                [Some(2), Some(10), None],
+                [Some(2), Some(10), Some(7)],
+            ],
+            &[
+                [None, Some(5), Some(100)],
+                [None, Some(5), None],
+                [None, Some(5), Some(300)],
+                [None, Some(5), Some(400)],
+            ],
+        ];
+        let constant = [[false, false], [true, false], [true, true]];
+        let mut context = Context::new(&Heap);
+        let mut columns = Columns { batches: Vec::new(), dropped: alloc::vec![3] };
+        for (rows, constant) in batches.iter().zip(constant) {
+            let count = u32::try_from(rows.len()).unwrap();
+            let batch = (0..3).map(|c| {
+                let values: Vec<_> = rows.iter().map(|row| row[c]).collect();
+                if constant.get(c) == Some(&true) {
+                    let one = column(DataType::Int64, &values[..1]);
+                    ColumnView::constant(&mut context, &one, count).unwrap()
+                } else {
+                    column(DataType::Int64, &values)
+                }
+            });
+            columns.batches.push(batch.collect());
+        }
+        // Each group's keys, then its rows, values, and the values' sum,
+        // least and greatest.
+        let mut expected: Vec<Vec<Option<i64>>> = Vec::new();
+        for (i, &[k1, k2, x]) in batches.iter().flat_map(|rows| rows.iter().enumerate()) {
+            if i == 3 {
+                continue;
+            }
+            if !expected.iter().any(|group| group[..2] == [k1, k2]) {
+                expected.push(alloc::vec![k1, k2, Some(0), Some(0), None, None, None]);
+            }
+            let group = expected.iter_mut().find(|group| group[..2] == [k1, k2]).unwrap();
+            group[2] = group[2].map(|n| n + 1);
+            if let Some(x) = x {
+                group[3] = group[3].map(|n| n + 1);
+                group[4] = Some(group[4].unwrap_or(0) + x);
+                group[5] = Some(group[5].map_or(x, |least| least.min(x)));
+                group[6] = Some(group[6].map_or(x, |greatest| greatest.max(x)));
+            }
+        }
+        expected.sort();
+        let functions = [Function::Count, Function::Sum, Function::Min, Function::Max];
+        for apart in [true, false] {
+            assert_eq!(merged(by(&[0, 1], 2, &functions), &columns, apart), expected);
+        }
+    }
+
+    #[test]
+    fn sums_widen_before_they_could_overflow() {
+        // Summed in 64 bits, the second batch's first two values would
+        // overflow, though the whole sum fits.
+        let big = 1 << 62;
+        let bounded = |values: &[Option<i64>], min, max| {
+            column(DataType::Int64, values).with_bounds(Bounds { min, max })
+        };
+        let columns = Columns {
+            batches: alloc::vec![
+                alloc::vec![
+                    column(DataType::Int64, &[Some(7); 2]),
+                    bounded(&[Some(1), Some(2)], 1, 2)
+                ],
+                alloc::vec![
+                    column(DataType::Int64, &[Some(7); 3]),
+                    bounded(&[Some(big), Some(big), Some(-big)], -big, big),
+                ],
+            ],
+            dropped: Vec::new(),
+        };
+        let functions = [Function::Sum];
+        let expected = [Some(5), Some(3 + big)];
+        let grouped: Vec<_> = [Some(7)].into_iter().chain(expected).collect();
+        // Apart, the second batch's state widens, then the first's as it's
+        // merged with it; together, the one state widens as it goes.
+        for apart in [true, false] {
+            assert_eq!(merged(by(&[], 1, &functions), &columns, apart), [expected.to_vec()]);
+            let got = merged(by(&[0], 1, &functions), &columns, apart);
+            assert_eq!(got, core::slice::from_ref(&grouped));
+        }
     }
 }
