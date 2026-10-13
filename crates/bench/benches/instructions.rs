@@ -123,7 +123,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
     Some(pipitdb_bench::plan(Box::leak(Box::new(hits)), query).expect("compiles"))
 }
 
-// ClickBench's filters over its first file, a million rows. 0 without the
+// ClickBench's filters and aggregations over its first file, a million rows. 0 without the
 // file, which CI fetches. The file is sorted by `CounterID`, so `fCounter`'s
 // 78,186 rows and `fCounterFew`'s 10 are each one run. (gungraun allows no
 // doc comment here.)
@@ -137,6 +137,10 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::f_search(hits_query("fSearch"))]
 #[bench::f_counter(hits_query("fCounter"))]
 #[bench::f_counter_few(hits_query("fCounterFew"))]
+#[bench::g_adv(hits_query("gAdv"))]
+#[bench::g_region(hits_query("gRegion"))]
+#[bench::g_window(hits_query("gWindow"))]
+#[bench::g_user(hits_query("gUser"))]
 fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
     plan.map_or(0, |plan| black_box(pipitdb_bench::run(black_box(plan.pipeline()))))
 }
