@@ -186,8 +186,12 @@ enum Totals {
     None,
     /// The least or greatest integer.
     Int(SlowVec<i64>),
-    /// The sum of integers, in 128 bits, so no sum of a batch's can
-    /// overflow.
+    /// The sum of integers, in 64 bits, while no sum can overflow them:
+    /// and how much more the magnitudes of the values summed can add up to
+    /// before one could.
+    Sum(SlowVec<i64>, u64),
+    /// The sum of integers, in 128 bits, so none can overflow, for when 64
+    /// bits might not do.
     Wide(SlowVec<i128>),
     /// The sum, least or greatest float. Least and greatest start as NaN,
     /// which `f64::min` and `f64::max` pass over.
@@ -206,6 +210,9 @@ struct Scratch {
     hashes: SlowVec<u64>,
     /// Each row's group.
     ids: SlowVec<u32>,
+    /// Where each run of rows of the same group starts, where runs are
+    /// found, then where the last ends.
+    starts: SlowVec<u16>,
 }
 
 /// Groups by their keys: a Swiss table, as abseil's and hashbrown's. Each
@@ -236,6 +243,22 @@ enum Ids<'a> {
     One(u32),
     /// Each row's, in order.
     Each(&'a [u32]),
+    /// Each row's, in order, in runs of rows of the same group, each
+    /// starting at one of these and ending at the next, the first at 0 and
+    /// the last at the number of rows.
+    Runs(&'a [u32], &'a [u16]),
+}
+
+/// How a batch's kept rows were grouped, into `Scratch`.
+#[derive(Clone, Copy)]
+enum Grouped {
+    /// Every row is in this group.
+    One(u32),
+    /// Each row's group is in `ids`.
+    Each,
+    /// As `Each`, in this many runs of rows of the same group, each
+    /// starting at one of `starts`, and ending at the next.
+    Runs(usize),
 }
 
 /// How many control bytes are probed at a time: a word's.
@@ -276,41 +299,56 @@ impl Table {
     /// Finds the group of each of `ids`' rows, whose keys are `keys`, a
     /// list for each key, and `nulls`, if any are, into `ids`, adding groups
     /// for keys not seen before, with room for each row's hash in `hashes`.
-    /// There must be room for the groups.
+    /// Returns how many runs of rows of the same group there are, if it
+    /// found them, and where each starts, in `starts`. There must be room
+    /// for the groups.
     fn assign(
         &mut self,
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
         hashes: &mut [u64],
         ids: &mut [u32],
-    ) {
+        starts: &mut [u16],
+    ) -> Option<usize> {
         let rows = ids.len();
-        check!(self.len + rows <= self.room() && hashes.len() == rows);
+        check!(self.len + rows <= self.room() && hashes.len() == rows && starts.len() > rows);
         check!(keys.iter().all(|keys| keys.len() >= rows) && nulls.is_none_or(|n| n.len() >= rows));
         match keys {
-            [key] if nulls.is_none() && !self.any_null => self.assign_unnulled(&[key], ids),
-            [a, b] if nulls.is_none() && !self.any_null => self.assign_unnulled(&[a, b], ids),
-            _ => self.assign_with(keys, nulls, hashes, ids, |table, group, row| {
-                let null = nulls.map_or(0, |nulls| *at!(nulls, row));
-                *at!(table.nulls, group) == null
-                    && table
-                        .keys
-                        .iter()
-                        .zip(keys)
-                        .all(|(ours, keys)| at!(ours, group) == at!(keys, row))
-            }),
+            [key] if nulls.is_none() && !self.any_null => {
+                Some(self.assign_unnulled(&[key], ids, starts))
+            }
+            [a, b] if nulls.is_none() && !self.any_null => {
+                Some(self.assign_unnulled(&[a, b], ids, starts))
+            }
+            _ => {
+                self.assign_with(keys, nulls, hashes, ids, |table, group, row| {
+                    let null = nulls.map_or(0, |nulls| *at!(nulls, row));
+                    *at!(table.nulls, group) == null
+                        && table
+                            .keys
+                            .iter()
+                            .zip(keys)
+                            .all(|(ours, keys)| at!(ours, group) == at!(keys, row))
+                });
+                None
+            }
         }
     }
 
     /// As `assign`, for `N` keys, where no key is null in any row or group.
     /// A row is hashed only if its keys aren't the last row's.
-    fn assign_unnulled<const N: usize>(&mut self, keys: &[&[i64]; N], ids: &mut [u32]) {
+    fn assign_unnulled<const N: usize>(
+        &mut self,
+        keys: &[&[i64]; N],
+        ids: &mut [u32],
+        starts: &mut [u16],
+    ) -> usize {
         let key = |k: usize, row: usize| {
             // SAFETY: there are `N` keys; `row` is one of `hashes`', and
             // `assign` checked there are as many keys.
             unsafe { *keys.get_unchecked(k).get_unchecked(row) }
         };
-        let mut last = None;
+        let (mut last, mut runs) = (None, 0);
         for (row, id) in ids.iter_mut().enumerate() {
             // Rows often come in runs of the same keys, as from sorted data.
             if let Some(last) = last
@@ -319,6 +357,10 @@ impl Table {
                 *id = last;
                 continue;
             }
+            #[expect(clippy::cast_possible_truncation, reason = "a row")]
+            let start = row as u16;
+            *at_mut!(starts, runs) = start;
+            runs += 1;
             let hash = (0..N).fold(SEED, |hash, k| mix(hash, key(k, row)));
             let found = self.find(hash, |group| {
                 (0..N).all(|k| {
@@ -330,10 +372,37 @@ impl Table {
             });
             *id = match found {
                 Ok(group) => group,
-                Err(slot) => self.insert(slot, hash, keys, None, row),
+                Err(slot) => self.insert_unnulled(slot, hash, keys, row),
             };
             last = Some(*id);
         }
+        #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+        let end = ids.len() as u16;
+        *at_mut!(starts, runs) = end;
+        runs
+    }
+
+    /// Adds a group with row `row`'s keys, none null, hashed as `hash`, in
+    /// `slot`.
+    #[cold]
+    #[inline(never)]
+    fn insert_unnulled<const N: usize>(
+        &mut self,
+        slot: usize,
+        hash: u64,
+        keys: &[&[i64]; N],
+        row: usize,
+    ) -> u32 {
+        let group = self.len;
+        for (ours, keys) in self.keys.iter_mut().zip(keys) {
+            *at_mut!(ours, group) = *at!(keys, row);
+        }
+        // Each list of nulls holds 0 until a group's set.
+        self.len += 1;
+        self.set(slot, hash, group);
+        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+        let group = group as u32;
+        group
     }
 
     /// As `assign`, with `same` saying whether a group has a row's keys.
@@ -422,15 +491,22 @@ impl Table {
     }
 
     /// Puts `group`, hashed as `hash`, in `slot`, which is empty.
+    #[inline]
     fn set(&mut self, slot: usize, hash: u64, group: usize) {
         let mask = self.slots.len() - 1;
+        let slot = slot & mask;
         let control = control(hash);
-        *at_mut!(self.controls, slot) = control;
-        // The copy, for the first `WIDTH` slots; for the rest, the slot again.
-        *at_mut!(self.controls, (slot.wrapping_sub(WIDTH) & mask) + WIDTH) = control;
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
         let group = group as u32;
-        *at_mut!(self.slots, slot) = group;
+        // SAFETY: masked, `slot` is a slot, and `grow` made a control byte
+        // for each, then a copy of the first `WIDTH`.
+        unsafe {
+            *self.slots.get_unchecked_mut(slot) = group;
+            *self.controls.get_unchecked_mut(slot) = control;
+            // The copy, for the first `WIDTH` slots; for the rest, the slot
+            // again.
+            *self.controls.get_unchecked_mut((slot.wrapping_sub(WIDTH) & mask) + WIDTH) = control;
+        }
     }
 
     /// Moves every group into `slots` new slots, and makes room in its lists
@@ -580,6 +656,29 @@ fn fold<S: Copy, T>(
             return;
         }
         Ids::Each(ids) => ids,
+        Ids::Runs(ids, starts) => {
+            check!(ids.len() == selection.len() as usize);
+            check!(starts.last().is_some_and(|&end| usize::from(end) == ids.len()));
+            for run in starts.windows(2) {
+                let (start, end) = (usize::from(*at!(run, 0)), usize::from(*at!(run, 1)));
+                // SAFETY: each id is a group, which `states` has room for.
+                let state = unsafe { states.get_unchecked_mut(*at!(ids, start) as usize) };
+                let mut folded = *state;
+                let mut fold_row = |row| {
+                    let (value, valid) = read(row);
+                    folded = op(folded, value, valid);
+                };
+                match selection.kept() {
+                    Kept::All => (start..end).for_each(&mut fold_row),
+                    Kept::Select(rows) => {
+                        at!(rows, start..end).iter().for_each(|&row| fold_row(usize::from(row)));
+                    }
+                    Kept::None => {}
+                }
+                *state = folded;
+            }
+            return;
+        }
     };
     check!(ids.len() == selection.len() as usize);
     let mut fold_row = |id: u32, row: usize| {
@@ -617,29 +716,25 @@ fn fold_column<S: Copy, T: Primitive>(
     }
 }
 
-/// The sum of the values of the rows `selection` keeps, none null, all
-/// within `bounds`, if known. Summed in 64 bits where no batch's sum can
-/// overflow them, which vectorizes; else in 128.
-fn sum(flat: Flat<i64>, bounds: Option<Bounds>, selection: &Selection) -> i128 {
-    let narrow = bounds.is_some_and(|bounds| {
-        let most = bounds.min.unsigned_abs().max(bounds.max.unsigned_abs());
-        most <= i64::MAX.unsigned_abs() / u64::from(BATCH_ROWS_MAX)
-    });
-    match (selection.kept(), narrow) {
-        (Kept::All, true) => {
-            i128::from(at!(flat.values, ..selection.len() as usize).iter().sum::<i64>())
-        }
-        (Kept::All, false) => {
-            at!(flat.values, ..selection.len() as usize).iter().map(|&x| i128::from(x)).sum()
-        }
-        (Kept::Select(rows), true) => {
-            i128::from(rows.iter().map(|&row| flat.value(usize::from(row))).sum::<i64>())
-        }
-        (Kept::Select(rows), false) => {
-            rows.iter().map(|&row| i128::from(flat.value(usize::from(row)))).sum()
-        }
-        (Kept::None, _) => 0,
+/// The greatest magnitude of any value of `column`, an integer one, if
+/// known.
+fn magnitude(column: &ColumnView) -> Option<u64> {
+    let magnitude = |bounds: Bounds| bounds.min.unsigned_abs().max(bounds.max.unsigned_abs());
+    match column.form() {
+        Form::Constant => Some(at!(column.values().int64s(), 0).unsigned_abs()),
+        _ => column.bounds().map(magnitude),
     }
+}
+
+/// `sums`, in 128 bits.
+#[cold]
+#[inline(never)]
+fn widen(allocator: &dyn Allocator, sums: &[i64]) -> Result<SlowVec<i128>, AllocError> {
+    let mut wide = SlowVec::new(allocator, GROUPS_MAX)?;
+    for &sum in sums {
+        wide.push(i128::from(sum)).map_err(|_| AllocError)?;
+    }
+    Ok(wide)
 }
 
 /// A column's values, for the rows a selection keeps.
@@ -712,7 +807,23 @@ fn merge_states(
         let added = at!(theirs.counts.as_ref().unwrap_or(counted.1), range.clone());
         fold(counts, ids, all, |i| (*at!(added, i), true), |count, x, _| count + x);
     }
+    if let Totals::Sum(sums, headroom) = &mut ours.totals {
+        match theirs.totals {
+            Totals::Sum(_, theirs) if i64::MAX.unsigned_abs() - theirs <= *headroom => {
+                *headroom -= i64::MAX.unsigned_abs() - theirs;
+            }
+            _ => ours.totals = Totals::Wide(widen(allocator, sums)?),
+        }
+    }
     match (&mut ours.totals, &theirs.totals, function) {
+        (Totals::Sum(ours, _), Totals::Sum(totals, _), _) => {
+            let totals = at!(totals, range.clone());
+            fold(ours, ids, all, |i| (*at!(totals, i), true), |sum, x, _| sum + x);
+        }
+        (Totals::Wide(ours), Totals::Sum(totals, _), _) => {
+            let totals = at!(totals, range.clone());
+            fold(ours, ids, all, |i| (*at!(totals, i), true), |sum, x, _| sum + i128::from(x));
+        }
         (Totals::Wide(ours), Totals::Wide(totals), _) => {
             let totals = at!(totals, range.clone());
             fold(ours, ids, all, |i| (*at!(totals, i), true), |sum, x, _| sum + x);
@@ -739,9 +850,9 @@ fn merge_states(
 
 /// Adds `value` to the end of `values` until it holds `len`.
 fn resize<T: Copy>(values: &mut SlowVec<T>, len: usize, value: T) -> Result<(), AllocError> {
-    let values_in_one_go = [value; 64];
+    let values_in_one_go = [value; 256];
     while values.len() < len {
-        values.extend_from_slice(at!(values_in_one_go, ..(len - values.len()).min(64)))?;
+        values.extend_from_slice(at!(values_in_one_go, ..(len - values.len()).min(256)))?;
     }
     Ok(())
 }
@@ -799,6 +910,7 @@ impl HashAggregate {
                     let min = aggregate.function == Function::Min;
                     resize(totals, room, if min { i64::MAX } else { i64::MIN })?;
                 }
+                Totals::Sum(totals, _) => resize(totals, room, 0)?,
                 Totals::Wide(totals) => resize(totals, room, 0)?,
                 Totals::Float(totals) => {
                     let sum = matches!(aggregate.function, Function::Sum | Function::Avg);
@@ -809,17 +921,16 @@ impl HashAggregate {
         Ok(())
     }
 
-    /// Finds the group of each row `input` keeps, into `groups.scratch.ids`,
-    /// adding groups for keys not seen before; or returns the one group of
-    /// every row, if each key is constant. There must be room for them.
-    fn group(&self, groups: &mut Groups, input: &RowBatch) -> Option<u32> {
+    /// Finds the group of each row `input` keeps, adding groups for keys not
+    /// seen before. There must be room for them.
+    fn group(&self, groups: &mut Groups, input: &RowBatch) -> Grouped {
         let positions = self.grouping.keys.iter();
         let constant = positions.clone().all(|&k| input.column(k).is_in(Forms::CONSTANT));
         // Every row's keys are its first's: only one is read.
         let one = Selection::all(1);
         let selection = if constant { &one } else { input.selection() };
         let rows = selection.len() as usize;
-        let Scratch { keys: copies, nulls, hashes, ids } = &mut groups.scratch;
+        let Scratch { keys: copies, nulls, hashes, ids, starts } = &mut groups.scratch;
         let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
         let mut any_null = false;
         let copies = copies.chunks_mut(BATCH_ROWS_MAX as usize);
@@ -864,8 +975,12 @@ impl HashAggregate {
         let keys = at!(keys, ..self.grouping.keys.len());
         let nulls = any_null.then_some(at!(nulls, ..rows));
         let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
-        groups.table.assign(keys, nulls, hashes, ids);
-        constant.then(|| *at!(ids, 0))
+        match groups.table.assign(keys, nulls, hashes, ids, starts) {
+            _ if constant => Grouped::One(*at!(ids, 0)),
+            // Folding a run at a time pays where runs are long enough.
+            Some(runs) if runs * 8 <= rows => Grouped::Runs(runs),
+            _ => Grouped::Each,
+        }
     }
 
     /// Folds `input`'s column for `aggregate` into `states`, given each
@@ -887,15 +1002,22 @@ impl HashAggregate {
                 count + u64::from(valid)
             });
         }
+        if let Totals::Sum(sums, headroom) = &mut states.totals {
+            let added = magnitude(column)
+                .and_then(|magnitude| magnitude.checked_mul(u64::from(selection.len())));
+            match added {
+                Some(added) if added <= *headroom => *headroom -= added,
+                _ => states.totals = Totals::Wide(widen(allocator, sums)?),
+            }
+        }
         match (&mut states.totals, aggregate.function) {
             (Totals::None, _) => {}
+            (Totals::Sum(sums, _), _) => {
+                fold_column(sums, ids, selection, column, |sum, x: i64, valid| {
+                    sum + if valid { x } else { 0 }
+                });
+            }
             (Totals::Wide(sums), _) => {
-                if let (Ids::One(group), Read::Flat(flat)) = (ids, read::<i64>(column, selection))
-                    && flat.validity.is_none()
-                {
-                    *at_mut!(sums, group as usize) += sum(flat, column.bounds(), selection);
-                    return Ok(());
-                }
                 fold_column(sums, ids, selection, column, |sum, x: i64, valid| {
                     sum + if valid { i128::from(x) } else { 0 }
                 });
@@ -956,6 +1078,9 @@ impl HashAggregate {
             let word = match (aggregate.function, &states.totals) {
                 (Function::Count, _) => Some(i64::try_from(count).map_err(|_| Error::Unsupported)?),
                 _ if count == 0 => None,
+                (Function::Avg, Totals::Sum(sums, _)) => {
+                    Some((*at!(sums, group) as f64 / count as f64).to_bits().cast_signed())
+                }
                 (Function::Avg, Totals::Wide(sums)) => {
                     Some((*at!(sums, group) as f64 / count as f64).to_bits().cast_signed())
                 }
@@ -966,7 +1091,7 @@ impl HashAggregate {
                 (_, Totals::Wide(sums)) => {
                     Some(i64::try_from(*at!(sums, group)).map_err(|_| Error::Unsupported)?)
                 }
-                (_, Totals::Int(totals)) => Some(*at!(totals, group)),
+                (_, Totals::Int(totals) | Totals::Sum(totals, _)) => Some(*at!(totals, group)),
                 (_, Totals::Float(totals)) => Some(at!(totals, group).to_bits().cast_signed()),
                 (_, Totals::None) => crate::check::check_failed(line!()),
             };
@@ -993,7 +1118,7 @@ impl Breaker for HashAggregate {
             let totals = match aggregate.function {
                 Function::Count => Totals::None,
                 Function::Sum | Function::Avg if integers => {
-                    Totals::Wide(SlowVec::new(allocator, GROUPS_MAX)?)
+                    Totals::Sum(SlowVec::new(allocator, GROUPS_MAX)?, i64::MAX.unsigned_abs())
                 }
                 Function::Min | Function::Max if integers => {
                     Totals::Int(SlowVec::new(allocator, GROUPS_MAX)?)
@@ -1012,6 +1137,7 @@ impl Breaker for HashAggregate {
                 nulls: SlowVec::zeroed(allocator, batch)?,
                 hashes: SlowVec::zeroed(allocator, batch)?,
                 ids: SlowVec::zeroed(allocator, batch)?,
+                starts: SlowVec::fixed_from(allocator, core::iter::repeat_n(0, batch + 1))?,
             },
             served: 0,
         };
@@ -1034,15 +1160,17 @@ impl Breaker for HashAggregate {
         if selection.is_empty() {
             return Ok(());
         }
-        let one = if self.grouping.keys.is_empty() {
-            Some(0)
+        let grouped = if self.grouping.keys.is_empty() {
+            Grouped::One(0)
         } else {
             self.reserve(allocator, groups, selection.len() as usize)?;
             self.group(groups, input)
         };
-        let ids = match one {
-            Some(group) => Ids::One(group),
-            None => Ids::Each(at!(groups.scratch.ids, ..selection.len() as usize)),
+        let ids = at!(groups.scratch.ids, ..selection.len() as usize);
+        let ids = match grouped {
+            Grouped::One(group) => Ids::One(group),
+            Grouped::Each => Ids::Each(ids),
+            Grouped::Runs(runs) => Ids::Runs(ids, at!(groups.scratch.starts, ..=runs)),
         };
         for (&aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
             HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids)?;
@@ -1073,9 +1201,9 @@ impl Breaker for HashAggregate {
                 }
                 let keys = at!(keys, ..width);
                 let nulls = Some(at!(other.table.nulls, theirs.clone()));
-                let Scratch { hashes, ids, .. } = &mut groups.scratch;
+                let Scratch { hashes, ids, starts, .. } = &mut groups.scratch;
                 let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
-                groups.table.assign(keys, nulls, hashes, ids);
+                groups.table.assign(keys, nulls, hashes, ids, starts);
                 Ids::Each(ids)
             };
             let aggregates = self.grouping.aggregates.iter().map(|aggregate| aggregate.function);
