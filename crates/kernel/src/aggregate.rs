@@ -4,14 +4,14 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Primitive;
-use crate::column::{ColumnView, DataType, Form, Forms};
+use crate::column::{ColumnView, DataType, Form, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use crate::selection::Kept;
+use crate::selection::{Kept, Selection};
 use crate::slow_vec::SlowVec;
 use crate::step::{Breaker, DynOperator, Step};
 
@@ -155,7 +155,9 @@ struct HashAggregate {
     grouping: Grouping,
 }
 
-/// The groups so far, and room to find a batch's.
+/// The groups so far. Each list of something for each group has room for
+/// as many as the table can take before it grows, so adding a group writes
+/// into each rather than growing it.
 struct Groups {
     /// Each group's keys, and the table that finds a group by them.
     table: Table,
@@ -176,24 +178,6 @@ struct States {
     counts: Option<SlowVec<u64>>,
     /// Each group's sum, least or greatest so far.
     totals: Totals,
-}
-
-impl States {
-    /// How many values each group has that aren't null, kept from now on,
-    /// given each group's row count, `counted`.
-    fn counts(
-        &mut self,
-        allocator: &dyn Allocator,
-        counted: &[u64],
-    ) -> Result<&mut SlowVec<u64>, AllocError> {
-        if self.counts.is_none() {
-            let mut counts = SlowVec::new(allocator, GROUPS_MAX)?;
-            counts.extend_from_slice(counted)?;
-            self.counts = Some(counts);
-        }
-        let Some(counts) = &mut self.counts else { crate::check::check_failed(line!()) };
-        Ok(counts)
-    }
 }
 
 /// Each group's total, by what the aggregate keeps.
@@ -239,6 +223,10 @@ struct Table {
     keys: SlowVec<SlowVec<i64>>,
     /// Which of each group's keys are null, a bit each.
     nulls: SlowVec<u64>,
+    /// How many groups there are.
+    len: usize,
+    /// Whether any group has a key that's null.
+    any_null: bool,
 }
 
 /// The groups of a batch's kept rows.
@@ -264,62 +252,111 @@ const SLOTS_MIN: usize = 16;
 
 impl Table {
     fn new(allocator: &dyn Allocator, width: usize) -> Result<Table, AllocError> {
-        let keys = (0..width).map(|_| SlowVec::new(allocator, GROUPS_MAX));
-        let mut keys_by_key = SlowVec::fixed(allocator, width.max(1))?;
-        for key in keys {
-            keys_by_key.push(key?).map_err(|_| AllocError)?;
+        let mut keys = SlowVec::fixed(allocator, width.max(1))?;
+        for _ in 0..width {
+            keys.push(SlowVec::new(allocator, GROUPS_MAX)?).map_err(|_| AllocError)?;
         }
-        Ok(Table {
-            controls: SlowVec::zeroed(allocator, SLOTS_MIN + WIDTH)?,
-            slots: SlowVec::zeroed(allocator, SLOTS_MIN)?,
-            keys: keys_by_key,
+        let mut table = Table {
+            controls: SlowVec::new(allocator, 1)?,
+            slots: SlowVec::new(allocator, 1)?,
+            keys,
             nulls: SlowVec::new(allocator, GROUPS_MAX)?,
-        })
+            len: 0,
+            any_null: false,
+        };
+        table.grow(allocator, SLOTS_MIN)?;
+        Ok(table)
     }
 
-    fn len(&self) -> usize {
-        self.nulls.len()
+    /// How many groups fit before the table grows: 7/8 of its slots.
+    fn room(&self) -> usize {
+        self.slots.len() / 8 * 7
     }
 
     /// Finds the group of each of `hashes`' rows, whose keys are `keys`, a
     /// list for each key, and `nulls`, if any are, into `ids`, adding groups
-    /// for keys not seen before.
-    fn assign(
-        &mut self,
-        allocator: &dyn Allocator,
-        keys: &[&[i64]],
-        nulls: Option<&[u64]>,
-        hashes: &[u64],
-        ids: &mut [u32],
-    ) -> Result<(), Error> {
-        self.reserve(allocator, hashes.len())?;
-        for (row, (&hash, id)) in hashes.iter().zip(ids.iter_mut()).enumerate() {
-            let null = nulls.map_or(0, |nulls| *at!(nulls, row));
-            let found = self.find(hash, |group| {
-                let group = group as usize;
-                *at!(self.nulls, group) == null
-                    && self
+    /// for keys not seen before. There must be room for them.
+    fn assign(&mut self, keys: &[&[i64]], nulls: Option<&[u64]>, hashes: &[u64], ids: &mut [u32]) {
+        let rows = hashes.len();
+        check!(self.len + rows <= self.room() && ids.len() == rows);
+        check!(keys.iter().all(|keys| keys.len() >= rows) && nulls.is_none_or(|n| n.len() >= rows));
+        match keys {
+            [key] if nulls.is_none() && !self.any_null => self.assign_unnulled(&[key], hashes, ids),
+            [a, b] if nulls.is_none() && !self.any_null => {
+                self.assign_unnulled(&[a, b], hashes, ids);
+            }
+            _ => self.assign_with(keys, nulls, hashes, ids, |table, group, row| {
+                let null = nulls.map_or(0, |nulls| *at!(nulls, row));
+                *at!(table.nulls, group) == null
+                    && table
                         .keys
                         .iter()
                         .zip(keys)
                         .all(|(ours, keys)| at!(ours, group) == at!(keys, row))
-            });
-            *id = match found {
-                Ok(group) => group,
-                Err(slot) => {
-                    let group = self.len();
-                    for (ours, keys) in self.keys.iter_mut().zip(keys) {
-                        ours.push(*at!(keys, row)).map_err(|_| AllocError)?;
-                    }
-                    self.nulls.push(null).map_err(|_| AllocError)?;
-                    self.set(slot, hash, group);
-                    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-                    let group = group as u32;
-                    group
+            }),
+        }
+    }
+
+    /// As `assign`, for `N` keys, where no key is null in any row or group.
+    fn assign_unnulled<const N: usize>(
+        &mut self,
+        keys: &[&[i64]; N],
+        hashes: &[u64],
+        ids: &mut [u32],
+    ) {
+        self.assign_with(keys, None, hashes, ids, |table, group, row| {
+            (0..N).all(|k| {
+                // SAFETY: there are `N` keys; the group is in a slot, so
+                // below `len`, within the room each list of keys has; `row`
+                // is one of `hashes`', and `assign` checked there are as
+                // many keys.
+                unsafe {
+                    let ours = table.keys.get_unchecked(k).get_unchecked(group);
+                    ours == keys.get_unchecked(k).get_unchecked(row)
                 }
+            })
+        });
+    }
+
+    /// As `assign`, with `same` saying whether a group has a row's keys.
+    #[inline]
+    fn assign_with(
+        &mut self,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        hashes: &[u64],
+        ids: &mut [u32],
+        same: impl Fn(&Table, usize, usize) -> bool,
+    ) {
+        for (row, (&hash, id)) in hashes.iter().zip(ids.iter_mut()).enumerate() {
+            *id = match self.find(hash, |group| same(self, group as usize, row)) {
+                Ok(group) => group,
+                Err(slot) => self.insert(slot, hash, keys, nulls, row),
             };
         }
-        Ok(())
+    }
+
+    /// Adds a group with row `row`'s keys, hashed as `hash`, in `slot`.
+    fn insert(
+        &mut self,
+        slot: usize,
+        hash: u64,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        row: usize,
+    ) -> u32 {
+        let group = self.len;
+        for (ours, keys) in self.keys.iter_mut().zip(keys) {
+            *at_mut!(ours, group) = *at!(keys, row);
+        }
+        let null = nulls.map_or(0, |nulls| *at!(nulls, row));
+        *at_mut!(self.nulls, group) = null;
+        self.any_null |= null != 0;
+        self.len += 1;
+        self.set(slot, hash, group);
+        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+        let group = group as u32;
+        group
     }
 
     /// The group hashed as `hash` that `same` says has the keys sought, or
@@ -339,7 +376,8 @@ impl Table {
             let mut matches = x.wrapping_sub(LOW) & !x & HIGH;
             while matches != 0 {
                 let slot = (at + matches.trailing_zeros() as usize / 8) & mask;
-                let group = *at!(self.slots, slot);
+                // SAFETY: masked, so below the number of slots.
+                let group = unsafe { *self.slots.get_unchecked(slot) };
                 if same(group) {
                     return Ok(group);
                 }
@@ -356,8 +394,10 @@ impl Table {
     }
 
     /// The `WIDTH` control bytes from slot `at`, the first lowest.
+    #[inline]
     fn word(&self, at: usize) -> u64 {
-        let bytes = at!(self.controls, at..at + WIDTH);
+        // SAFETY: `at` is a slot, and `grow` made room for a word from any.
+        let bytes = unsafe { self.controls.get_unchecked(at..at + WIDTH) };
         let Ok(bytes) = <[u8; WIDTH]>::try_from(bytes) else { crate::check::check_failed(line!()) };
         u64::from_le_bytes(bytes)
     }
@@ -374,31 +414,73 @@ impl Table {
         *at_mut!(self.slots, slot) = group;
     }
 
-    /// Makes room for `more` groups, keeping slots at most 7/8 full.
-    fn reserve(&mut self, allocator: &dyn Allocator, more: usize) -> Result<(), Error> {
-        let len = self.len() + more;
-        if len > GROUPS_MAX {
-            return Err(Error::OutOfMemory);
-        }
-        if len * 8 <= self.slots.len() * 7 {
-            return Ok(());
-        }
-        self.grow(allocator, (len * 8 / 7 + 1).next_power_of_two())
-    }
-
-    /// Moves every group into `slots` new slots.
+    /// Moves every group into `slots` new slots, and makes room in its lists
+    /// for as many groups as they take.
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, allocator: &dyn Allocator, slots: usize) -> Result<(), Error> {
+    fn grow(&mut self, allocator: &dyn Allocator, slots: usize) -> Result<(), AllocError> {
         self.controls = SlowVec::zeroed(allocator, slots + WIDTH)?;
         self.slots = SlowVec::zeroed(allocator, slots)?;
-        for group in 0..self.len() {
-            let keys = self.keys.iter().map(|keys| *at!(keys, group));
-            let hash = keys.fold(SEED ^ *at!(self.nulls, group), mix);
-            let Err(slot) = self.find(hash, |_| false) else { crate::check::check_failed(line!()) };
-            self.set(slot, hash, group);
+        check!(self.controls.len() == self.slots.len() + WIDTH && slots.is_power_of_two());
+        let mut hashes = [0; 256];
+        for first in (0..self.len).step_by(hashes.len()) {
+            let groups = first..self.len.min(first + hashes.len());
+            let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+            for (keys, ours) in keys.iter_mut().zip(self.keys.iter()) {
+                *keys = at!(ours, groups.clone());
+            }
+            let nulls = self.any_null.then(|| at!(self.nulls, groups.clone()));
+            let hashes = at_mut!(hashes, ..groups.len());
+            hash_rows(at!(keys, ..self.keys.len()), nulls, hashes);
+            for (group, &hash) in groups.zip(hashes.iter()) {
+                self.set(self.empty(hash), hash, group);
+            }
         }
-        Ok(())
+        let room = self.room();
+        for keys in self.keys.iter_mut() {
+            resize(keys, room, 0)?;
+        }
+        resize(&mut self.nulls, room, 0)
+    }
+
+    /// The first empty slot of those a group hashed as `hash` may be in.
+    fn empty(&self, hash: u64) -> usize {
+        let mask = self.slots.len() - 1;
+        #[expect(clippy::cast_possible_truncation, reason = "masked")]
+        let mut at = hash as usize & mask;
+        let mut stride = 0;
+        loop {
+            let empty = !self.word(at) & HIGH;
+            if empty != 0 {
+                return (at + empty.trailing_zeros() as usize / 8) & mask;
+            }
+            stride += WIDTH;
+            at = (at + stride) & mask;
+        }
+    }
+
+    /// The column of key `k` for groups `first..first + rows`.
+    fn key(
+        &self,
+        context: &mut Context,
+        k: usize,
+        first: usize,
+        rows: usize,
+    ) -> Result<ColumnView, Error> {
+        let mut values = context.values_buffer(rows * 8)?;
+        values.as_mut_slice::<i64>().copy_from_slice(at!(at!(self.keys, k), first..first + rows));
+        let nulls = at!(self.nulls, first..first + rows);
+        let mut validity = None;
+        if nulls.iter().any(|&null| null >> k & 1 != 0) {
+            let mut bits = context.small_buffer(rows.div_ceil(8))?;
+            let bytes = bits.as_mut_slice::<u8>();
+            bytes.fill(0);
+            for (i, &null) in nulls.iter().enumerate() {
+                *at_mut!(bytes, i / 8) |= u8::from(null >> k & 1 == 0) << (i % 8);
+            }
+            validity = Some(bits);
+        }
+        Ok(ColumnView::new(context, DataType::Int64, values, validity)?)
     }
 }
 
@@ -444,12 +526,11 @@ fn hash_rows(keys: &[&[i64]], nulls: Option<&[u64]>, hashes: &mut [u64]) {
     }
 }
 
-/// Calls `f` with each of the first `rows` rows `kept` keeps, and its place
-/// among them.
+/// Calls `f` with each row `selection` keeps, and its place among them.
 #[inline]
-fn for_kept(kept: Kept, rows: usize, mut f: impl FnMut(usize, usize)) {
-    match kept {
-        Kept::All => (0..rows).for_each(|row| f(row, row)),
+fn for_kept(selection: &Selection, mut f: impl FnMut(usize, usize)) {
+    match selection.kept() {
+        Kept::All => (0..selection.len() as usize).for_each(|row| f(row, row)),
         Kept::Select(rows) => {
             rows.iter().enumerate().for_each(|(i, &row)| f(i, usize::from(row)));
         }
@@ -457,32 +538,43 @@ fn for_kept(kept: Kept, rows: usize, mut f: impl FnMut(usize, usize)) {
     }
 }
 
-/// Folds each kept row's value, which `read` gives with whether it isn't
-/// null, into its group's state with `op`.
+/// Folds each row `selection` keeps, whose value `read` gives with whether
+/// it isn't null, into the state of its group in `ids` with `op`. `states`
+/// has room for every group.
 #[inline]
 fn fold<S: Copy, T>(
     states: &mut [S],
     ids: Ids,
-    kept: Kept,
-    rows: usize,
+    selection: &Selection,
     read: impl Fn(usize) -> (T, bool),
     op: impl Fn(S, T, bool) -> S,
 ) {
-    match ids {
+    let ids = match ids {
         Ids::One(group) => {
             let state = at_mut!(states, group as usize);
             let mut folded = *state;
-            for_kept(kept, rows, |_, row| {
+            for_kept(selection, |_, row| {
                 let (value, valid) = read(row);
                 folded = op(folded, value, valid);
             });
             *state = folded;
+            return;
         }
-        Ids::Each(ids) => for_kept(kept, rows, |i, row| {
-            let (value, valid) = read(row);
-            let state = at_mut!(states, *at!(ids, i) as usize);
-            *state = op(*state, value, valid);
-        }),
+        Ids::Each(ids) => ids,
+    };
+    check!(ids.len() == selection.len() as usize);
+    let mut fold_row = |id: u32, row: usize| {
+        let (value, valid) = read(row);
+        // SAFETY: each id is a group, which `states` has room for.
+        let state = unsafe { states.get_unchecked_mut(id as usize) };
+        *state = op(*state, value, valid);
+    };
+    match selection.kept() {
+        Kept::All => ids.iter().enumerate().for_each(|(row, &id)| fold_row(id, row)),
+        Kept::Select(rows) => {
+            rows.iter().zip(ids).for_each(|(&row, &id)| fold_row(id, usize::from(row)));
+        }
+        Kept::None => {}
     }
 }
 
@@ -491,38 +583,69 @@ fn fold<S: Copy, T>(
 fn fold_column<S: Copy, T: Primitive>(
     states: &mut [S],
     ids: Ids,
-    kept: Kept,
-    rows: usize,
+    selection: &Selection,
     column: &ColumnView,
     op: impl Fn(S, T, bool) -> S,
 ) {
-    let (values, mask) = values_of(column);
-    let words = values.slice_of::<T>();
-    match values.validity() {
-        None => fold(states, ids, kept, rows, |row| (*at!(words, row & mask), true), op),
-        Some(validity) => fold(
-            states,
-            ids,
-            kept,
-            rows,
-            |row| {
-                let i = row & mask;
-                // SAFETY: `i` is a row of the column, so one of its values.
-                #[expect(clippy::cast_possible_truncation, reason = "a row")]
-                (*at!(words, i), unsafe { validity.is_valid_unchecked(i as u32) })
-            },
-            op,
-        ),
+    match read(column, selection) {
+        Read::Constant(value, valid) => fold(states, ids, selection, |_| (value, valid), op),
+        Read::Flat(flat) if flat.validity.is_none() => {
+            fold(states, ids, selection, |row| (flat.value(row), true), op);
+        }
+        Read::Flat(flat) => {
+            fold(states, ids, selection, |row| (flat.value(row), flat.is_valid(row)), op);
+        }
     }
 }
 
-/// `column`'s values, and which bits of a row are its value's place: all,
-/// or none if it's constant.
-fn values_of(column: &ColumnView) -> (crate::column::Values<'_>, usize) {
+/// A column's values, for the rows a selection keeps.
+enum Read<'c, T> {
+    /// Each row's own.
+    Flat(Flat<'c, T>),
+    /// Every row's, and whether it isn't null.
+    Constant(T, bool),
+}
+
+/// A flat column's values, read only for the rows a selection keeps.
+#[derive(Clone, Copy)]
+struct Flat<'c, T> {
+    /// Each row's value.
+    values: &'c [T],
+    /// Which values aren't null, if any are.
+    validity: Option<Validity<'c>>,
+}
+
+/// `column`'s values, which are `T`s, checked to cover every row
+/// `selection` keeps.
+fn read<'c, T: Primitive>(column: &'c ColumnView, selection: &Selection) -> Read<'c, T> {
+    let values = column.values();
+    let (words, validity) = (values.slice_of::<T>(), values.validity());
     match column.form() {
-        Form::Flat => (column.values(), usize::MAX),
-        Form::Constant => (column.values(), 0),
+        Form::Flat => {
+            // Every row kept is below `rows()`.
+            check!(selection.rows() as usize <= words.len());
+            Read::Flat(Flat { values: words, validity })
+        }
+        Form::Constant => Read::Constant(*at!(words, 0), !values.is_null(0)),
         Form::Dictionary(_) => crate::check::check_failed(line!()),
+    }
+}
+
+impl<T: Primitive> Flat<'_, T> {
+    /// Row `row`'s value, which is a row kept.
+    #[inline]
+    fn value(self, row: usize) -> T {
+        // SAFETY: `read` checked each row kept is one of the values.
+        unsafe { *self.values.get_unchecked(row) }
+    }
+
+    /// Whether row `row`, which is a row kept, isn't null.
+    #[inline]
+    fn is_valid(self, row: usize) -> bool {
+        #[expect(clippy::cast_possible_truncation, reason = "a row")]
+        let row = row as u32;
+        // SAFETY: as in `value`; the validity has a bit for each value.
+        self.validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(row) })
     }
 }
 
@@ -538,30 +661,31 @@ fn merge_states(
     ids: Ids,
     range: &core::ops::Range<usize>,
 ) -> Result<(), AllocError> {
-    let (all, rows) = (Kept::All, range.len());
+    #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+    let all = &Selection::all(range.len() as u32);
     if ours.counts.is_some() || theirs.counts.is_some() {
         let counts = ours.counts(allocator, counted.0)?;
         let added = at!(theirs.counts.as_ref().unwrap_or(counted.1), range.clone());
-        fold(counts, ids, all, rows, |i| (*at!(added, i), true), |count, x, _| count + x);
+        fold(counts, ids, all, |i| (*at!(added, i), true), |count, x, _| count + x);
     }
     match (&mut ours.totals, &theirs.totals, function) {
         (Totals::Wide(ours), Totals::Wide(totals), _) => {
             let totals = at!(totals, range.clone());
-            fold(ours, ids, all, rows, |i| (*at!(totals, i), true), |sum, x, _| sum + x);
+            fold(ours, ids, all, |i| (*at!(totals, i), true), |sum, x, _| sum + x);
         }
         (Totals::Int(ours), Totals::Int(totals), function) => {
             let read = |i| (*at!(totals, range.start + i), true);
             match function {
-                Function::Min => fold(ours, ids, all, rows, read, |a, b: i64, _| a.min(b)),
-                _ => fold(ours, ids, all, rows, read, |a, b: i64, _| a.max(b)),
+                Function::Min => fold(ours, ids, all, read, |a, b: i64, _| a.min(b)),
+                _ => fold(ours, ids, all, read, |a, b: i64, _| a.max(b)),
             }
         }
         (Totals::Float(ours), Totals::Float(totals), function) => {
             let read = |i| (*at!(totals, range.start + i), true);
             match function {
-                Function::Min => fold(ours, ids, all, rows, read, |a, b: f64, _| a.min(b)),
-                Function::Max => fold(ours, ids, all, rows, read, |a, b: f64, _| a.max(b)),
-                _ => fold(ours, ids, all, rows, read, |a, b, _| a + b),
+                Function::Min => fold(ours, ids, all, read, |a, b: f64, _| a.min(b)),
+                Function::Max => fold(ours, ids, all, read, |a, b: f64, _| a.max(b)),
+                _ => fold(ours, ids, all, read, |a, b, _| a + b),
             }
         }
         _ => {}
@@ -570,173 +694,185 @@ fn merge_states(
 }
 
 /// Adds `value` to the end of `values` until it holds `len`.
-fn extend<T: Copy>(values: &mut SlowVec<T>, len: usize, value: T) -> Result<(), AllocError> {
+fn resize<T: Copy>(values: &mut SlowVec<T>, len: usize, value: T) -> Result<(), AllocError> {
+    let values_in_one_go = [value; 64];
     while values.len() < len {
-        values.push(value).map_err(|_| AllocError)?;
+        values.extend_from_slice(at!(values_in_one_go, ..(len - values.len()).min(64)))?;
     }
     Ok(())
 }
 
-impl Table {
-    /// The column of key `k` for groups `first..first + rows`.
-    fn key(
-        &self,
-        context: &mut Context,
-        k: usize,
-        first: usize,
-        rows: usize,
-    ) -> Result<ColumnView, Error> {
-        let mut values = context.values_buffer(rows * 8)?;
-        values.as_mut_slice::<i64>().copy_from_slice(at!(at!(self.keys, k), first..first + rows));
-        let nulls = at!(self.nulls, first..first + rows);
-        let mut validity = None;
-        if nulls.iter().any(|&null| null >> k & 1 != 0) {
-            let mut bits = context.small_buffer(rows.div_ceil(8))?;
-            let bytes = bits.as_mut_slice::<u8>();
-            bytes.fill(0);
-            for (i, &null) in nulls.iter().enumerate() {
-                *at_mut!(bytes, i / 8) |= u8::from(null >> k & 1 == 0) << (i % 8);
-            }
-            validity = Some(bits);
+impl States {
+    /// How many values each group has that aren't null, kept from now on,
+    /// given each group's row count, `counted`.
+    fn counts(
+        &mut self,
+        allocator: &dyn Allocator,
+        counted: &[u64],
+    ) -> Result<&mut SlowVec<u64>, AllocError> {
+        if self.counts.is_none() {
+            let mut counts = SlowVec::new(allocator, GROUPS_MAX)?;
+            counts.extend_from_slice(counted)?;
+            self.counts = Some(counts);
         }
-        Ok(ColumnView::new(context, DataType::Int64, values, validity)?)
+        let Some(counts) = &mut self.counts else { crate::check::check_failed(line!()) };
+        Ok(counts)
     }
 }
 
 impl HashAggregate {
-    /// Finds the group of each of `input`'s `rows` kept rows, into
-    /// `groups.scratch.ids`, adding groups for keys not seen before; or
-    /// returns the one group of every row, if each key is constant.
-    fn group(
+    /// Makes room for `more` groups in the table and every list of
+    /// something for each group.
+    fn reserve(
         &self,
         allocator: &dyn Allocator,
         groups: &mut Groups,
-        input: &RowBatch,
-        rows: usize,
-    ) -> Result<Option<u32>, Error> {
-        let positions = self.grouping.keys.iter();
-        let constant = positions.clone().all(|&k| input.column(k).is_in(Forms::CONSTANT));
-        // Every row's keys are its first's: only one is read.
-        let (kept, rows) = if constant { (Kept::All, 1) } else { (input.selection().kept(), rows) };
-        let Scratch { keys: copies, nulls, hashes, ids } = &mut groups.scratch;
-        let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
-        let mut any_null = false;
-        let copies = copies.chunks_mut(BATCH_ROWS_MAX as usize);
-        for ((k, &position), copy) in positions.enumerate().zip(copies) {
-            let column = input.column(position);
-            let (values, mask) = values_of(column);
-            let words = values.int64s();
-            let validity = values.validity();
-            if mask != 0 && validity.is_none() && kept == Kept::All {
-                *at_mut!(keys, k) = at!(words, ..rows);
-                continue;
-            }
-            let copy = at_mut!(copy, ..rows);
-            let Some(validity) = validity else {
-                for_kept(kept, rows, |i, row| *at_mut!(copy, i) = *at!(words, row & mask));
-                *at_mut!(keys, k) = copy;
-                continue;
-            };
-            if !any_null {
-                at_mut!(nulls, ..rows).fill(0);
-                any_null = true;
-            }
-            for_kept(kept, rows, |i, row| {
-                let value = row & mask;
-                // SAFETY: `value` is a row of the column, so one of its values.
-                #[expect(clippy::cast_possible_truncation, reason = "a row")]
-                let valid = unsafe { validity.is_valid_unchecked(value as u32) };
-                // Null keys are 0, so they compare and hash the same.
-                *at_mut!(copy, i) = if valid { *at!(words, value) } else { 0 };
-                *at_mut!(nulls, i) |= u64::from(!valid) << k;
-            });
-            *at_mut!(keys, k) = copy;
-        }
-        let width = self.grouping.keys.len();
-        let keys = at!(keys, ..width);
-        let nulls = any_null.then_some(at!(nulls, ..rows));
-        let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
-        hash_rows(keys, nulls, hashes);
-        groups.table.assign(allocator, keys, nulls, hashes, ids)?;
-        Ok(constant.then(|| *at!(ids, 0)))
-    }
-
-    /// Adds states for groups added since they were last added.
-    fn add_states(&self, groups: &mut Groups) -> Result<(), AllocError> {
-        let len = groups.table.len();
-        if groups.rows.len() == len {
+        more: usize,
+    ) -> Result<(), Error> {
+        let len = groups.table.len + more;
+        if len <= groups.table.room() {
             return Ok(());
         }
-        extend(&mut groups.rows, len, 0)?;
+        if len > GROUPS_MAX {
+            return Err(Error::OutOfMemory);
+        }
+        groups.table.grow(allocator, (len * 8 / 7 + 1).next_power_of_two())?;
+        Ok(self.resize_states(groups)?)
+    }
+
+    /// Makes room in every list of states for as many groups as the table
+    /// has room for.
+    fn resize_states(&self, groups: &mut Groups) -> Result<(), AllocError> {
+        let room = groups.table.room();
+        resize(&mut groups.rows, room, 0)?;
         for (aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
             if let Some(counts) = &mut states.counts {
-                extend(counts, len, 0)?;
+                resize(counts, room, 0)?;
             }
             match &mut states.totals {
                 Totals::None => {}
                 Totals::Int(totals) => {
-                    let first =
-                        if aggregate.function == Function::Min { i64::MAX } else { i64::MIN };
-                    extend(totals, len, first)?;
+                    let min = aggregate.function == Function::Min;
+                    resize(totals, room, if min { i64::MAX } else { i64::MIN })?;
                 }
-                Totals::Wide(totals) => extend(totals, len, 0)?,
+                Totals::Wide(totals) => resize(totals, room, 0)?,
                 Totals::Float(totals) => {
                     let sum = matches!(aggregate.function, Function::Sum | Function::Avg);
-                    extend(totals, len, if sum { 0.0 } else { f64::NAN })?;
+                    resize(totals, room, if sum { 0.0 } else { f64::NAN })?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Folds `input`'s column for `aggregate` into `states`.
+    /// Finds the group of each row `input` keeps, into `groups.scratch.ids`,
+    /// adding groups for keys not seen before; or returns the one group of
+    /// every row, if each key is constant. There must be room for them.
+    fn group(&self, groups: &mut Groups, input: &RowBatch) -> Option<u32> {
+        let positions = self.grouping.keys.iter();
+        let constant = positions.clone().all(|&k| input.column(k).is_in(Forms::CONSTANT));
+        // Every row's keys are its first's: only one is read.
+        let one = Selection::all(1);
+        let selection = if constant { &one } else { input.selection() };
+        let rows = selection.len() as usize;
+        let Scratch { keys: copies, nulls, hashes, ids } = &mut groups.scratch;
+        let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+        let mut any_null = false;
+        let copies = copies.chunks_mut(BATCH_ROWS_MAX as usize);
+        for ((k, &position), copy) in positions.enumerate().zip(copies) {
+            let column = input.column(position);
+            let copy = at_mut!(copy, ..rows);
+            let flat = match read::<i64>(column, selection) {
+                Read::Flat(flat) if flat.validity.is_none() && selection.kept() == Kept::All => {
+                    *at_mut!(keys, k) = at!(flat.values, ..rows);
+                    continue;
+                }
+                Read::Flat(flat) => flat,
+                // Null keys are 0, so they compare and hash the same.
+                Read::Constant(value, valid) => {
+                    copy.fill(if valid { value } else { 0 });
+                    if !valid {
+                        if !any_null {
+                            at_mut!(nulls, ..rows).fill(0);
+                            any_null = true;
+                        }
+                        at_mut!(nulls, ..rows).iter_mut().for_each(|null| *null |= 1 << k);
+                    }
+                    *at_mut!(keys, k) = copy;
+                    continue;
+                }
+            };
+            if flat.validity.is_none() {
+                for_kept(selection, |i, row| *at_mut!(copy, i) = flat.value(row));
+            } else {
+                if !any_null {
+                    at_mut!(nulls, ..rows).fill(0);
+                    any_null = true;
+                }
+                for_kept(selection, |i, row| {
+                    let valid = flat.is_valid(row);
+                    *at_mut!(copy, i) = if valid { flat.value(row) } else { 0 };
+                    *at_mut!(nulls, i) |= u64::from(!valid) << k;
+                });
+            }
+            *at_mut!(keys, k) = copy;
+        }
+        let keys = at!(keys, ..self.grouping.keys.len());
+        let nulls = any_null.then_some(at!(nulls, ..rows));
+        let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
+        hash_rows(keys, nulls, hashes);
+        groups.table.assign(keys, nulls, hashes, ids);
+        constant.then(|| *at!(ids, 0))
+    }
+
+    /// Folds `input`'s column for `aggregate` into `states`, given each
+    /// group's row count before it, `counted`.
     fn update(
         allocator: &dyn Allocator,
         aggregate: Lowered,
         states: &mut States,
-        counted: &SlowVec<u64>,
+        counted: &[u64],
         input: &RowBatch,
         ids: Ids,
-        rows: usize,
     ) -> Result<(), AllocError> {
         let Some((position, _)) = aggregate.input else { return Ok(()) };
-        let kept = input.selection().kept();
+        let selection = input.selection();
         let column = input.column(position);
         if column.has_nulls() {
             let counts = states.counts(allocator, counted)?;
-            fold_column(counts, ids, kept, rows, column, |count, _: u64, valid| {
+            fold_column(counts, ids, selection, column, |count, _: u64, valid| {
                 count + u64::from(valid)
             });
         }
         match (&mut states.totals, aggregate.function) {
             (Totals::None, _) => {}
             (Totals::Wide(sums), _) => {
-                fold_column(sums, ids, kept, rows, column, |sum, x: i64, valid| {
+                fold_column(sums, ids, selection, column, |sum, x: i64, valid| {
                     sum + if valid { i128::from(x) } else { 0 }
                 });
             }
             (Totals::Int(least), Function::Min) => {
-                fold_column(least, ids, kept, rows, column, |least: i64, x, valid| {
+                fold_column(least, ids, selection, column, |least: i64, x, valid| {
                     if valid { least.min(x) } else { least }
                 });
             }
             (Totals::Int(greatest), _) => {
-                fold_column(greatest, ids, kept, rows, column, |greatest: i64, x, valid| {
+                fold_column(greatest, ids, selection, column, |greatest: i64, x, valid| {
                     if valid { greatest.max(x) } else { greatest }
                 });
             }
             (Totals::Float(least), Function::Min) => {
-                fold_column(least, ids, kept, rows, column, |least: f64, x, valid| {
+                fold_column(least, ids, selection, column, |least: f64, x, valid| {
                     least.min(if valid { x } else { f64::NAN })
                 });
             }
             (Totals::Float(greatest), Function::Max) => {
-                fold_column(greatest, ids, kept, rows, column, |greatest: f64, x, valid| {
+                fold_column(greatest, ids, selection, column, |greatest: f64, x, valid| {
                     greatest.max(if valid { x } else { f64::NAN })
                 });
             }
             (Totals::Float(sums), _) => {
-                fold_column(sums, ids, kept, rows, column, |sum: f64, x, valid| {
+                fold_column(sums, ids, selection, column, |sum: f64, x, valid| {
                     sum + if valid { x } else { 0.0 }
                 });
             }
@@ -830,10 +966,10 @@ impl Breaker for HashAggregate {
             },
             served: 0,
         };
+        self.resize_states(&mut groups)?;
         // All rows are one group, which is there even if there are none.
         if width == 0 {
-            groups.table.nulls.push(0).map_err(|_| AllocError)?;
-            self.add_states(&mut groups)?;
+            groups.table.len = 1;
         }
         Ok(groups)
     }
@@ -845,26 +981,24 @@ impl Breaker for HashAggregate {
         input: &RowBatch,
     ) -> Result<(), Error> {
         let allocator = context.allocator();
-        let kept = input.selection().kept();
-        let rows = match kept {
-            Kept::All => input.row_count() as usize,
-            Kept::Select(rows) => rows.len(),
-            Kept::None => return Ok(()),
-        };
+        let selection = input.selection();
+        if selection.is_empty() {
+            return Ok(());
+        }
         let one = if self.grouping.keys.is_empty() {
             Some(0)
         } else {
-            self.group(allocator, groups, input, rows)?
+            self.reserve(allocator, groups, selection.len() as usize)?;
+            self.group(groups, input)
         };
-        self.add_states(groups)?;
         let ids = match one {
             Some(group) => Ids::One(group),
-            None => Ids::Each(at!(groups.scratch.ids, ..rows)),
+            None => Ids::Each(at!(groups.scratch.ids, ..selection.len() as usize)),
         };
         for (&aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
-            HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids, rows)?;
+            HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids)?;
         }
-        fold(&mut groups.rows, ids, kept, rows, |_| ((), true), |count, (), _| count + 1);
+        fold(&mut groups.rows, ids, selection, |_| ((), true), |count, (), _| count + 1);
         Ok(())
     }
 
@@ -877,12 +1011,13 @@ impl Breaker for HashAggregate {
         let allocator = context.allocator();
         let width = self.grouping.keys.len();
         let batch = BATCH_ROWS_MAX as usize;
-        for first in (0..other.table.len()).step_by(batch) {
-            let rows = (other.table.len() - first).min(batch);
+        for first in (0..other.table.len).step_by(batch) {
+            let rows = (other.table.len - first).min(batch);
             let theirs = first..first + rows;
             let ids = if width == 0 {
                 Ids::One(0)
             } else {
+                self.reserve(allocator, groups, rows)?;
                 let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
                 for (keys, theirs_by_key) in keys.iter_mut().zip(other.table.keys.iter()) {
                     *keys = at!(theirs_by_key, theirs.clone());
@@ -892,9 +1027,8 @@ impl Breaker for HashAggregate {
                 let Scratch { hashes, ids, .. } = &mut groups.scratch;
                 let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
                 hash_rows(keys, nulls, hashes);
-                groups.table.assign(allocator, keys, nulls, hashes, ids)?;
-                self.add_states(groups)?;
-                Ids::Each(at!(groups.scratch.ids, ..rows))
+                groups.table.assign(keys, nulls, hashes, ids);
+                Ids::Each(ids)
             };
             let aggregates = self.grouping.aggregates.iter().map(|aggregate| aggregate.function);
             for ((function, ours), theirs_states) in
@@ -904,14 +1038,9 @@ impl Breaker for HashAggregate {
                 merge_states(allocator, function, ours, theirs_states, counted, ids, &theirs)?;
             }
             let counted = at!(other.rows, theirs);
-            fold(
-                &mut groups.rows,
-                ids,
-                Kept::All,
-                rows,
-                |i| (*at!(counted, i), true),
-                |a, b, _| a + b,
-            );
+            #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+            let all = &Selection::all(rows as u32);
+            fold(&mut groups.rows, ids, all, |i| (*at!(counted, i), true), |a, b, _| a + b);
         }
         Ok(())
     }
@@ -927,7 +1056,7 @@ impl Breaker for HashAggregate {
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
         let first = groups.served;
-        let rows = (groups.table.len() - first).min(BATCH_ROWS_MAX as usize);
+        let rows = (groups.table.len - first).min(BATCH_ROWS_MAX as usize);
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         output.reset(rows as u32);
         for k in 0..self.grouping.keys.len() {
@@ -939,7 +1068,7 @@ impl Breaker for HashAggregate {
             let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
         }
         groups.served += rows;
-        Ok(groups.served < groups.table.len())
+        Ok(groups.served < groups.table.len)
     }
 }
 
@@ -1112,7 +1241,7 @@ mod tests {
         let (mut first, second) =
             (consumed(&mut context, 0..1500), consumed(&mut context, 1000..2000));
         breaker.merge(&mut context, &mut first, second).unwrap();
-        assert_eq!(first.table.len(), 2000);
+        assert_eq!(first.table.len, 2000);
         let mut output = RowBatch::new();
         let mut counts = Vec::new();
         loop {
