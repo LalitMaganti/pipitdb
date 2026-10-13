@@ -557,7 +557,7 @@ impl<'a> Values<'a> {
         at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
     }
 
-    fn slice_of<T: Primitive>(self) -> &'a [T] {
+    pub(crate) fn slice_of<T: Primitive>(self) -> &'a [T] {
         let width = self.header.data_type.width_bytes() / size_of::<T>();
         let (start, len) = (self.start as usize * width, self.len as usize * width);
         at!(self.header.values.as_slice::<T>(), start..start + len)

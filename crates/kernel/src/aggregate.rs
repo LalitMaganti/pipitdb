@@ -3,13 +3,14 @@
 //! has none; and `hash_aggregate`, the breaker that runs it.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{ColumnView, DataType, Forms};
+use crate::buffer::Primitive;
+use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
-use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
+use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
 use crate::step::{Breaker, DynOperator, Step};
@@ -109,6 +110,12 @@ impl<'c> Op<'c> for AggregateOp {
             reads.need(input);
         }
     }
+
+    /// Constants, whose one value it reads once: a batch whose keys are all
+    /// constant is one group, found once.
+    fn accepts(&self, _: ColumnId) -> Forms {
+        Forms::FLAT | Forms::CONSTANT
+    }
 }
 
 /// What a breaker that aggregates is given, once lowered.
@@ -141,136 +148,600 @@ const KEYS_MAX: usize = 64;
 /// The most groups an aggregation can hold.
 const GROUPS_MAX: usize = 1 << 26;
 
-/// Groups rows a row at a time, in a hash table of open addressing.
+/// Groups rows a batch at a time, in a Swiss table: it hashes every kept
+/// row's keys, then finds each row's group, then folds each aggregate's
+/// column into its groups' states.
 struct HashAggregate {
     grouping: Grouping,
 }
 
-/// The groups so far.
+/// The groups so far, and room to find a batch's.
 struct Groups {
-    /// A power of two many, at most half full: each the index of a group
-    /// plus one, or 0 if empty.
-    slots: SlowVec<u32>,
-    /// Each group's keys, one after another.
-    keys: SlowVec<i64>,
-    /// Which of each group's keys are null, a bit each.
-    nulls: SlowVec<u64>,
-    /// Each group's totals, one for each aggregate.
-    totals: SlowVec<Total>,
+    /// Each group's keys, and the table that finds a group by them.
+    table: Table,
+    /// How many rows each group has.
+    rows: SlowVec<u64>,
+    /// Each aggregate's states.
+    states: SlowVec<States>,
+    /// What a batch's rows need on the way to their groups.
+    scratch: Scratch,
     /// How many groups have been output.
     served: usize,
 }
 
-/// An aggregate's total for a group: how many values it's seen, and their
-/// sum, least or greatest so far, as an integer or a float by the column's
-/// type. Integers are summed in 128 bits, so no sum of a batch's can
-/// overflow.
-#[derive(Clone, Copy, Default)]
-struct Total {
-    count: u64,
-    int: i128,
-    float: f64,
+/// An aggregate's state for each group.
+struct States {
+    /// How many values each group has that aren't null, or `None` while no
+    /// value has been null: then it's each group's row count.
+    counts: Option<SlowVec<u64>>,
+    /// Each group's sum, least or greatest so far.
+    totals: Totals,
+}
+
+impl States {
+    /// How many values each group has that aren't null, kept from now on,
+    /// given each group's row count, `counted`.
+    fn counts(
+        &mut self,
+        allocator: &dyn Allocator,
+        counted: &[u64],
+    ) -> Result<&mut SlowVec<u64>, AllocError> {
+        if self.counts.is_none() {
+            let mut counts = SlowVec::new(allocator, GROUPS_MAX)?;
+            counts.extend_from_slice(counted)?;
+            self.counts = Some(counts);
+        }
+        let Some(counts) = &mut self.counts else { crate::check::check_failed(line!()) };
+        Ok(counts)
+    }
+}
+
+/// Each group's total, by what the aggregate keeps.
+enum Totals {
+    /// None: `COUNT` keeps only counts.
+    None,
+    /// The least or greatest integer.
+    Int(SlowVec<i64>),
+    /// The sum of integers, in 128 bits, so no sum of a batch's can
+    /// overflow.
+    Wide(SlowVec<i128>),
+    /// The sum, least or greatest float. Least and greatest start as NaN,
+    /// which `f64::min` and `f64::max` pass over.
+    Float(SlowVec<f64>),
+}
+
+/// Room for a batch's worth of what each kept row needs on the way to its
+/// group.
+struct Scratch {
+    /// Copies of the keys that can't be read in place, `BATCH_ROWS_MAX` a
+    /// key.
+    keys: SlowVec<i64>,
+    /// Which of each row's keys are null, a bit each.
+    nulls: SlowVec<u64>,
+    /// Each row's hash.
+    hashes: SlowVec<u64>,
+    /// Each row's group.
+    ids: SlowVec<u32>,
+}
+
+/// Groups by their keys: a Swiss table, as abseil's and hashbrown's. Each
+/// slot has a control byte, holding 7 bits of its group's hash, and the
+/// table is probed a word of `WIDTH` control bytes at a time, so most
+/// slots that can't hold the group are skipped without reading its keys.
+struct Table {
+    /// A byte for each slot: 0 if empty, else 0x80 and the top 7 bits of
+    /// its group's hash. Then a copy of the first `WIDTH`, so a word can be
+    /// read from any slot.
+    controls: SlowVec<u8>,
+    /// The group in each slot that isn't empty.
+    slots: SlowVec<u32>,
+    /// Each group's keys, a list for each key.
+    keys: SlowVec<SlowVec<i64>>,
+    /// Which of each group's keys are null, a bit each.
+    nulls: SlowVec<u64>,
+}
+
+/// The groups of a batch's kept rows.
+#[derive(Clone, Copy)]
+enum Ids<'a> {
+    /// Every row's is this one.
+    One(u32),
+    /// Each row's, in order.
+    Each(&'a [u32]),
+}
+
+/// How many control bytes are probed at a time: a word's.
+const WIDTH: usize = 8;
+
+/// A byte of 1 in each byte of a word.
+const LOW: u64 = 0x0101_0101_0101_0101;
+
+/// The top bit of each byte of a word.
+const HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// The slots a table starts with.
+const SLOTS_MIN: usize = 16;
+
+impl Table {
+    fn new(allocator: &dyn Allocator, width: usize) -> Result<Table, AllocError> {
+        let keys = (0..width).map(|_| SlowVec::new(allocator, GROUPS_MAX));
+        let mut keys_by_key = SlowVec::fixed(allocator, width.max(1))?;
+        for key in keys {
+            keys_by_key.push(key?).map_err(|_| AllocError)?;
+        }
+        Ok(Table {
+            controls: SlowVec::zeroed(allocator, SLOTS_MIN + WIDTH)?,
+            slots: SlowVec::zeroed(allocator, SLOTS_MIN)?,
+            keys: keys_by_key,
+            nulls: SlowVec::new(allocator, GROUPS_MAX)?,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.nulls.len()
+    }
+
+    /// Finds the group of each of `hashes`' rows, whose keys are `keys`, a
+    /// list for each key, and `nulls`, if any are, into `ids`, adding groups
+    /// for keys not seen before.
+    fn assign(
+        &mut self,
+        allocator: &dyn Allocator,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        hashes: &[u64],
+        ids: &mut [u32],
+    ) -> Result<(), Error> {
+        self.reserve(allocator, hashes.len())?;
+        for (row, (&hash, id)) in hashes.iter().zip(ids.iter_mut()).enumerate() {
+            let null = nulls.map_or(0, |nulls| *at!(nulls, row));
+            let found = self.find(hash, |group| {
+                let group = group as usize;
+                *at!(self.nulls, group) == null
+                    && self
+                        .keys
+                        .iter()
+                        .zip(keys)
+                        .all(|(ours, keys)| at!(ours, group) == at!(keys, row))
+            });
+            *id = match found {
+                Ok(group) => group,
+                Err(slot) => {
+                    let group = self.len();
+                    for (ours, keys) in self.keys.iter_mut().zip(keys) {
+                        ours.push(*at!(keys, row)).map_err(|_| AllocError)?;
+                    }
+                    self.nulls.push(null).map_err(|_| AllocError)?;
+                    self.set(slot, hash, group);
+                    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+                    let group = group as u32;
+                    group
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// The group hashed as `hash` that `same` says has the keys sought, or
+    /// else the empty slot where it goes.
+    #[inline]
+    fn find(&self, hash: u64, same: impl Fn(u32) -> bool) -> Result<u32, usize> {
+        let mask = self.slots.len() - 1;
+        let control = LOW * u64::from(control(hash));
+        #[expect(clippy::cast_possible_truncation, reason = "masked")]
+        let mut at = hash as usize & mask;
+        let mut stride = 0;
+        loop {
+            let word = self.word(at);
+            // A high bit for each byte that's `control`, and maybe for some
+            // just above one that is, which `same` turns down.
+            let x = word ^ control;
+            let mut matches = x.wrapping_sub(LOW) & !x & HIGH;
+            while matches != 0 {
+                let slot = (at + matches.trailing_zeros() as usize / 8) & mask;
+                let group = *at!(self.slots, slot);
+                if same(group) {
+                    return Ok(group);
+                }
+                matches &= matches - 1;
+            }
+            let empty = !word & HIGH;
+            if empty != 0 {
+                return Err((at + empty.trailing_zeros() as usize / 8) & mask);
+            }
+            // Triangular steps of whole words visit every word once.
+            stride += WIDTH;
+            at = (at + stride) & mask;
+        }
+    }
+
+    /// The `WIDTH` control bytes from slot `at`, the first lowest.
+    fn word(&self, at: usize) -> u64 {
+        let bytes = at!(self.controls, at..at + WIDTH);
+        let Ok(bytes) = <[u8; WIDTH]>::try_from(bytes) else { crate::check::check_failed(line!()) };
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Puts `group`, hashed as `hash`, in `slot`, which is empty.
+    fn set(&mut self, slot: usize, hash: u64, group: usize) {
+        let mask = self.slots.len() - 1;
+        let control = control(hash);
+        *at_mut!(self.controls, slot) = control;
+        // The copy, for the first `WIDTH` slots; for the rest, the slot again.
+        *at_mut!(self.controls, (slot.wrapping_sub(WIDTH) & mask) + WIDTH) = control;
+        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+        let group = group as u32;
+        *at_mut!(self.slots, slot) = group;
+    }
+
+    /// Makes room for `more` groups, keeping slots at most 7/8 full.
+    fn reserve(&mut self, allocator: &dyn Allocator, more: usize) -> Result<(), Error> {
+        let len = self.len() + more;
+        if len > GROUPS_MAX {
+            return Err(Error::OutOfMemory);
+        }
+        if len * 8 <= self.slots.len() * 7 {
+            return Ok(());
+        }
+        self.grow(allocator, (len * 8 / 7 + 1).next_power_of_two())
+    }
+
+    /// Moves every group into `slots` new slots.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, allocator: &dyn Allocator, slots: usize) -> Result<(), Error> {
+        self.controls = SlowVec::zeroed(allocator, slots + WIDTH)?;
+        self.slots = SlowVec::zeroed(allocator, slots)?;
+        for group in 0..self.len() {
+            let keys = self.keys.iter().map(|keys| *at!(keys, group));
+            let hash = keys.fold(SEED ^ *at!(self.nulls, group), mix);
+            let Err(slot) = self.find(hash, |_| false) else { crate::check::check_failed(line!()) };
+            self.set(slot, hash, group);
+        }
+        Ok(())
+    }
+}
+
+/// The control byte of a group hashed as `hash`: never 0, which is empty.
+fn control(hash: u64) -> u8 {
+    let top = (hash >> 57) as u8;
+    0x80 | top
+}
+
+/// What a hash starts as, with the bits of the keys that are null.
+const SEED: u64 = 0x243f_6a88_85a3_08d3;
+
+/// `hash` with `key` mixed in: multiplied, the high half folded into the
+/// low, so each bit of the result depends on every bit of both.
+fn mix(hash: u64, key: i64) -> u64 {
+    let product = u128::from(hash ^ key.cast_unsigned()) * 0x9e37_79b9_7f4a_7c15;
+    #[expect(clippy::cast_possible_truncation, reason = "the low half")]
+    let low = product as u64;
+    let high = (product >> 64) as u64;
+    low ^ high
+}
+
+/// Hashes each row of `keys`, a list for each key, and `nulls`, if any are,
+/// into `hashes`, a key at a time.
+fn hash_rows(keys: &[&[i64]], nulls: Option<&[u64]>, hashes: &mut [u64]) {
+    let Some((first, rest)) = keys.split_first() else { crate::check::check_failed(line!()) };
+    match nulls {
+        None => {
+            for (hash, &key) in hashes.iter_mut().zip(*first) {
+                *hash = mix(SEED, key);
+            }
+        }
+        Some(nulls) => {
+            for ((hash, &key), &null) in hashes.iter_mut().zip(*first).zip(nulls) {
+                *hash = mix(SEED ^ null, key);
+            }
+        }
+    }
+    for keys in rest {
+        for (hash, &key) in hashes.iter_mut().zip(*keys) {
+            *hash = mix(*hash, key);
+        }
+    }
+}
+
+/// Calls `f` with each of the first `rows` rows `kept` keeps, and its place
+/// among them.
+#[inline]
+fn for_kept(kept: Kept, rows: usize, mut f: impl FnMut(usize, usize)) {
+    match kept {
+        Kept::All => (0..rows).for_each(|row| f(row, row)),
+        Kept::Select(rows) => {
+            rows.iter().enumerate().for_each(|(i, &row)| f(i, usize::from(row)));
+        }
+        Kept::None => {}
+    }
+}
+
+/// Folds each kept row's value, which `read` gives with whether it isn't
+/// null, into its group's state with `op`.
+#[inline]
+fn fold<S: Copy, T>(
+    states: &mut [S],
+    ids: Ids,
+    kept: Kept,
+    rows: usize,
+    read: impl Fn(usize) -> (T, bool),
+    op: impl Fn(S, T, bool) -> S,
+) {
+    match ids {
+        Ids::One(group) => {
+            let state = at_mut!(states, group as usize);
+            let mut folded = *state;
+            for_kept(kept, rows, |_, row| {
+                let (value, valid) = read(row);
+                folded = op(folded, value, valid);
+            });
+            *state = folded;
+        }
+        Ids::Each(ids) => for_kept(kept, rows, |i, row| {
+            let (value, valid) = read(row);
+            let state = at_mut!(states, *at!(ids, i) as usize);
+            *state = op(*state, value, valid);
+        }),
+    }
+}
+
+/// As `fold`, of `column`'s values, which are `T`s.
+#[inline]
+fn fold_column<S: Copy, T: Primitive>(
+    states: &mut [S],
+    ids: Ids,
+    kept: Kept,
+    rows: usize,
+    column: &ColumnView,
+    op: impl Fn(S, T, bool) -> S,
+) {
+    let (values, mask) = values_of(column);
+    let words = values.slice_of::<T>();
+    match values.validity() {
+        None => fold(states, ids, kept, rows, |row| (*at!(words, row & mask), true), op),
+        Some(validity) => fold(
+            states,
+            ids,
+            kept,
+            rows,
+            |row| {
+                let i = row & mask;
+                // SAFETY: `i` is a row of the column, so one of its values.
+                #[expect(clippy::cast_possible_truncation, reason = "a row")]
+                (*at!(words, i), unsafe { validity.is_valid_unchecked(i as u32) })
+            },
+            op,
+        ),
+    }
+}
+
+/// `column`'s values, and which bits of a row are its value's place: all,
+/// or none if it's constant.
+fn values_of(column: &ColumnView) -> (crate::column::Values<'_>, usize) {
+    match column.form() {
+        Form::Flat => (column.values(), usize::MAX),
+        Form::Constant => (column.values(), 0),
+        Form::Dictionary(_) => crate::check::check_failed(line!()),
+    }
+}
+
+/// Folds `theirs`, the states of groups `range` of another `Groups`, into
+/// `ours`, those of groups `ids`, for `function`. `counted` is each side's
+/// row count for each group.
+fn merge_states(
+    allocator: &dyn Allocator,
+    function: Function,
+    ours: &mut States,
+    theirs: &States,
+    counted: (&SlowVec<u64>, &SlowVec<u64>),
+    ids: Ids,
+    range: &core::ops::Range<usize>,
+) -> Result<(), AllocError> {
+    let (all, rows) = (Kept::All, range.len());
+    if ours.counts.is_some() || theirs.counts.is_some() {
+        let counts = ours.counts(allocator, counted.0)?;
+        let added = at!(theirs.counts.as_ref().unwrap_or(counted.1), range.clone());
+        fold(counts, ids, all, rows, |i| (*at!(added, i), true), |count, x, _| count + x);
+    }
+    match (&mut ours.totals, &theirs.totals, function) {
+        (Totals::Wide(ours), Totals::Wide(totals), _) => {
+            let totals = at!(totals, range.clone());
+            fold(ours, ids, all, rows, |i| (*at!(totals, i), true), |sum, x, _| sum + x);
+        }
+        (Totals::Int(ours), Totals::Int(totals), function) => {
+            let read = |i| (*at!(totals, range.start + i), true);
+            match function {
+                Function::Min => fold(ours, ids, all, rows, read, |a, b: i64, _| a.min(b)),
+                _ => fold(ours, ids, all, rows, read, |a, b: i64, _| a.max(b)),
+            }
+        }
+        (Totals::Float(ours), Totals::Float(totals), function) => {
+            let read = |i| (*at!(totals, range.start + i), true);
+            match function {
+                Function::Min => fold(ours, ids, all, rows, read, |a, b: f64, _| a.min(b)),
+                Function::Max => fold(ours, ids, all, rows, read, |a, b: f64, _| a.max(b)),
+                _ => fold(ours, ids, all, rows, read, |a, b, _| a + b),
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Adds `value` to the end of `values` until it holds `len`.
+fn extend<T: Copy>(values: &mut SlowVec<T>, len: usize, value: T) -> Result<(), AllocError> {
+    while values.len() < len {
+        values.push(value).map_err(|_| AllocError)?;
+    }
+    Ok(())
+}
+
+impl Table {
+    /// The column of key `k` for groups `first..first + rows`.
+    fn key(
+        &self,
+        context: &mut Context,
+        k: usize,
+        first: usize,
+        rows: usize,
+    ) -> Result<ColumnView, Error> {
+        let mut values = context.values_buffer(rows * 8)?;
+        values.as_mut_slice::<i64>().copy_from_slice(at!(at!(self.keys, k), first..first + rows));
+        let nulls = at!(self.nulls, first..first + rows);
+        let mut validity = None;
+        if nulls.iter().any(|&null| null >> k & 1 != 0) {
+            let mut bits = context.small_buffer(rows.div_ceil(8))?;
+            let bytes = bits.as_mut_slice::<u8>();
+            bytes.fill(0);
+            for (i, &null) in nulls.iter().enumerate() {
+                *at_mut!(bytes, i / 8) |= u8::from(null >> k & 1 == 0) << (i % 8);
+            }
+            validity = Some(bits);
+        }
+        Ok(ColumnView::new(context, DataType::Int64, values, validity)?)
+    }
 }
 
 impl HashAggregate {
-    /// The group with `keys` and `nulls`, hashed as `hash`, added if new.
+    /// Finds the group of each of `input`'s `rows` kept rows, into
+    /// `groups.scratch.ids`, adding groups for keys not seen before; or
+    /// returns the one group of every row, if each key is constant.
     fn group(
         &self,
         allocator: &dyn Allocator,
         groups: &mut Groups,
-        hash: u64,
-        keys: &[i64],
-        nulls: u64,
-    ) -> Result<usize, Error> {
-        let mask = groups.slots.len() - 1;
-        #[expect(clippy::cast_possible_truncation, reason = "masked")]
-        let mut slot = hash as usize & mask;
-        loop {
-            let group = *at!(groups.slots, slot) as usize;
-            if group == 0 {
-                break;
+        input: &RowBatch,
+        rows: usize,
+    ) -> Result<Option<u32>, Error> {
+        let positions = self.grouping.keys.iter();
+        let constant = positions.clone().all(|&k| input.column(k).is_in(Forms::CONSTANT));
+        // Every row's keys are its first's: only one is read.
+        let (kept, rows) = if constant { (Kept::All, 1) } else { (input.selection().kept(), rows) };
+        let Scratch { keys: copies, nulls, hashes, ids } = &mut groups.scratch;
+        let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+        let mut any_null = false;
+        let copies = copies.chunks_mut(BATCH_ROWS_MAX as usize);
+        for ((k, &position), copy) in positions.enumerate().zip(copies) {
+            let column = input.column(position);
+            let (values, mask) = values_of(column);
+            let words = values.int64s();
+            let validity = values.validity();
+            if mask != 0 && validity.is_none() && kept == Kept::All {
+                *at_mut!(keys, k) = at!(words, ..rows);
+                continue;
             }
-            let found = group - 1;
-            let width = keys.len();
-            if *at!(groups.nulls, found) == nulls
-                && at!(groups.keys, found * width..(found + 1) * width) == keys
-            {
-                return Ok(found);
+            let copy = at_mut!(copy, ..rows);
+            let Some(validity) = validity else {
+                for_kept(kept, rows, |i, row| *at_mut!(copy, i) = *at!(words, row & mask));
+                *at_mut!(keys, k) = copy;
+                continue;
+            };
+            if !any_null {
+                at_mut!(nulls, ..rows).fill(0);
+                any_null = true;
             }
-            slot = (slot + 1) & mask;
+            for_kept(kept, rows, |i, row| {
+                let value = row & mask;
+                // SAFETY: `value` is a row of the column, so one of its values.
+                #[expect(clippy::cast_possible_truncation, reason = "a row")]
+                let valid = unsafe { validity.is_valid_unchecked(value as u32) };
+                // Null keys are 0, so they compare and hash the same.
+                *at_mut!(copy, i) = if valid { *at!(words, value) } else { 0 };
+                *at_mut!(nulls, i) |= u64::from(!valid) << k;
+            });
+            *at_mut!(keys, k) = copy;
         }
-        let found = groups.nulls.len();
-        if found == GROUPS_MAX {
-            return Err(Error::OutOfMemory);
-        }
-        groups.keys.extend_from_slice(keys)?;
-        groups.nulls.push(nulls).map_err(|_| AllocError)?;
-        for _ in 0..self.grouping.aggregates.len() {
-            groups.totals.push(Total::default()).map_err(|_| AllocError)?;
-        }
-        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-        let index = found as u32 + 1;
-        *at_mut!(groups.slots, slot) = index;
-        if (found + 1) * 2 > groups.slots.len() {
-            self.grow(allocator, groups)?;
-        }
-        Ok(found)
+        let width = self.grouping.keys.len();
+        let keys = at!(keys, ..width);
+        let nulls = any_null.then_some(at!(nulls, ..rows));
+        let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
+        hash_rows(keys, nulls, hashes);
+        groups.table.assign(allocator, keys, nulls, hashes, ids)?;
+        Ok(constant.then(|| *at!(ids, 0)))
     }
 
-    /// Doubles `groups`' slots, putting each group back.
-    fn grow(&self, allocator: &dyn Allocator, groups: &mut Groups) -> Result<(), Error> {
-        let mut slots = SlowVec::zeroed(allocator, groups.slots.len() * 2)?;
-        let mask = slots.len() - 1;
-        let width = self.grouping.keys.len();
-        for found in 0..groups.nulls.len() {
-            let keys = at!(groups.keys, found * width..(found + 1) * width);
-            #[expect(clippy::cast_possible_truncation, reason = "masked")]
-            let mut slot = hash(keys, *at!(groups.nulls, found)) as usize & mask;
-            while *at!(slots, slot) != 0 {
-                slot = (slot + 1) & mask;
-            }
-            #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-            let index = found as u32 + 1;
-            *at_mut!(slots, slot) = index;
+    /// Adds states for groups added since they were last added.
+    fn add_states(&self, groups: &mut Groups) -> Result<(), AllocError> {
+        let len = groups.table.len();
+        if groups.rows.len() == len {
+            return Ok(());
         }
-        groups.slots = slots;
+        extend(&mut groups.rows, len, 0)?;
+        for (aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
+            if let Some(counts) = &mut states.counts {
+                extend(counts, len, 0)?;
+            }
+            match &mut states.totals {
+                Totals::None => {}
+                Totals::Int(totals) => {
+                    let first =
+                        if aggregate.function == Function::Min { i64::MAX } else { i64::MIN };
+                    extend(totals, len, first)?;
+                }
+                Totals::Wide(totals) => extend(totals, len, 0)?,
+                Totals::Float(totals) => {
+                    let sum = matches!(aggregate.function, Function::Sum | Function::Avg);
+                    extend(totals, len, if sum { 0.0 } else { f64::NAN })?;
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Adds row `row` of `input` to `totals`, a group's.
-    fn add(&self, input: &Flat, row: u32, totals: &mut [Total]) {
-        for (aggregate, total) in self.grouping.aggregates.iter().zip(totals) {
-            let Some((position, data_type)) = aggregate.input else {
-                total.count += 1;
-                continue;
-            };
-            let column = input.column(position);
-            if column.is_null(row) {
-                continue;
-            }
-            match data_type {
-                DataType::Int64 => {
-                    let value = i128::from(*at!(column.int64s(), row as usize));
-                    total.int = match aggregate.function {
-                        Function::Min if total.count > 0 => total.int.min(value),
-                        Function::Max if total.count > 0 => total.int.max(value),
-                        Function::Min | Function::Max => value,
-                        _ => total.int + value,
-                    };
-                }
-                DataType::Float64 => {
-                    let value = *at!(column.float64s(), row as usize);
-                    total.float = match aggregate.function {
-                        Function::Min if total.count > 0 => total.float.min(value),
-                        Function::Max if total.count > 0 => total.float.max(value),
-                        Function::Min | Function::Max => value,
-                        _ => total.float + value,
-                    };
-                }
-                DataType::String => {}
-            }
-            total.count += 1;
+    /// Folds `input`'s column for `aggregate` into `states`.
+    fn update(
+        allocator: &dyn Allocator,
+        aggregate: Lowered,
+        states: &mut States,
+        counted: &SlowVec<u64>,
+        input: &RowBatch,
+        ids: Ids,
+        rows: usize,
+    ) -> Result<(), AllocError> {
+        let Some((position, _)) = aggregate.input else { return Ok(()) };
+        let kept = input.selection().kept();
+        let column = input.column(position);
+        if column.has_nulls() {
+            let counts = states.counts(allocator, counted)?;
+            fold_column(counts, ids, kept, rows, column, |count, _: u64, valid| {
+                count + u64::from(valid)
+            });
         }
+        match (&mut states.totals, aggregate.function) {
+            (Totals::None, _) => {}
+            (Totals::Wide(sums), _) => {
+                fold_column(sums, ids, kept, rows, column, |sum, x: i64, valid| {
+                    sum + if valid { i128::from(x) } else { 0 }
+                });
+            }
+            (Totals::Int(least), Function::Min) => {
+                fold_column(least, ids, kept, rows, column, |least: i64, x, valid| {
+                    if valid { least.min(x) } else { least }
+                });
+            }
+            (Totals::Int(greatest), _) => {
+                fold_column(greatest, ids, kept, rows, column, |greatest: i64, x, valid| {
+                    if valid { greatest.max(x) } else { greatest }
+                });
+            }
+            (Totals::Float(least), Function::Min) => {
+                fold_column(least, ids, kept, rows, column, |least: f64, x, valid| {
+                    least.min(if valid { x } else { f64::NAN })
+                });
+            }
+            (Totals::Float(greatest), Function::Max) => {
+                fold_column(greatest, ids, kept, rows, column, |greatest: f64, x, valid| {
+                    greatest.max(if valid { x } else { f64::NAN })
+                });
+            }
+            (Totals::Float(sums), _) => {
+                fold_column(sums, ids, kept, rows, column, |sum: f64, x, valid| {
+                    sum + if valid { x } else { 0.0 }
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The column of `aggregate`'s results for groups `first..first + rows`.
@@ -287,31 +758,32 @@ impl HashAggregate {
         let Some(output_type) = aggregate.function.output_type(data_type) else {
             crate::check::check_failed(line!());
         };
-        let count = self.grouping.aggregates.len();
+        let states = at!(groups.states, a);
+        let counts = states.counts.as_ref().unwrap_or(&groups.rows);
         let mut values = context.values_buffer(rows * 8)?;
         let mut validity = context.small_buffer(rows.div_ceil(8))?;
         validity.as_mut_slice::<u8>().fill(0);
         let mut any_null = false;
         for (i, value) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
-            let total = *at!(groups.totals, (first + i) * count + a);
-            let word = match (aggregate.function, data_type) {
-                (Function::Count, _) => {
-                    Some(i64::try_from(total.count).map_err(|_| Error::Unsupported)?)
+            let group = first + i;
+            let count = *at!(counts, group);
+            #[expect(clippy::cast_precision_loss, reason = "averages are approximate")]
+            let word = match (aggregate.function, &states.totals) {
+                (Function::Count, _) => Some(i64::try_from(count).map_err(|_| Error::Unsupported)?),
+                _ if count == 0 => None,
+                (Function::Avg, Totals::Wide(sums)) => {
+                    Some((*at!(sums, group) as f64 / count as f64).to_bits().cast_signed())
                 }
-                _ if total.count == 0 => None,
-                #[expect(clippy::cast_precision_loss, reason = "averages are approximate")]
-                (Function::Avg, Some(DataType::Int64)) => {
-                    Some((total.int as f64 / total.count as f64).to_bits().cast_signed())
-                }
-                #[expect(clippy::cast_precision_loss, reason = "averages are approximate")]
-                (Function::Avg, _) => {
-                    Some((total.float / total.count as f64).to_bits().cast_signed())
+                (Function::Avg, Totals::Float(sums)) => {
+                    Some((*at!(sums, group) / count as f64).to_bits().cast_signed())
                 }
                 // A sum that doesn't fit in an `Int64` would need a wider type.
-                (_, Some(DataType::Int64)) => {
-                    Some(i64::try_from(total.int).map_err(|_| Error::Unsupported)?)
+                (_, Totals::Wide(sums)) => {
+                    Some(i64::try_from(*at!(sums, group)).map_err(|_| Error::Unsupported)?)
                 }
-                _ => Some(total.float.to_bits().cast_signed()),
+                (_, Totals::Int(totals)) => Some(*at!(totals, group)),
+                (_, Totals::Float(totals)) => Some(at!(totals, group).to_bits().cast_signed()),
+                (_, Totals::None) => crate::check::check_failed(line!()),
             };
             *value = word.unwrap_or(0);
             match word {
@@ -321,78 +793,6 @@ impl HashAggregate {
         }
         Ok(ColumnView::new(context, output_type, values, any_null.then_some(validity))?)
     }
-
-    /// The column of key `k` for groups `first..first + rows`.
-    fn key(
-        &self,
-        context: &mut Context,
-        groups: &Groups,
-        k: usize,
-        first: usize,
-        rows: usize,
-    ) -> Result<ColumnView, Error> {
-        let width = self.grouping.keys.len();
-        let mut values = context.values_buffer(rows * 8)?;
-        let mut validity = context.small_buffer(rows.div_ceil(8))?;
-        validity.as_mut_slice::<u8>().fill(0);
-        let mut any_null = false;
-        for (i, value) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
-            let group = first + i;
-            *value = *at!(groups.keys, group * width + k);
-            if *at!(groups.nulls, group) >> k & 1 == 0 {
-                *at_mut!(validity.as_mut_slice::<u8>(), i / 8) |= 1 << (i % 8);
-            } else {
-                any_null = true;
-            }
-        }
-        Ok(ColumnView::new(context, DataType::Int64, values, any_null.then_some(validity))?)
-    }
-}
-
-impl HashAggregate {
-    /// Where the columns it reads are in batches.
-    fn read(&self) -> impl Iterator<Item = u32> + '_ {
-        let inputs = self.grouping.aggregates.iter().filter_map(|aggregate| aggregate.input);
-        self.grouping.keys.iter().copied().chain(inputs.map(|(position, _)| position))
-    }
-}
-
-/// A batch whose columns this reads are flat: they're in whatever form the
-/// first op to read them takes, so those that aren't are made flat.
-struct Flat<'b, 'r> {
-    batch: &'b RowBatch<'r>,
-    /// A flat copy of each column that isn't, by its position.
-    copies: [Option<ColumnView>; BATCH_COLUMNS_MAX as usize],
-}
-
-impl<'b, 'r> Flat<'b, 'r> {
-    fn new(
-        context: &mut Context,
-        batch: &'b RowBatch<'r>,
-        read: impl Iterator<Item = u32>,
-    ) -> Result<Flat<'b, 'r>, Error> {
-        let mut copies = [const { None }; BATCH_COLUMNS_MAX as usize];
-        for position in read {
-            let column = batch.column(position);
-            if !column.is_in(Forms::FLAT) && at!(copies, position as usize).is_none() {
-                let mut copy = column.clone();
-                copy.make_in(context, Forms::FLAT)?;
-                *at_mut!(copies, position as usize) = Some(copy);
-            }
-        }
-        Ok(Flat { batch, copies })
-    }
-
-    fn column(&self, position: u32) -> &ColumnView {
-        at!(self.copies, position as usize).as_ref().unwrap_or_else(|| self.batch.column(position))
-    }
-}
-
-/// `keys` and which are `nulls`, hashed.
-fn hash(keys: &[i64], nulls: u64) -> u64 {
-    let mix =
-        |hash: u64, word: u64| (hash ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29);
-    keys.iter().fold(mix(0, nulls), |hash, &key| mix(hash, key.cast_unsigned()))
 }
 
 impl Breaker for HashAggregate {
@@ -400,18 +800,40 @@ impl Breaker for HashAggregate {
 
     fn new_state(&self, context: &mut Context) -> Result<Groups, Error> {
         let allocator = context.allocator();
-        let width = self.grouping.keys.len().max(1);
-        let count = self.grouping.aggregates.len().max(1);
+        let width = self.grouping.keys.len();
+        let mut states = SlowVec::fixed(allocator, self.grouping.aggregates.len().max(1))?;
+        for aggregate in self.grouping.aggregates.iter() {
+            let integers =
+                aggregate.input.is_some_and(|(_, data_type)| data_type == DataType::Int64);
+            let totals = match aggregate.function {
+                Function::Count => Totals::None,
+                Function::Sum | Function::Avg if integers => {
+                    Totals::Wide(SlowVec::new(allocator, GROUPS_MAX)?)
+                }
+                Function::Min | Function::Max if integers => {
+                    Totals::Int(SlowVec::new(allocator, GROUPS_MAX)?)
+                }
+                _ => Totals::Float(SlowVec::new(allocator, GROUPS_MAX)?),
+            };
+            states.push(States { counts: None, totals }).map_err(|_| AllocError)?;
+        }
+        let batch = BATCH_ROWS_MAX as usize;
         let mut groups = Groups {
-            slots: SlowVec::zeroed(allocator, 16)?,
-            keys: SlowVec::new(allocator, (GROUPS_MAX * width).next_power_of_two())?,
-            nulls: SlowVec::new(allocator, GROUPS_MAX)?,
-            totals: SlowVec::new(allocator, (GROUPS_MAX * count).next_power_of_two())?,
+            table: Table::new(allocator, width)?,
+            rows: SlowVec::new(allocator, GROUPS_MAX)?,
+            states,
+            scratch: Scratch {
+                keys: SlowVec::zeroed(allocator, width * batch)?,
+                nulls: SlowVec::zeroed(allocator, batch)?,
+                hashes: SlowVec::zeroed(allocator, batch)?,
+                ids: SlowVec::zeroed(allocator, batch)?,
+            },
             served: 0,
         };
         // All rows are one group, which is there even if there are none.
-        if self.grouping.keys.is_empty() {
-            self.group(allocator, &mut groups, hash(&[], 0), &[], 0)?;
+        if width == 0 {
+            groups.table.nulls.push(0).map_err(|_| AllocError)?;
+            self.add_states(&mut groups)?;
         }
         Ok(groups)
     }
@@ -423,31 +845,27 @@ impl Breaker for HashAggregate {
         input: &RowBatch,
     ) -> Result<(), Error> {
         let allocator = context.allocator();
-        let input = Flat::new(context, input, self.read())?;
-        let mut keys = [0_i64; KEYS_MAX];
-        let keys = at_mut!(keys, ..self.grouping.keys.len());
-        let count = self.grouping.aggregates.len();
-        let mut add = |row: u32| -> Result<(), Error> {
-            let mut nulls = 0;
-            for (k, (key, &position)) in keys.iter_mut().zip(self.grouping.keys.iter()).enumerate()
-            {
-                let column = input.column(position);
-                if column.is_null(row) {
-                    nulls |= 1 << k;
-                    *key = 0;
-                } else {
-                    *key = *at!(column.int64s(), row as usize);
-                }
-            }
-            let group = self.group(allocator, groups, hash(keys, nulls), keys, nulls)?;
-            self.add(&input, row, at_mut!(groups.totals, group * count..(group + 1) * count));
-            Ok(())
+        let kept = input.selection().kept();
+        let rows = match kept {
+            Kept::All => input.row_count() as usize,
+            Kept::Select(rows) => rows.len(),
+            Kept::None => return Ok(()),
         };
-        match input.batch.selection().kept() {
-            Kept::All => (0..input.batch.row_count()).try_for_each(&mut add),
-            Kept::Select(rows) => rows.iter().try_for_each(|&row| add(u32::from(row))),
-            Kept::None => Ok(()),
+        let one = if self.grouping.keys.is_empty() {
+            Some(0)
+        } else {
+            self.group(allocator, groups, input, rows)?
+        };
+        self.add_states(groups)?;
+        let ids = match one {
+            Some(group) => Ids::One(group),
+            None => Ids::Each(at!(groups.scratch.ids, ..rows)),
+        };
+        for (&aggregate, states) in self.grouping.aggregates.iter().zip(groups.states.iter_mut()) {
+            HashAggregate::update(allocator, aggregate, states, &groups.rows, input, ids, rows)?;
         }
+        fold(&mut groups.rows, ids, kept, rows, |_| ((), true), |count, (), _| count + 1);
+        Ok(())
     }
 
     fn merge(
@@ -458,27 +876,42 @@ impl Breaker for HashAggregate {
     ) -> Result<(), Error> {
         let allocator = context.allocator();
         let width = self.grouping.keys.len();
-        let count = self.grouping.aggregates.len();
-        for found in 0..other.nulls.len() {
-            let keys = at!(other.keys, found * width..(found + 1) * width);
-            let nulls = *at!(other.nulls, found);
-            let group = self.group(allocator, groups, hash(keys, nulls), keys, nulls)?;
-            let theirs = at!(other.totals, found * count..(found + 1) * count);
-            let ours = at_mut!(groups.totals, group * count..(group + 1) * count);
-            for ((aggregate, ours), theirs) in self.grouping.aggregates.iter().zip(ours).zip(theirs)
-            {
-                if theirs.count == 0 {
-                    continue;
+        let batch = BATCH_ROWS_MAX as usize;
+        for first in (0..other.table.len()).step_by(batch) {
+            let rows = (other.table.len() - first).min(batch);
+            let theirs = first..first + rows;
+            let ids = if width == 0 {
+                Ids::One(0)
+            } else {
+                let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+                for (keys, theirs_by_key) in keys.iter_mut().zip(other.table.keys.iter()) {
+                    *keys = at!(theirs_by_key, theirs.clone());
                 }
-                let first = ours.count == 0;
-                (ours.int, ours.float) = match aggregate.function {
-                    _ if first => (theirs.int, theirs.float),
-                    Function::Min => (ours.int.min(theirs.int), ours.float.min(theirs.float)),
-                    Function::Max => (ours.int.max(theirs.int), ours.float.max(theirs.float)),
-                    _ => (ours.int + theirs.int, ours.float + theirs.float),
-                };
-                ours.count += theirs.count;
+                let keys = at!(keys, ..width);
+                let nulls = Some(at!(other.table.nulls, theirs.clone()));
+                let Scratch { hashes, ids, .. } = &mut groups.scratch;
+                let (hashes, ids) = (at_mut!(hashes, ..rows), at_mut!(ids, ..rows));
+                hash_rows(keys, nulls, hashes);
+                groups.table.assign(allocator, keys, nulls, hashes, ids)?;
+                self.add_states(groups)?;
+                Ids::Each(at!(groups.scratch.ids, ..rows))
+            };
+            let aggregates = self.grouping.aggregates.iter().map(|aggregate| aggregate.function);
+            for ((function, ours), theirs_states) in
+                aggregates.zip(groups.states.iter_mut()).zip(other.states.iter())
+            {
+                let counted = (&groups.rows, &other.rows);
+                merge_states(allocator, function, ours, theirs_states, counted, ids, &theirs)?;
             }
+            let counted = at!(other.rows, theirs);
+            fold(
+                &mut groups.rows,
+                ids,
+                Kept::All,
+                rows,
+                |i| (*at!(counted, i), true),
+                |a, b, _| a + b,
+            );
         }
         Ok(())
     }
@@ -494,11 +927,11 @@ impl Breaker for HashAggregate {
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
         let first = groups.served;
-        let rows = (groups.nulls.len() - first).min(BATCH_ROWS_MAX as usize);
+        let rows = (groups.table.len() - first).min(BATCH_ROWS_MAX as usize);
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         output.reset(rows as u32);
         for k in 0..self.grouping.keys.len() {
-            let column = self.key(context, groups, k, first, rows)?;
+            let column = groups.table.key(context, k, first, rows)?;
             let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
         }
         for a in 0..self.grouping.aggregates.len() {
@@ -506,7 +939,7 @@ impl Breaker for HashAggregate {
             let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
         }
         groups.served += rows;
-        Ok(groups.served < groups.nulls.len())
+        Ok(groups.served < groups.table.len())
     }
 }
 
@@ -679,7 +1112,7 @@ mod tests {
         let (mut first, second) =
             (consumed(&mut context, 0..1500), consumed(&mut context, 1000..2000));
         breaker.merge(&mut context, &mut first, second).unwrap();
-        assert_eq!(first.nulls.len(), 2000);
+        assert_eq!(first.table.len(), 2000);
         let mut output = RowBatch::new();
         let mut counts = Vec::new();
         loop {
