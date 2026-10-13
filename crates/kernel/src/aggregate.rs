@@ -284,9 +284,9 @@ impl Table {
         nulls: Option<&[u64]>,
         bounds: Option<Bounds>,
         empty: &[i64],
-        numbers: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
-        self.reserve(context.allocator(), numbers.len())?;
+        self.reserve(context.allocator(), numbers.groups.len())?;
         if let ([keys], None) = (keys, nulls) {
             if let Some(bounds) = bounds
                 && self.cover(context.allocator(), bounds)?
@@ -295,7 +295,7 @@ impl Table {
             }
             return self.find_or_add_values(keys, empty, numbers);
         }
-        let mut hashes = context.values_buffer(numbers.len() * 8)?;
+        let mut hashes = context.values_buffer(numbers.groups.len() * 8)?;
         let hashes = hashes.as_mut_slice::<u64>();
         for (hash, &key) in hashes.iter_mut().zip(*at!(keys, 0)) {
             *hash = mix(SEED, key.cast_unsigned());
@@ -310,7 +310,7 @@ impl Table {
                 *hash = if null == 0 { *hash } else { mix(*hash, null) };
             }
         }
-        let rows = numbers.len();
+        let rows = numbers.groups.len();
         check!(keys.iter().all(|keys| keys.len() >= rows));
         check!(nulls.is_none_or(|nulls| nulls.len() >= rows));
         // SAFETY: each key has a word for each row, as do `nulls`, checked
@@ -347,19 +347,23 @@ impl Table {
         null: impl Fn(usize) -> i64,
         equal: impl Fn(*const i64, usize) -> bool,
         empty: &[i64],
-        numbers: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
         let Table { slots, hashes: stored_hashes, records, width, .. } = self;
         let (slots, width) = (&mut slots[..], *width);
         check!(records.len() == stored_hashes.len() * width && width > keys.len());
         check!(slots.len().is_power_of_two());
         let mut stored: &[i64] = &records[..];
-        for (i, (&hash, number)) in hashes.iter().zip(numbers).enumerate() {
+        let rows = numbers.groups.len();
+        check!(hashes.len() >= rows);
+        let mut i = 0;
+        while i < rows {
+            let hash = *at!(hashes, i);
             // SAFETY: there are a power of two many slots, checked above, and
             // a group in a slot has a record.
             let found =
                 unsafe { probe(slots, hash, |group| equal(stored.as_ptr().add(group * width), i)) };
-            *number = match found {
+            let group = match found {
                 Ok(group) => group,
                 Err(at) => {
                     let mut key = [0_i64; 1 + KEYS_MAX];
@@ -373,6 +377,11 @@ impl Table {
                     group
                 }
             };
+            // Rows of sorted keys come in runs: the rest of this one are
+            // compared with the group's key, not hashed.
+            // SAFETY: as above.
+            let record = unsafe { stored.as_ptr().add(group as usize * width) };
+            i = run(numbers, i, group, |i| equal(record, i));
         }
         Ok(())
     }
@@ -406,15 +415,19 @@ impl Table {
         &mut self,
         keys: &[i64],
         empty: &[i64],
-        numbers: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
         let Table { slots, hashes, records, width, direct, direct_min } = self;
         let (direct, min, width) = (&mut direct[..], *direct_min, *width);
-        for (&key, number) in keys.iter().zip(numbers) {
+        let rows = numbers.groups.len();
+        check!(keys.len() >= rows);
+        let mut i = 0;
+        while i < rows {
+            let key = *at!(keys, i);
             #[expect(clippy::cast_possible_truncation, reason = "within the bounds")]
             let at = key.wrapping_sub(min).cast_unsigned() as usize;
             let entry = at_mut!(direct, at);
-            *number = if let Some(group) = entry.checked_sub(1) {
+            let group = if let Some(group) = entry.checked_sub(1) {
                 group
             } else {
                 let hash = mix(SEED, key.cast_unsigned());
@@ -422,6 +435,8 @@ impl Table {
                 *entry = group + 1;
                 group
             };
+            // SAFETY: checked above.
+            i = run(numbers, i, group, |i| unsafe { *keys.get_unchecked(i) } == key);
         }
         Ok(())
     }
@@ -433,14 +448,20 @@ impl Table {
         &mut self,
         keys: &[i64],
         empty: &[i64],
-        numbers: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
         let Table { slots, hashes, records, width, .. } = self;
         let (slots, width) = (&mut slots[..], *width);
         check!(records.len() == hashes.len() * width && width >= 2);
         check!(slots.len().is_power_of_two());
         let mut stored: &[i64] = &records[..];
-        for (&key, number) in keys.iter().zip(numbers) {
+        let rows = numbers.groups.len();
+        check!(keys.len() >= rows);
+        // SAFETY: checked just above.
+        let key = |i: usize| unsafe { *keys.get_unchecked(i) };
+        let mut i = 0;
+        while i < rows {
+            let key = key(i);
             let hash = mix(SEED, key.cast_unsigned());
             // SAFETY: there are a power of two many slots, checked above, and
             // a group in a slot has a record.
@@ -449,7 +470,7 @@ impl Table {
                     stored.get_unchecked(group * width..group * width + 2) == [0, key]
                 })
             };
-            *number = match found {
+            let group = match found {
                 Ok(group) => group,
                 Err(at) => {
                     let group = add(slots, hashes, records, at, hash, &[0, key], empty)?;
@@ -457,9 +478,38 @@ impl Table {
                     group
                 }
             };
+            // SAFETY: as above.
+            i = run(numbers, i, group, |i| unsafe { *keys.get_unchecked(i) } == key);
         }
         Ok(())
     }
+}
+
+/// A batch's group numbers: each row's, and where each run of rows of one
+/// group starts, as rows of sorted keys come in runs.
+struct Numbers<'a> {
+    groups: &'a mut [u32],
+    starts: &'a mut [u32],
+    runs: usize,
+}
+
+/// Writes `group` to `numbers` for row `start` and those after it while
+/// `same` says they have its key, and returns the row after them.
+#[inline]
+fn run(numbers: &mut Numbers, start: usize, group: u32, same: impl Fn(usize) -> bool) -> usize {
+    #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+    let row = start as u32;
+    *at_mut!(numbers.starts, numbers.runs) = row;
+    numbers.runs += 1;
+    let groups = &mut *numbers.groups;
+    *at_mut!(groups, start) = group;
+    let mut i = start + 1;
+    while i < groups.len() && same(i) {
+        // SAFETY: checked just above.
+        unsafe { *groups.get_unchecked_mut(i) = group };
+        i += 1;
+    }
+    i
 }
 
 /// The group whose key is `key`, hashed as `hash`, added with the record
@@ -594,9 +644,9 @@ impl HashAggregate {
         context: &mut Context,
         table: &mut Table,
         input: &Flat,
-        numbers: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
-        let rows = numbers.len();
+        let rows = numbers.groups.len();
         let select = input.select();
         // Each key as a word a row, 0 where null, copied unless every row is
         // kept and none is null.
@@ -851,6 +901,9 @@ fn int128(state: &[i64]) -> i128 {
 enum Rows<'a> {
     /// Each row's.
     Grouped(&'a [u32]),
+    /// Each row's, and where each run of rows of one group starts, then the
+    /// rows' end.
+    Runs(&'a [u32], &'a [u32]),
     /// This many rows, all in this group.
     All(u32, usize),
 }
@@ -858,14 +911,14 @@ enum Rows<'a> {
 impl Rows<'_> {
     fn len(self) -> usize {
         match self {
-            Rows::Grouped(numbers) => numbers.len(),
+            Rows::Grouped(numbers) | Rows::Runs(numbers, _) => numbers.len(),
             Rows::All(_, rows) => rows,
         }
     }
     /// Row `i`'s group.
     fn group(self, i: usize) -> u32 {
         match self {
-            Rows::Grouped(numbers) => *at!(numbers, i),
+            Rows::Grouped(numbers) | Rows::Runs(numbers, _) => *at!(numbers, i),
             Rows::All(group, _) => group,
         }
     }
@@ -1076,6 +1129,16 @@ fn sum(records: &mut [i64], place: Place, rows: Rows, values: &[i64]) {
     check!(offset < width && values.len() >= rows.len());
     let numbers = match rows {
         Rows::Grouped(numbers) => numbers,
+        Rows::Runs(numbers, starts) => {
+            for run in starts.windows(2) {
+                let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
+                let values = at!(values, start..end).iter();
+                let sum = values.fold(0_i64, |sum, &value| sum.wrapping_add(value));
+                let state = at_mut!(records, *at!(numbers, start) as usize * width + offset);
+                *state = state.wrapping_add(sum);
+            }
+            return;
+        }
         Rows::All(group, rows) => {
             let values = at!(values, ..rows).iter();
             let sum = values.fold(0_i64, |sum, &value| sum.wrapping_add(value));
@@ -1104,6 +1167,15 @@ fn count(records: &mut [i64], place: Place, rows: Rows) {
     check!(offset < width);
     let numbers = match rows {
         Rows::Grouped(numbers) => numbers,
+        Rows::Runs(numbers, starts) => {
+            for run in starts.windows(2) {
+                let (start, end) = (*at!(run, 0), *at!(run, 1));
+                let count =
+                    at_mut!(records, *at!(numbers, start as usize) as usize * width + offset);
+                *count += i64::from(end - start);
+            }
+            return;
+        }
         Rows::All(group, rows) => {
             *at_mut!(records, group as usize * width + offset) += i64::try_from(rows).unwrap_or(0);
             return;
@@ -1275,10 +1347,26 @@ impl Breaker for HashAggregate {
             (input, Rows::All(group, rows))
         } else {
             let input = Flat::new(context, input, self.read())?;
-            let numbers = numbers.insert(context.indices_buffer(rows * 4)?);
-            let numbers = numbers.as_mut_slice::<u32>();
-            self.find_or_add(context, &mut groups.table, &input, numbers)?;
-            (input, Rows::Grouped(numbers))
+            let (groups_of, starts) = numbers.insert((
+                context.indices_buffer(rows * 4)?,
+                context.indices_buffer((rows + 1) * 4)?,
+            ));
+            let mut numbers = Numbers {
+                groups: groups_of.as_mut_slice(),
+                starts: starts.as_mut_slice(),
+                runs: 0,
+            };
+            self.find_or_add(context, &mut groups.table, &input, &mut numbers)?;
+            let Numbers { groups: numbers, starts, runs } = numbers;
+            // Folding a run at a time pays where runs are long enough.
+            if runs * 2 <= rows {
+                #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+                let end = rows as u32;
+                *at_mut!(starts, runs) = end;
+                (input, Rows::Runs(numbers, at!(starts, ..=runs)))
+            } else {
+                (input, Rows::Grouped(numbers))
+            }
         };
         self.narrow(groups, &input, rows.len());
         for a in 0..self.grouping.aggregates.len() {
