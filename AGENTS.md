@@ -18,7 +18,7 @@
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
 - Prefer a few smoke tests over testing every combination.
-- Add benchmarks for hot code to `crates/bench`: wall-clock ones with criterion, and instruction counts with gungraun, which CI checks against `crates/bench/instructions`.
+- Add benchmarks for hot code to `crates/bench`: wall-clock ones with criterion, and instruction counts with gungraun, which CI checks against `crates/bench/instructions/ci.json`. Counts differ between machines, so each has its own file there; `ci.json` takes the counts CI prints.
 - Use new APIs from `crates/bench/examples/size.rs`, which CI checks against a size budget per architecture.
 - Commit titles are prefixed with the area, e.g. `kernel:`.
 
