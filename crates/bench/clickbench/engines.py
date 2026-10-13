@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Times other engines on every query in queries.tsv, over ClickBench's
 Parquet files, one thread and as many as the engine likes, and writes each
-to results/ENGINE-THREADS.tsv, with the machine, version and date, so we
-know where pipitdb stands without running them again.
+to results/MACHINE/ENGINE-THREADS.tsv, with the machine, version, date and
+load, so we know where pipitdb stands without running them again. Times
+from one machine only compare with times from the same one.
 
 Each engine runs in-process, best of RUNS after a warm-up, in ms. "1" is
 one thread, ClickHouse's parsing and download threads limited too; "N" is
@@ -10,9 +11,10 @@ the engine's default.
 
 Needs `pip install duckdb chdb datafusion polars`.
 
-Usage: crates/bench/clickbench/engines.py DIR [--engines duckdb,...]
-       [--threads 1,N] [--runs 2]
-DIR holds hits_*.parquet.
+Usage: crates/bench/clickbench/engines.py DIR --machine NAME
+       [--engines duckdb,...] [--threads 1,N] [--runs 2] [--quiet LOAD]
+DIR holds hits_*.parquet. --quiet waits until the machine's load average
+stays below LOAD before starting.
 """
 
 import argparse
@@ -42,6 +44,30 @@ def machine():
             ["sysctl", "-n", key], capture_output=True, text=True).stdout.strip()
         return f"{sysctl('machdep.cpu.brand_string')}, {sysctl('hw.ncpu')} cores, macOS {platform.mac_ver()[0]}"
     return f"{platform.processor() or platform.machine()}, {os.cpu_count()} cores, {platform.platform()}"
+
+
+def results(name):
+    """The directory of a machine's results."""
+    path = HERE / "results" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def wait_quiet(limit, timeout_s=4 * 3600):
+    """Waits until the one-minute load average is below `limit` three
+    checks in a row, 20 s apart, so other work doesn't skew the times.
+    Fails after `timeout_s`."""
+    start, calm = time.monotonic(), 0
+    while calm < 3:
+        if time.monotonic() - start > timeout_s:
+            sys.exit(f"the load stayed above {limit} for {timeout_s // 3600} hours")
+        calm = calm + 1 if os.getloadavg()[0] < limit else 0
+        if calm < 3:
+            time.sleep(20)
+
+
+def load():
+    return os.getloadavg()[0]
 
 
 def connect(engine, threads, directory):
@@ -85,9 +111,10 @@ def connect(engine, threads, directory):
     raise ValueError(engine)
 
 
-def run_one(engine, threads, runs, directory):
+def run_one(engine, threads, runs, directory, name):
     """Times every query with one engine, in this process, and writes its file."""
     run, version = connect(engine, threads, directory)
+    before = load()
     count = len(list(pathlib.Path(directory).glob("hits_*.parquet")))
     label = "1" if threads == 1 else "N"
     lines = [
@@ -95,7 +122,8 @@ def run_one(engine, threads, runs, directory):
         f" best of {runs} after a warm-up, ms",
         f"# {machine()}, {datetime.date.today()}, {count} files",
     ]
-    for name, sql in queries():
+    rows = []
+    for query, sql in queries():
         try:
             run(sql)
             best = float("inf")
@@ -103,12 +131,13 @@ def run_one(engine, threads, runs, directory):
                 start = time.perf_counter()
                 run(sql)
                 best = min(best, time.perf_counter() - start)
-            lines.append(f"{name}\t{best * 1000:.1f}")
+            rows.append(f"{query}\t{best * 1000:.1f}")
         except Exception as error:
-            lines.append(f"{name}\tfailed")
-            print(f"{engine}-{label} {name}: {str(error)[:200]}", file=sys.stderr)
-        print(f"{engine}-{label} {lines[-1]}", file=sys.stderr, flush=True)
-    (HERE / "results" / f"{engine}-{label}.tsv").write_text("\n".join(lines) + "\n")
+            rows.append(f"{query}\tfailed")
+            print(f"{engine}-{label} {query}: {str(error)[:200]}", file=sys.stderr)
+        print(f"{engine}-{label} {rows[-1]}", file=sys.stderr, flush=True)
+    lines.append(f"# load {before:.2f} before, {load():.2f} after")
+    (results(name) / f"{engine}-{label}.tsv").write_text("\n".join(lines + rows) + "\n")
 
 
 def main():
@@ -117,18 +146,22 @@ def main():
     parser.add_argument("--engines", default=",".join(ENGINES))
     parser.add_argument("--threads", default="1,N")
     parser.add_argument("--runs", type=int, default=2)
+    parser.add_argument("--machine", required=True)
+    parser.add_argument("--quiet", type=float)
     parser.add_argument("--one", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.one:
         engine, threads = args.one.split(":")
-        return run_one(engine, int(threads), args.runs, args.directory)
+        return run_one(engine, int(threads), args.runs, args.directory, args.machine)
+    if args.quiet:
+        wait_quiet(args.quiet)
     # Each in its own process, so one engine's threads and memory don't
     # affect the next, and Polars reads its thread count fresh.
     for engine in args.engines.split(","):
         for threads in args.threads.split(","):
             one = f"{engine}:{1 if threads == '1' else 0}"
             subprocess.run([sys.executable, __file__, args.directory, "--runs", str(args.runs),
-                            "--one", one], check=True)
+                            "--machine", args.machine, "--one", one], check=True)
 
 
 if __name__ == "__main__":
