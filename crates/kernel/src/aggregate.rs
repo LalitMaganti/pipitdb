@@ -704,7 +704,7 @@ fn fold<S: Copy, T>(
     }
 }
 
-/// As `fold`, of `column`'s values, which are `T`s: a flat column.
+/// As `fold`, of `column`'s values, which are `T`s.
 #[inline]
 fn fold_column<S: Copy, T: Primitive>(
     states: &mut [S],
@@ -714,7 +714,7 @@ fn fold_column<S: Copy, T: Primitive>(
     op: impl Fn(S, T, bool) -> S,
 ) {
     match read(column, selection) {
-        Read::Constant(..) => crate::check::check_failed(line!()),
+        Read::Constant(value, valid) => fold(states, ids, selection, |_| (value, valid), op),
         Read::Flat(flat) if flat.validity.is_none() => {
             fold(states, ids, selection, |row| (flat.value(row), true), op);
         }
@@ -725,8 +725,8 @@ fn fold_column<S: Copy, T: Primitive>(
 }
 
 /// `column`, an aggregate's input of `data_type`, with a constant made
-/// flat, so it's folded by the same loops as any, or `None` if it's a
-/// constant null.
+/// flat, so rows of many groups fold it by the same loops as any, or
+/// `None` if it's a constant null.
 fn flat_input(
     context: &mut Context,
     column: &ColumnView,
@@ -750,8 +750,11 @@ fn flat_input(
 }
 
 /// The greatest magnitude of any value of `column`, an integer one, if
-/// its bounds are known.
+/// known.
 fn magnitude(column: &ColumnView) -> Option<u64> {
+    if column.is_in(Forms::CONSTANT) {
+        return Some(at!(column.values().int64s(), 0).unsigned_abs());
+    }
     let bounds = column.bounds()?;
     Some(bounds.min.unsigned_abs().max(bounds.max.unsigned_abs()))
 }
@@ -1030,7 +1033,11 @@ impl HashAggregate {
         let Some((position, data_type)) = aggregate.input else { return Ok(()) };
         let allocator = context.allocator();
         let selection = input.selection();
-        let column = flat_input(context, input.column(position), data_type, selection)?;
+        let column = match ids {
+            // One group folds a constant as fast as it counts rows.
+            Ids::One(_) => Some(input.column(position).clone()),
+            _ => flat_input(context, input.column(position), data_type, selection)?,
+        };
         // A constant null adds no value, but counts are kept apart from rows.
         let Some(column) = &column else {
             states.counts(allocator, counted)?;
