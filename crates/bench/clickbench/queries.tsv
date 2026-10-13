@@ -28,3 +28,5 @@ f41	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15
 fPhone	FROM hits |> WHERE MobilePhoneModel != '' |> SELECT MobilePhoneModel, UserID	SELECT MobilePhoneModel, UserID FROM hits WHERE MobilePhoneModel <> ''
 fIpad	FROM hits |> WHERE MobilePhoneModel = 'iPad' |> SELECT UserID	SELECT UserID FROM hits WHERE MobilePhoneModel = 'iPad'
 fSearch	FROM hits |> WHERE SearchPhrase != '' |> SELECT SearchPhrase	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> ''
+fCounter	FROM hits |> WHERE CounterID = 59 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 59
+fCounterFew	FROM hits |> WHERE CounterID = 52 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 52

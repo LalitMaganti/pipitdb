@@ -9,14 +9,10 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
-use pipit_kernel::lower::{PhysicalPlan, lower};
-use pipit_kernel::optimize::optimize;
+use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_operators::table::Table;
-use pipit_pipesql::compile::compile;
-
-use crate::REGISTRY;
 
 fn data_dir() -> PathBuf {
     let perfetto = std::env::var_os("PIPIT_PERFETTO").map_or_else(
@@ -38,15 +34,7 @@ pub fn slice_query(
     slices: &'static DynScannable<'static>,
     query: &str,
 ) -> Option<PhysicalPlan<'static>> {
-    plan(Box::leak(Box::new(Slices(slices))), query)
-}
-
-/// `query` over the tables in `catalog`, compiled, optimized and lowered,
-/// ready to run.
-pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
-    let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
-    optimize(&Heap, &mut plan).ok()?;
-    lower(&Heap, &plan).ok()
+    crate::plan(Box::leak(Box::new(Slices(slices))), query)
 }
 
 /// The PipeSQL of the query called `name` in `clickbench/queries.tsv`, if

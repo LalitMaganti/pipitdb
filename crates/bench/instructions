@@ -2,6 +2,8 @@ clickbench.f1 13301167
 clickbench.f40 113118847
 clickbench.f41 99203037
 clickbench.f_adv 58540446
+clickbench.f_counter 11828940
+clickbench.f_counter_few 9876493
 clickbench.f_ipad 47609035
 clickbench.f_phone 47784946
 clickbench.f_search 61227067
@@ -18,3 +20,5 @@ predicate.not 1725911
 predicate.or 5669457
 query.typical 978713
 scan.table 204972
+small.point 36320
+small_planned.point 4862
