@@ -571,6 +571,15 @@ mod tests {
             *row = 0;
             Ok(Progress::NeedInput)
         }
+
+        fn finish(
+            &self,
+            _: &mut Context,
+            _: &mut u32,
+            _: &mut RowBatch,
+        ) -> Result<Progress, Error> {
+            Ok(Progress::NeedInput)
+        }
     }
 
     /// Outputs one row, the sum of its input's first column, once the input

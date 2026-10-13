@@ -156,6 +156,10 @@ impl Operator for PassOperator {
         output.selection_mut().clone_from(input.selection());
         Ok(Progress::NeedInput)
     }
+
+    fn finish(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<Progress, Error> {
+        Ok(Progress::NeedInput)
+    }
 }
 
 /// Runs `pipeline` once, returning the rows out, or as many as it made
