@@ -8,6 +8,11 @@
   "clickbench.f_ipad": 47610179,
   "clickbench.f_phone": 47786328,
   "clickbench.f_search": 61963986,
+  "clickbench.g_adv": 549425916,
+  "clickbench.g_region": 566213279,
+  "clickbench.g_user": 636513602,
+  "clickbench.g_window": 785674735,
+  "clickbench.q2": 542423582,
   "filter.greater": 1660299,
   "filter.greater_nulls": 3915402,
   "lexer.long_text": 103473,
@@ -19,8 +24,8 @@
   "predicate.and": 2686894,
   "predicate.not": 1729933,
   "predicate.or": 5674194,
-  "query.typical": 978800,
+  "query.typical": 982000,
   "scan.table": 204972,
-  "small.point": 43320,
+  "small.point": 43574,
   "small_planned.point": 5870
 }
