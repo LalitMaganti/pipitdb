@@ -597,9 +597,15 @@ pub struct Validity<'a> {
     row_count: u32,
 }
 
-impl Validity<'_> {
+impl<'a> Validity<'a> {
     pub fn row_count(self) -> u32 {
         self.row_count
+    }
+
+    /// The bitmap from the byte holding the first row's bit, and which bit
+    /// of it that is.
+    pub(crate) fn bits(self) -> (&'a [u8], u32) {
+        (at!(self.bits, self.start as usize / 8..), self.start % 8)
     }
 
     /// Whether `row` isn't null, without checking it's a row.
