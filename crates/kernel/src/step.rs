@@ -140,6 +140,8 @@ pub struct Erased<'a, F> {
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
     run: F,
     lifetime: PhantomData<&'a ()>,
+    #[cfg(test)]
+    pub(crate) name: &'static str,
 }
 
 /// Makes a step's state at the given place, or fails without making it.
@@ -173,7 +175,8 @@ pub struct OperatorFunctions {
 }
 
 impl<'a> DynSource<'a> {
-    /// A source from parts that already agree on its step's and state's types.
+    /// A source from parts that already agree on its step's and state's types,
+    /// named `name` for tests to print plans.
     ///
     /// # Safety
     ///
@@ -185,8 +188,20 @@ impl<'a> DynSource<'a> {
         new_state: NewState,
         drop_state: unsafe fn(NonNull<u8>),
         next: SourceNext,
+        name: &'static str,
     ) -> DynSource<'a> {
-        Erased { step, state_layout, new_state, drop_state, run: next, lifetime: PhantomData }
+        #[cfg(not(test))]
+        let _ = name;
+        Erased {
+            step,
+            state_layout,
+            new_state,
+            drop_state,
+            run: next,
+            lifetime: PhantomData,
+            #[cfg(test)]
+            name,
+        }
     }
 
     pub fn new<T: Source + 'a>(
@@ -211,6 +226,8 @@ impl<'a> DynSource<'a> {
                 value_of::<T>(source).next(context, state_of::<T::State>(state), batch)
             },
             lifetime: PhantomData,
+            #[cfg(test)]
+            name: type_name::<T>(),
         })
     }
 
@@ -231,7 +248,7 @@ impl<'a> DynSource<'a> {
 
 impl<'a> DynTransform<'a> {
     /// A transform from parts that already agree on its step's and state's
-    /// types.
+    /// types, named `name` for tests to print plans.
     ///
     /// # Safety
     ///
@@ -242,8 +259,20 @@ impl<'a> DynTransform<'a> {
         new_state: NewState,
         drop_state: unsafe fn(NonNull<u8>),
         process: TransformProcess,
+        name: &'static str,
     ) -> DynTransform<'a> {
-        Erased { step, state_layout, new_state, drop_state, run: process, lifetime: PhantomData }
+        #[cfg(not(test))]
+        let _ = name;
+        Erased {
+            step,
+            state_layout,
+            new_state,
+            drop_state,
+            run: process,
+            lifetime: PhantomData,
+            #[cfg(test)]
+            name,
+        }
     }
 
     pub fn new<T: Transform + 'a>(
@@ -266,6 +295,8 @@ impl<'a> DynTransform<'a> {
                 value_of::<T>(transform).process(context, state_of::<T::State>(state), batch)
             },
             lifetime: PhantomData,
+            #[cfg(test)]
+            name: type_name::<T>(),
         })
     }
 
@@ -311,6 +342,8 @@ impl<'a> DynOperator<'a> {
                 },
             },
             lifetime: PhantomData,
+            #[cfg(test)]
+            name: type_name::<T>(),
         })
     }
 
@@ -357,4 +390,12 @@ impl<F> Erased<'_, F> {
         // the rest.
         unsafe { (self.new_state)(self.step.as_ptr(), context, state) }
     }
+}
+
+/// `T`'s name, without its path or parameters, for tests to print plans.
+#[cfg(test)]
+fn type_name<T>() -> &'static str {
+    let name = core::any::type_name::<T>();
+    let name = name.split('<').next().unwrap_or(name);
+    name.rsplit("::").next().unwrap_or(name)
 }

@@ -67,6 +67,20 @@ impl<'a> Pipeline<'a> {
     }
 }
 
+#[cfg(test)]
+impl Pipeline<'_> {
+    /// Its source's and steps' types, in order, such as `Scan | Filter`.
+    pub(crate) fn describe(&self) -> alloc::string::String {
+        let steps = self.steps.iter().map(|step| match step {
+            Step::Transform(transform) => transform.name,
+            Step::Operator(operator) => operator.name,
+        });
+        let names: alloc::vec::Vec<&str> =
+            core::iter::once(self.source.name).chain(steps).collect();
+        names.join(" | ")
+    }
+}
+
 /// Where a run is with a segment. Kept together, apart from the slots, so
 /// moving between segments touches little memory.
 struct Segment {

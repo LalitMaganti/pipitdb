@@ -77,6 +77,9 @@ pub struct Lowering<'p, 'c> {
     column_count: u32,
 }
 
+/// Its methods are named by what they do. Building ones add to the
+/// pipeline, `declare_` ones record what a step added makes, and `query_`
+/// ones only read what's known.
 impl<'p, 'c> Lowering<'p, 'c> {
     /// What to make steps with.
     pub fn allocator(&self) -> &'p dyn Allocator {
@@ -99,9 +102,9 @@ impl<'p, 'c> Lowering<'p, 'c> {
         Ok(self.steps.push(step)?)
     }
 
-    /// Gives `column` the next position in batches, which fail to hold more
-    /// than `BATCH_COLUMNS_MAX`.
-    pub fn define(&mut self, column: ColumnId) -> Result<(), LowerError> {
+    /// Records that the source or a step makes `column`, at the next
+    /// position in batches, which fail to hold more than `BATCH_COLUMNS_MAX`.
+    pub fn declare_column(&mut self, column: ColumnId) -> Result<(), LowerError> {
         if self.column_count == BATCH_COLUMNS_MAX {
             return Err(LowerError::TooManyColumns);
         }
@@ -111,7 +114,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     /// Where `column` is in batches.
-    pub fn position(&self, column: ColumnId) -> u32 {
+    pub fn query_position(&self, column: ColumnId) -> u32 {
         let position = *at!(self.positions, column as usize);
         check!(position != u32::MAX);
         position
@@ -140,7 +143,7 @@ pub fn lower<'c>(
     let mut columns = SlowVec::fixed(allocator, plan.output.len())?;
     for column in plan.output.iter() {
         let name = names.add(plan.names.get(column.name))?;
-        columns.push(OutputColumn { name, position: lowering.position(column.id) })?;
+        columns.push(OutputColumn { name, position: lowering.query_position(column.id) })?;
     }
     let Some(source) = lowering.source else { crate::check::check_failed(line!()) };
     Ok(PhysicalPlan { pipeline: Pipeline::new(source, lowering.steps), names, columns })
@@ -577,6 +580,16 @@ mod tests {
         filters: &[(usize, Comparison, i64)],
         output: &[usize],
     ) -> (StdVec<StdVec<i64>>, u32) {
+        let (kept, rows, _) = counted_steps(table, filters, output);
+        (kept, rows)
+    }
+
+    /// As `counted`, and the pipeline's steps.
+    fn counted_steps(
+        table: &DynScannable,
+        filters: &[(usize, Comparison, i64)],
+        output: &[usize],
+    ) -> (StdVec<StdVec<i64>>, u32, alloc::string::String) {
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 3).unwrap();
         let mut bindings = StdVec::new();
@@ -617,7 +630,7 @@ mod tests {
                 kept.push(columns.map(|column| column.int64s()[usize::from(row)]).collect());
             }
         }
-        (kept, rows)
+        (kept, rows, physical.pipeline().describe())
     }
 
     #[test]
@@ -631,8 +644,9 @@ mod tests {
         // `a > 11` keeps rows 2 and 3 of batch 1, and batch 2; `b < 122` then
         // drops rows 2 and 3 of batch 2.
         let filters = [(0, Comparison::Greater, 11), (1, Comparison::Less, 122)];
-        let (kept, _) = counted(&table, &filters, &[2, 0]);
+        let (kept, _, steps) = counted_steps(&table, &filters, &[2, 0]);
         assert_eq!(kept, [[212, 12], [213, 13], [220, 20], [221, 21]]);
+        assert_eq!(steps, "Scan | Filter | Materialize | Filter | Materialize");
         // `a` is read by the scan's parent, so it isn't lazy. `b` is loaded
         // for the second filter, and `c` for the output, only for the batches
         // and rows still kept.
