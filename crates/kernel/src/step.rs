@@ -67,16 +67,14 @@ pub trait Operator {
         output: &mut RowBatch,
     ) -> Result<Progress, Error>;
 
-    /// Called after the last input, for operators that hold rows back.
+    /// Called after the last input, to output the rows held back, if any.
+    /// Required, so an operator that holds rows can't drop them by default.
     fn finish(
         &self,
         context: &mut Context,
         state: &mut Self::State,
         output: &mut RowBatch,
-    ) -> Result<Progress, Error> {
-        let _ = (context, state, output);
-        Ok(Progress::NeedInput)
-    }
+    ) -> Result<Progress, Error>;
 }
 
 /// What an operator did with its input.
