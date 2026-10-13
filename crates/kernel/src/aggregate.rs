@@ -1012,7 +1012,8 @@ impl HashAggregate {
         let Some((position, _)) = aggregate.input else { return Ok(()) };
         let selection = input.selection();
         let column = input.column(position);
-        if column.has_nulls() {
+        // Once a value's been null, counts are kept apart from rows.
+        if column.has_nulls() || states.counts.is_some() {
             let counts = states.counts(allocator, counted)?;
             fold_column(counts, ids, selection, column, |count, _: u64, valid| {
                 count + u64::from(valid)
@@ -1538,8 +1539,8 @@ mod tests {
     #[test]
     fn groups_by_keys_with_nulls_constants_and_runs() {
         // Rows of `k1`, `k2` and `x`, a batch each; in the second, `k1` is
-        // constant, and in the third, both keys are. Row 3 of each is
-        // dropped.
+        // constant, and in the third, both keys are, and no `x` is null.
+        // Row 3 of each is dropped.
         let batches: [&[[Option<i64>; 3]]; 3] = [
             &[
                 [Some(1), Some(10), Some(1)],
@@ -1562,7 +1563,7 @@ mod tests {
             ],
             &[
                 [None, Some(5), Some(100)],
-                [None, Some(5), None],
+                [None, Some(5), Some(200)],
                 [None, Some(5), Some(300)],
                 [None, Some(5), Some(400)],
             ],
