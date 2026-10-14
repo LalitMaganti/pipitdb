@@ -283,6 +283,7 @@ impl<'a> DynScannable<'a> {
                 scan_new_state,
                 self.drop_state,
                 scan_next,
+                "Scan",
             )
         };
         Ok(source)
@@ -310,6 +311,7 @@ impl<'a> DynScannable<'a> {
                 materialize_new_state,
                 self.drop_loader,
                 materialize_process,
+                "Materialize",
             )
         })
     }
