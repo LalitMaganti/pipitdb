@@ -1,14 +1,13 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
-use pipit_kernel::column::Forms;
-use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX, ScanColumn, ScanOp};
+use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Tag};
 use crate::compile::Compiler;
 use crate::condition::compile_condition;
-use crate::error::{Error, ErrorCode, Unsupported};
+use crate::error::{Error, Unsupported};
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -37,23 +36,8 @@ pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
 
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let name = compiler.node(stage.first_child()).span();
-    let Some(table) = compiler.catalog().find(compiler.text(name)) else {
-        return Err(Error::new(ErrorCode::UnknownTable, name));
-    };
-    let allocator = compiler.allocator();
-    let count = table.column_count();
-    let mut columns = SlowVec::fixed(allocator, count as usize)?;
-    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
-    for i in 0..count {
-        let binding = compiler.plan.add_column(table.column_name(i), table.column_type(i))?;
-        columns.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
-        scope.push(binding)?;
-    }
-    let scan = DynOp::new(allocator, ScanOp::new(table, columns))?;
-    let children = SlowVec::fixed(allocator, 0)?;
-    compiler.plan.add_node(scan, children)?;
-    compiler.scope = scope;
+    let relation = compiler.compile_relation(compiler.node(stage.first_child()))?;
+    compiler.scope = relation.columns;
     Ok(())
 }
 
