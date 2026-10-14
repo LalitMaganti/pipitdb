@@ -302,9 +302,17 @@ impl<'p> Run<'p> {
         // SAFETY: the source's state was made by `Execution::new`.
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Ok(true) => Made::Batch,
-            Ok(false) => Made::End,
+            Ok(false) => Self::end(batch),
             Err(error) => self.fail(error),
         }
+    }
+
+    /// Ends a segment, freeing its last batch's buffers before what follows
+    /// finishes.
+    #[cold]
+    fn end(batch: &mut RowBatch) -> Made {
+        batch.reset(0);
+        Made::End
     }
 
     /// Records that a step failed, and ends its segment.
@@ -331,7 +339,7 @@ impl<'p> Run<'p> {
         // SAFETY: the operator's state was made by `Execution::new`.
         let progress = unsafe {
             match segment.status {
-                Status::Done => return Made::End,
+                Status::Done => return Self::end(output),
                 Status::Ready => {
                     output.reset(0);
                     operator.execute(context, state, input, output)
@@ -543,6 +551,88 @@ mod tests {
         }
     }
 
+    /// Counts the allocations it made that are live.
+    struct Counting(Cell<u32>);
+
+    // SAFETY: forwards to `Heap`.
+    unsafe impl crate::allocator::Allocator for Counting {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+            self.0.set(self.0.get() + 1);
+            Heap.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.0.set(self.0.get() - 1);
+            // SAFETY: forwarded from the caller.
+            unsafe { Heap.deallocate(ptr, layout) }
+        }
+    }
+
+    /// One batch of one row, its column's values allocated from `live`.
+    struct Counted<'a> {
+        live: &'a Counting,
+    }
+
+    impl Source for Counted<'_> {
+        type State = bool;
+
+        fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
+            Ok(false)
+        }
+
+        fn next(
+            &self,
+            _: &mut Context,
+            made: &mut bool,
+            batch: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            if *made {
+                return Ok(false);
+            }
+            *made = true;
+            batch.reset(1);
+            let values = Buffer::allocate(self.live, 8).unwrap();
+            let column =
+                ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+            assert!(batch.push_column(column).is_ok());
+            Ok(true)
+        }
+    }
+
+    /// Outputs nothing, and checks when it finishes that nothing allocated
+    /// from `live` is held.
+    struct Released<'a> {
+        live: &'a Counting,
+    }
+
+    impl Operator for Released<'_> {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn execute(
+            &self,
+            _: &mut Context,
+            (): &mut (),
+            _: &RowBatch,
+            _: &mut RowBatch,
+        ) -> Result<Progress, Error> {
+            Ok(Progress::NeedInput)
+        }
+
+        fn finish(
+            &self,
+            _: &mut Context,
+            (): &mut (),
+            _: &mut RowBatch,
+        ) -> Result<Progress, Error> {
+            assert_eq!(self.live.0.get(), 0);
+            Ok(Progress::NeedInput)
+        }
+    }
+
     /// Outputs each input a row at a time.
     struct Split;
 
@@ -727,6 +817,14 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 3 }, steps);
         let query = QueryAllocators::new(&Heap);
         assert_eq!(batches(&mut pipeline.start(&query).unwrap()), [[[2 + 4]]]);
+    }
+
+    #[test]
+    fn operators_finish_without_their_last_input() {
+        let live = Counting(Cell::new(0));
+        let pipeline = pipeline(Counted { live: &live }, [operator(Released { live: &live })]);
+        let query = QueryAllocators::new(&Heap);
+        assert!(batches(&mut pipeline.start(&query).unwrap()).is_empty());
     }
 
     #[test]
