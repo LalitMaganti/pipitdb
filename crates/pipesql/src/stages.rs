@@ -4,6 +4,8 @@
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
 use pipit_kernel::limit::LimitOp;
+use pipit_kernel::lower::SortKey;
+use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -262,11 +264,29 @@ fn value_of(compiler: &Compiler<'_, '_>, value: Node) -> Result<NamedColumn, Err
     compiler.find_column(value)
 }
 
-/// `ORDER BY a, b DESC`: parsed, but nothing sorts yet.
+/// `ORDER BY a, b DESC`: the rows sorted by `a`, then `b` descending,
+/// stably. Keys are integer or float columns.
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let keys = compiler.node(stage.first_child());
-    let first = compiler.node(keys.first_child());
-    Err(Error::unsupported(Unsupported::OrderBy, compiler.span(first)))
+    let list = compiler.node(stage.first_child());
+    let allocator = compiler.allocator();
+    let mut keys = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    for i in 0..list.child_count() {
+        let key = compiler.node(list.first_child() + i);
+        let column = compiler.node(key.first_child());
+        let unsupported = Error::unsupported(Unsupported::OrderBy, compiler.span(column));
+        if column.tag() != Tag::Name {
+            return Err(unsupported);
+        }
+        let column_id = compiler.find_column(column)?.id;
+        if at!(compiler.plan.columns, column_id as usize).data_type.has_bytes() {
+            return Err(unsupported);
+        }
+        keys.push(SortKey { column: column_id, descending: key.descending() })?;
+    }
+    let order_by = DynOp::new(allocator, OrderByOp { keys })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(order_by, children)?;
+    Ok(())
 }
 
 /// `LIMIT 10 OFFSET 20`: the first 10 rows after skipping 20. Both are

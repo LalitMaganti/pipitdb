@@ -357,6 +357,14 @@ mod tests {
     }
 
     #[test]
+    fn orders_rows() {
+        assert_eq!(kept("FROM t |> ORDER BY a DESC |> SELECT b"), [20.0, 10.0]);
+        assert_eq!(kept("FROM t |> ORDER BY f |> SELECT s"), [4.0, 0.0]);
+        let top = "FROM t |> AGGREGATE count(*) AS n GROUP BY b |> ORDER BY b DESC |> LIMIT 1";
+        assert_eq!(run(top)[0].1, [20.0]);
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
@@ -373,7 +381,6 @@ mod tests {
         assert_eq!(error("FROM t |> RENAME a AS b, A AS c"), (ErrorCode::ListedTwice, 25));
         assert_eq!(error("FROM t |> SET a = a + 1"), (ErrorCode::Unsupported, 18));
         assert_eq!(error("FROM t |> EXTEND a |> SELECT a"), (ErrorCode::AmbiguousColumn, 29));
-        assert_eq!(error("FROM t |> ORDER BY a"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
@@ -392,6 +399,9 @@ mod tests {
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
+        assert_eq!(error("FROM t |> SELECT b AS c |> SELECT b"), (ErrorCode::UnknownColumn, 34));
+        assert_eq!(error("FROM t |> ORDER BY s"), (ErrorCode::Unsupported, 19));
+        assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
