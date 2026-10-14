@@ -121,7 +121,7 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             ("rows can't be sorted yet".into(), "`ORDER BY` isn't supported yet".into())
         }
         what if what == Unsupported::Limit as u16 => {
-            ("rows can't be limited yet".into(), "`LIMIT` isn't supported yet".into())
+            ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
         }
         what if what == Unsupported::GroupKey as u16 => (
             "only integer columns can be grouped by yet".into(),

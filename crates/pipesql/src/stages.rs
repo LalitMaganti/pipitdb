@@ -3,6 +3,7 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
+use pipit_kernel::limit::LimitOp;
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -110,10 +111,34 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
     Err(Error::unsupported(Unsupported::OrderBy, compiler.span(first)))
 }
 
-/// `LIMIT 10 OFFSET 20`: parsed, but nothing stops early yet.
+/// `LIMIT 10 OFFSET 20`: the first 10 rows after skipping 20. Both are
+/// integers.
 fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let count = compiler.node(stage.first_child());
-    Err(Error::unsupported(Unsupported::Limit, compiler.span(count)))
+    let count = count(compiler, compiler.node(stage.first_child()))?;
+    let offsets = compiler.node(stage.first_child() + 1);
+    let offset = match offsets.child_count() {
+        0 => 0,
+        1 => self::count(compiler, compiler.node(offsets.first_child()))?,
+        _ => {
+            let second = compiler.node(offsets.first_child() + 1);
+            return Err(Error::unsupported(Unsupported::Limit, compiler.span(second)));
+        }
+    };
+    let allocator = compiler.allocator();
+    let limit = DynOp::new(allocator, LimitOp { count, offset })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(limit, children)?;
+    Ok(())
+}
+
+/// The number of rows `node`, an integer, says.
+fn count(compiler: &Compiler<'_, '_>, node: Node) -> Result<u64, Error> {
+    if node.tag() != Tag::Integer {
+        return Err(Error::unsupported(Unsupported::Limit, compiler.span(node)));
+    }
+    // The lexer's integers are digits, so the only error is size.
+    let too_large = Error::new(ErrorCode::NumberTooLarge, node.span());
+    compiler.text(node.span()).parse::<u64>().map_err(|_| too_large)
 }
 
 /// `AGGREGATE COUNT(*), SUM(a) GROUP BY k`: a row for each group of rows

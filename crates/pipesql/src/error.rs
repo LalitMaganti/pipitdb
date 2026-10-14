@@ -69,7 +69,7 @@ pub enum Unsupported {
     GroupKey = 7,
     /// `ORDER BY`, which nothing sorts for yet.
     OrderBy = 8,
-    /// `LIMIT`, which nothing stops early for yet.
+    /// A `LIMIT` or `OFFSET` that isn't one integer.
     Limit = 9,
 }
 

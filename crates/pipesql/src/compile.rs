@@ -308,6 +308,13 @@ mod tests {
     }
 
     #[test]
+    fn limits_rows() {
+        assert_eq!(kept("FROM t |> LIMIT 1 |> SELECT b"), [10.0]);
+        assert_eq!(kept("FROM t |> LIMIT 5 OFFSET 1 |> SELECT b"), [20.0]);
+        assert_eq!(kept("FROM t |> WHERE a > 1 |> LIMIT 0 |> SELECT b"), []);
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
@@ -331,7 +338,8 @@ mod tests {
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> SELECT b AS c |> SELECT b"), (ErrorCode::UnknownColumn, 34));
         assert_eq!(error("FROM t |> ORDER BY a"), (ErrorCode::Unsupported, 19));
-        assert_eq!(error("FROM t |> LIMIT 1"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
