@@ -6,10 +6,10 @@
 //! Calls block. A store that's remote does its uploads and fetches on its
 //! own threads, behind them.
 
-use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Strings};
+use crate::column::{ColumnView, DataType, Strings, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::row_batch::BATCH_ROWS_MAX;
 
 /// A log in a store, which the store names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,8 +60,12 @@ pub struct SpilledColumn {
     pub validity: Option<Block>,
 }
 
-/// How many rows' null bits `write_column` appends at once.
+/// How many rows' null bits, or strings' views, `write_column` appends at
+/// once.
 const CHUNK_ROWS: u32 = 512;
+
+/// The bytes of `CHUNK_ROWS` rows' null bits.
+const CHUNK_BYTES: usize = CHUNK_ROWS as usize / 8;
 
 /// Appends `column`, which must be flat, to `log`: its values, or its
 /// strings' views and then bytes, then its null bitmap, if any.
@@ -77,32 +81,32 @@ pub fn write_column(
     };
     let validity = match column.validity() {
         None => None,
-        Some(validity) => {
-            // Bits from the first row, a chunk at a time, so a view that
-            // starts mid-byte needs no memory to shift them in.
-            let mut chunk = [0_u8; CHUNK_ROWS as usize / 8];
-            let mut block: Option<Block> = None;
-            let row_count = validity.row_count();
-            for first in (0..row_count).step_by(CHUNK_ROWS as usize) {
-                let rows = (row_count - first).min(CHUNK_ROWS);
-                let bytes = at_mut!(chunk, ..rows.div_ceil(8) as usize);
-                bytes.fill(0);
-                for row in 0..rows {
-                    // SAFETY: `first + row` is below `row_count`.
-                    let valid = unsafe { validity.is_valid_unchecked(first + row) };
-                    *at_mut!(bytes, row as usize / 8) |= u8::from(valid) << (row % 8);
-                }
-                let appended = store.append(log, bytes)?;
-                block = Some(match block {
-                    None => appended,
-                    Some(block) => Block { offset: block.offset, len: block.len + appended.len },
-                });
-            }
-            block
-        }
+        Some(validity) => Some(write_validity(store, log, validity)?),
     };
     let (data_type, row_count) = (column.data_type(), column.row_count());
     Ok(SpilledColumn { data_type, row_count, values, bytes, validity })
+}
+
+/// Appends `validity`'s bits from the first row, shifted a chunk at a time
+/// if the view starts mid-byte, so they need no memory.
+fn write_validity(store: &dyn SpillStore, log: LogId, validity: Validity) -> Result<Block, Error> {
+    let (bits, shift) = validity.bits();
+    let len = validity.row_count().div_ceil(8) as usize;
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    let mut block = None;
+    for first in (0..len).step_by(CHUNK_BYTES) {
+        let count = (len - first).min(CHUNK_BYTES);
+        for (i, byte) in at_mut!(chunk, ..count).iter_mut().enumerate() {
+            let next = bits.get(first + i + 1).copied().unwrap_or(0);
+            let pair = u16::from(next) << 8 | u16::from(*at!(bits, first + i));
+            #[expect(clippy::cast_possible_truncation, reason = "a byte of the pair")]
+            let shifted = (pair >> shift) as u8;
+            *byte = shifted;
+        }
+        block = Some(grow(block, store.append(log, at!(chunk, ..count))?));
+    }
+    let Some(block) = block else { crate::check::check_failed(line!()) };
+    Ok(block)
 }
 
 /// Appends `strings`' views, then their bytes, one after another, with the
@@ -154,17 +158,20 @@ fn grow(block: Option<Block>, appended: Block) -> Block {
     }
 }
 
-/// Reads a column `write_column` wrote, into memory from `context`.
+/// Reads a column `write_column` wrote, of at most a batch's rows, into
+/// buffers from `context`.
 pub fn read_column(
     context: &mut Context,
     store: &dyn SpillStore,
     log: LogId,
     spilled: &SpilledColumn,
 ) -> Result<ColumnView, Error> {
+    check!(spilled.row_count <= BATCH_ROWS_MAX);
     let has_bytes = spilled.data_type.has_bytes();
     let size_bytes = spilled.row_count as usize * spilled.data_type.width_bytes();
     check!(spilled.values.len == size_bytes as u64);
-    let mut values = Buffer::allocate(context.allocator(), size_bytes)?;
+    // Reading a block writes every byte of each of these buffers.
+    let mut values = context.values_buffer(size_bytes)?;
     store.read(log, spilled.values, values.as_mut_slice::<u8>())?;
     if has_bytes {
         // Views were written little-endian.
@@ -177,7 +184,7 @@ pub fn read_column(
         Some(block) => {
             let len = spilled.row_count.div_ceil(8);
             check!(block.len == u64::from(len));
-            let mut bits = Buffer::allocate(context.allocator(), len as usize)?;
+            let mut bits = context.small_buffer(len as usize)?;
             store.read(log, block, bits.as_mut_slice::<u8>())?;
             Some(bits)
         }
@@ -186,7 +193,7 @@ pub fn read_column(
         return Ok(ColumnView::new(context, spilled.data_type, values, validity)?);
     };
     let len = usize::try_from(block.len).map_err(|_| Error::OutOfMemory)?;
-    let mut bytes = Buffer::allocate(context.allocator(), len)?;
+    let mut bytes = context.bytes_buffer(len)?;
     store.read(log, block, bytes.as_mut_slice::<u8>())?;
     Ok(ColumnView::strings(context, values, bytes, validity)?)
 }
@@ -198,6 +205,7 @@ mod tests {
 
     use super::*;
     use crate::allocator::Heap;
+    use crate::buffer::Buffer;
     use crate::context::Context;
 
     /// Behaves as S3 does, in memory: appends are uploaded in parts of at

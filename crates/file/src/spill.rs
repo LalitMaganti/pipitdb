@@ -150,7 +150,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri can't use real files")]
     fn spills_columns_to_files_and_back() {
         let store = FileSpill::new(std::env::temp_dir());
-        let values: Vec<i64> = (0..3000).collect();
+        let values: Vec<i64> = (0..2048).collect();
         let columns = [column(&values), column(&values).slice(3, 2000)];
         // Two logs, written in turns, read back independently.
         let (a, b) = (store.create().unwrap(), store.create().unwrap());

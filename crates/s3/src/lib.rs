@@ -256,6 +256,7 @@ mod tests {
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
+    use pipit_kernel::row_batch::BATCH_ROWS_MAX;
     use pipit_kernel::spill::{read_column, write_column};
     use rusty_s3::UrlStyle;
 
@@ -303,8 +304,9 @@ mod tests {
     #[test]
     fn round_trips_columns_across_parts() {
         let Some(store) = store(PART_BYTES_MIN) else { return };
-        // About 12 MiB: two full parts, and a last, smaller one.
-        let columns = [column(600_000), column(600_000), column(400_000)];
+        // A batch's columns, as the engine spills them: about 12 MiB, two
+        // full parts and a last, smaller one.
+        let columns: Vec<_> = (0..750).map(|_| column(BATCH_ROWS_MAX as usize)).collect();
         let log = store.create().unwrap();
         let spilled: Vec<_> =
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
