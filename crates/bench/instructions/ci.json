@@ -24,8 +24,8 @@
   "predicate.and": 2297003,
   "predicate.not": 1506782,
   "predicate.or": 4858603,
-  "query.typical": 791674,
+  "query.typical": 808174,
   "scan.table": 200897,
-  "small.point": 39726,
+  "small.point": 39933,
   "small_planned.point": 5512
 }

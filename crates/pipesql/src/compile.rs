@@ -10,7 +10,7 @@ use pipit_kernel::plan::{
 use pipit_kernel::scannable::Catalog;
 use pipit_kernel::slow_vec::SlowVec;
 
-use crate::ast::{Ast, Node};
+use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::parser::parse_query;
 use crate::registry::Registry;
@@ -90,6 +90,27 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
         let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
         Ok(Relation { node, columns })
+    }
+
+    /// `column`, named `alias` if there is one: the same column, under another
+    /// name.
+    pub fn named(
+        &mut self,
+        column: NamedColumn,
+        alias: Option<Span>,
+    ) -> Result<NamedColumn, Error> {
+        let Some(alias) = alias else { return Ok(column) };
+        let name = self.plan.names.add(self.text(alias))?;
+        Ok(NamedColumn { name, id: column.id })
+    }
+
+    /// `node`, and its name if it's an `Alias`.
+    pub fn unalias(&self, node: Node) -> (Node, Option<Span>) {
+        if node.tag() != Tag::Alias {
+            return (node, None);
+        }
+        let name = self.node(node.first_child() + 1).span();
+        (self.node(node.first_child()), Some(name))
     }
 
     /// Where `node` starts, for errors about it: its leftmost leaf.
@@ -242,7 +263,9 @@ mod tests {
         let s = (b"s".to_vec(), [4.0, 0.0].to_vec());
         assert_eq!(run("FROM t"), [a.clone(), b.clone(), f, s]);
         assert_eq!(run("FROM t |> SELECT b, a"), [b.clone(), a.clone()]);
-        assert_eq!(run("FROM t |> SELECT b |> SELECT b"), [b]);
+        assert_eq!(run("FROM t |> SELECT b |> SELECT b"), core::slice::from_ref(&b));
+        // A column renamed, under its new name only.
+        assert_eq!(run("FROM t |> SELECT b AS c |> SELECT c"), [(b"c".to_vec(), b.1)]);
     }
 
     #[test]
@@ -276,6 +299,9 @@ mod tests {
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
         assert_eq!(groups, [(b"max(b)".to_vec(), [20.0].to_vec())]);
+        let aliased = run("FROM t |> AGGREGATE count(*) AS n, sum(b) AS total GROUP BY a AS k");
+        let names: StdVec<&[u8]> = aliased.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(names, [b"k".as_slice(), b"n", b"total"]);
         let mut keys = kept("FROM t |> AGGREGATE count(*) GROUP BY a |> SELECT a");
         keys.sort_by(f64::total_cmp);
         assert_eq!(keys, [1.0, 2.0]);
@@ -303,6 +329,9 @@ mod tests {
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
+        assert_eq!(error("FROM t |> SELECT b AS c |> SELECT b"), (ErrorCode::UnknownColumn, 34));
+        assert_eq!(error("FROM t |> ORDER BY a"), (ErrorCode::Unsupported, 19));
+        assert_eq!(error("FROM t |> LIMIT 1"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));

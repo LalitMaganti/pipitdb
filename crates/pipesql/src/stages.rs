@@ -29,19 +29,33 @@ pub const WHERE: Rule = Rule {
 pub const SELECT: Rule = Rule {
     keyword: "select",
     point: Point::Stage,
-    items: &[Item::List(Shared::Expr)],
+    items: &[Item::List(Shared::Aliased)],
     compile: compile_select,
+};
+
+pub const ORDER_BY: Rule = Rule {
+    keyword: "order",
+    point: Point::Stage,
+    items: &[Item::After(&["by"], Shared::Ordered)],
+    compile: compile_order_by,
+};
+
+pub const LIMIT: Rule = Rule {
+    keyword: "limit",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Expr), Item::Clause(&["offset"], Shared::Expr)],
+    compile: compile_limit,
 };
 
 pub const AGGREGATE: Rule = Rule {
     keyword: "aggregate",
     point: Point::Stage,
-    items: &[Item::List(Shared::Expr), Item::Clause(&["group", "by"], Shared::Name)],
+    items: &[Item::List(Shared::Aliased), Item::Clause(&["group", "by"], Shared::Aliased)],
     compile: compile_aggregate,
 };
 
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
+pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, ORDER_BY, LIMIT];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
@@ -78,14 +92,28 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
     let list = compiler.node(stage.first_child());
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
+        let (item, alias) = compiler.unalias(compiler.node(list.first_child() + i));
         if item.tag() != Tag::Name {
             return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(item)));
         }
-        scope.push(compiler.find_column(item)?)?;
+        let column = compiler.find_column(item)?;
+        scope.push(compiler.named(column, alias)?)?;
     }
     compiler.scope = scope;
     Ok(())
+}
+
+/// `ORDER BY a, b DESC`: parsed, but nothing sorts yet.
+fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let keys = compiler.node(stage.first_child());
+    let first = compiler.node(keys.first_child());
+    Err(Error::unsupported(Unsupported::OrderBy, compiler.span(first)))
+}
+
+/// `LIMIT 10 OFFSET 20`: parsed, but nothing stops early yet.
+fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let count = compiler.node(stage.first_child());
+    Err(Error::unsupported(Unsupported::Limit, compiler.span(count)))
 }
 
 /// `AGGREGATE COUNT(*), SUM(a) GROUP BY k`: a row for each group of rows
@@ -98,17 +126,20 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
     let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
-        let key = compiler.node(by.first_child() + i);
+        let (key, alias) = compiler.unalias(compiler.node(by.first_child() + i));
+        if key.tag() != Tag::Name {
+            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
+        }
         let column = compiler.find_column(key)?;
         if at!(compiler.plan.columns, column.id as usize).data_type != DataType::Int64 {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
         keys.push(column.id)?;
-        scope.push(column)?;
+        scope.push(compiler.named(column, alias)?)?;
     }
     let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
+        let (item, alias) = compiler.unalias(compiler.node(list.first_child() + i));
         let span = compiler.span(item);
         let unsupported = Error::unsupported(Unsupported::Aggregate, span);
         if item.tag() != Tag::Call || item.child_count() != 2 {
@@ -132,7 +163,10 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         };
         let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
-        let name = compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?;
+        let name = match alias {
+            Some(alias) => compiler.plan.names.add(compiler.text(alias))?,
+            None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
+        };
         let binding = compiler.plan.add_named_column(name, output_type)?;
         aggregates.push(Aggregate { function, input, binding })?;
         scope.push(binding)?;
@@ -173,6 +207,8 @@ mod tests {
                 let rule = REGISTRY.rule(node.rule());
                 (rule.keyword.to_uppercase(), u32::try_from(rule.items.len()).unwrap())
             }
+            Tag::Alias => ("AS".to_string(), 2),
+            Tag::SortKey => ((if node.descending() { "DESC" } else { "ASC" }).to_string(), 1),
             Tag::Unary => (format!("{:?}", node.operator()), 1),
             Tag::Binary => (format!("{:?}", node.operator()), 2),
             _ => {
@@ -211,16 +247,31 @@ mod tests {
             parse("FROM t |> AGGREGATE count(*)"),
             "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
         );
+        assert_eq!(
+            parse("FROM t |> AGGREGATE count(*) AS n GROUP BY a AS k |> SELECT k as key, n"),
+            "(Query (FROM t) (AGGREGATE (List (AS (Call count *) n)) (List (AS a k))) \
+             (SELECT (List (AS k key) n)))"
+        );
+        assert_eq!(
+            parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10 OFFSET 5"),
+            "(Query (FROM t) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List 5)))"
+        );
+        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
     }
 
     #[test]
     fn reports_errors() {
         assert_eq!(error("WHERE x"), (ErrorCode::ExpectedSource, 0));
         assert_eq!(error("FROM t |> FROM u"), (ErrorCode::UnexpectedSource, 10));
-        assert_eq!(error("FROM t |> ORDER x"), (ErrorCode::UnknownStage, 10));
+        assert_eq!(error("FROM t |> SORT x"), (ErrorCode::UnknownStage, 10));
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP a"), (ErrorCode::ExpectedWord, 35));
-        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY"), (ErrorCode::ExpectedToken, 37));
+        assert_eq!(error("FROM t |> ORDER a"), (ErrorCode::ExpectedWord, 16));
+        assert_eq!(error("FROM t |> SELECT a AS"), (ErrorCode::ExpectedToken, 21));
+        assert_eq!(
+            error("FROM t |> AGGREGATE count(*) GROUP BY"),
+            (ErrorCode::ExpectedExpression, 37)
+        );
     }
 }

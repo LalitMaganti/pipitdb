@@ -413,7 +413,8 @@ impl Parser<'_> {
             *at_mut!(children, i) = match *item {
                 Item::One(shared) => self.shared(shared)?,
                 Item::List(shared) => self.list_of(shared)?,
-                Item::Clause(words, shared) => self.clause(words, shared)?,
+                Item::Clause(words, shared) => self.clause(words, shared, false)?,
+                Item::After(words, shared) => self.clause(words, shared, true)?,
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));
@@ -427,6 +428,23 @@ impl Parser<'_> {
                 Ok(Node::leaf(Tag::Name, token.span))
             }
             Shared::Expr => self.expression(),
+            Shared::Aliased => {
+                let expression = self.expression()?;
+                if !self.at_word("as") {
+                    return Ok(expression);
+                }
+                self.advance()?;
+                let name = self.expect(TokenKind::Identifier)?;
+                Ok(Node::alias(self.write(&[expression, Node::leaf(Tag::Name, name.span)])))
+            }
+            Shared::Ordered => {
+                let expression = self.expression()?;
+                let descending = self.at_word("desc");
+                if descending || self.at_word("asc") {
+                    self.advance()?;
+                }
+                Ok(Node::sort_key(descending, self.write(&[expression])))
+            }
         }
     }
 
@@ -447,11 +465,14 @@ impl Parser<'_> {
         }
     }
 
-    /// `words`, then one or more `shared`, or an empty list if the first word
-    /// isn't next.
-    fn clause(&mut self, words: &[&str], shared: Shared) -> Result<Node, Error> {
+    /// `words`, then one or more `shared`. If the first word isn't next, an
+    /// empty list, or an error if `required`.
+    fn clause(&mut self, words: &[&str], shared: Shared, required: bool) -> Result<Node, Error> {
         let Some((first, rest)) = words.split_first() else { pipit_kernel::failed!() };
         if !self.at_word(first) {
+            if required {
+                return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+            }
             return Ok(self.list(Tag::List, &[]));
         }
         self.advance()?;
