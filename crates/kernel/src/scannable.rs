@@ -88,6 +88,12 @@ pub trait Scannable {
         Forms::FLAT
     }
 
+    /// The columns its rows are known to be sorted by, in order, each with
+    /// whether it descends, as a scan of it reads them. By default, none.
+    fn sorted_by(&self) -> &[(u32, bool)] {
+        &[]
+    }
+
     /// A loader, made for each run that loads columns. Only called if
     /// `forms` says a column can be lazy.
     fn new_loader(&self, context: &mut Context) -> Result<Self::Loader, Error> {
@@ -153,6 +159,7 @@ pub struct DynScannable<'a> {
     next: ScannableNext,
     scan_within: ScannableScanWithin<'a>,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
+    sorted_by: unsafe fn(NonNull<()>) -> *const [(u32, bool)],
     loader_layout: Layout,
     new_loader: NewState,
     drop_loader: unsafe fn(NonNull<u8>),
@@ -203,6 +210,8 @@ impl<'a> DynScannable<'a> {
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
+            // SAFETY: as above.
+            sorted_by: |scannable| unsafe { value_of::<T>(scannable).sorted_by() },
             loader_layout: Layout::new::<T::Loader>(),
             // SAFETY: as above.
             new_loader: |scannable, context, loader| unsafe {
@@ -239,6 +248,12 @@ impl<'a> DynScannable<'a> {
     pub fn forms(&self, column: u32) -> Forms {
         // SAFETY: as above.
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }
+    }
+
+    /// The columns its rows are known to be sorted by, in order.
+    pub fn sorted_by(&self) -> &[(u32, bool)] {
+        // SAFETY: as above, and the keys live as long as the scannable.
+        unsafe { &*(self.sorted_by)(self.scannable.as_ptr()) }
     }
 
     /// A source of `columns` of this, in that order, each written in one of
