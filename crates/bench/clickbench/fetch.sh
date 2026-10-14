@@ -8,8 +8,10 @@ dir=${1:-target/clickbench}
 here=$(dirname "$0")
 url=https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet
 mkdir -p "$dir"
+# Linux has sha256sum, and not always shasum; macOS has shasum.
+if command -v sha256sum >/dev/null; then sum=sha256sum; else sum="shasum -a 256"; fi
 check() {
-  (cd "$dir" && sed "s/hits_0.parquet/$1/" "$OLDPWD/$here/hits_0.sha256" | shasum -a 256 -c - >/dev/null)
+  (cd "$dir" && sed "s/hits_0.parquet/$1/" "$OLDPWD/$here/hits_0.sha256" | $sum -c - >/dev/null)
 }
 if [ -f "$dir/hits_0.parquet" ] && check hits_0.parquet; then
   exit 0
