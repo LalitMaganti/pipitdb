@@ -3,7 +3,10 @@
 //! the same way.
 
 use pipit_kernel::allocator::Allocator;
-use pipit_kernel::plan::{LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX};
+use pipit_kernel::column::Forms;
+use pipit_kernel::plan::{
+    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
+};
 use pipit_kernel::scannable::Catalog;
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -11,6 +14,13 @@ use crate::ast::{Ast, Node};
 use crate::error::{Error, ErrorCode, Span};
 use crate::parser::parse_query;
 use crate::registry::Registry;
+
+/// What a query reads rows from, compiled: its plan node, and its columns, by
+/// name.
+pub struct Relation {
+    pub node: PlanNodeId,
+    pub columns: SlowVec<NamedColumn>,
+}
 
 /// A plan being compiled from a query, which each stage's rule adds to.
 pub struct Compiler<'q, 'c> {
@@ -58,6 +68,28 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let text = self.text(name.span());
         let found = self.scope.iter().find(|column| self.plan.names.get(column.name) == text);
         found.copied().ok_or_else(|| Error::new(ErrorCode::UnknownColumn, name.span()))
+    }
+
+    /// The relation `name`, a `Name` node, names: a table in the catalog,
+    /// scanned. Every source of rows is compiled through this, so a query
+    /// read by another can be one more kind of relation.
+    #[inline]
+    pub fn compile_relation(&mut self, name: Node) -> Result<Relation, Error> {
+        let span = name.span();
+        let Some(table) = self.catalog.find(self.text(span)) else {
+            return Err(Error::new(ErrorCode::UnknownTable, span));
+        };
+        let count = table.column_count();
+        let mut reads = SlowVec::fixed(self.allocator, count as usize)?;
+        let mut columns = SlowVec::new(self.allocator, PLAN_COLUMNS_MAX)?;
+        for i in 0..count {
+            let binding = self.plan.add_column(table.column_name(i), table.column_type(i))?;
+            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
+            columns.push(binding)?;
+        }
+        let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
+        let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
+        Ok(Relation { node, columns })
     }
 
     /// Where `node` starts, for errors about it: its leftmost leaf.
