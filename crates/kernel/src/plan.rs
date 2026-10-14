@@ -11,7 +11,7 @@ use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition};
 use crate::erase::{value_mut_of, value_of};
-use crate::lower::{LowerError, Lowering};
+use crate::lower::{LowerError, Lowering, SortKey};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::predicate::{Filter, Predicate};
@@ -363,6 +363,22 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
         lowering.set_source(self.scannable.scan(lowering.allocator(), read, conditions)?);
+        // As far as the columns it sorts by are read: a sort by one that
+        // isn't says nothing of the order by those after it.
+        let read = |&(column, descending): &(u32, bool)| {
+            let read = self.columns.iter().find(|read| read.column == column);
+            read.map(|read| SortKey { column: read.binding.id, descending })
+        };
+        let empty = SortKey { column: 0, descending: false };
+        let mut sorted = [empty; 8];
+        let mut len = 0;
+        for (slot, key) in sorted.iter_mut().zip(self.scannable.sorted_by().iter().map_while(read))
+        {
+            (*slot, len) = (key, len + 1);
+        }
+        if len > 0 {
+            lowering.declare_sorted(at!(sorted, ..len));
+        }
         Ok(())
     }
 
@@ -443,7 +459,7 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
         let forms = self.columns.iter().map(|&(_, forms)| forms);
         let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
         let transform = self.scannable.materialize(lowering.allocator(), positions, forms)?;
-        lowering.add_step(Step::Transform(transform))
+        lowering.add_order_independent(Step::Transform(transform))
     }
 
     /// Keeps loading the needed columns, if any.
@@ -473,7 +489,10 @@ impl<'c> Op<'c> for FilterOp {
         lowering.lower(*at!(node.children, 0))?;
         let allocator = lowering.allocator();
         let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
-        lowering.add_step(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
+        lowering.add_order_independent(Step::Transform(DynTransform::new(
+            allocator,
+            Filter { predicate },
+        )?))
     }
 
     /// Makes no columns.

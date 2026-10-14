@@ -61,6 +61,48 @@ impl<'c> PhysicalPlan<'c> {
     }
 }
 
+/// A key rows are sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SortKey {
+    pub column: ColumnId,
+    pub descending: bool,
+}
+
+/// A layout known to hold for a pipeline's rows: grouped by the columns of
+/// its first `grouped` keys, none meaning one group, and each group sorted
+/// by the `sorted` keys after them. Rows sorted by (a, b) are also grouped
+/// by a, and sorted by b within each group.
+#[derive(Clone, Copy)]
+struct Arrangement {
+    grouped: u8,
+    sorted: u8,
+    keys: [SortKey; ARRANGEMENT_KEYS_MAX],
+}
+
+impl Arrangement {
+    const NONE: Arrangement = Arrangement {
+        grouped: 0,
+        sorted: 0,
+        keys: [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX],
+    };
+
+    fn grouped_by(&self) -> impl Iterator<Item = ColumnId> + '_ {
+        at!(self.keys, ..usize::from(self.grouped)).iter().map(|key| key.column)
+    }
+
+    fn sorted_by(&self) -> &[SortKey] {
+        let start = usize::from(self.grouped);
+        at!(self.keys, start..start + usize::from(self.sorted))
+    }
+}
+
+/// The most keys an arrangement has: one with more isn't kept, as knowing
+/// less of the order is always safe.
+const ARRANGEMENT_KEYS_MAX: usize = 8;
+
+/// The most arrangements a pipeline's rows are known to have at once.
+const ARRANGEMENTS_MAX: usize = 1 << 4;
+
 /// A pipeline being built from a plan, which each operation adds to.
 pub struct Lowering<'p, 'c> {
     /// The plan being lowered.
@@ -75,6 +117,10 @@ pub struct Lowering<'p, 'c> {
     positions: SlowVec<u32>,
     /// How many columns batches have.
     column_count: u32,
+    /// Every arrangement known to hold for the rows, the first `arranged` of
+    /// these, replaced when a step replaces them.
+    arrangements: [Arrangement; ARRANGEMENTS_MAX],
+    arranged: usize,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -98,7 +144,16 @@ impl<'p, 'c> Lowering<'p, 'c> {
         self.source = Some(source);
     }
 
-    pub fn add_step(&mut self, step: Step<'c>) -> Result<(), LowerError> {
+    /// Adds `step`, which keeps the rows in the order they come in, so what's
+    /// known of their order still holds.
+    pub fn add_order_independent(&mut self, step: Step<'c>) -> Result<(), LowerError> {
+        Ok(self.steps.push(step)?)
+    }
+
+    /// Adds `step`, a breaker, whose rows replace those it reads: nothing is
+    /// known of their order but what's declared after.
+    pub fn add_breaker(&mut self, step: Step<'c>) -> Result<(), LowerError> {
+        self.arranged = 0;
         Ok(self.steps.push(step)?)
     }
 
@@ -111,6 +166,94 @@ impl<'p, 'c> Lowering<'p, 'c> {
         *at_mut!(self.positions, column as usize) = self.column_count;
         self.column_count += 1;
         Ok(())
+    }
+
+    /// Records that rows are sorted by `keys`.
+    pub fn declare_sorted(&mut self, keys: &[SortKey]) {
+        self.declare_sorted_within_groups(&[], keys);
+    }
+
+    /// Records that rows are grouped by `keys`: rows with equal keys are next
+    /// to each other.
+    pub fn declare_grouped(&mut self, keys: &[ColumnId]) {
+        self.declare_sorted_within_groups(keys, &[]);
+    }
+
+    /// Records that rows are grouped by `keys`, and each group sorted by
+    /// `sorted_by`. What there isn't room for is forgotten, which is safe.
+    pub fn declare_sorted_within_groups(&mut self, keys: &[ColumnId], sorted_by: &[SortKey]) {
+        let (Ok(grouped), Ok(sorted)) = (u8::try_from(keys.len()), u8::try_from(sorted_by.len()))
+        else {
+            return;
+        };
+        if keys.len() + sorted_by.len() > ARRANGEMENT_KEYS_MAX {
+            return;
+        }
+        let mut arrangement = Arrangement { grouped, sorted, ..Arrangement::NONE };
+        let grouped_by = keys.iter().map(|&column| SortKey { column, descending: false });
+        for (slot, key) in
+            arrangement.keys.iter_mut().zip(grouped_by.chain(sorted_by.iter().copied()))
+        {
+            *slot = key;
+        }
+        if let Some(slot) = self.arrangements.get_mut(self.arranged) {
+            *slot = arrangement;
+            self.arranged += 1;
+        }
+    }
+
+    /// The longest start of a known sort of all rows that sorts by `columns`
+    /// alone.
+    pub fn query_sorted_by(&self, columns: &[ColumnId]) -> &[SortKey] {
+        let mut longest: &[SortKey] = &[];
+        for arrangement in self.known().iter().filter(|a| a.grouped == 0) {
+            let keys = arrangement.sorted_by();
+            let len = keys.iter().take_while(|key| columns.contains(&key.column)).count();
+            if len > longest.len() {
+                longest = at!(keys, ..len);
+            }
+        }
+        longest
+    }
+
+    /// Whether rows are known to be grouped by `keys`, and each group sorted
+    /// by `sorted_by`. Sorting by some keys first also groups by them, and a
+    /// sort key on a grouped column is the same within a group, so means
+    /// nothing.
+    pub fn query_arranged(&self, keys: &[ColumnId], sorted_by: &[SortKey]) -> bool {
+        let wanted = || sorted_by.iter().filter(|key| !keys.contains(&key.column));
+        if keys.is_empty() && wanted().next().is_none() {
+            return true;
+        }
+        'arrangements: for arrangement in self.known() {
+            if !arrangement.grouped_by().all(|column| keys.contains(&column)) {
+                continue;
+            }
+            let grouped = |column| arrangement.grouped_by().any(|by| by == column);
+            let mut sorted = arrangement.sorted_by().iter().filter(|key| !grouped(key.column));
+            // Sort keys on the rest of `keys` group by them too.
+            let mut covered = usize::from(arrangement.grouped);
+            let mut next = sorted.next();
+            while next.is_some_and(|key| keys.contains(&key.column)) {
+                covered += 1;
+                next = sorted.next();
+            }
+            if covered != keys.len() {
+                continue;
+            }
+            for want in wanted() {
+                if next != Some(want) {
+                    continue 'arrangements;
+                }
+                next = sorted.next();
+            }
+            return true;
+        }
+        false
+    }
+
+    fn known(&self) -> &[Arrangement] {
+        at!(self.arrangements, ..self.arranged)
     }
 
     /// Where `column` is in batches.
@@ -136,6 +279,8 @@ pub fn lower<'c>(
         steps: SlowVec::new(allocator, LOWERED_STEPS_MAX)?,
         positions,
         column_count: 0,
+        arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
+        arranged: 0,
     };
     lowering.lower(plan.root)?;
 
@@ -170,7 +315,7 @@ mod tests {
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable};
     use crate::selection::{Kept, Selection};
-    use crate::step::DynSource;
+    use crate::step::{DynOperator, DynSource};
 
     /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20.
     struct Ab;
@@ -181,6 +326,11 @@ mod tests {
         where
             Self: 's;
         type Loader = ();
+
+        // As its rows are: `a` is 1 and 2, `b` 10 and 20.
+        fn sorted_by(&self) -> &[(u32, bool)] {
+            &[(0, false), (1, false)]
+        }
 
         fn column_count(&self) -> u32 {
             2
@@ -261,6 +411,123 @@ mod tests {
             physical.columns().iter().map(|c| batch.column(c.position).int64s()).collect();
         assert_eq!(rows, [[10, 20], [1, 2]]);
         assert!(!execution.next(&mut batch).unwrap());
+    }
+
+    /// Keys to group by, and keys to sort by within groups, each with whether
+    /// it descends.
+    type Ask<'t> = (&'t [ColumnId], &'t [(ColumnId, bool)]);
+
+    /// Lowers its child, then, if `breaker`, a breaker, and asks lowering
+    /// which of `asks` hold: each is keys to group by and keys to sort by
+    /// within groups, by column, a sort key's with whether it descends.
+    struct Knows<'t> {
+        breaker: bool,
+        asks: &'t [Ask<'t>],
+        known: &'t RefCell<StdVec<bool>>,
+        sorted_by_b: &'t RefCell<usize>,
+    }
+
+    impl<'c> Op<'c> for Knows<'_> {
+        fn lower(
+            &self,
+            node: &PlanNode<'c>,
+            lowering: &mut Lowering<'_, 'c>,
+        ) -> Result<(), LowerError> {
+            lowering.lower(*at!(node.children, 0))?;
+            if self.breaker {
+                let operator = DynOperator::new(lowering.allocator(), Nothing)?;
+                lowering.add_breaker(Step::Operator(operator))?;
+            }
+            for &(keys, sorted_by) in self.asks {
+                let sorted_by: StdVec<SortKey> = sorted_by
+                    .iter()
+                    .map(|&(column, descending)| SortKey { column, descending })
+                    .collect();
+                self.known.borrow_mut().push(lowering.query_arranged(keys, &sorted_by));
+            }
+            *self.sorted_by_b.borrow_mut() = lowering.query_sorted_by(&[1]).len();
+            Ok(())
+        }
+    }
+
+    /// Outputs nothing.
+    struct Nothing;
+
+    impl crate::step::Operator for Nothing {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn execute(
+            &self,
+            _: &mut Context,
+            (): &mut (),
+            _: &RowBatch,
+            _: &mut RowBatch,
+        ) -> Result<crate::step::Progress, Error> {
+            Ok(crate::step::Progress::NeedInput)
+        }
+
+        fn finish(
+            &self,
+            _: &mut Context,
+            (): &mut (),
+            _: &mut RowBatch,
+        ) -> Result<crate::step::Progress, Error> {
+            Ok(crate::step::Progress::NeedInput)
+        }
+    }
+
+    /// Which of `asks` hold of `Ab`'s rows, scanning its columns `read`, after
+    /// a breaker if `breaker`; and how many keys `b` alone sorts by.
+    fn knows(read: &[u32], breaker: bool, asks: &[Ask]) -> (StdVec<bool>, usize) {
+        let (known, sorted_by_b) = (RefCell::new(StdVec::new()), RefCell::new(0));
+        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let bindings = [
+            plan.add_column("a", DataType::Int64).unwrap(),
+            plan.add_column("b", DataType::Int64).unwrap(),
+        ];
+        let mut columns = SlowVec::fixed(&Heap, read.len()).unwrap();
+        for &column in read {
+            let binding = bindings[column as usize];
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let op = Knows { breaker, asks, known: &known, sorted_by_b: &sorted_by_b };
+        let op = DynOp::new(&Heap, op).unwrap();
+        plan.add_node(op, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        assert!(plan.output.push(bindings[read[0] as usize]).is_ok());
+        lower(&Heap, &plan).unwrap();
+        drop(plan);
+        (known.into_inner(), sorted_by_b.into_inner())
+    }
+
+    #[test]
+    fn knows_the_order_scans_say_rows_are_in() {
+        // `Ab` is sorted by `a` and then `b`, so also grouped by `a`, and by
+        // `a` and `b`, and sorted by `b` within groups of `a`; but not grouped
+        // by `b`, nor sorted by `b` alone, nor descending.
+        let asks: &[Ask] = &[
+            (&[], &[]),
+            (&[0], &[]),
+            (&[0, 1], &[]),
+            (&[1, 0], &[]),
+            (&[0], &[(1, false)]),
+            (&[], &[(0, false), (1, false)]),
+            (&[1], &[]),
+            (&[], &[(1, false)]),
+            (&[], &[(0, true)]),
+        ];
+        let expected = [true, true, true, true, true, true, false, false, false];
+        assert_eq!(knows(&[0, 1], false, asks), (expected.to_vec(), 0));
+        // Without `a` read, nothing is known of `b`'s order.
+        assert_eq!(knows(&[1], false, &asks[6..8]), ([false, false].to_vec(), 0));
+        // A breaker's rows are new.
+        assert_eq!(knows(&[0, 1], true, &asks[1..2]), ([false].to_vec(), 0));
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
