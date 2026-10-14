@@ -94,6 +94,9 @@ pub struct Bounds {
 ///
 /// It's a handle, small to move: the buffers and what they hold are in a
 /// header it shares with its clones and slices.
+///
+/// A view in a batch has the batch's rows, at most `BATCH_ROWS_MAX`. One an
+/// integration keeps for itself, such as a chunk's dictionary, may have more.
 #[derive(Clone)]
 pub struct ColumnView {
     /// A `Header`, written in it.
