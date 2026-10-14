@@ -2,7 +2,9 @@
 //!
 //! Each log is a multipart upload. Appends are staged in a local file until
 //! there's a part's worth, then streamed up from it, so parts never sit in
-//! memory. Sealing completes the upload; reads are ranged gets.
+//! memory. Sealing completes the upload. Reads fetch a part's worth at a
+//! time, into a local file, and are served from it: the engine reads a
+//! batch's column at a time, far less than is worth a request.
 //!
 //! Logs are deleted when they're done with. If a process ends first, what
 //! it left is cleaned up by the bucket's lifecycle rules, which the bucket's
@@ -52,7 +54,20 @@ struct Log {
     staged: Option<(LogId, u64)>,
     len: u64,
     sealed: bool,
+    /// What reads fetched of the sealed log, kept until it's deleted.
+    fetched: Vec<Fetched>,
 }
+
+/// Bytes of a sealed log, fetched into a staged log of their own.
+#[derive(Clone, Copy)]
+struct Fetched {
+    offset: u64,
+    len: u64,
+    staged: LogId,
+}
+
+/// How many bytes of a fetch are read from S3 at once, and staged.
+const FETCH_CHUNK_BYTES: usize = 64 << 10;
 
 impl S3Spill {
     /// Logs in `bucket`, as `prefix`, a UUID and a number, uploaded in parts of
@@ -116,6 +131,37 @@ impl S3Spill {
         Ok(etag.to_str().map_err(|_| Error::Io)?.to_owned())
     }
 
+    /// Fetches `len` bytes of `log`, which is sealed, from `offset`.
+    fn fetch(&self, log: &Log, offset: u64, len: u64) -> Result<Fetched, Error> {
+        let staged = self.staging.create()?;
+        let fetched = self.fetch_into(log, offset, len, staged);
+        if fetched.is_err() {
+            self.staging.delete(staged);
+        }
+        fetched.map(|()| Fetched { offset, len, staged })
+    }
+
+    fn fetch_into(&self, log: &Log, offset: u64, len: u64, staged: LogId) -> Result<(), Error> {
+        let action = self.bucket.get_object(Some(&self.credentials), &log.key);
+        let last = offset + len - 1;
+        let mut response = self
+            .agent
+            .get(action.sign(SIGNED_FOR).as_str())
+            .header("range", format!("bytes={offset}-{last}"))
+            .call()
+            .map_err(|_| Error::Io)?;
+        let mut body = response.body_mut().as_reader();
+        let mut chunk = vec![0; FETCH_CHUNK_BYTES];
+        let mut left = len;
+        while left > 0 {
+            let n = usize::try_from(left).map_or(chunk.len(), |left| left.min(chunk.len()));
+            body.read_exact(&mut chunk[..n]).map_err(|_| Error::Io)?;
+            self.staging.append(staged, &chunk[..n])?;
+            left -= n as u64;
+        }
+        self.staging.seal(staged)
+    }
+
     fn complete(&self, log: &Log) -> Result<(), Error> {
         let action = self.bucket.complete_multipart_upload(
             Some(&self.credentials),
@@ -147,6 +193,7 @@ impl SpillStore for S3Spill {
             staged: None,
             len: 0,
             sealed: false,
+            fetched: Vec::new(),
         };
         let mut logs = self.logs.lock().map_err(|_| Error::Io)?;
         logs.push(Some(log));
@@ -194,15 +241,18 @@ impl SpillStore for S3Spill {
             if into.is_empty() {
                 return Ok(());
             }
-            let action = self.bucket.get_object(Some(&self.credentials), &log.key);
-            let last = block.offset + block.len - 1;
-            let mut response = self
-                .agent
-                .get(action.sign(SIGNED_FOR).as_str())
-                .header("range", format!("bytes={}-{last}", block.offset))
-                .call()
-                .map_err(|_| Error::Io)?;
-            response.body_mut().as_reader().read_exact(into).map_err(|_| Error::Io)
+            let end = block.offset + block.len;
+            let covers = |f: &&Fetched| f.offset <= block.offset && end <= f.offset + f.len;
+            let fetched = if let Some(&fetched) = log.fetched.iter().find(covers) {
+                fetched
+            } else {
+                let len = block.len.max(self.part_bytes).min(log.len - block.offset);
+                let fetched = self.fetch(log, block.offset, len)?;
+                log.fetched.push(fetched);
+                fetched
+            };
+            let staged = Block { offset: block.offset - fetched.offset, len: block.len };
+            self.staging.read(fetched.staged, staged, into)
         })
     }
 
@@ -212,6 +262,9 @@ impl SpillStore for S3Spill {
         let Some(log) = slot.take() else { return };
         if let Some((staged, _)) = log.staged {
             self.staging.delete(staged);
+        }
+        for fetched in &log.fetched {
+            self.staging.delete(fetched.staged);
         }
         // Failing to delete leaves an object or upload behind, which a
         // bucket's lifecycle rules can clean up: nothing else is affected.
@@ -315,6 +368,10 @@ mod tests {
             let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
             assert_eq!(read.int64s(), column.int64s());
         }
+        // A request per part, not per column.
+        let logs = store.logs.lock().unwrap();
+        assert_eq!(logs[usize::try_from(log.0).unwrap()].as_ref().unwrap().fetched.len(), 3);
+        drop(logs);
         store.delete(log);
     }
 
