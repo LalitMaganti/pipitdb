@@ -149,6 +149,9 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "only integer and float columns can be aggregated yet".into(),
             "not a number column".into(),
         ),
+        what if what == Unsupported::OrderBy as u16 => {
+            ("rows can't be sorted yet".into(), "`ORDER BY` isn't supported yet".into())
+        }
         what if what == Unsupported::GroupKey as u16 => (
             "only integer columns can be grouped by yet".into(),
             "not an integer column".into(),

@@ -31,6 +31,9 @@ pub enum Tag {
     /// An expression and a name for it, a `Name`, from `first_child`: `a AS
     /// b` in `SELECT` and `RENAME`, and `b = a` in `SET`.
     Named,
+    /// What rows are sorted by: the expression at `first_child`, and whether
+    /// it descends.
+    SortKey,
     /// A stage of a query: one child per item of its rule, from
     /// `first_child`. Its rule is `rule()`, an id in the parser's registry.
     Stage,
@@ -126,6 +129,10 @@ impl Node {
         Node { tag: tag as u8, data: [a, b, c], payload: first_child }
     }
 
+    pub(crate) fn sort_key(descending: bool, first_child: u32) -> Node {
+        Node { tag: Tag::SortKey as u8, data: [u8::from(descending), 0, 0], payload: first_child }
+    }
+
     pub(crate) fn operation(tag: Tag, operator: Operator, first_child: u32) -> Node {
         Node { tag: tag as u8, data: [operator as u8, 0, 0], payload: first_child }
     }
@@ -157,6 +164,12 @@ impl Node {
     pub fn child_count(self) -> u32 {
         check!(matches!(self.tag(), Tag::Call | Tag::List | Tag::Query));
         self.data_u24()
+    }
+
+    /// For `SortKey`: whether it sorts descending.
+    pub fn descending(self) -> bool {
+        check!(self.tag() == Tag::SortKey);
+        self.data[0] != 0
     }
 
     /// For `Stage`: its rule's id in the registry it was parsed with.

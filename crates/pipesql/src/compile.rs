@@ -348,6 +348,9 @@ mod tests {
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
         assert_eq!(groups, [(b"max(b)".to_vec(), [20.0].to_vec())]);
+        let aliased = run("FROM t |> AGGREGATE count(*) AS n, sum(b) AS total GROUP BY a AS k");
+        let names: StdVec<&[u8]> = aliased.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(names, [b"k".as_slice(), b"n", b"total"]);
         let mut keys = kept("FROM t |> AGGREGATE count(*) GROUP BY a |> SELECT a");
         keys.sort_by(f64::total_cmp);
         assert_eq!(keys, [1.0, 2.0]);
@@ -370,6 +373,7 @@ mod tests {
         assert_eq!(error("FROM t |> RENAME a AS b, A AS c"), (ErrorCode::ListedTwice, 25));
         assert_eq!(error("FROM t |> SET a = a + 1"), (ErrorCode::Unsupported, 18));
         assert_eq!(error("FROM t |> EXTEND a |> SELECT a"), (ErrorCode::AmbiguousColumn, 29));
+        assert_eq!(error("FROM t |> ORDER BY a"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
