@@ -41,6 +41,10 @@ pub enum ErrorCode {
     NumberTooLarge = 17,
     /// A condition has more than `PREDICATE_NODES_MAX` parts.
     ConditionTooLarge = 18,
+    /// A table has two columns of one name, ignoring case.
+    DuplicateColumn = 19,
+    /// A name names more than one column, ignoring case.
+    AmbiguousColumn = 20,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -79,7 +83,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::ConditionTooLarge;
+    pub const LAST: ErrorCode = ErrorCode::AmbiguousColumn;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {
