@@ -30,3 +30,7 @@ fIpad	FROM hits |> WHERE MobilePhoneModel = 'iPad' |> SELECT UserID	SELECT UserI
 fSearch	FROM hits |> WHERE SearchPhrase != '' |> SELECT SearchPhrase	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> ''
 fCounter	FROM hits |> WHERE CounterID = 59 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 59
 fCounterFew	FROM hits |> WHERE CounterID = 52 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 52
+7	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*) AS c GROUP BY AdvEngineID |> ORDER BY c DESC	SELECT AdvEngineID, COUNT(*) AS c FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY c DESC
+15	FROM hits |> AGGREGATE count(*) AS c GROUP BY UserID |> ORDER BY c DESC |> LIMIT 10	SELECT UserID, COUNT(*) AS c FROM hits GROUP BY UserID ORDER BY c DESC LIMIT 10
+24t	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY EventTime, WatchID |> LIMIT 10 |> SELECT SearchPhrase	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, WatchID LIMIT 10
+30t	FROM hits |> WHERE SearchPhrase != '' |> AGGREGATE count(*) AS c, sum(IsRefresh), avg(ResolutionWidth) GROUP BY SearchEngineID, ClientIP |> ORDER BY c DESC, SearchEngineID, ClientIP |> LIMIT 10	SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC, SearchEngineID, ClientIP LIMIT 10

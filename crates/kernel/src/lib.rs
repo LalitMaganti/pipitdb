@@ -23,6 +23,7 @@ pub mod limit;
 pub mod lower;
 pub mod names;
 pub mod optimize;
+pub mod order_by;
 pub mod pipeline;
 pub mod plan;
 pub mod predicate;

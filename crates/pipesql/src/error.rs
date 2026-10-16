@@ -80,7 +80,7 @@ pub enum Unsupported {
     AggregateType = 7,
     /// A key to group by that isn't an `Int64` column.
     GroupKey = 8,
-    /// `ORDER BY`, which nothing sorts for yet.
+    /// An `ORDER BY` key that isn't an integer or float column.
     OrderBy = 9,
 }
 
