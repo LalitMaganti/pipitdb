@@ -3,6 +3,7 @@
 - Follow [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 - The kernel and pipesql crates are `no_std` + `alloc`. No new dependencies without asking.
 - Keep code simple and easy to read.
+- pipitdb and Perfetto's trace processor should each be the best of both, on size and on speed. Port Perfetto literally, with its structure, interfaces and names, unless pipitdb's way is measurably smaller or faster; then Perfetto should take it too. Each divergence is listed in the PR's description with its measured reason, and has an issue labelled `perfetto-divergence` saying which side should change: `improve-pipitdb` or `improve-perfetto`. `keep` is only for what one side's constraints force, such as pipitdb's memory budget or Perfetto's SQLite host, listed in #175.
 - Don't implement something poorly: leave it out until it can be done well.
 - Refactor early and often. When a change shows the code should be shaped differently, such as two types that are really one, reshape it now rather than leaving it: later means migrating more code.
 - Only add a comment when the code isn't obvious. Keep it as short as it can be, but no shorter, and plain.
