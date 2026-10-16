@@ -31,6 +31,9 @@ pub enum Item {
     One(Shared),
     /// One or more, separated by commas, under a `List` node.
     List(Shared),
+    /// If the query has this word next, ignoring case, a list of the rest
+    /// after it, as `List` does; if not, an empty `List`.
+    Clause(&'static str, Shared),
 }
 
 /// The pieces of grammar stages are built from.

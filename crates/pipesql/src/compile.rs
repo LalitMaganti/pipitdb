@@ -10,7 +10,7 @@ use pipit_kernel::plan::{
 use pipit_kernel::scannable::Catalog;
 use pipit_kernel::slow_vec::SlowVec;
 
-use crate::ast::{Ast, Node};
+use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::parser::parse_query;
 use crate::registry::Registry;
@@ -111,6 +111,14 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
         let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
         Ok(Relation { node, columns })
+    }
+
+    /// The value of `node`, an `Integer`.
+    pub fn integer(&self, node: Node) -> Result<u64, Error> {
+        check!(node.tag() == Tag::Integer);
+        // The lexer's integers are digits, so the only error is size.
+        let too_large = Error::new(ErrorCode::NumberTooLarge, node.span());
+        self.text(node.span()).parse::<u64>().map_err(|_| too_large)
     }
 
     /// Where `node` starts, for errors about it: its leftmost leaf.
@@ -297,6 +305,13 @@ mod tests {
     }
 
     #[test]
+    fn limits_rows() {
+        assert_eq!(kept("FROM t |> LIMIT 1 |> SELECT b"), [10.0]);
+        assert_eq!(kept("FROM t |> LIMIT 5 OFFSET 1 |> SELECT b"), [20.0]);
+        assert_eq!(kept("FROM t |> WHERE a > 1 |> LIMIT 0 |> SELECT b"), []);
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
@@ -305,6 +320,8 @@ mod tests {
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));
         assert_eq!(error("FROM dup"), (ErrorCode::DuplicateColumn, 5));
+        assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
