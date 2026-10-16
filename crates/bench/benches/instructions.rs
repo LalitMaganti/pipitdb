@@ -137,6 +137,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::f_search(hits_query("fSearch"))]
 #[bench::f_counter(hits_query("fCounter"))]
 #[bench::f_counter_few(hits_query("fCounterFew"))]
+#[bench::q2(hits_query("2"))]
 #[bench::g_adv(hits_query("gAdv"))]
 #[bench::g_region(hits_query("gRegion"))]
 #[bench::g_window(hits_query("gWindow"))]
