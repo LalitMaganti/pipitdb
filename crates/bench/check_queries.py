@@ -4,13 +4,15 @@ files, checks the rows match, and says how many of the suite's queries
 pipitdb runs. Floats match if they're within a relative 1e-9, and rows in any
 order.
 
-Suites are ClickBench, in clickbench/queries.tsv, and TPC-H and TPC-DS, in
-tpc/, whose files tpc/generate.py makes. A query pipitdb can't run yet has no
-PipeSQL there.
+Suites are ours over ClickBench's data, in clickbench/queries.tsv;
+ClickBench's own 43 queries, in clickbench/official.tsv; and TPC-H and TPC-DS,
+in tpc/, whose files tpc/generate.py makes. A query pipitdb can't run yet has
+no PipeSQL there.
 
 Usage: crates/bench/check_queries.py SUITE FILE...
-SUITE is clickbench, tpch or tpcds. Each file is a table named after it, less
-a trailing `_N`, as the `suite` example names them.
+SUITE is clickbench, clickbench-official, tpch or tpcds. Each file is a
+table named after it, less a trailing `_N`, as the `suite` example names
+them.
 """
 
 import pathlib
@@ -21,6 +23,7 @@ import sys
 HERE = pathlib.Path(__file__).parent
 QUERIES = {
     "clickbench": HERE / "clickbench/queries.tsv",
+    "clickbench-official": HERE / "clickbench/official.tsv",
     "tpch": HERE / "tpc/tpch.tsv",
     "tpcds": HERE / "tpc/tpcds.tsv",
 }
@@ -75,11 +78,15 @@ def main():
     tables = {}
     for file in files:
         tables.setdefault(table(file), []).append(f"'{file}'")
-    # ClickBench's strings are stored as binary.
+    # ClickBench's strings are stored as binary. Its own queries read its dates
+    # as dates, as its DuckDB setup does; ours and pipitdb read the day number.
+    select = "* REPLACE (make_date(EventDate) AS EventDate)" if suite == "clickbench-official" else "*"
     views = "".join(
-        f"CREATE VIEW {name} AS SELECT * FROM read_parquet([{', '.join(paths)}], binary_as_string=true);\n"
+        f"CREATE VIEW {name} AS SELECT {select} FROM read_parquet([{', '.join(paths)}], binary_as_string=true);\n"
         for name, paths in tables.items()
     )
+    if suite == "clickbench-official":
+        views += "CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);\n"
     total, written, matched = 0, 0, 0
     for line in queries.read_text().splitlines():
         number, pipesql, sql = line.split("\t")
