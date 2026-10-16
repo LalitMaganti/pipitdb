@@ -775,16 +775,6 @@ mod tests {
             Ok(())
         }
 
-        fn merge(
-            &self,
-            _: &mut Context,
-            values: &mut Vec<i64>,
-            other: Vec<i64>,
-        ) -> Result<(), Error> {
-            values.extend(other);
-            Ok(())
-        }
-
         fn finalize(&self, _: &mut Context, values: &mut Vec<i64>) -> Result<(), Error> {
             values.reverse();
             Ok(())
@@ -906,24 +896,6 @@ mod tests {
             batches(&mut pipeline.start(&query).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
-    }
-
-    #[test]
-    fn merged_breakers_hold_every_copys_rows() {
-        let mut context = Context::new(&Heap);
-        let consumed = |context: &mut Context, values: &[i64]| {
-            let mut batch = RowBatch::new();
-            batch.reset(2);
-            assert!(batch.push_column(int64s(values)).is_ok());
-            let mut state = Breaker::new_state(&Backwards, context).unwrap();
-            Backwards.consume(context, &mut state, &batch).unwrap();
-            state
-        };
-        let (mut first, second) =
-            (consumed(&mut context, &[0, 1]), consumed(&mut context, &[2, 3]));
-        Backwards.merge(&mut context, &mut first, second).unwrap();
-        Backwards.finalize(&mut context, &mut first).unwrap();
-        assert_eq!(first, [3, 2, 1, 0]);
     }
 
     #[test]

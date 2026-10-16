@@ -80,10 +80,6 @@ pub trait Operator {
 /// Holds back every row of its input, then outputs rows made from them, such
 /// as a sort or an aggregation: an operator, which consumes each input, then
 /// finalizes and serves once the input ends.
-///
-/// Its state is mergeable, so the executor can run copies of the work before
-/// it, each consuming into a state of its own, and merge them before it
-/// finalizes. Run on one thread, nothing is merged.
 pub trait Breaker {
     type State;
 
@@ -96,16 +92,7 @@ pub trait Breaker {
         input: &RowBatch,
     ) -> Result<(), Error>;
 
-    /// Folds `other`, which consumed other rows of the same input, into
-    /// `state`. Neither is finalized.
-    fn merge(
-        &self,
-        context: &mut Context,
-        state: &mut Self::State,
-        other: Self::State,
-    ) -> Result<(), Error>;
-
-    /// Called once, after every input is consumed and every state merged.
+    /// Called once, after every input is consumed.
     fn finalize(&self, context: &mut Context, state: &mut Self::State) -> Result<(), Error>;
 
     /// Fills `output`, which is empty when called, with the next rows,
