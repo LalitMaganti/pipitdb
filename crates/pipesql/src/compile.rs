@@ -270,8 +270,8 @@ mod tests {
     fn aggregates_with_and_without_keys() {
         let count = (b"count(*)".to_vec(), [2.0].to_vec());
         let sum = (b"sum(b)".to_vec(), [30.0].to_vec());
-        let least = (b"min(a)".to_vec(), [1.0].to_vec());
-        assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), min(a)"), [count, sum, least]);
+        let avg = (b"avg(f)".to_vec(), [1.5].to_vec());
+        assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), avg(f)"), [count, sum, avg]);
         // Each `a` is a group, of one row; the keys come first.
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
@@ -304,7 +304,6 @@ mod tests {
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
     }
