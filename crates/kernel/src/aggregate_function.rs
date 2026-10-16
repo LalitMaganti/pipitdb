@@ -183,6 +183,30 @@ pub(crate) trait AggregateFunction {
         states: GroupStates,
         overflow: &mut bool,
     );
+    /// As `update_group` for each run of rows of one group: the rows from
+    /// each of `starts` to the next, of the group `groups` says. `input` has
+    /// no nulls.
+    fn update_runs(
+        &self,
+        input: &AggregateInput,
+        groups: &[u32],
+        starts: &[u32],
+        mut states: GroupStates,
+        overflow: &mut bool,
+    ) {
+        for run in starts.windows(2) {
+            let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
+            let values = input.values.get(start..end).unwrap_or_default();
+            let rows = end - start;
+            let run_input = AggregateInput { values, valid: None, rows, bounds: input.bounds };
+            let states = GroupStates {
+                words: &mut *states.words,
+                stride: states.stride,
+                seen: states.seen.as_deref_mut(),
+            };
+            self.update_group(&run_input, *at!(groups, start), states, overflow);
+        }
+    }
     /// Writes the result of each of `groups` to `values`, and to `valid`, a
     /// bit each, whether it holds one.
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]);
@@ -287,6 +311,16 @@ fn scatter(
     }
 }
 
+/// Whether `rows` values within `bounds`, if known, can't sum past an
+/// `Int64`.
+fn fits(bounds: Option<Bounds>, rows: usize) -> bool {
+    bounds.is_some_and(|bounds| {
+        let largest = bounds.min.unsigned_abs().max(bounds.max.unsigned_abs());
+        let reach = largest.checked_mul(rows as u64);
+        reach.is_some_and(|reach| reach <= i64::MAX.cast_unsigned())
+    })
+}
+
 /// The sum of `input`'s values that aren't null, exactly. The high and low
 /// 32 bits of the values are summed apart, which can't overflow for a batch
 /// and vectorizes, unlike checking each addition.
@@ -367,6 +401,20 @@ impl AggregateFunction for CountStar {
         _: &mut bool,
     ) {
         *states.word_mut(group) += i64::try_from(input.rows).unwrap_or(0);
+    }
+
+    fn update_runs(
+        &self,
+        _: &AggregateInput,
+        groups: &[u32],
+        starts: &[u32],
+        mut states: GroupStates,
+        _: &mut bool,
+    ) {
+        for run in starts.windows(2) {
+            let (start, end) = (*at!(run, 0), *at!(run, 1));
+            *states.word_mut(*at!(groups, start as usize)) += i64::from(end - start);
+        }
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
@@ -457,6 +505,38 @@ impl AggregateFunction for Sum {
         *states.word_mut(group) = total;
         *overflow |= sum.is_err() || o;
         states.mark(group, input.count_valid() != 0);
+    }
+
+    fn update_runs(
+        &self,
+        input: &AggregateInput,
+        groups: &[u32],
+        starts: &[u32],
+        mut states: GroupStates,
+        overflow: &mut bool,
+    ) {
+        // Each run is summed wrapping where the bounds say no run can
+        // overflow, and checking each addition otherwise.
+        let fits = fits(input.bounds, input.rows);
+        let mut ovf = false;
+        for run in starts.windows(2) {
+            let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
+            let values = at!(input.values, start..end).iter();
+            let (sum, o) = if fits {
+                (values.fold(0_i64, |sum, &value| sum.wrapping_add(value)), false)
+            } else {
+                values.fold((0_i64, false), |(sum, ovf), &value| {
+                    let (sum, o) = sum.overflowing_add(value);
+                    (sum, ovf | o)
+                })
+            };
+            let group = *at!(groups, start);
+            let (total, o2) = states.word(group).overflowing_add(sum);
+            *states.word_mut(group) = total;
+            states.mark(group, true);
+            ovf |= o | o2;
+        }
+        *overflow |= ovf;
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
