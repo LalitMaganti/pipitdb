@@ -4,7 +4,7 @@
 set -eu
 target=$1
 
-cargo build -q --release --target "$target" -p pipitdb-bench --example size --features size
+cargo build -q --release --target "$target" -p pipitdb-bench --example size --no-default-features --features size
 case $target in
   wasm32-*) file=size.wasm ;;
   *-apple-*) file=libsize.dylib ;;

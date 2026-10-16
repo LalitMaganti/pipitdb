@@ -62,9 +62,7 @@ impl<'a> FixedAllocator<'a> {
         let first = (4 * self.block_bytes + BUFFER_ALIGNMENT_BYTES).max(CHUNK_BYTES_MIN);
         let max = CHUNK_BYTES_MAX.max(first);
         let bytes = (first << self.chunk_count.get().min(16)).min(max);
-        let Ok(layout) = Layout::from_size_align(bytes, BUFFER_ALIGNMENT_BYTES) else {
-            crate::check::check_failed(line!())
-        };
+        let Ok(layout) = Layout::from_size_align(bytes, BUFFER_ALIGNMENT_BYTES) else { failed!() };
         layout
     }
 
@@ -125,7 +123,7 @@ impl Drop for FixedAllocator<'_> {
             let (before, bytes) = unsafe { at.cast::<Link>().read() };
             chunk = before;
             let Ok(layout) = Layout::from_size_align(bytes, BUFFER_ALIGNMENT_BYTES) else {
-                crate::check::check_failed(line!())
+                failed!()
             };
             // SAFETY: taken with this layout, and no block in it is used.
             unsafe { self.allocator.deallocate(at, layout) };

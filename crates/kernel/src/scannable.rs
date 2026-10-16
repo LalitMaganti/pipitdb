@@ -98,7 +98,7 @@ pub trait Scannable {
     /// `forms` says a column can be lazy.
     fn new_loader(&self, context: &mut Context) -> Result<Self::Loader, Error> {
         let _ = context;
-        crate::check::check_failed(line!())
+        failed!()
     }
 
     /// The values of `lazy`, which this wrote, for the rows `selection`
@@ -114,7 +114,7 @@ pub trait Scannable {
         forms: Forms,
     ) -> Result<ColumnView, Error> {
         let _ = (context, loader, lazy, selection, forms);
-        crate::check::check_failed(line!())
+        failed!()
     }
 }
 

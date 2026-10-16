@@ -297,7 +297,7 @@ pub fn lower<'c>(
         let name = names.add(plan.names.get(column.name))?;
         columns.push(OutputColumn { name, position: lowering.query_position(column.id) })?;
     }
-    let Some(source) = lowering.source else { crate::check::check_failed(line!()) };
+    let Some(source) = lowering.source else { failed!() };
     Ok(PhysicalPlan { pipeline: Pipeline::new(source, lowering.steps), names, columns })
 }
 
@@ -980,7 +980,7 @@ mod tests {
 
     impl<'c> Op<'c> for Reads {
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
-            crate::check::check_failed(line!())
+            failed!()
         }
 
         fn reads(&self, reads: &mut Needed) {

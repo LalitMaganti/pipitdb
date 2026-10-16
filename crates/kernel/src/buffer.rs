@@ -194,7 +194,7 @@ unsafe fn header<'a>(data: NonNull<u8>) -> &'a Header {
 unsafe fn deallocate(data: NonNull<u8>) {
     // SAFETY: upheld by the caller.
     let header = unsafe { header(data) };
-    let Ok(layout) = layout(header.size_bytes) else { crate::check::check_failed(line!()) };
+    let Ok(layout) = layout(header.size_bytes) else { failed!() };
     // SAFETY: the header and bytes were allocated together with this layout,
     // from this allocator, which outlives them.
     unsafe { header.allocator.as_ref().deallocate(data.sub(HEADER_BYTES), layout) };
