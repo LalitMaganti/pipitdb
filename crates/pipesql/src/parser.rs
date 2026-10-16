@@ -5,6 +5,7 @@
 
 use crate::ast::{Ast, BLOCK_BYTES, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
+use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::allocator::Allocator;
@@ -347,7 +348,7 @@ impl Parser<'_> {
             3 => (Keyword::Not, b"not".as_slice()),
             _ => return Keyword::None,
         };
-        if text.eq_ignore_ascii_case(keyword.1) { keyword.0 } else { Keyword::None }
+        if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }
     }
 }
 
@@ -460,8 +461,7 @@ impl Parser<'_> {
     /// Whether the current token is `word`, ignoring case.
     fn at_word(&self, word: &str) -> bool {
         let current = self.current();
-        current.kind == TokenKind::Identifier
-            && self.text(current).eq_ignore_ascii_case(word.as_bytes())
+        current.kind == TokenKind::Identifier && same_word(self.text(current), word.as_bytes())
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.

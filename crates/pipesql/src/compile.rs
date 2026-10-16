@@ -12,6 +12,7 @@ use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
+use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
 
@@ -68,7 +69,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     #[inline(never)]
     fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
         let name = |i: usize| self.plan.names.get(at!(columns, i).name);
-        (1..columns.len()).any(|i| (0..i).any(|j| name(j).eq_ignore_ascii_case(name(i))))
+        (1..columns.len())
+            .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
     }
 
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
@@ -76,8 +78,9 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// a`, but then the name can't be used, as in Perfetto.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
         let text = self.text(name.span());
-        let named =
-            |column: &&NamedColumn| self.plan.names.get(column.name).eq_ignore_ascii_case(text);
+        let named = |column: &&NamedColumn| {
+            same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
+        };
         let mut found = self.scope.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
