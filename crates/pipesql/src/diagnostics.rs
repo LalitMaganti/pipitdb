@@ -66,13 +66,42 @@ fn describe(found: &str, error: &Error) -> Message {
             "the list is too long".into(),
             format!("lists are limited to {} items", crate::parser::LIST_MAX),
         ),
+        ErrorCode::ExpectedAs => {
+            (format!("expected `AS`, found {found}"), "expected `AS` here".into())
+        }
+        ErrorCode::NumberTooLarge => {
+            (format!("{found} is too large"), "doesn't fit in 64 bits".into())
+        }
+        ErrorCode::ConditionTooLarge => (
+            "the condition is too large".into(),
+            format!(
+                "conditions are limited to {} parts",
+                pipit_kernel::predicate::PREDICATE_NODES_MAX
+            ),
+        ),
+        ErrorCode::ExpectedWord => (
+            format!("expected the rest of the clause, found {found}"),
+            "expected the clause's next word, such as `BY`".into(),
+        ),
+        ErrorCode::UnknownTable
+        | ErrorCode::UnknownColumn
+        | ErrorCode::AmbiguousColumn
+        | ErrorCode::ListedTwice
+        | ErrorCode::NoColumnsLeft
+        | ErrorCode::DuplicateColumn
+        | ErrorCode::UnknownFunction => named(found, error.code),
+        ErrorCode::Unsupported => unsupported(found, error.detail),
+    };
+    Message { title, label }
+}
+
+/// The title and label for an error about what a name names, `code`.
+fn named(found: &str, code: ErrorCode) -> (String, String) {
+    match code {
         ErrorCode::UnknownTable => (format!("no table {found}"), "not in the catalog".into()),
         ErrorCode::UnknownColumn => (format!("no column {found}"), "not a column here".into()),
         ErrorCode::AmbiguousColumn => {
             (format!("more than one column named {found}"), "could be any of them".into())
-        }
-        ErrorCode::ExpectedAs => {
-            (format!("expected `AS`, found {found}"), "expected `AS` here".into())
         }
         ErrorCode::ListedTwice => {
             (format!("{found} is listed twice"), "already listed in this stage".into())
@@ -84,19 +113,11 @@ fn describe(found: &str, error: &Error) -> Message {
             format!("{found} has two columns of one name"),
             "a table's columns need their own names".into(),
         ),
-        ErrorCode::NumberTooLarge => {
-            (format!("{found} is too large"), "doesn't fit in 64 bits".into())
+        ErrorCode::UnknownFunction => {
+            (format!("no function {found}"), "not a function there is".into())
         }
-        ErrorCode::ConditionTooLarge => (
-            "the condition is too large".into(),
-            format!(
-                "conditions are limited to {} parts",
-                pipit_kernel::predicate::PREDICATE_NODES_MAX
-            ),
-        ),
-        ErrorCode::Unsupported => unsupported(found, error.detail),
-    };
-    Message { title, label }
+        _ => pipit_kernel::failed!(),
+    }
 }
 
 /// The title and label for an `Unsupported` error about `detail`.
@@ -121,6 +142,18 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
         what if what == Unsupported::Limit as u16 => {
             ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
         }
+        what if what == Unsupported::Aggregate as u16 => (
+            "only functions of a column, or `count(*)`, can be aggregated yet".into(),
+            "not a function of a column".into(),
+        ),
+        what if what == Unsupported::AggregateType as u16 => (
+            "only integer columns can be aggregated yet".into(),
+            "not an integer column".into(),
+        ),
+        what if what == Unsupported::GroupKey as u16 => (
+            "only integer columns can be grouped by yet".into(),
+            "not an integer column".into(),
+        ),
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }
 }

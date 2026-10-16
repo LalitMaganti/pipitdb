@@ -27,7 +27,8 @@ use pipit_parquet_full::Codecs;
 use pipit_pipesql::compile::compile;
 use pipit_pipesql::registry::Registry;
 
-static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
+static REGISTRY: Registry =
+    Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION]);
 
 /// Each query's name, PipeSQL, if pipitdb can run it yet, and SQL, a line
 /// each.
