@@ -16,7 +16,7 @@ use crate::slow_vec::SlowVec;
 /// which rows hold one.
 #[derive(Clone, Copy)]
 pub(crate) struct AggregateInput<'a> {
-    /// A value a row: none for `COUNT(*)`.
+    /// A value a row, an integer or a float's bits: none for `COUNT(*)`.
     pub(crate) values: &'a [i64],
     /// Bit r set if row r holds a value, or `None` if every row does.
     pub(crate) valid: Option<&'a [u64]>,
@@ -56,7 +56,7 @@ pub(crate) struct AggregateInputLoader {
 
 impl AggregateInputLoader {
     /// Loads the first `rows` rows `select` keeps of `column`, a flat
-    /// `Int64`, or the first `rows` of it if `select` is empty.
+    /// `Int64` or `Float64`, or the first `rows` of it if `select` is empty.
     pub(crate) fn load<'a>(
         &'a mut self,
         context: &mut Context,
@@ -65,7 +65,7 @@ impl AggregateInputLoader {
         rows: usize,
     ) -> Result<AggregateInput<'a>, Error> {
         let AggregateInputLoader { values, valid } = self;
-        let values = gathered(context, select, column.int64s(), values)?;
+        let values = gathered(context, select, words(column), values)?;
         *valid = validity(context, column, select, rows)?;
         Ok(AggregateInput { values, valid: valid.as_ref().map(Buffer::as_slice), rows })
     }
@@ -185,23 +185,36 @@ pub(crate) trait AggregateFunction {
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]);
 }
 
-/// The function that computes `function`.
-pub(crate) fn make_aggregate_function(function: Function) -> &'static dyn AggregateFunction {
+/// The function that computes `function` of a column of `data_type`.
+pub(crate) fn make_aggregate_function(
+    function: Function,
+    data_type: DataType,
+) -> &'static dyn AggregateFunction {
+    // Flips the sign: words order as the values do, the least being zero.
+    const MAX: u64 = 1 << 63;
+    // Flips every bit but the sign: the least value is the greatest word.
+    const MIN: u64 = !MAX;
+    let float = data_type == DataType::Float64;
     match function {
         Function::CountStar => &CountStar,
         Function::Count => &Count,
+        Function::Sum if float => &FloatSum,
         Function::Sum => &Sum,
-        // Flips every bit but the sign: the least value is the greatest word.
-        Function::Min => &Extreme { mask: !(1 << 63) },
-        // Flips the sign: words order as the values do, the least being zero.
-        Function::Max => &Extreme { mask: 1 << 63 },
+        Function::Min if float => &Extreme { mask: MIN, float: MIN },
+        Function::Min => &Extreme { mask: MIN, float: 0 },
+        Function::Max if float => &Extreme { mask: MAX, float: MIN },
+        Function::Max => &Extreme { mask: MAX, float: 0 },
+        Function::Avg if float => &Avg { float: true },
+        Function::Avg => &Avg { float: false },
     }
 }
 
-/// `function`'s result for each of `groups`, in buffers from `context`.
+/// `function`'s result, of `data_type`, for each of `groups`, in buffers from
+/// `context`.
 pub(crate) fn finalize_to_buffer(
     context: &mut Context,
     function: &dyn AggregateFunction,
+    data_type: DataType,
     states: GroupStates,
     groups: &[u32],
 ) -> Result<ColumnView, Error> {
@@ -213,7 +226,7 @@ pub(crate) fn finalize_to_buffer(
     let (whole, last) = (rows / 8, rows % 8);
     let all = at!(bits, ..whole).iter().all(|&byte| byte == u8::MAX)
         && (last == 0 || !*at!(bits, whole) & ((1 << last) - 1) == 0);
-    Ok(ColumnView::new(context, DataType::Int64, values, (!all).then_some(valid))?)
+    Ok(ColumnView::new(context, data_type, values, (!all).then_some(valid))?)
 }
 
 /// Writes to `valid` a bit for each of `groups`, set if it's seen a value.
@@ -269,6 +282,34 @@ fn scatter(
             }
         }
     }
+}
+
+/// The sum of `input`'s values that aren't null, exactly. The high and low
+/// 32 bits of the values are summed apart, which can't overflow for a batch
+/// and vectorizes, unlike checking each addition.
+fn batch_sum(input: &AggregateInput) -> i128 {
+    check!(input.rows <= BATCH_ROWS_MAX as usize);
+    let values = at!(input.values, ..input.rows);
+    let (mut high, mut low) = (0_i64, 0_u64);
+    match input.valid {
+        None => {
+            for &value in values {
+                high += value >> 32;
+                low += value.cast_unsigned() & 0xffff_ffff;
+            }
+        }
+        // A word of validity at a time, rather than a bit for each row.
+        Some(valid) => {
+            for (values, &valid) in values.chunks(64).zip(valid) {
+                for (i, &value) in values.iter().enumerate() {
+                    let value = value & mask(valid >> i & 1 != 0);
+                    high += value >> 32;
+                    low += value.cast_unsigned() & 0xffff_ffff;
+                }
+            }
+        }
+    }
+    (i128::from(high) << 32) + i128::from(low)
 }
 
 /// A word that's 0 if not `valid`, and all ones if so.
@@ -397,37 +438,10 @@ impl AggregateFunction for Sum {
         mut states: GroupStates,
         overflow: &mut bool,
     ) {
-        // The high and low 32 bits of the values are summed apart, which can't
-        // overflow for a batch and vectorizes, unlike checking each addition.
-        check!(input.rows <= BATCH_ROWS_MAX as usize);
-        let values = at!(input.values, ..input.rows);
-        let (mut high, mut low) = (0_i64, 0_u64);
-        match input.valid {
-            None => {
-                for &value in values {
-                    high += value >> 32;
-                    low += value.cast_unsigned() & 0xffff_ffff;
-                }
-            }
-            // A word of validity at a time, rather than a bit for each row.
-            Some(valid) => {
-                for (values, &valid) in values.chunks(64).zip(valid) {
-                    for (i, &value) in values.iter().enumerate() {
-                        let value = value & mask(valid >> i & 1 != 0);
-                        high += value >> 32;
-                        low += value.cast_unsigned() & 0xffff_ffff;
-                    }
-                }
-            }
-        }
-        // The sum is high * 2^32 + low, which fits in 64 bits if, once low's
-        // carry is in high, high fits in 32.
-        high += (low >> 32).cast_signed();
-        let fits = i32::try_from(high).is_ok();
-        let sum = (high.cast_unsigned() << 32 | low & 0xffff_ffff).cast_signed();
-        let (total, o) = states.word(group).overflowing_add(sum);
+        let sum = i64::try_from(batch_sum(input));
+        let (total, o) = states.word(group).overflowing_add(sum.unwrap_or(0));
         *states.word_mut(group) = total;
-        *overflow |= !fits || o;
+        *overflow |= sum.is_err() || o;
         states.mark(group, input.count_valid() != 0);
     }
 
@@ -440,17 +454,31 @@ impl AggregateFunction for Sum {
 }
 
 /// `MIN` or `MAX`: a group's extreme value, null if it holds none. The state
-/// is the value, its bits flipped by a mask chosen so that, as unsigned words, the
-/// larger state is the value wanted and zero is below every value: a zeroed
-/// state holds nothing, and states merge by unsigned maximum.
+/// is the value, its bits flipped by a mask chosen so that, as unsigned words,
+/// the larger state is the value wanted and zero is below every value: a
+/// zeroed state holds nothing, and states merge by unsigned maximum. A
+/// negative float's bits but the sign are flipped first, so floats order as
+/// integers do, and a NaN is above every number.
 struct Extreme {
+    /// What a value's bits are flipped by, once they order as integers do.
     mask: u64,
+    /// The bits flipped of a negative value first: all but the sign for
+    /// floats, none for integers.
+    float: u64,
 }
 
 impl Extreme {
-    /// `value` as a state, or zero if not `valid`.
+    /// `value`, an integer or a float's bits, as a state, or zero if not
+    /// `valid`.
     fn encode(&self, value: i64, valid: bool) -> u64 {
-        (value.cast_unsigned() ^ self.mask) & mask(valid).cast_unsigned()
+        let bits = value.cast_unsigned() ^ ((value >> 63).cast_unsigned() & self.float);
+        (bits ^ self.mask) & mask(valid).cast_unsigned()
+    }
+
+    fn decode(&self, state: i64) -> i64 {
+        // The sign is as it was, so says which bits were flipped.
+        let bits = state ^ self.mask.cast_signed();
+        bits ^ ((bits >> 63).cast_unsigned() & self.float).cast_signed()
     }
 }
 
@@ -491,10 +519,176 @@ impl AggregateFunction for Extreme {
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
         for (value, &group) in values.iter_mut().zip(groups) {
-            *value = (states.word(group).cast_unsigned() ^ self.mask).cast_signed();
+            *value = self.decode(states.word(group));
         }
         write_seen(valid, groups, &states);
     }
+}
+
+fn float(word: i64) -> f64 {
+    f64::from_bits(word.cast_unsigned())
+}
+
+fn word(value: f64) -> i64 {
+    value.to_bits().cast_signed()
+}
+
+/// `SUM` of floats: the total of a group's values, null if it holds none.
+struct FloatSum;
+
+impl AggregateFunction for FloatSum {
+    fn state_words(&self) -> usize {
+        1
+    }
+
+    fn reads_input(&self) -> bool {
+        true
+    }
+
+    fn tracks_seen(&self) -> bool {
+        true
+    }
+
+    fn update(&self, input: &AggregateInput, groups: &[u32], states: GroupStates, _: &mut bool) {
+        scatter(input, groups, states, 1, |total, value, valid| {
+            *at_mut!(total, 0) = word(float(*at!(total, 0)) + float(value & mask(valid)));
+        });
+    }
+
+    fn update_group(
+        &self,
+        input: &AggregateInput,
+        group: u32,
+        mut states: GroupStates,
+        _: &mut bool,
+    ) {
+        let mut total = float(states.word(group));
+        for (row, &value) in at!(input.values, ..input.rows).iter().enumerate() {
+            total += float(value & mask(input.is_valid(row)));
+        }
+        *states.word_mut(group) = word(total);
+        states.mark(group, input.count_valid() != 0);
+    }
+
+    fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
+        Sum.finalize(states, groups, values, valid);
+    }
+}
+
+/// `AVG`: the mean of a group's values, a float, null if it holds none. The
+/// state is the sum, then how many values there are. The sum of integers
+/// takes two words, low then high, so it can't overflow: a mean fits where
+/// the sum it's of may not.
+struct Avg {
+    /// Whether the values are floats.
+    float: bool,
+}
+
+impl Avg {
+    /// Where the count is in a state.
+    fn count_at(&self) -> usize {
+        if self.float { 1 } else { 2 }
+    }
+
+    /// Adds `sum` and `count` to `group`'s state: the sum of floats' bits,
+    /// or of integers.
+    fn add(&self, states: &mut GroupStates, group: u32, sum: i128, count: usize) {
+        let start = group as usize * states.stride;
+        let state = at_mut!(states.words, start..start + self.state_words());
+        if self.float {
+            #[expect(clippy::cast_possible_truncation, reason = "a float's bits")]
+            let added = float(sum as i64);
+            *at_mut!(state, 0) = word(float(*at!(state, 0)) + added);
+        } else {
+            set_int128(state, int128(state) + sum);
+        }
+        *at_mut!(state, self.count_at()) += i64::try_from(count).unwrap_or(0);
+    }
+}
+
+/// The two words of an integer sum, low then high, as one.
+fn int128(state: &[i64]) -> i128 {
+    i128::from(*at!(state, 1)) << 64 | i128::from(at!(state, 0).cast_unsigned())
+}
+
+/// Writes `sum` to its two words.
+fn set_int128(state: &mut [i64], sum: i128) {
+    #[expect(clippy::cast_possible_truncation, reason = "split in two")]
+    at_mut!(state, ..2).copy_from_slice(&[sum as i64, (sum >> 64) as i64]);
+}
+
+impl AggregateFunction for Avg {
+    fn state_words(&self) -> usize {
+        self.count_at() + 1
+    }
+
+    fn reads_input(&self) -> bool {
+        true
+    }
+
+    fn tracks_seen(&self) -> bool {
+        false
+    }
+
+    fn update(&self, input: &AggregateInput, groups: &[u32], states: GroupStates, _: &mut bool) {
+        let at = self.count_at();
+        scatter(input, groups, states, self.state_words(), |state, value, valid| {
+            let value = value & mask(valid);
+            if self.float {
+                *at_mut!(state, 0) = word(float(*at!(state, 0)) + float(value));
+            } else {
+                set_int128(state, int128(state) + i128::from(value));
+            }
+            *at_mut!(state, at) += i64::from(valid);
+        });
+    }
+
+    fn update_group(
+        &self,
+        input: &AggregateInput,
+        group: u32,
+        mut states: GroupStates,
+        _: &mut bool,
+    ) {
+        let values = at!(input.values, ..input.rows).iter().enumerate();
+        let sum = if self.float {
+            let total = values
+                .fold(0.0, |total, (row, &value)| total + float(value & mask(input.is_valid(row))));
+            i128::from(word(total))
+        } else {
+            batch_sum(input)
+        };
+        self.add(&mut states, group, sum, input.count_valid());
+    }
+
+    fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
+        let (at, words) = (self.count_at(), self.state_words());
+        let state = |group: u32| {
+            let start = group as usize * states.stride;
+            at!(states.words, start..start + words)
+        };
+        for (value, &group) in values.iter_mut().zip(groups) {
+            let state = state(group);
+            #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
+            let sum = if self.float { float(*at!(state, 0)) } else { int128(state) as f64 };
+            #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
+            let count = *at!(state, at) as f64;
+            *value = word(sum / count);
+        }
+        for (byte, groups) in valid.iter_mut().zip(groups.chunks(8)) {
+            let bits = groups.iter().enumerate();
+            *byte =
+                bits.fold(0, |byte, (i, &group)| byte | u8::from(*at!(state(group), at) != 0) << i);
+        }
+    }
+}
+
+/// A flat column's values as words: integers, or floats' bits.
+fn words(column: &ColumnView) -> &[i64] {
+    // SAFETY: any bits are an `i64`.
+    let (before, words, after) = unsafe { column.value_bytes().align_to::<i64>() };
+    check!(before.is_empty() && after.is_empty());
+    words
 }
 
 /// Whether `row` isn't null by `validity`.

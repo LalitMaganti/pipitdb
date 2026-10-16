@@ -55,8 +55,9 @@ impl HashAggregate {
     fn new(spec: HashAggregateSpec) -> HashAggregate {
         check!(spec.key_columns.len() <= KEYS_MAX);
         let calls = spec.aggregates.iter();
-        let state_words =
-            calls.map(|call| make_aggregate_function(call.function).state_words()).sum();
+        let state_words = calls
+            .map(|call| make_aggregate_function(call.function, call.data_type).state_words())
+            .sum();
         HashAggregate { spec, state_words }
     }
 
@@ -186,7 +187,7 @@ impl Breaker for HashAggregate {
         let mut overflow = false;
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
-            let function = make_aggregate_function(call.function);
+            let function = make_aggregate_function(call.function, call.data_type);
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
             if function.reads_input() {
@@ -239,7 +240,7 @@ impl Breaker for HashAggregate {
         let (base, stride) = self.state_base(table, total);
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
-            let function = make_aggregate_function(call.function);
+            let function = make_aggregate_function(call.function, call.data_type);
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
             let seen = if function.tracks_seen() {
@@ -249,7 +250,8 @@ impl Breaker for HashAggregate {
             };
             let states = Self::states(base, stride, offset, seen);
             offset += function.state_words();
-            let column = finalize_to_buffer(context, function, states, numbers)?;
+            let column =
+                finalize_to_buffer(context, function, call.output_type(), states, numbers)?;
             let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
@@ -272,6 +274,12 @@ mod tests {
 
     /// An `Int64` column of `values`, null where `None`.
     fn column(values: &[Option<i64>]) -> ColumnView {
+        typed(DataType::Int64, values)
+    }
+
+    /// A column of `data_type` of `values`, integers or floats' bits, null
+    /// where `None`.
+    fn typed(data_type: DataType, values: &[Option<i64>]) -> ColumnView {
         let mut words = Buffer::allocate(&Heap, values.len() * 8).unwrap();
         let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
         bits.as_mut_slice::<u8>().fill(0);
@@ -280,7 +288,7 @@ mod tests {
             bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
         }
         let validity = values.iter().any(Option::is_none).then_some(bits);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, words, validity).unwrap()
+        ColumnView::new(&mut Context::new(&Heap), data_type, words, validity).unwrap()
     }
 
     /// Batches of a key `k` and a value `x`, each a list of rows, keeping
@@ -316,12 +324,24 @@ mod tests {
     }
 
     /// By the columns at `keys`, `COUNT(*)`, then `COUNT`, `SUM`, `MIN` and
-    /// `MAX` of the column at 1.
+    /// `MAX` of the column at 1, an `Int64`.
     fn spec(keys: &[u32]) -> HashAggregateSpec {
-        let functions =
-            [Function::CountStar, Function::Count, Function::Sum, Function::Min, Function::Max];
+        spec_of(keys, DataType::Int64, false)
+    }
+
+    /// As `spec`, of a column of `data_type`, and then `AVG` if `avg`.
+    fn spec_of(keys: &[u32], data_type: DataType, avg: bool) -> HashAggregateSpec {
+        let functions = [
+            Function::CountStar,
+            Function::Count,
+            Function::Sum,
+            Function::Min,
+            Function::Max,
+            Function::Avg,
+        ];
+        let functions = &functions[..if avg { 6 } else { 5 }];
         let aggregates =
-            functions.into_iter().map(|function| AggregateCall { function, column: 1 });
+            functions.iter().map(|&function| AggregateCall { function, column: 1, data_type });
         HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
             aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
@@ -329,7 +349,7 @@ mod tests {
     }
 
     /// Each row out, its columns as integers, or `None` if null, sorted.
-    fn run(rows: Rows, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
+    fn run(rows: impl Source, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let mut steps = SlowVec::new(&Heap, 1).unwrap();
         assert!(steps.push(Step::Operator(hash_aggregate(&Heap, spec).unwrap())).is_ok());
         let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
@@ -341,7 +361,10 @@ mod tests {
             for row in 0..batch.row_count() {
                 let values = (0..batch.column_count()).map(|i| {
                     let column = batch.column(i);
-                    (!column.is_null(row)).then(|| column.int64s()[row as usize])
+                    (!column.is_null(row)).then(|| match column.data_type() {
+                        DataType::Float64 => bits(column.float64s()[row as usize]),
+                        _ => column.int64s()[row as usize],
+                    })
                 });
                 out.push(values.collect());
             }
@@ -419,6 +442,69 @@ mod tests {
         };
         let expected = [alloc::vec![Some(5), Some(4), Some(-4), Some(-half), Some(half)]];
         assert_eq!(run(rows, spec(&[])).unwrap(), expected);
+    }
+
+    /// A float's bits, as `run` gives them.
+    fn bits(value: f64) -> i64 {
+        value.to_bits().cast_signed()
+    }
+
+    /// Batches of the columns given.
+    struct Columns(Vec<Vec<ColumnView>>);
+
+    impl Source for Columns {
+        type State = usize;
+
+        fn new_state(&self, _: &mut Context) -> Result<usize, Error> {
+            Ok(0)
+        }
+
+        fn next(
+            &self,
+            _: &mut Context,
+            i: &mut usize,
+            batch: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            let Some(columns) = self.0.get(*i) else { return Ok(false) };
+            *i += 1;
+            batch.reset(columns[0].row_count());
+            for column in columns {
+                assert!(batch.push_column(column.clone()).is_ok());
+            }
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn aggregates_floats_and_means() {
+        let x = [Some(1.5), None, Some(-2.0), None].map(|x| x.map(bits));
+        let floats = typed(DataType::Float64, &x);
+        let batches = Columns(alloc::vec![alloc::vec![
+            column(&[Some(1), Some(1), Some(1), Some(2)]),
+            floats
+        ]]);
+        let expected = [
+            alloc::vec![
+                Some(1),
+                Some(3),
+                Some(2),
+                Some(bits(-0.5)),
+                Some(bits(-2.0)),
+                Some(bits(1.5)),
+                Some(bits(-0.25))
+            ],
+            alloc::vec![Some(2), Some(1), Some(0), None, None, None, None],
+        ];
+        assert_eq!(run(batches, spec_of(&[0], DataType::Float64, true)).unwrap(), expected);
+        // Integers' means are exact, though their sum passes an `Int64`.
+        let half = i64::MAX / 2;
+        let values = [half, half, half, -half, -half].map(Some);
+        let batches = Columns(alloc::vec![alloc::vec![column(&[Some(1); 5]), column(&values)]]);
+        let mut means = spec_of(&[], DataType::Int64, true);
+        means.aggregates.retain(|call| call.function == Function::Avg);
+        #[expect(clippy::cast_precision_loss, reason = "as `AVG` does")]
+        let mean = bits(half as f64 / 5.0);
+        assert_eq!(run(batches, means).unwrap(), [[Some(mean)]]);
     }
 
     #[test]

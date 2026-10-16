@@ -10,8 +10,8 @@ use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::Step;
 
-/// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
-/// `Int64` values and makes an `Int64`.
+/// An aggregate function, as Perfetto's `AggregateCall::Function`, and
+/// `Avg`. Each reads `Int64` or `Float64` values.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Function {
     /// How many rows there are.
@@ -24,6 +24,22 @@ pub enum Function {
     Min,
     /// The greatest value that isn't null, null if there are none.
     Max,
+    /// The mean of the values that aren't null, a `Float64`, null if there
+    /// are none.
+    Avg,
+}
+
+impl Function {
+    /// What it makes of a column of `data_type`, `None` for `COUNT(*)`, or
+    /// `None` if it can't.
+    pub fn output_type(self, data_type: Option<DataType>) -> Option<DataType> {
+        match (self, data_type) {
+            (Function::CountStar, None) | (Function::Count, Some(_)) => Some(DataType::Int64),
+            (_, None | Some(DataType::String)) | (Function::CountStar, _) => None,
+            (Function::Avg, Some(_)) => Some(DataType::Float64),
+            (_, Some(data_type)) => Some(data_type),
+        }
+    }
 }
 
 /// An aggregate in a plan: its function, the column it reads, `None` only for
@@ -41,7 +57,7 @@ pub struct Aggregate {
 pub struct AggregateOp {
     /// The `Int64` columns rows are grouped by.
     pub keys: SlowVec<ColumnId>,
-    /// What each group's rows make, from `Int64` columns.
+    /// What each group's rows make.
     pub aggregates: SlowVec<Aggregate>,
 }
 
@@ -54,19 +70,17 @@ impl<'c> Op<'c> for AggregateOp {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
         let allocator = lowering.allocator();
-        let inputs = self.aggregates.iter().filter_map(|aggregate| aggregate.input);
-        check!(
-            self.keys
-                .iter()
-                .copied()
-                .chain(inputs)
-                .all(|id| lowering.query_type(id) == DataType::Int64)
-        );
+        check!(self.keys.iter().all(|&key| lowering.query_type(key) == DataType::Int64));
+        check!(self.aggregates.iter().all(|aggregate| {
+            let data_type = aggregate.input.map(|id| lowering.query_type(id));
+            aggregate.function.output_type(data_type).is_some()
+        }));
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
         let key_columns = SlowVec::fixed_from(allocator, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
             function: aggregate.function,
             column: aggregate.input.map_or(0, |id| lowering.query_position(id)),
+            data_type: aggregate.input.map_or(DataType::Int64, |id| lowering.query_type(id)),
         });
         let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
         // Groups are output in the order first seen, so if the input is sorted
@@ -131,4 +145,14 @@ pub struct AggregateCall {
     pub function: Function,
     /// Where the column it reads is in batches: unused by `COUNT(*)`.
     pub column: u32,
+    /// What that column holds: unused by `COUNT(*)`.
+    pub data_type: DataType,
+}
+
+impl AggregateCall {
+    /// What it makes.
+    pub fn output_type(&self) -> DataType {
+        let input = (self.function != Function::CountStar).then_some(self.data_type);
+        self.function.output_type(input).unwrap_or(DataType::Int64)
+    }
 }
