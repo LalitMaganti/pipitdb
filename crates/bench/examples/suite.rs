@@ -1,9 +1,12 @@
-//! Runs the ClickBench queries pipitdb can run over ClickBench's Parquet
-//! files, as the table `hits`, printing each row of each result and, to
-//! stderr, how long each took. `clickbench/check.py` compares the rows with
-//! DuckDB's.
+//! Runs the queries of a suite, such as ClickBench or TPC-H, that pipitdb can
+//! run over Parquet files, printing each row of each result and, to stderr,
+//! how long each took. `check_queries.py` compares the rows with DuckDB's.
 //!
-//! Usage: `cargo run --profile speed -p pipitdb-bench --example clickbench -- FILE...`
+//! Usage: `cargo run --profile speed -p pipitdb-bench --example suite -- [QUERIES] FILE...`
+//!
+//! `QUERIES` is a file of them, as `clickbench/queries.tsv` is, which is the
+//! default. Each file is a table named after it, less a trailing `_N`, so
+//! `hits_0.parquet` and `hits_1.parquet` are both `hits`.
 //!
 //! `QUERY` runs only that query, `REPEAT` runs each that many times and times
 //! the last, and `QUIET` doesn't print rows.
@@ -29,9 +32,9 @@ use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry = Registry::new(&[pipit_pipesql::stages::RELATIONAL]);
 
-/// Each query's name, PipeSQL, if pipitdb can run it yet, and SQL, a line
-/// each.
-const QUERIES: &str = include_str!("../clickbench/queries.tsv");
+/// ClickBench's queries: each one's name, PipeSQL, if pipitdb can run it yet,
+/// and SQL, a line each.
+const CLICKBENCH: &str = include_str!("../clickbench/queries.tsv");
 
 /// Decompresses as `Codecs` does, counting the pages and the bytes they
 /// decompress to, which tells how much a query read.
@@ -54,24 +57,75 @@ impl Codec for Counting {
     }
 }
 
-struct Hits<'a>(DynScannable<'a>);
+/// The tables, by name.
+struct Tables<'a>(Vec<(String, DynScannable<'a>)>);
 
-impl Catalog for Hits<'_> {
+impl Catalog for Tables<'_> {
     fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
-        (name == "hits").then_some(&self.0)
+        self.0.iter().find(|(table, _)| table == name).map(|(_, scannable)| scannable)
     }
 }
 
-fn main() -> Result<(), String> {
-    let mut files = Vec::new();
-    for path in std::env::args().skip(1) {
-        files.push(FileSource::open(&path).map_err(|e| format!("{path}: {e}"))?);
+/// The table `path` is part of: its file's name, less its extension and any
+/// trailing `_N`.
+fn table_name(path: &str) -> String {
+    let stem = std::path::Path::new(path).file_stem().map_or(path.into(), |s| s.to_string_lossy());
+    let trimmed = stem.trim_end_matches(|c: char| c.is_ascii_digit());
+    match trimmed.strip_suffix('_') {
+        Some(name) if trimmed.len() < stem.len() => name.into(),
+        _ => stem.into(),
     }
-    let sources: Vec<&dyn ByteSource> = files.iter().map(|file| file as &dyn ByteSource).collect();
+}
+
+/// The queries in `args`'s first, if it's a queries file, which it removes,
+/// or else ClickBench's.
+fn take_queries(args: &mut Vec<String>) -> Result<String, String> {
+    let is_queries = args.first().is_some_and(|path| {
+        std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("tsv"))
+    });
+    if !is_queries {
+        return Ok(CLICKBENCH.into());
+    }
+    let path = args.remove(0);
+    std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))
+}
+
+/// The files at `paths`, opened, by the table each is part of.
+fn open_files(paths: &[String]) -> Result<Vec<(String, Vec<FileSource>)>, String> {
+    let mut files: Vec<(String, Vec<FileSource>)> = Vec::new();
+    for path in paths {
+        let file = FileSource::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let name = table_name(path);
+        match files.iter_mut().find(|(table, _)| *table == name) {
+            Some((_, table)) => table.push(file),
+            None => files.push((name, vec![file])),
+        }
+    }
+    Ok(files)
+}
+
+fn main() -> Result<(), String> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let queries = take_queries(&mut args)?;
+    let files = open_files(&args)?;
+    let sources: Vec<(&str, Vec<&dyn ByteSource>)> = files
+        .iter()
+        .map(|(name, table)| (name.as_str(), table.iter().map(|f| f as &dyn ByteSource).collect()))
+        .collect();
     let codecs = Counting::default();
-    let table = ParquetTable::open(&Heap, &codecs, &sources).map_err(|e| format!("{e:?}"))?;
-    let hits = Hits(DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?);
-    for line in QUERIES.lines() {
+    let mut tables = Vec::new();
+    for (name, sources) in &sources {
+        // A table pipitdb can't read is left out, so only queries reading it fail.
+        match ParquetTable::open(&Heap, &codecs, sources) {
+            Ok(table) => {
+                let table = DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?;
+                tables.push(((*name).to_string(), table));
+            }
+            Err(error) => eprintln!("{name}: {error:?}"),
+        }
+    }
+    let tables = Tables(tables);
+    for line in queries.lines() {
         let mut fields = line.split('\t');
         let (Some(number), Some(query)) = (fields.next(), fields.next()) else { continue };
         // A query with no PipeSQL is one pipitdb can't run yet; other engines
@@ -84,7 +138,7 @@ fn main() -> Result<(), String> {
         }
         let repeat = std::env::var("REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
         for _ in 1..repeat {
-            run(&hits, query, &QueryAllocators::new(&Heap))?;
+            run(&tables, query, &QueryAllocators::new(&Heap))?;
         }
         let limit = LimitAllocator::new(&Heap, usize::MAX);
         // Counts what the query holds at its peak, for the report.
@@ -92,7 +146,7 @@ fn main() -> Result<(), String> {
         codecs.pages.set(0);
         codecs.bytes.set(0);
         let start = Instant::now();
-        match run(&hits, query, &allocators) {
+        match run(&tables, query, &allocators) {
             Ok(columns) => {
                 // Timed up to the results, as other engines' times are; turning
                 // them into text isn't.
@@ -190,9 +244,9 @@ impl Output {
 
 /// The result of `query`: a column of its kept rows for each it outputs,
 /// built as each batch comes, as other engines build theirs.
-fn run(hits: &Hits, query: &str, allocators: &QueryAllocators) -> Result<Vec<Output>, String> {
+fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec<Output>, String> {
     let mut plan =
-        compile(&Heap, &REGISTRY, hits, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
+        compile(&Heap, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
     optimize(&Heap, &mut plan).map_err(|e| format!("{e:?}"))?;
     let physical = lower(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
     let mut execution = physical.pipeline().start(allocators).map_err(|e| format!("{e:?}"))?;

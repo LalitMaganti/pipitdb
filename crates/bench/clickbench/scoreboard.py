@@ -91,8 +91,8 @@ def main():
         binary = args.binary
         if not binary:
             subprocess.run(["cargo", "build", "-q", "--profile", "speed", "-p", "pipitdb-bench",
-                            "--example", "clickbench"], cwd=ROOT, check=True)
-            binary = ROOT / "target/speed/examples/clickbench"
+                            "--example", "suite"], cwd=ROOT, check=True)
+            binary = ROOT / "target/speed/examples/suite"
         commit = subprocess.run(["git", "-C", str(ROOT), "describe", "--always", "--dirty"],
                                 capture_output=True, text=True).stdout.strip()
         built = "build " + (os.path.basename(str(binary)) if args.binary else f"at {commit}")
