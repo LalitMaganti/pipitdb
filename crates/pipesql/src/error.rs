@@ -2,7 +2,6 @@
 //! The `diagnostics` feature turns them into messages.
 
 use pipit_kernel::allocator::AllocError;
-use pipit_kernel::slow_vec::Full;
 
 /// The bytes `start..start + len` of the query.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,12 +71,6 @@ pub struct Error {
 impl From<AllocError> for Error {
     fn from(_: AllocError) -> Error {
         Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 })
-    }
-}
-
-impl<T> From<Full<T>> for Error {
-    fn from(_: Full<T>) -> Error {
-        Error::from(AllocError)
     }
 }
 

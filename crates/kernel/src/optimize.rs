@@ -190,7 +190,7 @@ pub fn choose_forms(
     for node in plan.nodes.iter() {
         let mut read = Needed::none(allocator, columns)?;
         node.op.reads(&mut read);
-        reads.push(read).map_err(|_| AllocError)?;
+        reads.push(read)?;
     }
     let mut output = Needed::none(allocator, columns)?;
     for column in plan.output.iter() {
@@ -212,7 +212,7 @@ pub fn choose_forms(
             let made = at_mut!(plan.nodes, maker).op.allow(column, allowed);
             if made.contains(Forms::LAZY) && !accepted.contains(Forms::LAZY) && load != Load::Never
             {
-                lazy.push((maker, load, column, accepted)).map_err(|_| AllocError)?;
+                lazy.push((maker, load, column, accepted))?;
             }
         }
     }
@@ -225,7 +225,7 @@ pub fn choose_forms(
         }
         let mut loaded = SlowVec::fixed(allocator, at!(lazy, i..).iter().filter(same).count())?;
         for &(_, _, column, forms) in at!(lazy, i..).iter().filter(same) {
-            loaded.push((column, forms)).map_err(|_| AllocError)?;
+            loaded.push((column, forms))?;
         }
         let op = at!(plan.nodes, maker).op.materialize(allocator, loaded)?;
         let below = match load {
@@ -235,7 +235,7 @@ pub fn choose_forms(
         let children = SlowVec::fixed_from(allocator, core::iter::once(below))?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
         let id = plan.nodes.len() as PlanNodeId;
-        plan.nodes.push(PlanNode { op, children }).map_err(|_| AllocError)?;
+        plan.nodes.push(PlanNode { op, children })?;
         match load {
             Load::Below(parent, slot) => {
                 *at_mut!(at_mut!(plan.nodes, parent as usize).children, slot) = id;

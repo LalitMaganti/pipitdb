@@ -67,9 +67,9 @@ impl HashAggregate {
         for call in spec.aggregates.iter() {
             let function = make_aggregate_function(call.function);
             #[expect(clippy::cast_possible_truncation, reason = "a word each")]
-            offsets.push(state_words as u32).map_err(|_| AllocError)?;
+            offsets.push(state_words as u32)?;
             state_words += function.state_words();
-            functions.push(function).map_err(|_| AllocError)?;
+            functions.push(function)?;
         }
         Ok(HashAggregate { spec, functions, offsets, state_words })
     }
@@ -165,7 +165,7 @@ impl Breaker for HashAggregate {
         total.extend_zeroed(self.state_words)?;
         let mut seen = SlowVec::fixed(allocator, self.functions.len())?;
         for _ in 0..self.functions.len() {
-            seen.push(SeenBytes::new(allocator)?).map_err(|_| AllocError)?;
+            seen.push(SeenBytes::new(allocator)?)?;
         }
         Ok(State { groups, total, consumed: false, seen, emitted: 0 })
     }
