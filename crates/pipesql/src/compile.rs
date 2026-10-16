@@ -301,6 +301,8 @@ mod tests {
     fn filters_strings_with_where() {
         // `''` in a string is a quote.
         assert_eq!(kept("FROM t |> WHERE s = 'it''s' |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> WHERE s LIKE '%t''%' |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> WHERE NOT s like 'i_%' |> SELECT a"), [2.0]);
         assert_eq!(kept("FROM t |> WHERE s <> '' |> SELECT a"), [1.0]);
         // Either way round, and byte by byte: `i` is after `I`.
         assert_eq!(kept("FROM t |> WHERE 'I' < s |> SELECT a"), [1.0]);
@@ -329,6 +331,7 @@ mod tests {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));

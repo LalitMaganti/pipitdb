@@ -312,6 +312,10 @@ mod tests {
             "(Query (FROM slice) (WHERE (Greater dur 1000)) \
              (SELECT (List name (Divide dur 1000) (Call count *))))"
         );
+        assert_eq!(
+            parse("FROM t |> WHERE url LIKE '%x%' AND a = 1"),
+            "(Query (FROM t) (WHERE (And (Like url '%x%') (Equal a 1))))"
+        );
         assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
         assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
         assert_eq!(

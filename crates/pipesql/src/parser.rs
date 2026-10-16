@@ -173,6 +173,7 @@ enum Keyword {
     And,
     Or,
     Not,
+    Like,
 }
 
 #[derive(Clone, Copy)]
@@ -320,7 +321,7 @@ impl Parser<'_> {
                 }
                 Keyword::None => Step::Operand(leaf(token)?),
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
-                Keyword::And | Keyword::Or => {
+                Keyword::And | Keyword::Or | Keyword::Like => {
                     return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
                 }
             },
@@ -335,6 +336,7 @@ impl Parser<'_> {
         match self.keyword(token) {
             Keyword::And => Some((Operator::And, AND)),
             Keyword::Or => Some((Operator::Or, OR)),
+            Keyword::Like => Some((Operator::Like, COMPARISON)),
             Keyword::Not | Keyword::None => None,
         }
     }
@@ -346,6 +348,7 @@ impl Parser<'_> {
             2 => (Keyword::Or, b"or".as_slice()),
             3 if text[0].eq_ignore_ascii_case(&b'a') => (Keyword::And, b"and".as_slice()),
             3 => (Keyword::Not, b"not".as_slice()),
+            4 => (Keyword::Like, b"like".as_slice()),
             _ => return Keyword::None,
         };
         if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }

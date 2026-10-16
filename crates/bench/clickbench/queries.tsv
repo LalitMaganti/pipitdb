@@ -30,3 +30,4 @@ fIpad	FROM hits |> WHERE MobilePhoneModel = 'iPad' |> SELECT UserID	SELECT UserI
 fSearch	FROM hits |> WHERE SearchPhrase != '' |> SELECT SearchPhrase	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> ''
 fCounter	FROM hits |> WHERE CounterID = 59 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 59
 fCounterFew	FROM hits |> WHERE CounterID = 52 |> SELECT UserID	SELECT UserID FROM hits WHERE CounterID = 52
+fGoogle	FROM hits |> WHERE URL LIKE '%google%' |> SELECT URL	SELECT URL FROM hits WHERE URL LIKE '%google%'

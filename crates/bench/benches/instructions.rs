@@ -135,6 +135,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::f_phone(hits_query("fPhone"))]
 #[bench::f_ipad(hits_query("fIpad"))]
 #[bench::f_search(hits_query("fSearch"))]
+#[bench::f_google(hits_query("fGoogle"))]
 #[bench::f_counter(hits_query("fCounter"))]
 #[bench::f_counter_few(hits_query("fCounterFew"))]
 fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {

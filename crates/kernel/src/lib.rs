@@ -19,6 +19,7 @@ pub mod error;
 pub mod filter;
 mod group_table;
 mod hash_aggregate;
+pub mod like;
 pub mod limit;
 pub mod lower;
 pub mod names;
