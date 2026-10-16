@@ -18,3 +18,8 @@ rustflags = ["-C", "llvm-args=-align-loops=64"]
 # which makes MIN and MAX 2.9 times slower. Replaces [build]'s rustflags.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "llvm-args=-align-loops=64", "-C", "target-cpu=x86-64-v3"]
+
+# Wasm with SIMD, as Perfetto builds it, so loops can be vectorized there
+# too. Replaces [build]'s rustflags.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "llvm-args=-align-loops=64", "-C", "target-feature=+simd128"]
