@@ -180,7 +180,7 @@ impl GroupTable {
         while row < count {
             // SAFETY: checked above.
             let key = unsafe { *keys.get_unchecked(row) };
-            let hash = fmix(key.cast_unsigned());
+            let hash = mix(SEED, key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
             // SAFETY: a group in a slot has a record, of at least two words.
@@ -361,27 +361,21 @@ fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32,
     }
 }
 
-/// `fmix64` from Murmur hash 3, as Perfetto hashes a key.
+/// What a group's keys are hashed from.
+const SEED: u64 = 0x243f_6a88_85a3_08d3;
+
+/// `hash` with `word` mixed in: their xor multiplied out to 128 bits, and
+/// the halves folded, so every bit of the word reaches both the low bits a
+/// slot is picked by and the top ones it keeps.
 #[inline]
-fn fmix(word: u64) -> u64 {
-    let mut h = word ^ word >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^ h >> 33
+fn mix(hash: u64, word: u64) -> u64 {
+    let product = u128::from(hash ^ word) * u128::from(0x9e37_79b9_7f4a_7c15_u64);
+    #[expect(clippy::cast_possible_truncation, reason = "folded")]
+    let folded = product as u64 ^ (product >> 64) as u64;
+    folded
 }
 
-/// What Perfetto's `MurmurHashCombiner` starts from.
-const SEED: u64 = 0xe17a_1465;
-
-/// `hash` with `word` combined in, as Perfetto's `MurmurHashCombiner` does.
-#[inline]
-fn combine(hash: u64, word: u64) -> u64 {
-    hash ^ fmix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
-}
-
-/// The hash of row `row` of `keys`, whose null word is `null`, as Perfetto's
-/// `GroupTable::Hash`.
+/// The hash of row `row` of `keys`, whose null word is `null`.
 ///
 /// # Safety
 ///
@@ -390,9 +384,6 @@ fn combine(hash: u64, word: u64) -> u64 {
 unsafe fn hash_row(keys: &[&[i64]], row: usize, null: u64) -> u64 {
     // SAFETY: as the caller promises.
     let key = |keys: &[i64]| unsafe { keys.get_unchecked(row) }.cast_unsigned();
-    if let ([keys], 0) = (keys, null) {
-        return fmix(key(keys));
-    }
-    let hash = keys.iter().fold(SEED, |hash, keys| combine(hash, key(keys)));
-    if null == 0 { hash } else { combine(hash, null) }
+    let hash = keys.iter().fold(SEED, |hash, keys| mix(hash, key(keys)));
+    if null == 0 { hash } else { mix(hash, null) }
 }
