@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Runs pipitdb's ClickBench queries, best of RUNS, saves the times to
-results/pipitdb.tsv with the commit, and prints them beside every other
-result saved there: the engines engines.py ran, one thread and N, and
-results/spike.tsv, the prototype pipitdb grew from. Also ClickBench's score
+results/MACHINE/pipitdb.tsv with the commit, and prints them beside every
+other result saved for that machine: the engines engines.py ran, one thread
+and N, and spike.tsv, the prototype pipitdb grew from. Also ClickBench's score
 for each, over the queries all of them ran: the geometric mean of
 (t + 10) / (best + 10), so 1.0 is best on every query.
 
-The machine's load changes times, so run this on an idle machine, and
-compare results from the same one: each file says which it came from.
+The machine's load changes times, so run this on an idle machine, or with
+--quiet LOAD to wait until the load average stays below LOAD. Each file says
+which machine it came from and the load around its run.
 
-Usage: crates/bench/clickbench/scoreboard.py DIR [--runs 3]
-       [--binary PATH] [--save NAME] [--no-run]
+Usage: crates/bench/clickbench/scoreboard.py DIR --machine NAME [--runs 3]
+       [--binary PATH] [--save NAME] [--no-run] [--quiet LOAD]
 DIR holds hits_*.parquet. --binary runs another build, such as the spike's,
 and --save names its results file.
 """
@@ -25,12 +26,11 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).parent
-RESULTS = HERE / "results"
 ROOT = HERE.parents[2]
 TIME = re.compile(r"^Q(\S+): ([\d.]+)(ns|µs|ms|s) ")
 SECONDS = {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
 sys.path.insert(0, str(HERE))
-from engines import machine  # noqa: E402
+from engines import load as load_average, machine, results, wait_quiet  # noqa: E402
 
 
 def names():
@@ -82,7 +82,10 @@ def main():
     parser.add_argument("--binary")
     parser.add_argument("--save", default="pipitdb")
     parser.add_argument("--no-run", action="store_true")
+    parser.add_argument("--machine", required=True)
+    parser.add_argument("--quiet", type=float)
     args = parser.parse_args()
+    directory = results(args.machine)
     files = sorted(str(p) for p in pathlib.Path(args.directory).glob("hits_*.parquet"))
     if not args.no_run:
         binary = args.binary
@@ -93,14 +96,18 @@ def main():
         commit = subprocess.run(["git", "-C", str(ROOT), "describe", "--always", "--dirty"],
                                 capture_output=True, text=True).stdout.strip()
         built = "build " + (os.path.basename(str(binary)) if args.binary else f"at {commit}")
+        if args.quiet:
+            wait_quiet(args.quiet)
+        before = load_average()
         best = run(binary, files, args.runs)
         lines = [f"# {args.save}, {built}, one thread, best of {args.runs}, ms",
-                 f"# {machine()}, {datetime.date.today()}, {len(files)} files"]
+                 f"# {machine()}, {datetime.date.today()}, {len(files)} files",
+                 f"# load {before:.2f} before, {load_average():.2f} after"]
         lines += [f"{name}\t{best[name]:.1f}" for name in names() if name in best]
-        (RESULTS / f"{args.save}.tsv").write_text("\n".join(lines) + "\n")
+        (directory / f"{args.save}.tsv").write_text("\n".join(lines) + "\n")
 
     # pipitdb, the spike, then each engine, one thread before N.
-    paths = sorted(RESULTS.glob("*.tsv"), key=lambda p: (
+    paths = sorted(directory.glob("*.tsv"), key=lambda p: (
         {"pipitdb": 0, "spike": 1}.get(p.stem, 2), p.stem.endswith("-N"), p.stem))
     times = {}
     for path in paths:
