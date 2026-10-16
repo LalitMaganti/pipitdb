@@ -1,7 +1,8 @@
 //! Conditions, such as `WHERE`'s, compiled to a `Predicate`.
 //!
 //! A condition is comparisons of a column with an integer, or of a string
-//! column with a string, combined with `AND`, `OR`, `NOT` and parentheses.
+//! column with a string or a `LIKE` pattern, combined with `AND`, `OR`, `NOT`
+//! and parentheses.
 //! Anything else is `Unsupported`.
 
 use pipit_kernel::column::DataType;
@@ -68,6 +69,7 @@ fn compare(
         Operator::LessEqual => Comparison::LessEqual,
         Operator::Greater => Comparison::Greater,
         Operator::GreaterEqual => Comparison::GreaterEqual,
+        Operator::Like => return like(compiler, strings, node),
         _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(node))),
     };
     let (left, right) = (compiler.node(node.first_child()), compiler.node(node.first_child() + 1));
@@ -85,6 +87,21 @@ fn compare(
     }
     let value = value(compiler, literal, false, data_type)?;
     Ok(Leaf::Compare { column: column.id, comparison, value })
+}
+
+/// `column LIKE 'pattern'`, a string column matched with a string, whose
+/// bytes go in `strings`.
+fn like(compiler: &Compiler<'_, '_>, strings: &mut SlowVec<u8>, node: Node) -> Result<Leaf, Error> {
+    let (left, right) = (compiler.node(node.first_child()), compiler.node(node.first_child() + 1));
+    if left.tag() != Tag::Name || right.tag() != Tag::String {
+        return Err(Error::unsupported(Unsupported::Where, compiler.span(node)));
+    }
+    let column = compiler.find_column(left)?;
+    if at!(compiler.plan.columns, column.id as usize).data_type != DataType::String {
+        return Err(Error::unsupported(Unsupported::Where, compiler.span(node)));
+    }
+    let (start, len) = string(compiler, strings, right)?;
+    Ok(Leaf::Like { column: column.id, start, len })
 }
 
 /// Adds the bytes of `node`, a string literal, to `strings`, a quote for

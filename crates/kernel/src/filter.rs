@@ -83,10 +83,49 @@ pub fn compare_string(
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
 ) {
+    let equality = matches!(comparison, Comparison::Equal | Comparison::NotEqual);
+    if !equality || !matches!(column.form(), Form::Flat) {
+        let holds = |cell: &[u8]| comparison.holds(cell.cmp(string));
+        return keep_strings(column, &holds, selection, dropped);
+    }
     check_covers(column, selection);
     check!(column.data_type() == DataType::String);
     let strings = column.values().strings();
-    let holds = |cell: &[u8]| comparison.holds(cell.cmp(string));
+    let valid = valid_rows(column);
+    // Equality needn't order: most cells differ in length, so aren't read.
+    // One test for both `=` and `<>`, so the loop isn't copied.
+    let equal = comparison == Comparison::Equal;
+    retain(selection, dropped, |row| {
+        valid(row) && (strings.get(usize::from(row)) == string) == equal
+    });
+}
+
+/// Narrows `selection` to the rows where `column LIKE pattern` is `want`,
+/// writing the rows it drops to `dropped`, if given. Null rows are dropped
+/// either way.
+pub fn like(
+    column: &ColumnView,
+    pattern: &[u8],
+    want: bool,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    keep_strings(column, &|cell| crate::like::like(cell, pattern) == want, selection, dropped);
+}
+
+/// Narrows `selection` to the rows of `column`, a string column that isn't a
+/// dictionary, whose string `holds` is true for, writing the rows it drops to
+/// `dropped`, if given. One loop for every such test, so it isn't copied.
+#[inline(never)]
+fn keep_strings(
+    column: &ColumnView,
+    holds: &dyn Fn(&[u8]) -> bool,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check_covers(column, selection);
+    check!(column.data_type() == DataType::String);
+    let strings = column.values().strings();
     match column.form() {
         Form::Flat => {}
         // One value for every row: kept or dropped together.
@@ -94,25 +133,29 @@ pub fn compare_string(
             return keep_all(selection, dropped);
         }
         Form::Constant => return drop_all(selection, dropped),
-        // Only string comparisons take dictionaries: see `FilterOp::accepts`.
+        // Only string conditions take dictionaries, which they test by entry:
+        // see `FilterOp::accepts`.
         Form::Dictionary(_) => failed!(),
     }
-    // A null row's view isn't read: it may not point at bytes.
+    let valid = valid_rows(column);
+    retain(selection, dropped, |row| valid(row) && holds(strings.get(usize::from(row))));
+}
+
+/// Whether each row of `column` isn't null. A null row's view isn't read: it
+/// may not point at bytes.
+fn valid_rows(column: &ColumnView) -> impl Fn(u16) -> bool + '_ {
     let validity = column.validity();
-    let valid = move |row: u16| {
+    move |row: u16| {
         // SAFETY: `check_covers` checked every row is a row of `column`.
         validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(u32::from(row)) })
-    };
-    let cell = move |row: u16| strings.get(usize::from(row));
-    match comparison {
-        // Equality needn't order: most cells differ in length, so aren't
-        // read. One test for both `=` and `<>`, so the loop isn't copied.
-        Comparison::Equal | Comparison::NotEqual => {
-            let equal = comparison == Comparison::Equal;
-            retain(selection, dropped, |row| valid(row) && (cell(row) == string) == equal);
-        }
-        _ => retain(selection, dropped, |row| valid(row) && holds(cell(row))),
     }
+}
+
+/// Sets the bit of each of a dictionary's entries, `values`, where
+/// `entry LIKE pattern` is `want`, as `like` keeps rows.
+pub fn like_bits(values: Values<'_>, pattern: &[u8], want: bool, bits: &mut [u64]) {
+    let strings = values.strings();
+    set(bits, values, |e| crate::like::like(strings.get(e as usize), pattern) == want);
 }
 
 /// Which entries of a dictionary a condition is `want` for, a bit for each:
@@ -140,7 +183,7 @@ impl Entries {
         allocator: &dyn Allocator,
         column: &ColumnView,
         want: bool,
-        set: impl FnOnce(Values<'_>, &mut [u64]),
+        set: &dyn Fn(Values<'_>, &mut [u64]),
     ) -> Result<&Self, AllocError> {
         let found = self.want == want
             && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));

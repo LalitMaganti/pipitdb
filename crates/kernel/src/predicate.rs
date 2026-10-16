@@ -44,6 +44,13 @@ pub enum Leaf {
         start: u32,
         len: u32,
     },
+    /// The string column at `column` in a batch, matched with the `LIKE`
+    /// pattern in bytes `start..start + len` of the predicate's strings.
+    Like {
+        column: u32,
+        start: u32,
+        len: u32,
+    },
     IsNull {
         column: u32,
     },
@@ -69,7 +76,7 @@ impl Predicate {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
         let bytes = strings.as_ref().map_or(0, |strings| strings.len());
         check!(nodes.iter().all(|node| match *node {
-            Node::Leaf(Leaf::CompareString { start, len, .. }) => {
+            Node::Leaf(Leaf::CompareString { start, len, .. } | Leaf::Like { start, len, .. }) => {
                 (start as usize).checked_add(len as usize).is_some_and(|end| end <= bytes)
             }
             _ => true,
@@ -180,7 +187,7 @@ impl Predicate {
         });
         let mut on_column = leaves.filter(|leaf| leaf.column() == column).peekable();
         on_column.peek().is_some()
-            && on_column.all(|leaf| matches!(leaf, Leaf::CompareString { .. }))
+            && on_column.all(|leaf| matches!(leaf, Leaf::CompareString { .. } | Leaf::Like { .. }))
     }
 
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.
@@ -205,6 +212,9 @@ impl Predicate {
             Node::Leaf(Leaf::CompareString { column, comparison, start, len }) => {
                 let column = renumber(column);
                 Node::Leaf(Leaf::CompareString { column, comparison, start, len })
+            }
+            Node::Leaf(Leaf::Like { column, start, len }) => {
+                Node::Leaf(Leaf::Like { column: renumber(column), start, len })
             }
             Node::Leaf(Leaf::IsNull { column }) => {
                 Node::Leaf(Leaf::IsNull { column: renumber(column) })
@@ -314,6 +324,7 @@ impl Leaf {
         match self {
             Leaf::Compare { column, .. }
             | Leaf::CompareString { column, .. }
+            | Leaf::Like { column, .. }
             | Leaf::IsNull { column } => column,
         }
     }
@@ -345,8 +356,21 @@ impl Leaf {
                     return Ok(());
                 }
                 let entries = at_mut!(inputs.entries, node as usize);
-                let entries = entries.find(inputs.allocator, column, want, |values, bits| {
+                let entries = entries.find(inputs.allocator, column, want, &|values, bits| {
                     filter::compare_string_bits(values, comparison, string, bits);
+                })?;
+                filter::keep_entries(column, entries, selection, dropped);
+            }
+            Leaf::Like { column, start, len } => {
+                let pattern = at!(inputs.strings, start as usize..(start + len) as usize);
+                let column = at!(inputs.columns, column as usize);
+                if !matches!(column.form(), Form::Dictionary(_)) {
+                    filter::like(column, pattern, want, selection, dropped);
+                    return Ok(());
+                }
+                let entries = at_mut!(inputs.entries, node as usize);
+                let entries = entries.find(inputs.allocator, column, want, &|values, bits| {
+                    filter::like_bits(values, pattern, want, bits);
                 })?;
                 filter::keep_entries(column, entries, selection, dropped);
             }
@@ -627,6 +651,16 @@ mod tests {
                 let expected = kept_of(&predicate, &mut entries, &flat);
                 assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
             }
+        }
+        // `x LIKE '_'` and `NOT x LIKE '_'`: neither keeps the null.
+        for (not, expected) in [(false, [0, 2, 3, 5, 6].as_slice()), (true, &[4])] {
+            let nodes = [Node::Leaf(Leaf::Like { column: 0, start: 0, len: 1 }), Node::Not(0)];
+            let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
+            let pattern = SlowVec::fixed_from(&Heap, b"_".iter().copied()).unwrap();
+            let predicate = Predicate::with_strings(nodes.unwrap(), Some(pattern));
+            let mut entries = predicate.new_entries(&Heap).unwrap();
+            assert_eq!(kept_of(&predicate, &mut entries, &flat), expected);
+            assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
         }
     }
 
