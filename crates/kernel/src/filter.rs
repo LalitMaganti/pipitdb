@@ -128,28 +128,30 @@ pub struct Entries {
     want: bool,
     /// Bit `e` is set if the condition is `want` for entry `e`.
     bits: Option<SlowVec<u64>>,
+    /// How many bits are set.
+    matched: u32,
 }
 
 impl Entries {
-    /// The bits for `column`'s dictionary and `want`, set by `set` for its
-    /// entries, unless found already.
+    /// Finds the bits for `column`'s dictionary and `want`, set by `set` for
+    /// its entries, unless found already.
     pub fn find(
         &mut self,
         allocator: &dyn Allocator,
         column: &ColumnView,
         want: bool,
         set: impl FnOnce(Values<'_>, &mut [u64]),
-    ) -> Result<&[u64], AllocError> {
+    ) -> Result<&Self, AllocError> {
         let found = self.want == want
             && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));
         if !found {
             let values = column.values();
             let mut bits = SlowVec::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
             set(values, &mut bits);
+            self.matched = bits.iter().map(|word| word.count_ones()).sum();
             (self.dictionary, self.want, self.bits) = (Some(column.clone()), want, Some(bits));
         }
-        let Some(bits) = &self.bits else { failed!() };
-        Ok(bits)
+        Ok(self)
     }
 }
 
@@ -175,16 +177,24 @@ fn set(bits: &mut [u64], values: Values<'_>, test: impl Fn(u32) -> bool) {
 }
 
 /// Narrows `selection` to the rows of `column`, a dictionary, whose entry's
-/// bit is set in `bits`, writing the rows it drops to `dropped`, if given.
+/// bit is set in `entries`, writing the rows it drops to `dropped`, if given.
 /// One test for every condition, so the loops it runs aren't copied for each.
 pub fn keep_entries(
     column: &ColumnView,
-    bits: &[u64],
+    entries: &Entries,
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
 ) {
     check_covers(column, selection);
     let Form::Dictionary(indices) = column.form() else { failed!() };
+    let Some(bits) = &entries.bits else { failed!() };
+    // When no entry or every entry matches, rows needn't be read.
+    if entries.matched == 0 {
+        return drop_all(selection, dropped);
+    }
+    if entries.matched == column.values().len() {
+        return keep_all(selection, dropped);
+    }
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
         // index each.

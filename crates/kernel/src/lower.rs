@@ -175,15 +175,18 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     /// Records that rows are grouped by `keys`, and each group sorted by
-    /// `sorted_by`. What there isn't room for is forgotten, which is safe.
+    /// `sorted_by`. What there isn't room for is forgotten, which is safe:
+    /// sort keys past the room left are dropped, as rows sorted by keys are
+    /// sorted by their start too.
     pub fn declare_sorted_within_groups(&mut self, keys: &[ColumnId], sorted_by: &[SortKey]) {
+        let Some(room) = ARRANGEMENT_KEYS_MAX.checked_sub(keys.len()) else {
+            return;
+        };
+        let sorted_by = at!(sorted_by, ..sorted_by.len().min(room));
         let (Ok(grouped), Ok(sorted)) = (u8::try_from(keys.len()), u8::try_from(sorted_by.len()))
         else {
             return;
         };
-        if keys.len() + sorted_by.len() > ARRANGEMENT_KEYS_MAX {
-            return;
-        }
         let mut arrangement = Arrangement { grouped, sorted, ..Arrangement::NONE };
         let grouped_by = keys.iter().map(|&column| SortKey { column, descending: false });
         for (slot, key) in
@@ -535,6 +538,30 @@ mod tests {
         assert_eq!(knows(&[1], false, &asks[6..8]), ([false, false].to_vec(), 0));
         // A breaker's rows are new.
         assert_eq!(knows(&[0, 1], true, &asks[1..2]), ([false].to_vec(), 0));
+    }
+
+    #[test]
+    fn keeps_the_start_of_sorts_too_long_to_hold() {
+        let plan = LogicalPlan::new(&Heap).unwrap();
+        let mut lowering = Lowering {
+            plan: &plan,
+            allocator: &Heap,
+            source: None,
+            steps: SlowVec::fixed(&Heap, 0).unwrap(),
+            positions: SlowVec::fixed(&Heap, 0).unwrap(),
+            column_count: 0,
+            arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
+            arranged: 0,
+        };
+        let key = |column| SortKey { column, descending: false };
+        let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
+        lowering.declare_sorted_within_groups(&[10], &sorted_by);
+        assert!(lowering.query_arranged(&[10], &sorted_by[..7]));
+        assert!(!lowering.query_arranged(&[10], &sorted_by[..8]));
+        // Grouping by too many keys says nothing of grouping by fewer.
+        let keys: StdVec<ColumnId> = (0..9).collect();
+        lowering.declare_grouped(&keys);
+        assert!(!lowering.query_arranged(&keys[..8], &[]));
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.

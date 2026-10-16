@@ -345,10 +345,10 @@ impl Leaf {
                     return Ok(());
                 }
                 let entries = at_mut!(inputs.entries, node as usize);
-                let bits = entries.find(inputs.allocator, column, want, |values, bits| {
+                let entries = entries.find(inputs.allocator, column, want, |values, bits| {
                     filter::compare_string_bits(values, comparison, string, bits);
                 })?;
-                filter::keep_entries(column, bits, selection, dropped);
+                filter::keep_entries(column, entries, selection, dropped);
             }
             Leaf::IsNull { column } => {
                 filter::is_null(at!(inputs.columns, column as usize), want, selection, dropped);
@@ -628,6 +628,18 @@ mod tests {
                 assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
             }
         }
+    }
+
+    #[test]
+    fn keeps_all_or_none_when_every_entry_or_none_matches() {
+        let dictionary = indexed(&strings(&[Some("a"), Some("c")]), &[1, 0, 1]);
+        let kept = |comparison| {
+            let predicate = compare_b(comparison, false);
+            let mut entries = predicate.new_entries(&Heap).unwrap();
+            kept_of(&predicate, &mut entries, &dictionary)
+        };
+        assert_eq!(kept(Comparison::Equal), []);
+        assert_eq!(kept(Comparison::NotEqual), [0, 1, 2]);
     }
 
     #[test]
