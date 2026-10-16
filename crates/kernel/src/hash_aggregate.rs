@@ -4,8 +4,8 @@
 
 use crate::aggregate::{Function, HashAggregateSpec};
 use crate::aggregate_function::{
-    AggregateFunction, AggregateInput, AggregateInputLoader, GroupStates, SeenBytes,
-    finalize_to_buffer, make_aggregate_function,
+    AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, finalize_to_buffer,
+    make_aggregate_function,
 };
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, Forms};
@@ -22,7 +22,7 @@ pub fn hash_aggregate<'a>(
     allocator: &dyn Allocator,
     spec: HashAggregateSpec,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, HashAggregate::new(allocator, spec)?)
+    DynOperator::new(allocator, HashAggregate::new(spec))
 }
 
 /// Groups rows by their keys and outputs a row for each group: its keys,
@@ -33,11 +33,8 @@ pub fn hash_aggregate<'a>(
 /// with the groups, not the rows.
 struct HashAggregate {
     spec: HashAggregateSpec,
-    /// Each aggregate's function.
-    functions: SlowVec<&'static dyn AggregateFunction>,
-    /// Where each aggregate's state starts in a group's payload.
-    offsets: SlowVec<u32>,
-    /// How many words of state a group keeps.
+    /// How many words of state a group keeps: each aggregate's, one after
+    /// another.
     state_words: usize,
 }
 
@@ -55,23 +52,12 @@ struct State {
 }
 
 impl HashAggregate {
-    fn new(
-        allocator: &dyn Allocator,
-        spec: HashAggregateSpec,
-    ) -> Result<HashAggregate, AllocError> {
+    fn new(spec: HashAggregateSpec) -> HashAggregate {
         check!(spec.key_columns.len() <= KEYS_MAX);
-        let count = spec.aggregates.len();
-        let mut functions = SlowVec::fixed(allocator, count)?;
-        let mut offsets = SlowVec::fixed(allocator, count)?;
-        let mut state_words = 0;
-        for call in spec.aggregates.iter() {
-            let function = make_aggregate_function(call.function);
-            #[expect(clippy::cast_possible_truncation, reason = "a word each")]
-            offsets.push(state_words as u32)?;
-            state_words += function.state_words();
-            functions.push(function)?;
-        }
-        Ok(HashAggregate { spec, functions, offsets, state_words })
+        let calls = spec.aggregates.iter();
+        let state_words =
+            calls.map(|call| make_aggregate_function(call.function).state_words()).sum();
+        HashAggregate { spec, state_words }
     }
 
     /// The states of every group, from the first, and how many words apart
@@ -88,15 +74,14 @@ impl HashAggregate {
         (groups.payloads(), stride)
     }
 
-    /// The states of aggregate `a`, with `seen`.
+    /// The states of the aggregate whose words start at `offset` of each
+    /// group's, with `seen`.
     fn states<'s>(
-        &self,
         base: &'s mut [i64],
         stride: usize,
-        a: usize,
+        offset: usize,
         seen: Option<&'s mut [u8]>,
     ) -> GroupStates<'s> {
-        let offset = *at!(self.offsets, a) as usize;
         // No groups, no words.
         let words = base.get_mut(offset..).unwrap_or_default();
         GroupStates { words, stride, seen }
@@ -163,8 +148,8 @@ impl Breaker for HashAggregate {
         let groups = GroupTable::new(allocator, self.spec.key_columns.len(), self.state_words)?;
         let mut total = SlowVec::new(allocator, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
-        let mut seen = SlowVec::fixed(allocator, self.functions.len())?;
-        for _ in 0..self.functions.len() {
+        let mut seen = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
+        for _ in 0..self.spec.aggregates.len() {
             seen.push(SeenBytes::new(allocator)?)?;
         }
         Ok(State { groups, total, consumed: false, seen, emitted: 0 })
@@ -199,9 +184,9 @@ impl Breaker for HashAggregate {
         let State { groups, total, seen, .. } = state;
         let (base, stride) = self.state_base(groups, total);
         let mut overflow = false;
-        for (a, (&function, call)) in
-            self.functions.iter().zip(self.spec.aggregates.iter()).enumerate()
-        {
+        let mut offset = 0;
+        for (a, call) in self.spec.aggregates.iter().enumerate() {
+            let function = make_aggregate_function(call.function);
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
             if function.reads_input() {
@@ -212,7 +197,8 @@ impl Breaker for HashAggregate {
             } else {
                 None
             };
-            let states = self.states(base, stride, a, seen);
+            let states = Self::states(base, stride, offset, seen);
+            offset += function.state_words();
             match &numbers {
                 Some(numbers) => {
                     function.update(&loaded, numbers.as_slice(), states, &mut overflow);
@@ -251,7 +237,9 @@ impl Breaker for HashAggregate {
         }
         let State { groups: table, total, seen, consumed, .. } = state;
         let (base, stride) = self.state_base(table, total);
-        for (a, &function) in self.functions.iter().enumerate() {
+        let mut offset = 0;
+        for (a, call) in self.spec.aggregates.iter().enumerate() {
+            let function = make_aggregate_function(call.function);
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
             let seen = if function.tracks_seen() {
@@ -259,7 +247,8 @@ impl Breaker for HashAggregate {
             } else {
                 None
             };
-            let states = self.states(base, stride, a, seen);
+            let states = Self::states(base, stride, offset, seen);
+            offset += function.state_words();
             let column = finalize_to_buffer(context, function, states, numbers)?;
             let Ok(()) = output.push_column(column) else { failed!() };
         }
