@@ -9,16 +9,6 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
 
-/// A value that didn't fit in a `SlowVec`. With `?`, it becomes an `AllocError`.
-#[derive(PartialEq, Eq, Debug)]
-pub struct Full<T>(pub T);
-
-impl<T> From<Full<T>> for AllocError {
-    fn from(_: Full<T>) -> AllocError {
-        AllocError
-    }
-}
-
 /// A list for building things now and then, such as plans and footers. It
 /// stays small rather than fast: what doesn't depend on its values' type is
 /// shared by every `SlowVec`, not copied for each type. Hot loops work on
@@ -49,6 +39,7 @@ struct RawVec {
 
 impl<T> SlowVec<T> {
     /// An empty `SlowVec` that can grow to `max` values.
+    #[inline]
     pub fn new(allocator: &dyn Allocator, max: usize) -> Result<SlowVec<T>, AllocError> {
         check!(max.is_power_of_two());
         SlowVec::empty(allocator, 0, max)
@@ -56,12 +47,14 @@ impl<T> SlowVec<T> {
 
     /// An empty `SlowVec` with room for `len` values, rounded up, that never
     /// grows: for lists whose length is known.
+    #[inline]
     pub fn fixed(allocator: &dyn Allocator, len: usize) -> Result<SlowVec<T>, AllocError> {
         let max = len.next_power_of_two();
         SlowVec::empty(allocator, max, max)
     }
 
     /// `values`, in a `SlowVec` that never grows.
+    #[inline]
     pub fn fixed_from(
         allocator: &dyn Allocator,
         values: impl ExactSizeIterator<Item = T>,
@@ -95,6 +88,7 @@ impl<T> SlowVec<T> {
     }
 
     /// An empty `SlowVec` with room for `capacity` values, 0 or `max`.
+    #[inline]
     fn empty(
         allocator: &dyn Allocator,
         capacity: usize,
@@ -113,17 +107,12 @@ impl<T> SlowVec<T> {
         unsafe { self.raw.values.cast::<T>().add(i) }
     }
 
-    /// Adds `value` at the end, growing if full. Fails, giving `value` back,
-    /// if the `SlowVec` holds `max` values or can't grow.
-    pub fn push(&mut self, value: T) -> Result<(), Full<T>> {
-        if self.raw.len == self.raw.capacity as usize
-            && self.raw.make_room(size_of::<T>(), 1).is_err()
-        {
-            return Err(Full(value));
-        }
-        // SAFETY: there is room for a value at `len`.
-        unsafe { self.slot(self.raw.len).write(value) };
-        self.raw.len += 1;
+    /// Adds `value` at the end, growing if full. Fails, dropping `value`, if
+    /// the `SlowVec` holds `max` values or can't grow.
+    pub fn push(&mut self, value: T) -> Result<(), AllocError> {
+        let slot = self.raw.next_slot(size_of::<T>())?;
+        // SAFETY: `next_slot` made room for a value there, and counted it.
+        unsafe { slot.cast::<T>().write(value) };
         Ok(())
     }
 
@@ -258,6 +247,20 @@ impl RawVec {
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
         let capacity = capacity as u32;
         Ok(RawVec { values, allocator, len: 0, capacity, max })
+    }
+
+    /// Where the next value of `item` bytes goes, growing if full, and
+    /// counted: the caller writes it. Out of line, so each type's `push` is
+    /// only that write.
+    #[inline(never)]
+    fn next_slot(&mut self, item: usize) -> Result<NonNull<u8>, AllocError> {
+        if self.len == self.capacity as usize {
+            self.make_room(item, 1)?;
+        }
+        // SAFETY: there's room for a value at `len`.
+        let slot = unsafe { self.values.add(self.len * item) };
+        self.len += 1;
+        Ok(slot)
     }
 
     /// Grows so `additional` more values of `item` bytes fit, unless that's
@@ -405,7 +408,7 @@ mod tests {
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
-        assert_eq!(values.push(4), Err(Full(4)));
+        assert_eq!(values.push(4), Err(AllocError));
         assert_eq!(*values, [0, 1, 2, 3]);
     }
 
@@ -417,7 +420,7 @@ mod tests {
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
-        assert_eq!(values.push(4), Err(Full(4)));
+        assert_eq!(values.push(4), Err(AllocError));
         // Made with room for its max, it never grew.
         assert_eq!(left.get(), 0);
         assert_eq!(values.capacity(), 4);

@@ -6,7 +6,7 @@ use crate::names::{Name, Names};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
 use crate::row_batch::BATCH_COLUMNS_MAX;
-use crate::slow_vec::{Full, SlowVec};
+use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, Step};
 
 /// Why a plan couldn't be lowered.
@@ -20,12 +20,6 @@ pub enum LowerError {
 
 impl From<AllocError> for LowerError {
     fn from(_: AllocError) -> LowerError {
-        LowerError::OutOfMemory
-    }
-}
-
-impl<T> From<Full<T>> for LowerError {
-    fn from(_: Full<T>) -> LowerError {
         LowerError::OutOfMemory
     }
 }

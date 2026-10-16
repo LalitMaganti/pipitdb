@@ -192,7 +192,7 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
-        self.hashes.push(hash).map_err(|_| AllocError)?;
+        self.hashes.push(hash)?;
         let start = self.records.len();
         self.records.extend_zeroed(self.stride)?;
         at_mut!(self.records, start..start + key.len()).copy_from_slice(key);
