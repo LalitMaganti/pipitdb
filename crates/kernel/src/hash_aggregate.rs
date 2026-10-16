@@ -11,7 +11,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, Forms};
 use crate::context::Context;
 use crate::error::Error;
-use crate::group_table::{GroupTable, KEYS_MAX};
+use crate::group_table::{GroupTable, KEYS_MAX, Numbers};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
@@ -171,15 +171,28 @@ impl Breaker for HashAggregate {
         // so a row starts a new group when its number equals the group count.
         // With no keys, every row is in the one group.
         state.consumed = true;
-        let mut numbers = None;
+        let mut buffers = None;
+        // Each row's group, where each run of rows of one group starts, and
+        // whether runs are long enough to fold a run at a time.
+        let mut found: Option<(&[u32], &[u32], bool)> = None;
         if !self.spec.key_columns.is_empty() {
             let mut keys = [input.column(0); KEYS_MAX];
             for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
                 *key = input.column(column);
             }
             let keys = at!(keys, ..self.spec.key_columns.len());
-            let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
-            state.groups.find_or_create(context, keys, input.select(), groups)?;
+            let (groups, starts) = buffers.insert((
+                context.indices_buffer(rows * 4)?,
+                context.indices_buffer((rows + 1) * 4)?,
+            ));
+            let mut numbers =
+                Numbers { groups: groups.as_mut_slice(), starts: starts.as_mut_slice(), runs: 0 };
+            state.groups.find_or_create(context, keys, input.select(), &mut numbers)?;
+            let Numbers { groups, starts, runs } = numbers;
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+            let end = rows as u32;
+            *at_mut!(starts, runs) = end;
+            found = Some((groups, at!(starts, ..=runs), runs * 2 <= rows));
         }
         let group_count = self.group_count(state);
         let State { groups, total, seen, .. } = state;
@@ -198,14 +211,28 @@ impl Breaker for HashAggregate {
             } else {
                 None
             };
-            let states = Self::states(base, stride, offset, seen);
-            offset += function.state_words();
-            match &numbers {
-                Some(numbers) => {
-                    function.update(&loaded, numbers.as_slice(), states, &mut overflow);
+            let mut seen = seen;
+            match found {
+                // A run's rows are one group's: folded as a batch of no keys is.
+                Some((groups, starts, true)) if loaded.valid.is_none() => {
+                    for run in starts.windows(2) {
+                        let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
+                        let values = loaded.values.get(start..end).unwrap_or_default();
+                        let input = AggregateInput { values, valid: None, rows: end - start };
+                        let states = Self::states(base, stride, offset, seen.as_deref_mut());
+                        function.update_group(&input, *at!(groups, start), states, &mut overflow);
+                    }
                 }
-                None => function.update_group(&loaded, 0, states, &mut overflow),
+                Some((groups, _, _)) => {
+                    let states = Self::states(base, stride, offset, seen);
+                    function.update(&loaded, groups, states, &mut overflow);
+                }
+                None => {
+                    let states = Self::states(base, stride, offset, seen);
+                    function.update_group(&loaded, 0, states, &mut overflow);
+                }
             }
+            offset += function.state_words();
         }
         if overflow { Err(Error::Overflow) } else { Ok(()) }
     }
@@ -505,6 +532,28 @@ mod tests {
         #[expect(clippy::cast_precision_loss, reason = "as `AVG` does")]
         let mean = bits(half as f64 / 5.0);
         assert_eq!(run(batches, means).unwrap(), [[Some(mean)]]);
+    }
+
+    #[test]
+    fn folds_runs_of_one_group() {
+        // Runs of keys 1, 2, then 1 again, by one key and by two.
+        let keys = [1, 1, 1, 2, 2, 1, 1, 1].map(Some);
+        let values = [1, 2, 3, 4, 5, 6, 7, 8].map(Some);
+        let rows = || Rows {
+            batches: alloc::vec![keys.into_iter().zip(values).collect()],
+            dropped: Vec::new(),
+        };
+        let expected = [
+            alloc::vec![Some(1), Some(6), Some(6), Some(27), Some(1), Some(8)],
+            alloc::vec![Some(2), Some(2), Some(2), Some(9), Some(4), Some(5)],
+        ];
+        assert_eq!(run(rows(), spec(&[0])).unwrap(), expected);
+        let mut by_both = spec(&[0, 0]);
+        by_both.aggregates.retain(|call| call.function == Function::Sum);
+        assert_eq!(
+            run(rows(), by_both).unwrap(),
+            [[Some(1), Some(1), Some(27)], [Some(2), Some(2), Some(9)]]
+        );
     }
 
     #[test]
