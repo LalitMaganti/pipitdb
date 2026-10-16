@@ -14,6 +14,8 @@ pub enum Error {
     Corrupt,
     /// Data uses something that isn't supported.
     Unsupported,
+    /// An integer result didn't fit in its type.
+    Overflow,
 }
 
 impl From<AllocError> for Error {

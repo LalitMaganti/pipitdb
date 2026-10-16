@@ -5,6 +5,8 @@ extern crate alloc;
 #[macro_use]
 pub mod check;
 
+pub mod aggregate;
+mod aggregate_function;
 pub mod allocator;
 pub mod boxed;
 pub mod buffer;
@@ -15,6 +17,8 @@ pub mod context;
 mod erase;
 pub mod error;
 pub mod filter;
+mod group_table;
+mod hash_aggregate;
 pub mod lower;
 pub mod names;
 pub mod optimize;
