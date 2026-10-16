@@ -12,3 +12,9 @@ CXXFLAGS_x86_64_apple_darwin = "-DNDEBUG -DHAVE_BUILTIN_CTZ=1 -DHAVE_BUILTIN_EXP
 # eight-instruction loop across a 4 KB boundary and made f1 35% slower.
 [build]
 rustflags = ["-C", "llvm-args=-align-loops=64"]
+
+# x86-64 with AVX2, BMI2 and popcnt, as Perfetto builds: no_std can't check
+# for them at run time, and baseline x86-64 can't vectorize 64-bit compares,
+# which makes MIN and MAX 2.9 times slower. Replaces [build]'s rustflags.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "llvm-args=-align-loops=64", "-C", "target-cpu=x86-64-v3"]
