@@ -6,6 +6,13 @@
 //! Building fails if two keywords hash the same (including the same keyword
 //! twice), or if finding a keyword would take more than `PROBES_MAX` probes.
 
+/// Whether `a` and `b` are the same word, ignoring ASCII case: one copy, out
+/// of line, for every name and keyword compared.
+#[inline(never)]
+pub fn same_word(a: &[u8], b: &[u8]) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
 /// The most slots a lookup checks.
 pub const PROBES_MAX: usize = 4;
 

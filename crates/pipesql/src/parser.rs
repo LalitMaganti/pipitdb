@@ -5,6 +5,7 @@
 
 use crate::ast::{Ast, BLOCK_BYTES, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
+use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::allocator::Allocator;
@@ -347,7 +348,7 @@ impl Parser<'_> {
             3 => (Keyword::Not, b"not".as_slice()),
             _ => return Keyword::None,
         };
-        if text.eq_ignore_ascii_case(keyword.1) { keyword.0 } else { Keyword::None }
+        if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }
     }
 }
 
@@ -427,7 +428,30 @@ impl Parser<'_> {
                 Ok(Node::leaf(Tag::Name, token.span))
             }
             Shared::Expr => self.expression(),
+            Shared::Aliased | Shared::Renamed | Shared::Assigned => self.named(shared),
         }
+    }
+
+    /// An expression and its name, as `shared` has them, as a `Named`; or
+    /// an expression alone, if `Aliased` has no `AS`.
+    fn named(&mut self, shared: Shared) -> Result<Node, Error> {
+        let (expression, name) = if shared == Shared::Assigned {
+            let name = self.shared(Shared::Name)?;
+            self.expect(TokenKind::Equal)?;
+            (self.expression()?, name)
+        } else {
+            let first = if shared == Shared::Aliased { Shared::Expr } else { Shared::Name };
+            let expression = self.shared(first)?;
+            if !self.at_word("as") {
+                if shared == Shared::Aliased {
+                    return Ok(expression);
+                }
+                return Err(Error::new(ErrorCode::ExpectedAs, self.current().span));
+            }
+            self.advance()?;
+            (expression, self.shared(Shared::Name)?)
+        };
+        Ok(Node::list(Tag::Named, 2, self.write(&[expression, name])))
     }
 
     /// One or more `shared`, separated by commas.
@@ -460,8 +484,7 @@ impl Parser<'_> {
     /// Whether the current token is `word`, ignoring case.
     fn at_word(&self, word: &str) -> bool {
         let current = self.current();
-        current.kind == TokenKind::Identifier
-            && self.text(current).eq_ignore_ascii_case(word.as_bytes())
+        current.kind == TokenKind::Identifier && same_word(self.text(current), word.as_bytes())
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.

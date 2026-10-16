@@ -12,6 +12,7 @@ use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
+use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
 
@@ -68,7 +69,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     #[inline(never)]
     fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
         let name = |i: usize| self.plan.names.get(at!(columns, i).name);
-        (1..columns.len()).any(|i| (0..i).any(|j| name(j).eq_ignore_ascii_case(name(i))))
+        (1..columns.len())
+            .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
     }
 
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
@@ -76,8 +78,9 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// a`, but then the name can't be used, as in Perfetto.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
         let text = self.text(name.span());
-        let named =
-            |column: &&NamedColumn| self.plan.names.get(column.name).eq_ignore_ascii_case(text);
+        let named = |column: &&NamedColumn| {
+            same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
+        };
         let mut found = self.scope.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
@@ -305,6 +308,16 @@ mod tests {
     }
 
     #[test]
+    fn names_and_drops_columns() {
+        let names = |query| -> StdVec<StdVec<u8>> { run(query).into_iter().map(|c| c.0).collect() };
+        assert_eq!(kept("FROM t |> SELECT b AS c |> SELECT c"), [10.0, 20.0]);
+        assert_eq!(names("FROM t |> EXTEND b AS c, a |> DROP f, s, A"), [b"b", b"c"]);
+        // Renames happen at once, and values are set from the scope before.
+        assert_eq!(kept("FROM t |> RENAME a AS b, b AS a |> SELECT a"), [10.0, 20.0]);
+        assert_eq!(kept("FROM t |> SET a = b, b = a |> SELECT b"), [1.0, 2.0]);
+    }
+
+    #[test]
     fn limits_rows() {
         assert_eq!(kept("FROM t |> LIMIT 1 |> SELECT b"), [10.0]);
         assert_eq!(kept("FROM t |> LIMIT 5 OFFSET 1 |> SELECT b"), [20.0]);
@@ -320,6 +333,12 @@ mod tests {
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));
         assert_eq!(error("FROM dup"), (ErrorCode::DuplicateColumn, 5));
+        assert_eq!(error("FROM t |> DROP a, A"), (ErrorCode::ListedTwice, 18));
+        assert_eq!(error("FROM t |> DROP c"), (ErrorCode::UnknownColumn, 15));
+        assert_eq!(error("FROM t |> DROP a, b, f, s"), (ErrorCode::NoColumnsLeft, 15));
+        assert_eq!(error("FROM t |> RENAME a AS b, A AS c"), (ErrorCode::ListedTwice, 25));
+        assert_eq!(error("FROM t |> SET a = a + 1"), (ErrorCode::Unsupported, 18));
+        assert_eq!(error("FROM t |> EXTEND a |> SELECT a"), (ErrorCode::AmbiguousColumn, 29));
         assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));

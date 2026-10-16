@@ -28,6 +28,9 @@ pub enum Tag {
     Call,
     /// `child_count` items from `first_child`, as in `SELECT a, b`.
     List,
+    /// An expression and a name for it, a `Name`, from `first_child`: `a AS
+    /// b` in `SELECT` and `RENAME`, and `b = a` in `SET`.
+    Named,
     /// A stage of a query: one child per item of its rule, from
     /// `first_child`. Its rule is `rule()`, an id in the parser's registry.
     Stage,

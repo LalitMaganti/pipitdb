@@ -7,7 +7,7 @@
 use crate::ast::Node;
 use crate::compile::Compiler;
 use crate::error::Error;
-use crate::keywords::KeywordTable;
+use crate::keywords::{KeywordTable, same_word};
 use crate::settings::build_setting;
 
 /// How many keywords a registry has room for. Set at build time with
@@ -41,6 +41,13 @@ pub enum Item {
 pub enum Shared {
     Name,
     Expr,
+    /// An expression, then maybe `AS` and its name: a `Named` if there is
+    /// one.
+    Aliased,
+    /// A name, `AS`, and a new name for it, as a `Named`.
+    Renamed,
+    /// A name, `=`, and an expression for it, as a `Named`.
+    Assigned,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -82,7 +89,7 @@ impl Registry {
 
     /// The id of the rule whose keyword is `word`, ignoring case.
     pub fn find(&self, word: &[u8]) -> Option<u16> {
-        self.keywords.get(word, |id| self.rule(id).keyword.as_bytes().eq_ignore_ascii_case(word))
+        self.keywords.get(word, |id| same_word(self.rule(id).keyword.as_bytes(), word))
     }
 
     pub fn rule(&self, id: u16) -> &'static Rule {
