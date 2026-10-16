@@ -5,7 +5,7 @@
 use crate::aggregate::Function;
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Validity};
+use crate::column::{Bounds, ColumnView, DataType, Validity};
 use crate::context::Context;
 use crate::error::Error;
 use crate::group_table::GROUPS_MAX;
@@ -22,6 +22,8 @@ pub(crate) struct AggregateInput<'a> {
     pub(crate) valid: Option<&'a [u64]>,
     /// How many rows there are.
     pub(crate) rows: usize,
+    /// The least and greatest value, if known.
+    pub(crate) bounds: Option<Bounds>,
 }
 
 impl AggregateInput<'_> {
@@ -67,7 +69,8 @@ impl AggregateInputLoader {
         let AggregateInputLoader { values, valid } = self;
         let values = gathered(context, select, words(column), values)?;
         *valid = validity(context, column, select, rows)?;
-        Ok(AggregateInput { values, valid: valid.as_ref().map(Buffer::as_slice), rows })
+        let valid = valid.as_ref().map(Buffer::as_slice);
+        Ok(AggregateInput { values, valid, rows, bounds: column.bounds() })
     }
 }
 
@@ -290,6 +293,17 @@ fn scatter(
 fn batch_sum(input: &AggregateInput) -> i128 {
     check!(input.rows <= BATCH_ROWS_MAX as usize);
     let values = at!(input.values, ..input.rows);
+    // Where the bounds say the sum fits in one word, it's summed wrapping,
+    // which vectorizes better still, nulls added as zeros.
+    let fits = input.bounds.is_some_and(|bounds| {
+        let largest = bounds.min.unsigned_abs().max(bounds.max.unsigned_abs());
+        largest
+            .checked_mul(values.len() as u64)
+            .is_some_and(|reach| reach <= i64::MAX.cast_unsigned())
+    });
+    if fits && input.valid.is_none() {
+        return i128::from(values.iter().fold(0_i64, |sum, &value| sum.wrapping_add(value)));
+    }
     let (mut high, mut low) = (0_i64, 0_u64);
     match input.valid {
         None => {
