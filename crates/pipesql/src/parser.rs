@@ -413,6 +413,7 @@ impl Parser<'_> {
             *at_mut!(children, i) = match *item {
                 Item::One(shared) => self.shared(shared)?,
                 Item::List(shared) => self.list_of(shared)?,
+                Item::Clause(word, shared) => self.clause(word, shared)?,
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));
@@ -444,6 +445,23 @@ impl Parser<'_> {
             }
             self.advance()?;
         }
+    }
+
+    /// `word`, then one or more `shared`, or an empty list if `word` isn't
+    /// next.
+    fn clause(&mut self, word: &str, shared: Shared) -> Result<Node, Error> {
+        if !self.at_word(word) {
+            return Ok(self.list(Tag::List, &[]));
+        }
+        self.advance()?;
+        self.list_of(shared)
+    }
+
+    /// Whether the current token is `word`, ignoring case.
+    fn at_word(&self, word: &str) -> bool {
+        let current = self.current();
+        current.kind == TokenKind::Identifier
+            && self.text(current).eq_ignore_ascii_case(word.as_bytes())
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.

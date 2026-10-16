@@ -60,6 +60,8 @@ pub enum Unsupported {
     NumberType = 3,
     /// A number with a decimal point, which conditions can't compare yet.
     Decimal = 4,
+    /// A `LIMIT` or `OFFSET` that isn't one integer.
+    Limit = 5,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

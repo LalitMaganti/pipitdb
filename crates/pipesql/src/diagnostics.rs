@@ -101,6 +101,9 @@ fn describe(found: &str, error: &Error) -> Message {
                 "numbers with a decimal point can't be compared yet".into(),
                 "not an integer".into(),
             ),
+            what if what == Unsupported::Limit as u16 => {
+                ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
+            }
             _ => ("not supported yet".into(), "this can't be run yet".into()),
         },
     };

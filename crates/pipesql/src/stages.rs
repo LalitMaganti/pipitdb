@@ -1,6 +1,7 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
+use pipit_kernel::limit::LimitOp;
 use pipit_kernel::plan::{DynOp, FilterOp, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -31,8 +32,15 @@ pub const SELECT: Rule = Rule {
     compile: compile_select,
 };
 
+pub const LIMIT: Rule = Rule {
+    keyword: "limit",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Expr), Item::Clause("offset", Shared::Expr)],
+    compile: compile_limit,
+};
+
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT];
+pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, LIMIT];
 
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
@@ -65,6 +73,34 @@ fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
     }
     compiler.scope = scope;
     Ok(())
+}
+
+/// `LIMIT 10 OFFSET 20`: the first 10 rows after skipping 20. Both are
+/// integers.
+fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let count = count(compiler, compiler.node(stage.first_child()))?;
+    let offsets = compiler.node(stage.first_child() + 1);
+    let offset = match offsets.child_count() {
+        0 => 0,
+        1 => self::count(compiler, compiler.node(offsets.first_child()))?,
+        _ => {
+            let second = compiler.node(offsets.first_child() + 1);
+            return Err(Error::unsupported(Unsupported::Limit, compiler.span(second)));
+        }
+    };
+    let allocator = compiler.allocator();
+    let limit = DynOp::new(allocator, LimitOp { count, offset })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(limit, children)?;
+    Ok(())
+}
+
+/// The number of rows `node`, an integer, says.
+fn count(compiler: &Compiler<'_, '_>, node: Node) -> Result<u64, Error> {
+    if node.tag() != Tag::Integer {
+        return Err(Error::unsupported(Unsupported::Limit, compiler.span(node)));
+    }
+    compiler.integer(node)
 }
 
 #[cfg(test)]
@@ -126,6 +162,8 @@ mod tests {
             "(Query (FROM slice) (WHERE (Greater dur 1000)) \
              (SELECT (List name (Divide dur 1000) (Call count *))))"
         );
+        assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
+        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
     }
 
     #[test]

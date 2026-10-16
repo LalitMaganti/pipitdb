@@ -132,16 +132,14 @@ fn value(
     negative: bool,
     data_type: DataType,
 ) -> Result<Value, Error> {
-    let text = |node: Node| compiler.text(node.span());
     let inexact = Error::unsupported(Unsupported::NumberType, compiler.span(node));
     match node.tag() {
         Tag::Unary if node.operator() == Operator::Negate => {
             value(compiler, compiler.node(node.first_child()), !negative, data_type)
         }
         Tag::Integer => {
-            // The lexer's integers are digits, so the only error is size.
             let too_large = Error::new(ErrorCode::NumberTooLarge, node.span());
-            let magnitude = i128::from(text(node).parse::<u64>().map_err(|_| too_large)?);
+            let magnitude = i128::from(compiler.integer(node)?);
             let value = if negative { -magnitude } else { magnitude };
             let value = i64::try_from(value).map_err(|_| too_large)?;
             match data_type {
