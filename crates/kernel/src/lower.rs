@@ -993,8 +993,9 @@ mod tests {
     }
 
     /// How many nodes a plan has once its forms are chosen: a scan of
-    /// `Counted`, a filter on `a`, and an op reading `b` in `accepts`.
-    fn nodes_with(accepts: Forms) -> usize {
+    /// `Counted`, a filter on `a`, and ops reading `b`, each in its forms of
+    /// `accepts`, in turn.
+    fn nodes_with(accepts: &[Forms]) -> usize {
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = DynScannable::new(
             &Heap,
@@ -1018,10 +1019,13 @@ mod tests {
         };
         let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
         let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
-        let filter = plan.add_node(filter, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap());
-        let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();
-        let children = SlowVec::fixed_from(&Heap, [filter.unwrap()].into_iter()).unwrap();
-        plan.add_node(reads, children).unwrap();
+        let mut below =
+            plan.add_node(filter, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        for &accepts in accepts {
+            let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();
+            let children = SlowVec::fixed_from(&Heap, [below].into_iter()).unwrap();
+            below = plan.add_node(reads, children).unwrap();
+        }
         choose_forms(&Heap, &mut plan).unwrap();
         plan.nodes.len()
     }
@@ -1031,7 +1035,11 @@ mod tests {
         // `b` passes the filter before it's read, so it's made lazy: loaded
         // below a reader that takes it flat, by one more node, and handed as
         // it is to one that takes it lazy.
-        assert_eq!(nodes_with(Forms::FLAT), 4);
-        assert_eq!(nodes_with(Forms::LAZY), 3);
+        assert_eq!(nodes_with(&[Forms::FLAT]), 4);
+        assert_eq!(nodes_with(&[Forms::LAZY]), 3);
+        // Every reader gets the column as the first does, so it's loaded
+        // for the first if a later one doesn't take it lazy.
+        assert_eq!(nodes_with(&[Forms::LAZY, Forms::FLAT]), 5);
+        assert_eq!(nodes_with(&[Forms::LAZY, Forms::LAZY]), 4);
     }
 }
