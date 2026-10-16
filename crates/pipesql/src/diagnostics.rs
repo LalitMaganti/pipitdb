@@ -80,9 +80,10 @@ fn describe(found: &str, error: &Error) -> Message {
         ErrorCode::NoColumnsLeft => {
             ("no columns would be left".into(), "dropped with every other column".into())
         }
-        ErrorCode::DuplicateColumn => {
-            (format!("{found} has two columns of one name"), "a table's columns need their own names".into())
-        }
+        ErrorCode::DuplicateColumn => (
+            format!("{found} has two columns of one name"),
+            "a table's columns need their own names".into(),
+        ),
         ErrorCode::NumberTooLarge => {
             (format!("{found} is too large"), "doesn't fit in 64 bits".into())
         }
@@ -93,30 +94,35 @@ fn describe(found: &str, error: &Error) -> Message {
                 pipit_kernel::predicate::PREDICATE_NODES_MAX
             ),
         ),
-        ErrorCode::Unsupported => match error.detail {
-            what if what == Unsupported::SelectExpression as u16 => {
-                ("only column names can be used here yet".into(), "not a column's name".into())
-            }
-            what if what == Unsupported::Where as u16 => (
-                "only comparisons of a column with a number, or of a string column with a string, can filter yet"
-                    .into(),
-                "can't filter on this yet".into(),
-            ),
-            what if what == Unsupported::NumberType as u16 => (
-                format!("{found} can't be compared with this column yet"),
-                "a float can't hold this integer exactly".into(),
-            ),
-            what if what == Unsupported::Decimal as u16 => (
-                "numbers with a decimal point can't be compared yet".into(),
-                "not an integer".into(),
-            ),
-            what if what == Unsupported::Limit as u16 => {
-                ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
-            }
-            _ => ("not supported yet".into(), "this can't be run yet".into()),
-        },
+        ErrorCode::Unsupported => unsupported(found, error.detail),
     };
     Message { title, label }
+}
+
+/// The title and label for an `Unsupported` error about `detail`.
+fn unsupported(found: &str, detail: u16) -> (String, String) {
+    match detail {
+        what if what == Unsupported::SelectExpression as u16 => {
+            ("only column names can be used here yet".into(), "not a column's name".into())
+        }
+        what if what == Unsupported::Where as u16 => (
+            "only comparisons of a column with a number, or of a string column with a string, can filter yet"
+                .into(),
+            "can't filter on this yet".into(),
+        ),
+        what if what == Unsupported::NumberType as u16 => (
+            format!("{found} can't be compared with this column yet"),
+            "a float can't hold this integer exactly".into(),
+        ),
+        what if what == Unsupported::Decimal as u16 => (
+            "numbers with a decimal point can't be compared yet".into(),
+            "not an integer".into(),
+        ),
+        what if what == Unsupported::Limit as u16 => {
+            ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
+        }
+        _ => ("not supported yet".into(), "this can't be run yet".into()),
+    }
 }
 
 fn token(kind: TokenKind) -> &'static str {
