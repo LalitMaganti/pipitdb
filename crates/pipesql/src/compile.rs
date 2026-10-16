@@ -63,14 +63,29 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.allocator
     }
 
+    /// Whether two of `columns` have one name, ignoring case: a relation's
+    /// columns must each have their own, as in Perfetto.
+    #[inline(never)]
+    fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
+        let name = |i: usize| self.plan.names.get(at!(columns, i).name);
+        (1..columns.len()).any(|i| (0..i).any(|j| name(j).eq_ignore_ascii_case(name(i))))
+    }
+
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
-    /// case, as SQL does.
+    /// case, as SQL does. Two columns may share a name, as after `SELECT a,
+    /// a`, but then the name can't be used, as in Perfetto.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
         let text = self.text(name.span());
         let named =
             |column: &&NamedColumn| self.plan.names.get(column.name).eq_ignore_ascii_case(text);
-        let found = self.scope.iter().find(named);
-        found.copied().ok_or_else(|| Error::new(ErrorCode::UnknownColumn, name.span()))
+        let mut found = self.scope.iter().filter(named);
+        let Some(&column) = found.next() else {
+            return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
+        };
+        if found.next().is_some() {
+            return Err(Error::new(ErrorCode::AmbiguousColumn, name.span()));
+        }
+        Ok(column)
     }
 
     /// The relation `name`, a `Name` node, names: a table in the catalog,
@@ -89,6 +104,9 @@ impl<'q, 'c> Compiler<'q, 'c> {
             let binding = self.plan.add_column(table.column_name(i), table.column_type(i))?;
             reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
             columns.push(binding)?;
+        }
+        if self.repeats_a_name(&columns) {
+            return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
         let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
@@ -155,17 +173,21 @@ mod tests {
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
 
-    /// One table, `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5,
-    /// `s` is `it's` and the empty string.
-    struct OneTable(DynScannable<'static>);
+    /// Table `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5, `s`
+    /// is `it's` and the empty string. And `dup`, of `a` and `A`.
+    struct Tables(DynScannable<'static>, DynScannable<'static>);
 
-    impl Catalog for OneTable {
+    impl Catalog for Tables {
         fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
-            (name == "t").then_some(&self.0)
+            match name {
+                "t" => Some(&self.0),
+                "dup" => Some(&self.1),
+                _ => None,
+            }
         }
     }
 
-    fn catalog() -> OneTable {
+    fn catalog() -> Tables {
         let column = |data_type, values: [i64; 2]| {
             let mut buffer = Buffer::allocate(&Heap, 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
@@ -190,7 +212,10 @@ mod tests {
             ("s", DataType::String),
         ];
         let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
-        OneTable(DynScannable::new(&Heap, table).unwrap())
+        let same = [column(DataType::Int64, [1, 2]), column(DataType::Int64, [3, 4])];
+        let same_names = [("a", DataType::Int64), ("A", DataType::Int64)];
+        let same = Table::new(&Heap, &same_names, &[&same]).unwrap();
+        Tables(DynScannable::new(&Heap, table).unwrap(), DynScannable::new(&Heap, same).unwrap())
     }
 
     /// Runs `query`, returning each result column's name and the values of
@@ -277,6 +302,9 @@ mod tests {
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
+        assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
+        assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));
+        assert_eq!(error("FROM dup"), (ErrorCode::DuplicateColumn, 5));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));

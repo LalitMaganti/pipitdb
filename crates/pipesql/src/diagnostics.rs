@@ -68,6 +68,12 @@ fn describe(found: &str, error: &Error) -> Message {
         ),
         ErrorCode::UnknownTable => (format!("no table {found}"), "not in the catalog".into()),
         ErrorCode::UnknownColumn => (format!("no column {found}"), "not a column here".into()),
+        ErrorCode::AmbiguousColumn => {
+            (format!("more than one column named {found}"), "could be any of them".into())
+        }
+        ErrorCode::DuplicateColumn => {
+            (format!("{found} has two columns of one name"), "a table's columns need their own names".into())
+        }
         ErrorCode::NumberTooLarge => {
             (format!("{found} is too large"), "doesn't fit in 64 bits".into())
         }
