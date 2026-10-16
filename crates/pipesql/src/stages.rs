@@ -316,6 +316,10 @@ mod tests {
             parse("FROM t |> WHERE url LIKE '%x%' AND a = 1"),
             "(Query (FROM t) (WHERE (And (Like url '%x%') (Equal a 1))))"
         );
+        assert_eq!(
+            parse("FROM t |> WHERE a IS NULL OR NOT b is not null"),
+            "(Query (FROM t) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
+        );
         assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
         assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
         assert_eq!(
@@ -332,6 +336,7 @@ mod tests {
         assert_eq!(error("FROM t |> ORDER x"), (ErrorCode::UnknownStage, 10));
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
+        assert_eq!(error("FROM t |> WHERE a IS 1"), (ErrorCode::ExpectedWord, 21));
         assert_eq!(error("FROM t |> RENAME a b"), (ErrorCode::ExpectedAs, 19));
         assert_eq!(error("FROM t |> SET a b"), (ErrorCode::ExpectedToken, 16));
     }

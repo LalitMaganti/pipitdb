@@ -1,8 +1,8 @@
 //! Conditions, such as `WHERE`'s, compiled to a `Predicate`.
 //!
 //! A condition is comparisons of a column with an integer, or of a string
-//! column with a string or a `LIKE` pattern, combined with `AND`, `OR`, `NOT`
-//! and parentheses.
+//! column with a string or a `LIKE` pattern, and `IS [NOT] NULL`s, combined
+//! with `AND`, `OR`, `NOT` and parentheses.
 //! Anything else is `Unsupported`.
 
 use pipit_kernel::column::DataType;
@@ -38,6 +38,18 @@ fn add(
     let mut add = |node: Node| add(compiler, nodes, strings, node);
     let added = match node.tag() {
         Tag::Unary if node.operator() == Operator::Not => PredicateNode::Not(add(child(0))?),
+        Tag::Unary if matches!(node.operator(), Operator::IsNull | Operator::IsNotNull) => {
+            let name = child(0);
+            if name.tag() != Tag::Name {
+                return Err(Error::unsupported(Unsupported::Where, compiler.span(name)));
+            }
+            let leaf = PredicateNode::Leaf(Leaf::IsNull { column: compiler.find_column(name)?.id });
+            if node.operator() == Operator::IsNull {
+                leaf
+            } else {
+                PredicateNode::Not(push(compiler, nodes, leaf, name)?)
+            }
+        }
         Tag::Binary if node.operator() == Operator::And => {
             PredicateNode::And(add(child(0))?, add(child(1))?)
         }
@@ -47,6 +59,16 @@ fn add(
         Tag::Binary => PredicateNode::Leaf(compare(compiler, strings, node)?),
         _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(node))),
     };
+    push(compiler, nodes, added, node)
+}
+
+/// Pushes `added`, for `node`, to `nodes`, and returns its index.
+fn push(
+    compiler: &Compiler<'_, '_>,
+    nodes: &mut SlowVec<PredicateNode>,
+    added: PredicateNode,
+    node: Node,
+) -> Result<u32, Error> {
     if nodes.len() == PREDICATE_NODES_MAX {
         return Err(Error::new(ErrorCode::ConditionTooLarge, compiler.span(node)));
     }
