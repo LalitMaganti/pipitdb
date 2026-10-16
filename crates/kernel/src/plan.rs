@@ -112,7 +112,7 @@ pub trait Op<'c> {
         condition: Predicate,
     ) -> Result<(), AllocError> {
         let _ = (allocator, column, condition);
-        crate::check::check_failed(line!())
+        failed!()
     }
 
     /// The op that loads `columns`, which this makes lazy, each in one of
@@ -124,7 +124,7 @@ pub trait Op<'c> {
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         let _ = (allocator, columns);
-        crate::check::check_failed(line!())
+        failed!()
     }
 }
 
@@ -410,7 +410,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         condition: Predicate,
     ) -> Result<(), AllocError> {
         let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         let condition = Condition::new(scanned.column, &condition);
         let conditions = match &mut self.conditions {

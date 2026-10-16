@@ -301,9 +301,7 @@ impl RawVec {
         if self.capacity == 0 {
             return;
         }
-        let Ok(layout) = layout(item, self.capacity as usize) else {
-            crate::check::check_failed(line!())
-        };
+        let Ok(layout) = layout(item, self.capacity as usize) else { failed!() };
         // SAFETY: allocated with this layout from this allocator, which
         // outlives it.
         unsafe { self.allocator.as_ref().deallocate(self.values, layout) };

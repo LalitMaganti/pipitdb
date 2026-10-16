@@ -119,7 +119,7 @@ impl<'a> Rows<'a> {
                 reader.read(context, rows as usize, forms)?
             };
             let Ok(()) = batch.push_column(view) else {
-                pipit_kernel::check::check_failed(line!());
+                pipit_kernel::failed!();
             };
         }
         self.left -= u64::from(rows);
@@ -252,7 +252,7 @@ impl<'a> Scannable for ParquetTable<'a> {
 
     fn column_count(&self) -> u32 {
         let Ok(count) = u32::try_from(self.first().columns().len()) else {
-            pipit_kernel::check::check_failed(line!());
+            pipit_kernel::failed!();
         };
         count
     }
@@ -264,7 +264,7 @@ impl<'a> Scannable for ParquetTable<'a> {
 
     fn column_type(&self, column: u32) -> DataType {
         let Some(data_type) = at!(self.first().columns(), column as usize).data_type() else {
-            pipit_kernel::check::check_failed(line!());
+            pipit_kernel::failed!();
         };
         data_type
     }

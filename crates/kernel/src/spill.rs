@@ -105,7 +105,7 @@ fn write_validity(store: &dyn SpillStore, log: LogId, validity: Validity) -> Res
         }
         block = Some(grow(block, store.append(log, at!(chunk, ..count))?));
     }
-    let Some(block) = block else { crate::check::check_failed(line!()) };
+    let Some(block) = block else { failed!() };
     Ok(block)
 }
 
@@ -146,7 +146,7 @@ fn write_strings(
         }
     }
     bytes = Some(grow(bytes, store.append(log, at!(chunk, ..filled))?));
-    let Some(views) = views else { crate::check::check_failed(line!()) };
+    let Some(views) = views else { failed!() };
     Ok((views, bytes))
 }
 

@@ -161,7 +161,7 @@ impl Scannable for Table {
                     let mut flat = view.clone();
                     flat.make_in(context, forms)?;
                     let Ok(()) = batch.push_column(flat) else {
-                        pipit_kernel::check::check_failed(line!());
+                        pipit_kernel::failed!();
                     };
                 }
             }

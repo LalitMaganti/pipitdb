@@ -167,7 +167,7 @@ impl ColumnView {
         check!(!data_type.has_bytes());
         check!(values.size_bytes().is_multiple_of(data_type.width_bytes()));
         let Ok(len) = u32::try_from(values.size_bytes() / data_type.width_bytes()) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         ColumnView::flat(context, data_type, values, None, validity, len)
     }
@@ -184,7 +184,7 @@ impl ColumnView {
     ) -> Result<ColumnView, AllocError> {
         check!(views.size_bytes().is_multiple_of(8));
         let Ok(len) = u32::try_from(views.size_bytes() / 8) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         // Each value's range is checked when it's read.
         ColumnView::flat(context, DataType::String, views, Some(bytes), validity, len)
@@ -237,7 +237,7 @@ impl ColumnView {
     ) -> Result<ColumnView, AllocError> {
         check!(dictionary.header().kind == Kind::Flat);
         let Ok(row_count) = u32::try_from(indices.size_bytes() / 4) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         // Each index is checked when it's read.
         let header = Header { kind: Kind::Dictionary, ..dictionary.shared(Some(indices)) };
@@ -344,14 +344,14 @@ impl ColumnView {
             Kind::Flat => Form::Flat,
             Kind::Constant => Form::Constant,
             Kind::Dictionary => {
-                let Some(indices) = &header.indices else { crate::check::check_failed(line!()) };
+                let Some(indices) = &header.indices else { failed!() };
                 let start = self.start as usize;
                 Form::Dictionary(at!(
                     indices.as_slice::<u32>(),
                     start..start + self.row_count as usize
                 ))
             }
-            Kind::Lazy => crate::check::check_failed(line!()),
+            Kind::Lazy => failed!(),
         }
     }
 
@@ -365,7 +365,7 @@ impl ColumnView {
             Kind::Constant | Kind::Dictionary => {
                 Values { header, start: header.value_start, len: header.len }
             }
-            Kind::Lazy => crate::check::check_failed(line!()),
+            Kind::Lazy => failed!(),
         }
     }
 
@@ -543,7 +543,7 @@ impl<'a> Values<'a> {
 
     pub fn strings(self) -> Strings<'a> {
         check!(self.header.data_type == DataType::String);
-        let Some(bytes) = &self.header.bytes else { crate::check::check_failed(line!()) };
+        let Some(bytes) = &self.header.bytes else { failed!() };
         Strings { views: self.slice_of::<u32>(), bytes: bytes.as_slice() }
     }
 

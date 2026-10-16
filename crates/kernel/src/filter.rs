@@ -95,7 +95,7 @@ pub fn compare_string(
         }
         Form::Constant => return drop_all(selection, dropped),
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => crate::check::check_failed(line!()),
+        Form::Dictionary(_) => failed!(),
     }
     // A null row's view isn't read: it may not point at bytes.
     let validity = column.validity();
@@ -148,7 +148,7 @@ impl Entries {
             set(values, &mut bits);
             (self.dictionary, self.want, self.bits) = (Some(column.clone()), want, Some(bits));
         }
-        let Some(bits) = &self.bits else { crate::check::check_failed(line!()) };
+        let Some(bits) = &self.bits else { failed!() };
         Ok(bits)
     }
 }
@@ -184,7 +184,7 @@ pub fn keep_entries(
     dropped: Option<&mut Selection>,
 ) {
     check_covers(column, selection);
-    let Form::Dictionary(indices) = column.form() else { crate::check::check_failed(line!()) };
+    let Form::Dictionary(indices) = column.form() else { failed!() };
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
         // index each.
@@ -215,7 +215,7 @@ fn compare_form<T: Copy>(
             }
         }
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => crate::check::check_failed(line!()),
+        Form::Dictionary(_) => failed!(),
     }
 }
 
@@ -234,7 +234,7 @@ pub fn is_null(
         Form::Constant if column.is_null(0) == nulls => return keep_all(selection, dropped),
         Form::Constant => return drop_all(selection, dropped),
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => crate::check::check_failed(line!()),
+        Form::Dictionary(_) => failed!(),
     }
     match column.validity() {
         // No row is null.

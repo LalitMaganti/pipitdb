@@ -241,7 +241,7 @@ impl Breaker for HashAggregate {
         output.reset(count as u32);
         for k in 0..self.spec.key_columns.len() {
             let column = state.groups.write_keys(context, k, first..first + count)?;
-            let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
+            let Ok(()) = output.push_column(column) else { failed!() };
         }
         let mut numbers = context.indices_buffer(count * 4)?;
         let numbers = numbers.as_mut_slice::<u32>();
@@ -261,7 +261,7 @@ impl Breaker for HashAggregate {
             };
             let states = self.states(base, stride, a, seen);
             let column = finalize_to_buffer(context, function, states, numbers)?;
-            let Ok(()) = output.push_column(column) else { crate::check::check_failed(line!()) };
+            let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
         Ok(state.emitted < groups)

@@ -9,5 +9,10 @@ rust-version.workspace = true
 
 [lib]
 name = "pipit_kernel"
+
+[features]
+# Failed checks in release builds say their line: see `check`.
+check-lines = []
+
 [lints]
 workspace = true

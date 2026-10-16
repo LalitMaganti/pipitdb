@@ -280,7 +280,7 @@ fn load_key_words(
         words.as_mut_slice::<u64>().fill(0);
         *nulls = Some(words);
     }
-    let Some(nulls) = nulls else { crate::check::check_failed(line!()) };
+    let Some(nulls) = nulls else { failed!() };
     let out = copy.insert(context.values_buffer(count * 8)?).as_mut_slice::<i64>();
     for (i, (out, null)) in out.iter_mut().zip(nulls.as_mut_slice::<u64>()).enumerate() {
         let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };

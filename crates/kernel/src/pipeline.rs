@@ -155,11 +155,11 @@ impl<'p> Execution<'p> {
         mut buffer: Buffer,
     ) -> Result<Execution<'p>, Error> {
         let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         let mut context = Context::for_query(query);
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         let failed = Cell::new(None);
         let mut run =
@@ -295,7 +295,7 @@ impl<'p> Run<'p> {
         let mut i = first;
         while i < end {
             let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
-                crate::check::check_failed(line!());
+                failed!();
             };
             // SAFETY: the transform's state was made by `Execution::new`.
             if let Err(error) = unsafe { transform.process(context, self.state(Some(i)), batch) } {
@@ -345,7 +345,7 @@ impl<'p> Run<'p> {
     ) -> Made {
         let op = segment.head;
         let Step::Operator(operator) = at!(self.pipeline.steps, op) else {
-            crate::check::check_failed(line!());
+            failed!();
         };
         // SAFETY: the operator's slot, which nothing else borrows.
         let input = unsafe { &(*self.slot(op)).input };
@@ -362,7 +362,7 @@ impl<'p> Run<'p> {
                     output.reset(0);
                     operator.finish(context, state, output)
                 }
-                Status::Waiting => crate::check::check_failed(line!()),
+                Status::Waiting => failed!(),
             }
         };
         let progress = match progress {

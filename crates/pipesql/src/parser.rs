@@ -270,7 +270,7 @@ impl Parser<'_> {
                         operand
                     }
                     Pending::Call(_) | Pending::Argument(_) => {
-                        pipit_kernel::check::check_failed(line!())
+                        pipit_kernel::failed!()
                     }
                 };
             }

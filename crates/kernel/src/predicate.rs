@@ -265,7 +265,7 @@ impl Predicate {
             // and those `b` is among the rest.
             Node::And(a, b) | Node::Or(a, b) => {
                 let Some((rest, scratch)) = scratch.split_first_mut() else {
-                    crate::check::check_failed(line!());
+                    failed!();
                 };
                 if let Node::Leaf(leaf) = *at!(self.nodes, a as usize) {
                     // In one pass.
