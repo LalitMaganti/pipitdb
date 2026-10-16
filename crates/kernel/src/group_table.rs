@@ -116,24 +116,24 @@ impl GroupTable {
         if let ([keys], None) = (keys, nulls) {
             return self.find_values(keys, numbers);
         }
-        self.find_hashed(keys, nulls, numbers)
-    }
-
-    /// As `find_or_create`, given each key as a word a row, and each row's
-    /// null word unless none are null.
-    #[inline(never)]
-    fn find_hashed(
-        &mut self,
-        keys: &[&[i64]],
-        nulls: Option<&[u64]>,
-        numbers: &mut Numbers,
-    ) -> Result<(), Error> {
-        let count = numbers.groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
+        // SAFETY: each key has a word for each row, checked above.
+        let hash = |row: usize| unsafe { hash_row(keys, row, null(row)) };
+        if let (None, &[first, second]) = (nulls, keys) {
+            // Two keys, the commonest after one, compared without a loop.
+            // SAFETY: as above, and `stored` is a group's record, of three
+            // words or more.
+            let equal = |stored: *const i64, row: usize| unsafe {
+                (*stored == 0)
+                    & (*stored.add(1) == *first.get_unchecked(row))
+                    & (*stored.add(2) == *second.get_unchecked(row))
+            };
+            return self.find_hashed(keys, null, hash, equal, numbers);
+        }
         // SAFETY: as above, and `stored` is a group's record.
         let equal = |stored: *const i64, row: usize| unsafe {
             (*stored).cast_unsigned() == null(row)
@@ -142,10 +142,25 @@ impl GroupTable {
                     .enumerate()
                     .all(|(k, keys)| *stored.add(1 + k) == *keys.get_unchecked(row))
         };
+        self.find_hashed(keys, null, hash, equal, numbers)
+    }
+
+    /// As `find_or_create`, given each key as a word a row, each row's null
+    /// word by `null`, its hash by `hash`, and whether a record's key is a
+    /// row's by `equal`.
+    #[inline(never)]
+    fn find_hashed(
+        &mut self,
+        keys: &[&[i64]],
+        null: impl Fn(usize) -> u64,
+        hash: impl Fn(usize) -> u64,
+        equal: impl Fn(*const i64, usize) -> bool,
+        numbers: &mut Numbers,
+    ) -> Result<(), Error> {
+        let count = numbers.groups.len();
         let mut row = 0;
         while row < count {
-            // SAFETY: each key has a word for each row, checked above.
-            let hash = unsafe { hash_row(keys, row, null(row)) };
+            let hash = hash(row);
             let (records, stride) = (self.records.as_ptr(), self.stride);
             let found = probe(&self.slots, hash, |group| {
                 // SAFETY: a group in a slot has a record.
