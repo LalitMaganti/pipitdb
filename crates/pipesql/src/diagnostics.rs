@@ -146,8 +146,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "not a function of a column".into(),
         ),
         what if what == Unsupported::AggregateType as u16 => (
-            "only integer columns can be aggregated yet".into(),
-            "not an integer column".into(),
+            "only integer and float columns can be aggregated yet".into(),
+            "not a number column".into(),
         ),
         what if what == Unsupported::GroupKey as u16 => (
             "only integer columns can be grouped by yet".into(),

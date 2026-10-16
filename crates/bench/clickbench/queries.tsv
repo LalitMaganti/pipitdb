@@ -1,13 +1,13 @@
 0	FROM hits |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits
 1	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
-2		SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
-3		SELECT AVG(UserID) FROM hits
+2	FROM hits |> AGGREGATE sum(AdvEngineID), count(*), avg(ResolutionWidth)	SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+3	FROM hits |> AGGREGATE avg(UserID)	SELECT AVG(UserID) FROM hits
 6	FROM hits |> AGGREGATE min(EventDate), max(EventDate)	SELECT MIN(EventDate), MAX(EventDate) FROM hits
 40	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND (TraficSourceID = -1 OR TraficSourceID = 6) AND RefererHash = 3594120000172545465 |> AGGREGATE count(*) GROUP BY URLHash, EventDate	SELECT URLHash, EventDate, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate
 41	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 |> AGGREGATE count(*) GROUP BY WindowClientWidth, WindowClientHeight	SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight
 41all	FROM hits |> WHERE CounterID >= 0 |> AGGREGATE count(*) GROUP BY WindowClientWidth, WindowClientHeight	SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID >= 0 GROUP BY WindowClientWidth, WindowClientHeight
-pAdv		SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE AdvEngineID <> 0
-pRefresh		SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE IsRefresh <> 0
+pAdv	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE sum(ResolutionWidth), avg(UserID)	SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE AdvEngineID <> 0
+pRefresh	FROM hits |> WHERE IsRefresh != 0 |> AGGREGATE sum(ResolutionWidth), avg(UserID)	SELECT SUM(ResolutionWidth), AVG(UserID) FROM hits WHERE IsRefresh <> 0
 4		SELECT COUNT(DISTINCT UserID) FROM hits
 s1	FROM hits |> WHERE SearchPhrase != '' |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE SearchPhrase <> ''
 s2	FROM hits |> WHERE MobilePhoneModel = 'iPad' |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE MobilePhoneModel = 'iPad'
