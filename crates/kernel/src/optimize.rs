@@ -144,24 +144,32 @@ enum Load {
 }
 
 /// Where `column` is first read above `maker`, the node with that id: below a
-/// node, above the root, or nowhere; and whether a node is passed first.
+/// node, above the root, or nowhere; whether a node is passed first; and the
+/// forms every reader above accepts, as each passes it on as it is.
 fn first_read(
+    nodes: &[PlanNode<'_>],
     parents: &[Option<(PlanNodeId, usize)>],
     reads: &[Needed],
     output: &Needed,
     maker: usize,
     column: ColumnId,
-) -> (Load, bool) {
+) -> (Load, bool, Forms) {
     let (mut at, mut above_parent) = (*at!(parents, maker), false);
-    loop {
-        match at {
-            None if output.is_needed(column) => return (Load::AtRoot, above_parent),
-            None => return (Load::Never, above_parent),
-            Some((parent, slot)) if at!(reads, parent as usize).is_needed(column) => {
-                return (Load::Below(parent, slot), above_parent);
-            }
-            Some((parent, _)) => (at, above_parent) = (*at!(parents, parent as usize), true),
+    let (mut first, mut accepted) = (None, OUTPUT_FORMS | Forms::LAZY);
+    while let Some((parent, slot)) = at {
+        if at!(reads, parent as usize).is_needed(column) {
+            accepted = accepted & at!(nodes, parent as usize).op.accepts(column);
+            first.get_or_insert((Load::Below(parent, slot), above_parent));
         }
+        (at, above_parent) = (*at!(parents, parent as usize), true);
+    }
+    if output.is_needed(column) {
+        accepted = accepted & OUTPUT_FORMS;
+        first.get_or_insert((Load::AtRoot, above_parent));
+    }
+    match first {
+        Some((load, above_parent)) => (load, above_parent, accepted),
+        None => (Load::Never, above_parent, Forms::FLAT),
     }
 }
 
@@ -170,8 +178,8 @@ fn first_read(
 const OUTPUT_FORMS: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
 
 /// Chooses the forms each column is made in. A column may be made in any
-/// form the op that first reads it accepts, as ops between pass a column
-/// they don't read on as it is; its maker is told which, and says which it
+/// form every op that reads it accepts, as each passes it on as it is; its
+/// maker is told which, and says which it
 /// will make. Lazy is allowed too where a column is read later than it's
 /// made, so its values are read only for the rows left then, or never read:
 /// a lazy column is loaded just below the op that first reads it, unless
@@ -200,12 +208,8 @@ pub fn choose_forms(
     let mut lazy = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for maker in 0..nodes {
         for column in (0..).take(columns) {
-            let (load, above_parent) = first_read(&parents, &reads, &output, maker, column);
-            let accepted = match load {
-                Load::Below(reader, _) => at!(plan.nodes, reader as usize).op.accepts(column),
-                Load::AtRoot => OUTPUT_FORMS,
-                Load::Never => Forms::FLAT,
-            };
+            let (load, above_parent, accepted) =
+                first_read(&plan.nodes, &parents, &reads, &output, maker, column);
             // A column nothing reads may be lazy too, and isn't loaded.
             let worth = above_parent || load == Load::Never;
             let allowed = if worth { accepted | Forms::LAZY } else { accepted };
