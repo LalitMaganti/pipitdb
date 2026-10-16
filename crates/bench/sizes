@@ -1,4 +1,4 @@
 aarch64-apple-darwin 80330
 aarch64-unknown-linux-gnu 101900
-x86_64-unknown-linux-gnu 144390
-wasm32-unknown-unknown 122140
+x86_64-unknown-linux-gnu 145040
+wasm32-unknown-unknown 123110
