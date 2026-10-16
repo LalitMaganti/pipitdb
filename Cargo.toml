@@ -12,8 +12,10 @@ rust-version = "1.98"
 [profile.dev]
 panic = "abort"
 
-# gungraun finds benchmark functions by their symbols.
+# Built for speed, as ClickBench's times are, so benchmarks count what's
+# timed. gungraun finds benchmark functions by their symbols.
 [profile.bench]
+opt-level = 3
 strip = false
 debug = true
 
@@ -29,7 +31,6 @@ strip = true
 [profile.speed]
 inherits = "release"
 opt-level = 3
-lto = "fat"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
