@@ -53,9 +53,9 @@ pub trait Op<'c> {
     -> Result<(), LowerError>;
 
     /// Drops the columns this makes that aren't in `needed`, and marks the
-    /// ones it reads. By default, it can't say, so everything is kept.
+    /// ones it reads. By default, it drops none, and marks what `reads` does.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        needed.need_all();
+        self.reads(needed);
         Pruned::Keep
     }
 
@@ -151,9 +151,14 @@ type Materialize<'c> = unsafe fn(
 ) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
-/// allocator, and the function that knows its type.
+/// allocator, and the functions that know its type.
 pub struct DynOp<'c> {
     op: ErasedBox,
+    functions: &'c OpFunctions<'c>,
+}
+
+/// An op type's functions: one table for each type, which its ops share.
+struct OpFunctions<'c> {
     lower: for<'l> unsafe fn(
         NonNull<()>,
         &PlanNode<'c>,
@@ -167,39 +172,44 @@ pub struct DynOp<'c> {
     takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
     take_condition: TakeCondition,
     materialize: Materialize<'c>,
-    lifetime: PhantomData<&'c ()>,
+}
+
+/// Holds `T`'s table.
+struct Functions<'c, T>(PhantomData<(&'c (), T)>);
+
+impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
+    const TABLE: OpFunctions<'c> = OpFunctions {
+        // SAFETY: only called with this op.
+        lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
+        // SAFETY: as above, and the caller has the op mutably.
+        prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
+        // SAFETY: as for `lower`.
+        reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
+        // SAFETY: as for `lower`.
+        accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
+        // SAFETY: as for `prune`.
+        allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
+        // SAFETY: as for `prune`.
+        give_condition: |op, allocator, column| unsafe {
+            value_mut_of::<T>(op).give_condition(allocator, column)
+        },
+        // SAFETY: as for `lower`.
+        takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
+        // SAFETY: as for `prune`.
+        take_condition: |op, allocator, column, condition| unsafe {
+            value_mut_of::<T>(op).take_condition(allocator, column, condition)
+        },
+        // SAFETY: as for `lower`.
+        materialize: |op, allocator, columns| unsafe {
+            value_of::<T>(op).materialize(allocator, columns)
+        },
+    };
 }
 
 impl<'c> DynOp<'c> {
     pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
-        Ok(DynOp {
-            op: Box::new(allocator, op)?.erase(),
-            // SAFETY: only called with this op.
-            lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
-            // SAFETY: as above, and the caller has the op mutably.
-            prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
-            // SAFETY: as for `lower`.
-            reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
-            // SAFETY: as for `lower`.
-            accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
-            // SAFETY: as for `prune`.
-            allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
-            // SAFETY: as for `prune`.
-            give_condition: |op, allocator, column| unsafe {
-                value_mut_of::<T>(op).give_condition(allocator, column)
-            },
-            // SAFETY: as for `lower`.
-            takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
-            // SAFETY: as for `prune`.
-            take_condition: |op, allocator, column, condition| unsafe {
-                value_mut_of::<T>(op).take_condition(allocator, column, condition)
-            },
-            // SAFETY: as for `lower`.
-            materialize: |op, allocator, columns| unsafe {
-                value_of::<T>(op).materialize(allocator, columns)
-            },
-            lifetime: PhantomData,
-        })
+        let op = Box::new(allocator, op)?.erase();
+        Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
     }
 
     pub(crate) fn lower(
@@ -208,29 +218,29 @@ impl<'c> DynOp<'c> {
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.lower)(self.op.as_ptr(), node, lowering) }
+        unsafe { (self.functions.lower)(self.op.as_ptr(), node, lowering) }
     }
 
     pub(crate) fn prune(&mut self, needed: &mut Needed) -> Pruned {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.prune)(self.op.as_ptr(), needed) }
+        unsafe { (self.functions.prune)(self.op.as_ptr(), needed) }
     }
 
     pub(crate) fn reads(&self, reads: &mut Needed) {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.reads)(self.op.as_ptr(), reads) }
+        unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
     }
 
     pub(crate) fn accepts(&self, column: ColumnId) -> Forms {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.accepts)(self.op.as_ptr(), column) }
+        unsafe { (self.functions.accepts)(self.op.as_ptr(), column) }
     }
 
     pub(crate) fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.allow)(self.op.as_ptr(), column, allowed) }
+        unsafe { (self.functions.allow)(self.op.as_ptr(), column, allowed) }
     }
 
     pub(crate) fn give_condition(
@@ -240,12 +250,12 @@ impl<'c> DynOp<'c> {
     ) -> Result<Given, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.give_condition)(self.op.as_ptr(), allocator, column) }
+        unsafe { (self.functions.give_condition)(self.op.as_ptr(), allocator, column) }
     }
 
     pub(crate) fn takes_condition(&self, column: ColumnId) -> bool {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.takes_condition)(self.op.as_ptr(), column) }
+        unsafe { (self.functions.takes_condition)(self.op.as_ptr(), column) }
     }
 
     pub(crate) fn take_condition(
@@ -256,7 +266,7 @@ impl<'c> DynOp<'c> {
     ) -> Result<(), AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.take_condition)(self.op.as_ptr(), allocator, column, condition) }
+        unsafe { (self.functions.take_condition)(self.op.as_ptr(), allocator, column, condition) }
     }
 
     pub(crate) fn materialize(
@@ -265,7 +275,7 @@ impl<'c> DynOp<'c> {
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.materialize)(self.op.as_ptr(), allocator, columns) }
+        unsafe { (self.functions.materialize)(self.op.as_ptr(), allocator, columns) }
     }
 }
 
@@ -493,12 +503,6 @@ impl<'c> Op<'c> for FilterOp {
             allocator,
             Filter { predicate },
         )?))
-    }
-
-    /// Makes no columns.
-    fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        self.reads(needed);
-        Pruned::Keep
     }
 
     /// Its predicate's columns.
