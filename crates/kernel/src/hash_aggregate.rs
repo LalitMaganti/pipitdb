@@ -4,8 +4,8 @@
 
 use crate::aggregate::{Function, HashAggregateSpec};
 use crate::aggregate_function::{
-    AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, finalize_to_buffer,
-    make_aggregate_function,
+    AggregateFunction, AggregateInput, AggregateInputLoader, GroupStates, SeenBytes,
+    finalize_to_buffer, make_aggregate_function,
 };
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, Forms};
@@ -98,6 +98,32 @@ impl HashAggregate {
         let inputs =
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
+    }
+}
+
+/// Updates the states of `groups`, each row's group, by `function` with
+/// `input`, which has no nulls, a run of rows at a time: the rows from each
+/// of `starts` to the next are one group's, so are folded as a batch with no
+/// keys is.
+fn fold_runs(
+    function: &dyn AggregateFunction,
+    input: &AggregateInput,
+    groups: &[u32],
+    starts: &[u32],
+    mut states: GroupStates,
+    overflow: &mut bool,
+) {
+    for run in starts.windows(2) {
+        let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
+        let values = input.values.get(start..end).unwrap_or_default();
+        let run_input =
+            AggregateInput { values, valid: None, rows: end - start, bounds: input.bounds };
+        let states = GroupStates {
+            words: &mut *states.words,
+            stride: states.stride,
+            seen: states.seen.as_deref_mut(),
+        };
+        function.update_group(&run_input, *at!(groups, start), states, overflow);
     }
 }
 
@@ -202,7 +228,7 @@ impl Breaker for HashAggregate {
         for (a, call) in self.spec.aggregates.iter().enumerate() {
             let function = make_aggregate_function(call.function, call.data_type);
             let mut buffers = AggregateInputLoader::default();
-            let mut loaded = AggregateInput { values: &[], valid: None, rows };
+            let mut loaded = AggregateInput { values: &[], valid: None, rows, bounds: None };
             if function.reads_input() {
                 loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
             }
@@ -211,26 +237,13 @@ impl Breaker for HashAggregate {
             } else {
                 None
             };
-            let mut seen = seen;
+            let states = Self::states(base, stride, offset, seen);
             match found {
-                // A run's rows are one group's: folded as a batch of no keys is.
                 Some((groups, starts, true)) if loaded.valid.is_none() => {
-                    for run in starts.windows(2) {
-                        let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
-                        let values = loaded.values.get(start..end).unwrap_or_default();
-                        let input = AggregateInput { values, valid: None, rows: end - start };
-                        let states = Self::states(base, stride, offset, seen.as_deref_mut());
-                        function.update_group(&input, *at!(groups, start), states, &mut overflow);
-                    }
+                    fold_runs(function, &loaded, groups, starts, states, &mut overflow);
                 }
-                Some((groups, _, _)) => {
-                    let states = Self::states(base, stride, offset, seen);
-                    function.update(&loaded, groups, states, &mut overflow);
-                }
-                None => {
-                    let states = Self::states(base, stride, offset, seen);
-                    function.update_group(&loaded, 0, states, &mut overflow);
-                }
+                Some((groups, _, _)) => function.update(&loaded, groups, states, &mut overflow),
+                None => function.update_group(&loaded, 0, states, &mut overflow),
             }
             offset += function.state_words();
         }
