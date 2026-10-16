@@ -1,6 +1,7 @@
 //! `lower`: a `LogicalPlan` to a `PhysicalPlan`, a pipeline ready to run.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::column::DataType;
 use crate::names::{Name, Names};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
@@ -254,6 +255,18 @@ impl<'p, 'c> Lowering<'p, 'c> {
 
     fn known(&self) -> &[Arrangement] {
         at!(self.arrangements, ..self.arranged)
+    }
+
+    /// Records that the step added last makes new batches, holding only the
+    /// columns declared after this.
+    pub fn declare_new_batches(&mut self) {
+        self.positions.iter_mut().for_each(|position| *position = u32::MAX);
+        self.column_count = 0;
+    }
+
+    /// What `column` holds.
+    pub fn query_type(&self, column: ColumnId) -> DataType {
+        at!(self.plan.columns, column as usize).data_type
     }
 
     /// Where `column` is in batches.

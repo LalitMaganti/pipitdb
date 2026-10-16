@@ -147,6 +147,22 @@ impl<T> SlowVec<T> {
         Ok(())
     }
 
+    /// Adds `count` zeros at the end, growing if there isn't room. Fails,
+    /// adding none, if that would take it past `max` or it can't grow.
+    pub fn extend_zeroed(&mut self, count: usize) -> Result<(), AllocError>
+    where
+        T: Primitive,
+    {
+        if count > self.raw.capacity as usize - self.raw.len {
+            self.raw.make_room(size_of::<T>(), count)?;
+        }
+        // SAFETY: there is room for `count` values from `len`, and zero bits
+        // are a valid `Primitive`.
+        unsafe { self.slot(self.raw.len).write_bytes(0, count) };
+        self.raw.len += count;
+        Ok(())
+    }
+
     /// Removes the last value, if any.
     pub fn pop(&mut self) -> Option<T> {
         self.raw.len = self.raw.len.checked_sub(1)?;
