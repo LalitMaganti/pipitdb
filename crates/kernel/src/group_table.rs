@@ -80,17 +80,21 @@ impl GroupTable {
     }
 
     /// Writes the group of each row `select` keeps of `columns`, all if it's
-    /// empty, to `groups`, with `columns` as the key. New keys get new
+    /// empty, to `numbers`, with `columns` as the key. New keys get new
     /// groups. Each column is a flat `Int64`.
+    ///
+    /// Rows of sorted keys come in runs, so only the first row of a run is
+    /// hashed and probed: the rows after it are compared with its group's
+    /// key.
     pub(crate) fn find_or_create(
         &mut self,
         context: &mut Context,
         columns: &[&ColumnView],
         select: &[u16],
-        groups: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
         check!(columns.len() == self.keys);
-        let count = groups.len();
+        let count = numbers.groups.len();
         // Each key as a word a row, 0 where null, and a word a row of which
         // keys are null, unless none are.
         let mut copies = [const { None }; KEYS_MAX];
@@ -108,10 +112,11 @@ impl GroupTable {
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         self.grow(context.allocator(), self.len() + count)?;
+        numbers.runs = 0;
         if let ([keys], None) = (keys, nulls) {
-            return self.find_values(keys, groups);
+            return self.find_values(keys, numbers);
         }
-        self.find_hashed(keys, nulls, groups)
+        self.find_hashed(keys, nulls, numbers)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
@@ -121,9 +126,9 @@ impl GroupTable {
         &mut self,
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
-        groups: &mut [u32],
+        numbers: &mut Numbers,
     ) -> Result<(), Error> {
-        let count = groups.len();
+        let count = numbers.groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
@@ -137,7 +142,8 @@ impl GroupTable {
                     .enumerate()
                     .all(|(k, keys)| *stored.add(1 + k) == *keys.get_unchecked(row))
         };
-        for (row, group) in groups.iter_mut().enumerate() {
+        let mut row = 0;
+        while row < count {
             // SAFETY: each key has a word for each row, checked above.
             let hash = unsafe { hash_row(keys, row, null(row)) };
             let (records, stride) = (self.records.as_ptr(), self.stride);
@@ -145,7 +151,7 @@ impl GroupTable {
                 // SAFETY: a group in a slot has a record.
                 equal(unsafe { records.add(group * stride) }, row)
             });
-            *group = match found {
+            let group = match found {
                 Ok(group) => group,
                 Err(at) => {
                     let mut key = [0_i64; 1 + KEYS_MAX];
@@ -156,6 +162,9 @@ impl GroupTable {
                     self.add(at, hash, at!(key, ..=self.keys))?
                 }
             };
+            // SAFETY: a group has a record.
+            let stored = unsafe { self.records.as_ptr().add(group as usize * self.stride) };
+            row = numbers.run(row, group, |row| equal(stored, row));
         }
         Ok(())
     }
@@ -163,9 +172,14 @@ impl GroupTable {
     /// As `find_or_create`, for a single key with no nulls: compares the key
     /// values directly.
     #[inline(never)]
-    fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
+    fn find_values(&mut self, keys: &[i64], numbers: &mut Numbers) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
-        for (&key, group) in keys.iter().zip(groups) {
+        let count = numbers.groups.len();
+        check!(keys.len() >= count);
+        let mut row = 0;
+        while row < count {
+            // SAFETY: checked above.
+            let key = unsafe { *keys.get_unchecked(row) };
             let hash = fmix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
@@ -174,10 +188,12 @@ impl GroupTable {
                 let stored = records.add(group * stride);
                 *stored == 0 && *stored.add(1) == key
             };
-            *group = match probe(&self.slots, hash, equal) {
+            let group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
                 Err(at) => self.add(at, hash, &[0, key])?,
             };
+            // SAFETY: checked above.
+            row = numbers.run(row, group, |row| unsafe { *keys.get_unchecked(row) } == key);
         }
         Ok(())
     }
@@ -254,6 +270,37 @@ impl GroupTable {
                 .fold(0, |bits, (i, record)| bits | u8::from(*at!(record, 0) >> k & 1 == 0) << i);
         }
         Ok(ColumnView::new(context, DataType::Int64, values, Some(validity))?)
+    }
+}
+
+/// A batch's group numbers: each row's, and where each run of rows of one
+/// group starts.
+pub(crate) struct Numbers<'a> {
+    /// Each row's group.
+    pub(crate) groups: &'a mut [u32],
+    /// Where each run starts, with room for one more, for the rows' end.
+    pub(crate) starts: &'a mut [u32],
+    /// How many runs there are.
+    pub(crate) runs: usize,
+}
+
+impl Numbers<'_> {
+    /// Writes `group` for row `start` and those after it while `same` says
+    /// they have its key, and returns the row after them.
+    #[inline]
+    fn run(&mut self, start: usize, group: u32, same: impl Fn(usize) -> bool) -> usize {
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+        let row = start as u32;
+        *at_mut!(self.starts, self.runs) = row;
+        self.runs += 1;
+        *at_mut!(self.groups, start) = group;
+        let mut i = start + 1;
+        while i < self.groups.len() && same(i) {
+            // SAFETY: checked just above.
+            unsafe { *self.groups.get_unchecked_mut(i) = group };
+            i += 1;
+        }
+        i
     }
 }
 
