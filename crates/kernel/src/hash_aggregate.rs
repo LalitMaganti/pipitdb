@@ -4,8 +4,8 @@
 
 use crate::aggregate::{Function, HashAggregateSpec};
 use crate::aggregate_function::{
-    AggregateFunction, AggregateInput, AggregateInputLoader, GroupStates, SeenBytes,
-    finalize_to_buffer, make_aggregate_function,
+    AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, finalize_to_buffer,
+    make_aggregate_function,
 };
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, Forms};
@@ -98,32 +98,6 @@ impl HashAggregate {
         let inputs =
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
-    }
-}
-
-/// Updates the states of `groups`, each row's group, by `function` with
-/// `input`, which has no nulls, a run of rows at a time: the rows from each
-/// of `starts` to the next are one group's, so are folded as a batch with no
-/// keys is.
-fn fold_runs(
-    function: &dyn AggregateFunction,
-    input: &AggregateInput,
-    groups: &[u32],
-    starts: &[u32],
-    mut states: GroupStates,
-    overflow: &mut bool,
-) {
-    for run in starts.windows(2) {
-        let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
-        let values = input.values.get(start..end).unwrap_or_default();
-        let run_input =
-            AggregateInput { values, valid: None, rows: end - start, bounds: input.bounds };
-        let states = GroupStates {
-            words: &mut *states.words,
-            stride: states.stride,
-            seen: states.seen.as_deref_mut(),
-        };
-        function.update_group(&run_input, *at!(groups, start), states, overflow);
     }
 }
 
@@ -240,7 +214,7 @@ impl Breaker for HashAggregate {
             let states = Self::states(base, stride, offset, seen);
             match found {
                 Some((groups, starts, true)) if loaded.valid.is_none() => {
-                    fold_runs(function, &loaded, groups, starts, states, &mut overflow);
+                    function.update_runs(&loaded, groups, starts, states, &mut overflow);
                 }
                 Some((groups, _, _)) => function.update(&loaded, groups, states, &mut overflow),
                 None => function.update_group(&loaded, 0, states, &mut overflow),
