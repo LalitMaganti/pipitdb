@@ -141,11 +141,15 @@ impl<B: Breaker> Operator for B {
 
 /// What an operator did with its input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Progress {
     /// The output holds everything left for this input, maybe nothing.
     NeedInput,
     /// The output holds some of it. Call again with the same input.
     MoreOutput,
+    /// The output holds the last rows it will make, maybe none: it needs no
+    /// more input, nor to finish, so nothing before it runs again.
+    Done,
 }
 
 /// A step after a pipeline's source.

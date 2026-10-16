@@ -93,6 +93,7 @@ struct Segment {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 enum Status {
     /// Needs another input batch.
     Waiting,
@@ -102,6 +103,18 @@ enum Status {
     Ended,
     /// The operator has nothing left to output.
     Done,
+}
+
+/// The status an operator leaves its segment in, by what it said it did and
+/// the status it ran in: a lookup, as every operator call makes one.
+static NEXT: [[Status; 4]; 3] = next();
+
+const fn next() -> [[Status; 4]; 3] {
+    use Status::{Done, Ended, Ready, Waiting};
+    let mut next = [[Waiting, Ready, Ended, Done]; 3];
+    next[Progress::NeedInput as usize] = [Waiting, Waiting, Done, Done];
+    next[Progress::Done as usize] = [Done; 4];
+    next
 }
 
 /// What a run keeps for a step.
@@ -369,10 +382,7 @@ impl<'p> Run<'p> {
             Ok(progress) => progress,
             Err(error) => return self.fail(error),
         };
-        if progress == Progress::NeedInput {
-            segment.status =
-                if segment.status == Status::Ready { Status::Waiting } else { Status::Done };
-        }
+        segment.status = *at!(at!(NEXT, progress as usize), segment.status as usize);
         Made::Batch
     }
 
