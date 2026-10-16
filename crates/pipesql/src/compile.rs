@@ -63,10 +63,13 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.allocator
     }
 
-    /// The column in scope that `name`, a `Name` node, names.
+    /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
+    /// case, as SQL does.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
         let text = self.text(name.span());
-        let found = self.scope.iter().find(|column| self.plan.names.get(column.name) == text);
+        let named =
+            |column: &&NamedColumn| self.plan.names.get(column.name).eq_ignore_ascii_case(text);
+        let found = self.scope.iter().find(named);
         found.copied().ok_or_else(|| Error::new(ErrorCode::UnknownColumn, name.span()))
     }
 
@@ -242,7 +245,9 @@ mod tests {
         let s = (b"s".to_vec(), [4.0, 0.0].to_vec());
         assert_eq!(run("FROM t"), [a.clone(), b.clone(), f, s]);
         assert_eq!(run("FROM t |> SELECT b, a"), [b.clone(), a.clone()]);
-        assert_eq!(run("FROM t |> SELECT b |> SELECT b"), [b]);
+        assert_eq!(run("FROM t |> SELECT b |> SELECT b"), core::slice::from_ref(&b));
+        // Names match ignoring case, and keep the case they were made with.
+        assert_eq!(run("FROM t |> SELECT B"), [b]);
     }
 
     #[test]
