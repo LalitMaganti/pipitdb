@@ -7,8 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Replaces .cargo/config.toml's rustflags, so it repeats them.
-  RUSTFLAGS: -D warnings -C llvm-args=-align-loops=64
   # Pinned so Miri's standard library build can be cached.
   MIRI_NIGHTLY: nightly-2026-09-27
 
@@ -23,8 +21,10 @@ jobs:
         with:
           key: ${{ hashFiles('Cargo.toml') }}
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets
-      - run: cargo clippy --all-targets -p pipitdb-pipesql --features diagnostics
+      # Warnings are denied here rather than by RUSTFLAGS, which would replace
+      # .cargo/config.toml's.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets -p pipitdb-pipesql --features diagnostics -- -D warnings
       - run: cargo test
       - run: cargo test -p pipitdb-pipesql --features diagnostics
       # Small blocks, so the tests also cover growing and running out of them.
@@ -84,7 +84,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
-      - run: cargo clippy -p pipitdb-bench --example size --features size --target ${{ matrix.target }}
+      - run: cargo clippy -p pipitdb-bench --example size --features size --target ${{ matrix.target }} -- -D warnings
       # `shell: bash` sets pipefail, so `tee` doesn't hide a failure.
       - shell: bash
         run: crates/bench/check_size.sh ${{ matrix.target }} | tee -a "$GITHUB_STEP_SUMMARY"
