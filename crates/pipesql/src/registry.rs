@@ -41,6 +41,13 @@ pub enum Item {
 pub enum Shared {
     Name,
     Expr,
+    /// An expression, then maybe `AS` and its name: a `Named` if there is
+    /// one.
+    Aliased,
+    /// A name, `AS`, and a new name for it, as a `Named`.
+    Renamed,
+    /// A name, `=`, and an expression for it, as a `Named`.
+    Assigned,
 }
 
 #[derive(Clone, Copy, Debug)]

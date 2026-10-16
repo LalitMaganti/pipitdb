@@ -71,6 +71,15 @@ fn describe(found: &str, error: &Error) -> Message {
         ErrorCode::AmbiguousColumn => {
             (format!("more than one column named {found}"), "could be any of them".into())
         }
+        ErrorCode::ExpectedAs => {
+            (format!("expected `AS`, found {found}"), "expected `AS` here".into())
+        }
+        ErrorCode::ListedTwice => {
+            (format!("{found} is listed twice"), "already listed in this stage".into())
+        }
+        ErrorCode::NoColumnsLeft => {
+            ("no columns would be left".into(), "dropped with every other column".into())
+        }
         ErrorCode::DuplicateColumn => {
             (format!("{found} has two columns of one name"), "a table's columns need their own names".into())
         }
@@ -86,7 +95,7 @@ fn describe(found: &str, error: &Error) -> Message {
         ),
         ErrorCode::Unsupported => match error.detail {
             what if what == Unsupported::SelectExpression as u16 => {
-                ("only column names can be selected yet".into(), "not a column's name".into())
+                ("only column names can be used here yet".into(), "not a column's name".into())
             }
             what if what == Unsupported::Where as u16 => (
                 "only comparisons of a column with a number, or of a string column with a string, can filter yet"

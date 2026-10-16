@@ -428,7 +428,30 @@ impl Parser<'_> {
                 Ok(Node::leaf(Tag::Name, token.span))
             }
             Shared::Expr => self.expression(),
+            Shared::Aliased | Shared::Renamed | Shared::Assigned => self.named(shared),
         }
+    }
+
+    /// An expression and its name, as `shared` has them, as a `Named`; or
+    /// an expression alone, if `Aliased` has no `AS`.
+    fn named(&mut self, shared: Shared) -> Result<Node, Error> {
+        let (expression, name) = if shared == Shared::Assigned {
+            let name = self.shared(Shared::Name)?;
+            self.expect(TokenKind::Equal)?;
+            (self.expression()?, name)
+        } else {
+            let first = if shared == Shared::Aliased { Shared::Expr } else { Shared::Name };
+            let expression = self.shared(first)?;
+            if !self.at_word("as") {
+                if shared == Shared::Aliased {
+                    return Ok(expression);
+                }
+                return Err(Error::new(ErrorCode::ExpectedAs, self.current().span));
+            }
+            self.advance()?;
+            (expression, self.shared(Shared::Name)?)
+        };
+        Ok(Node::list(Tag::Named, 2, self.write(&[expression, name])))
     }
 
     /// One or more `shared`, separated by commas.

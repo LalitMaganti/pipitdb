@@ -45,13 +45,20 @@ pub enum ErrorCode {
     DuplicateColumn = 19,
     /// A name names more than one column, ignoring case.
     AmbiguousColumn = 20,
+    /// `AS` isn't next where a stage needs it, as in `RENAME a AS b`.
+    ExpectedAs = 21,
+    /// A list names a column twice, ignoring case, where it can only once,
+    /// as `DROP a, a`.
+    ListedTwice = 22,
+    /// `DROP` would leave no columns.
+    NoColumnsLeft = 23,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u16)]
 pub enum Unsupported {
-    /// Anything but a column's name in `SELECT`.
+    /// Anything but a column's name where a stage takes a column.
     SelectExpression = 1,
     /// A condition that isn't comparisons of a column with a number,
     /// combined with `AND`, `OR` and `NOT`.
@@ -85,7 +92,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::AmbiguousColumn;
+    pub const LAST: ErrorCode = ErrorCode::NoColumnsLeft;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {
