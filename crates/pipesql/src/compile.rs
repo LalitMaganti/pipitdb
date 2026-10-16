@@ -186,13 +186,14 @@ mod tests {
 
     /// Table `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5, `s`
     /// is `it's` and the empty string. And `dup`, of `a` and `A`.
-    struct Tables(DynScannable<'static>, DynScannable<'static>);
+    struct Tables(DynScannable<'static>, DynScannable<'static>, DynScannable<'static>);
 
     impl Catalog for Tables {
         fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
             match name {
                 "t" => Some(&self.0),
                 "dup" => Some(&self.1),
+                "n" => Some(&self.2),
                 _ => None,
             }
         }
@@ -226,7 +227,15 @@ mod tests {
         let same = [column(DataType::Int64, [1, 2]), column(DataType::Int64, [3, 4])];
         let same_names = [("a", DataType::Int64), ("A", DataType::Int64)];
         let same = Table::new(&Heap, &same_names, &[&same]).unwrap();
-        Tables(DynScannable::new(&Heap, table).unwrap(), DynScannable::new(&Heap, same).unwrap())
+        // `x` is 1 and null.
+        let mut values = Buffer::allocate(&Heap, 16).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&[1, 0]);
+        let mut validity = Buffer::allocate(&Heap, 8).unwrap();
+        validity.as_mut_slice::<u8>().copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        let x = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity));
+        let nulls = Table::new(&Heap, &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
+        let scannable = |table| DynScannable::new(&Heap, table).unwrap();
+        Tables(scannable(table), scannable(same), scannable(nulls))
     }
 
     /// Runs `query`, returning each result column's name and the values of
@@ -302,6 +311,9 @@ mod tests {
         // `''` in a string is a quote.
         assert_eq!(kept("FROM t |> WHERE s = 'it''s' |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> WHERE s LIKE '%t''%' |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM n |> WHERE x IS NULL |> SELECT x").len(), 1);
+        assert_eq!(kept("FROM n |> WHERE x is not null |> SELECT x"), [1.0]);
+        assert_eq!(kept("FROM n |> WHERE x IS NULL OR x = 1 |> SELECT x").len(), 2);
         assert_eq!(kept("FROM t |> WHERE NOT s like 'i_%' |> SELECT a"), [2.0]);
         assert_eq!(kept("FROM t |> WHERE s <> '' |> SELECT a"), [1.0]);
         // Either way round, and byte by byte: `i` is after `I`.
@@ -332,6 +344,7 @@ mod tests {
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::Unsupported, 16));
+        assert_eq!(error("FROM t |> WHERE a + 1 IS NULL"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));

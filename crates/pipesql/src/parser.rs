@@ -235,6 +235,10 @@ impl Parser<'_> {
                 }
             };
             loop {
+                if COMPARISON > min_power && self.at_word("is") {
+                    operand = self.is_null(operand)?;
+                    continue;
+                }
                 if let Some((operator, power)) = self.infix(self.current())
                     && power > min_power
                 {
@@ -277,6 +281,21 @@ impl Parser<'_> {
                 };
             }
         }
+    }
+
+    /// `operand IS NULL` or `operand IS NOT NULL`, from the `IS`.
+    fn is_null(&mut self, operand: Node) -> Result<Node, Error> {
+        self.advance()?;
+        let not = self.at_word("not");
+        if not {
+            self.advance()?;
+        }
+        if !self.at_word("null") {
+            return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+        }
+        self.advance()?;
+        let operator = if not { Operator::IsNotNull } else { Operator::IsNull };
+        Ok(self.operation(Tag::Unary, operator, &[operand]))
     }
 
     /// Pops a call and its arguments off `stack`, `last` being its last

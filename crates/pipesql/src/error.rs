@@ -52,6 +52,9 @@ pub enum ErrorCode {
     ListedTwice = 22,
     /// `DROP` would leave no columns.
     NoColumnsLeft = 23,
+    /// A word an expression or a stage needs isn't next, as `NULL` after
+    /// `IS`.
+    ExpectedWord = 24,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -92,7 +95,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::NoColumnsLeft;
+    pub const LAST: ErrorCode = ErrorCode::ExpectedWord;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

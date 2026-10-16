@@ -56,6 +56,8 @@ pub enum Operator {
     Multiply,
     Divide,
     Like,
+    IsNull,
+    IsNotNull,
 }
 
 /// `data` is the operator for `Unary` and `Binary`, the child count for `Call`,
@@ -136,7 +138,7 @@ impl Node {
 
     pub fn operator(self) -> Operator {
         check!(matches!(self.tag(), Tag::Unary | Tag::Binary));
-        check!(self.data[0] <= Operator::Like as u8);
+        check!(self.data[0] <= Operator::IsNotNull as u8);
         // SAFETY: `Operator` is a `u8` and the value is in range, checked above.
         unsafe { core::mem::transmute::<u8, Operator>(self.data[0]) }
     }
