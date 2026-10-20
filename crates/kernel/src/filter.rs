@@ -289,6 +289,13 @@ pub fn is_null(
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => failed!(),
     }
+    if let Some(null) = column.null_value() {
+        let cells = column.values().int64s();
+        return retain(selection, dropped, move |row| {
+            // SAFETY: `check_covers` checked every row is a row of `column`.
+            (unsafe { cell(cells, row) } == null) == nulls
+        });
+    }
     match column.validity() {
         // No row is null.
         None if nulls => drop_all(selection, dropped),
@@ -348,7 +355,20 @@ fn compare_cells<T: Copy>(
     // SAFETY: `compare` checked every row is a row of `column`, whose values
     // `cells` are.
     let at = move |row: u16| key(unsafe { cell(cells, row) });
-    retain_valid(column, selection, dropped, move |row| range.contains(at(row)));
+    // Only integers have a null value, and their keys are their values.
+    match column.null_value() {
+        // Nulls' value isn't in the range, so the test drops them as it is.
+        Some(null) if !range.contains(null) => {
+            retain(selection, dropped, move |row| range.contains(at(row)));
+        }
+        Some(null) => retain(selection, dropped, move |row| {
+            let key = at(row);
+            #[expect(clippy::needless_bitwise_bool, reason = "`&&` would branch for each row")]
+            let holds = range.contains(key) & (key != null);
+            holds
+        }),
+        None => retain_valid(column, selection, dropped, move |row| range.contains(at(row))),
+    }
 }
 
 /// A float's place in the order SQL engines like DuckDB compare floats in:

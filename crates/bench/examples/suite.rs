@@ -9,7 +9,9 @@
 //! `hits_0.parquet` and `hits_1.parquet` are both `hits`.
 //!
 //! `QUERY` runs only that query, `REPEAT` runs each that many times and times
-//! the last, and `QUIET` doesn't print rows.
+//! the last, and `QUIET` doesn't print rows. `NULL_VALUES` is `off` for
+//! nulls found only by validity, or `not_least` for null values that are never
+//! the least `Int64`, as if every column held it.
 
 use std::cell::Cell;
 use std::time::Instant;
@@ -106,6 +108,8 @@ fn open_files(paths: &[String]) -> Result<Vec<(String, Vec<FileSource>)>, String
 }
 
 fn main() -> Result<(), String> {
+    // How nulls are found, while null values are measured, #223.
+    pipitdb_bench::set_null_values();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let queries = take_queries(&mut args)?;
     let files = open_files(&args)?;

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generates the tables the nulls suite reads beside TPC-DS's, as Parquet:
-`collide`, whose integers use the whole range, the least included, with
+`collide`, whose integers use the whole range, both ends included, with
 nulls among them, so no value is free to stand for null in every row group.
 
 Needs `pip install duckdb`.
@@ -14,11 +14,12 @@ import pathlib
 import duckdb
 
 # Spread over the whole range by DuckDB's hash, with the least integer every
-# 997th row and a null every 50th.
+# 997th row, the greatest every 991st, and a null every 50th.
 COLLIDE = """
 SELECT
     CASE WHEN i % 50 = 1 THEN NULL
          WHEN i % 997 = 0 THEN -9223372036854775808
+         WHEN i % 991 = 0 THEN 9223372036854775807
          ELSE (hash(i)::HUGEINT - 9223372036854775808)::BIGINT END AS h,
     CASE WHEN i % 37 = 0 THEN NULL
          WHEN i % 1009 = 0 THEN -9223372036854775808

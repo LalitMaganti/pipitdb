@@ -420,6 +420,18 @@ pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -
     kept
 }
 
+/// Sets whether columns get null values by `$NULL_VALUES`, as the `suite`
+/// example does: `off`, `not_least`, or else on.
+pub fn set_null_values() {
+    use pipit_kernel::column::NullValues;
+    let mode = match std::env::var("NULL_VALUES").as_deref() {
+        Ok("off") => NullValues::Off,
+        Ok("not_least") => NullValues::NotLeast,
+        _ => NullValues::On,
+    };
+    pipit_kernel::column::set_null_values(mode);
+}
+
 /// A column's value for row `i`, and every how many rows, from which, it's
 /// null.
 type NullableColumn = (fn(i64) -> i64, i64, i64);
@@ -439,6 +451,7 @@ impl Catalog for Nullable {
 /// has bounds, as Parquet's statistics give. Kept for the rest of the run.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn nullable_table(row_groups: usize) -> &'static dyn Catalog {
+    set_null_values();
     let rows = BATCH_ROWS_MAX as usize;
     let columns: [NullableColumn; 4] = [
         (|i| (i * 7919) % 1000, 50, 7),
@@ -462,10 +475,9 @@ pub fn nullable_table(row_groups: usize) -> &'static dyn Catalog {
                     (min, max) = (min.min(*slot), max.max(*slot));
                 }
             }
-            let column =
-                ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity))
-                    .expect("allocates");
-            column.with_bounds(pipit_kernel::column::Bounds { min, max })
+            let bounds = Some(pipit_kernel::column::Bounds { min, max });
+            ColumnView::int64s_with_nulls(&mut Context::new(&Heap), values, validity, bounds)
+                .expect("allocates")
         });
         groups.push(views);
     }

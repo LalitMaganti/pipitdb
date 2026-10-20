@@ -18,8 +18,11 @@ use crate::slow_vec::SlowVec;
 pub(crate) struct AggregateInput<'a> {
     /// A value a row, an integer or a float's bits: none for `COUNT(*)`.
     pub(crate) values: &'a [i64],
-    /// Bit r set if row r holds a value, or `None` if every row does.
+    /// Bit r set if row r holds a value, or `None` if every row does, or
+    /// `null` says which don't.
     pub(crate) valid: Option<&'a [u64]>,
+    /// The value only null rows hold, if `valid` is `None` and some may be.
+    pub(crate) null: Option<i64>,
     /// How many rows there are.
     pub(crate) rows: usize,
     /// The least and greatest value, if known.
@@ -29,6 +32,9 @@ pub(crate) struct AggregateInput<'a> {
 impl AggregateInput<'_> {
     /// How many rows hold a value.
     fn count_valid(&self) -> usize {
+        if let Some(null) = self.null {
+            return at!(self.values, ..self.rows).iter().filter(|&&value| value != null).count();
+        }
         let Some(valid) = self.valid else { return self.rows };
         let words = at!(valid, ..self.rows.div_ceil(64)).iter().enumerate();
         let counts = words.map(|(w, &word)| {
@@ -63,9 +69,10 @@ impl AggregateInputLoader {
     ) -> Result<AggregateInput<'a>, Error> {
         let AggregateInputLoader { values, valid } = self;
         let values = gathered(context, select, words(column), values)?;
-        *valid = validity(context, column, select, rows)?;
+        let null = column.null_value();
+        *valid = if null.is_some() { None } else { validity(context, column, select, rows)? };
         let valid = valid.as_ref().map(Buffer::as_slice);
-        Ok(AggregateInput { values, valid, rows, bounds: column.bounds() })
+        Ok(AggregateInput { values, valid, null, rows, bounds: column.bounds() })
     }
 }
 
@@ -193,7 +200,8 @@ pub(crate) trait AggregateFunction {
             let (start, end) = (*at!(run, 0) as usize, *at!(run, 1) as usize);
             let values = input.values.get(start..end).unwrap_or_default();
             let rows = end - start;
-            let run_input = AggregateInput { values, valid: None, rows, bounds: input.bounds };
+            let run_input =
+                AggregateInput { values, valid: None, null: None, rows, bounds: input.bounds };
             let states = GroupStates {
                 words: &mut *states.words,
                 stride: states.stride,
@@ -293,11 +301,12 @@ fn scatter(
         // SAFETY: the bounds are checked above, and each number is a group's,
         // whose state is in `states`, and whose byte is in `seen`.
         unsafe {
-            let valid = input
-                .valid
-                .is_none_or(|valid| *valid.get_unchecked(row / 64) >> (row % 64) & 1 != 0);
             let group = *groups.get_unchecked(row) as usize;
             let value = values.map_or(0, |values| *values.get_unchecked(row));
+            let valid = match input.valid {
+                Some(valid) => *valid.get_unchecked(row / 64) >> (row % 64) & 1 != 0,
+                None => input.null.is_none_or(|null| value != null),
+            };
             add(core::slice::from_raw_parts_mut(base.add(group * stride), words), value, valid);
             if let Some(seen) = &mut seen {
                 *seen.get_unchecked_mut(group) |= u8::from(valid);
@@ -351,7 +360,10 @@ fn batch_sum(input: &AggregateInput) -> i128 {
 fn each(input: &AggregateInput, mut f: impl FnMut(i64, bool)) {
     let values = at!(input.values, ..input.rows);
     match input.valid {
-        None => values.iter().for_each(|&value| f(value, true)),
+        None => match input.null {
+            None => values.iter().for_each(|&value| f(value, true)),
+            Some(null) => values.iter().for_each(|&value| f(value, value != null)),
+        },
         Some(valid) => {
             for (values, &valid) in values.chunks(64).zip(valid) {
                 for (i, &value) in values.iter().enumerate() {

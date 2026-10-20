@@ -318,8 +318,7 @@ impl<'s> ChunkReader<'s> {
             self.position.value = at + valid * width;
         }
         self.position.left -= rows;
-        let column = ColumnView::new(context, self.data_type, out, validity)?;
-        Ok(bounds::bounded(column, bounds))
+        Ok(bounds::column(context, self.data_type, out, validity, bounds)?)
     }
 
     /// The next `rows` rows, which must be in the page being read and are at
@@ -367,10 +366,7 @@ impl<'s> ChunkReader<'s> {
                 if let Some(bits) = bits {
                     bits::spread(words, valid, bits, 0);
                 }
-                bounds::bounded(
-                    ColumnView::new(context, self.data_type, out, validity)?,
-                    self.bounds,
-                )
+                bounds::column(context, self.data_type, out, validity, self.bounds)?
             }
         };
         self.scratch = Some(scratch);
@@ -456,8 +452,7 @@ impl<'s> ChunkReader<'s> {
             if let Some(bits) = bits {
                 bits::spread(values, valid, bits, 0);
             }
-            let column = ColumnView::new(context, self.data_type, out, validity)?;
-            return Ok(bounds::bounded(column, dictionary.bounds));
+            return Ok(bounds::column(context, self.data_type, out, validity, dictionary.bounds)?);
         }
         let mut indices = context.indices_buffer(rows * 4)?;
         let out = indices.as_mut_slice::<u32>();

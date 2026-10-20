@@ -105,9 +105,12 @@ impl GroupTable {
             // found by their values, as with no nulls.
             let mut copy = None;
             let keys = gathered(context, select, column.int64s(), &mut copy)?;
-            let Some(valid) = validity(context, column, select, count)? else { failed!() };
             self.grow(context.allocator(), self.len() + count)?;
             numbers.runs = 0;
+            if let Some(null) = column.null_value() {
+                return self.find_values_or_null_value(keys, null, numbers);
+            }
+            let Some(valid) = validity(context, column, select, count)? else { failed!() };
             return self.find_values_or_null(keys, valid.as_slice(), numbers);
         }
         // Each key as a word a row, 0 where null, and a word a row of which
@@ -218,6 +221,20 @@ impl GroupTable {
         check!(valid.len() * 64 >= numbers.groups.len());
         // SAFETY: checked above, for every row.
         let valid = |row: usize| unsafe { *valid.get_unchecked(row / 64) } >> (row % 64) & 1 != 0;
+        self.find_by_value(keys, valid, numbers)
+    }
+
+    /// As `find_values`, for a single key that's null where it's `null`.
+    #[inline(never)]
+    fn find_values_or_null_value(
+        &mut self,
+        keys: &[i64],
+        null: i64,
+        numbers: &mut Numbers,
+    ) -> Result<(), Error> {
+        check!(keys.len() >= numbers.groups.len());
+        // SAFETY: checked above, for every row.
+        let valid = |row: usize| unsafe { *keys.get_unchecked(row) } != null;
         self.find_by_value(keys, valid, numbers)
     }
 
@@ -399,6 +416,23 @@ fn load_key_words(
     nulls: &mut Option<Buffer>,
 ) -> Result<(), Error> {
     let values = column.int64s();
+    if let Some(null) = column.null_value() {
+        if nulls.is_none() {
+            let mut words = context.values_buffer(count * 8)?;
+            words.as_mut_slice::<u64>().fill(0);
+            *nulls = Some(words);
+        }
+        let Some(nulls) = nulls else { failed!() };
+        let out = copy.insert(context.values_buffer(count * 8)?).as_mut_slice::<i64>();
+        for (i, (out, null_bits)) in out.iter_mut().zip(nulls.as_mut_slice::<u64>()).enumerate() {
+            let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+            let value = *at!(values, row);
+            let valid = value != null;
+            *out = value & -i64::from(valid);
+            *null_bits |= u64::from(!valid) << k;
+        }
+        return Ok(());
+    }
     let Some(valid) = validity(context, column, select, count)? else {
         gathered(context, select, values, copy)?;
         return Ok(());

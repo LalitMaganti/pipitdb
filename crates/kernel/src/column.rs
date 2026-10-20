@@ -2,6 +2,7 @@
 
 use core::cell::Cell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
@@ -122,6 +123,7 @@ struct Header {
     value_start: u32,
     len: u32,
     bounds: Cell<Bounds>,
+    null_value: Option<i64>,
 }
 
 /// Each is its bit in `Forms`.
@@ -136,6 +138,84 @@ enum Kind {
 
 /// Bounds no value is within, for when they aren't known.
 const UNKNOWN: Bounds = Bounds { min: 1, max: 0 };
+
+/// The most rows `int64s_with_nulls` finds a free value among: a batch's.
+const NULL_VALUE_ROWS_MAX: usize = crate::row_batch::BATCH_ROWS_MAX as usize;
+
+/// Whether columns get a null value: see `ColumnView::null_value`. A switch
+/// while null values are measured against validity alone, #223.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NullValues {
+    /// None do: nulls are found by validity.
+    Off = 0,
+    /// Each `Int64` column with nulls does: the least `Int64` where no value
+    /// is, else the greatest, else the least free value above the least.
+    On = 1,
+    /// As `On`, but never the least `Int64`, as if every column held it,
+    /// to test the columns that do.
+    NotLeast = 2,
+}
+
+static NULL_VALUES: AtomicU8 = AtomicU8::new(NullValues::On as u8);
+
+/// Sets whether columns get a null value, for those made after.
+pub fn set_null_values(mode: NullValues) {
+    NULL_VALUES.store(mode as u8, Ordering::Relaxed);
+}
+
+/// A value none of `words` that `valid` has a bit set for holds, if columns
+/// get one: the least `Int64`, if `bounds` or the words show no value is it,
+/// else the greatest, if none is, else the least above the least no value
+/// is. Of the `n + 2` values from the least
+/// up, `n` words and the least can't hold every one, so there's always one.
+/// `mode` is a `NullValues`.
+fn free_value(words: &[i64], valid: &[u64], bounds: Option<Bounds>, mode: u8) -> Option<i64> {
+    if mode == NullValues::Off as u8 {
+        return None;
+    }
+    let not_least = mode == NullValues::NotLeast as u8;
+    if !not_least && bounds.is_some_and(|bounds| bounds.min > i64::MIN) {
+        return Some(i64::MIN);
+    }
+    // Without a branch for each value, so it vectorizes: most columns hold
+    // neither end of the range.
+    let (mut min, mut max) = (i64::MAX, i64::MIN);
+    for (words, &valid) in words.chunks(64).zip(valid) {
+        for (i, &word) in words.iter().enumerate() {
+            let keep = -i64::from(valid >> i & 1 != 0);
+            min = min.min(word & keep | i64::MAX & !keep);
+            max = max.max(word & keep | i64::MIN & !keep);
+        }
+    }
+    if !not_least && min > i64::MIN {
+        return Some(i64::MIN);
+    }
+    if max < i64::MAX {
+        return Some(i64::MAX);
+    }
+    // Bit d is set if a value is `i64::MIN + d`, for d up to the count.
+    let mut taken = [0_u64; NULL_VALUE_ROWS_MAX / 64 + 1];
+    *at_mut!(taken, 0) |= u64::from(not_least);
+    let count = words.len() as u64;
+    for (words, &valid) in words.chunks(64).zip(valid) {
+        for (i, &word) in words.iter().enumerate() {
+            let d = word.wrapping_sub(i64::MIN).cast_unsigned();
+            // One past the count, as the least may be taken without a value.
+            if valid >> i & 1 != 0 && d <= count + 1 {
+                #[expect(clippy::cast_possible_truncation, reason = "at most the count")]
+                let d = d as usize;
+                if let Some(bits) = taken.get_mut(d / 64) {
+                    *bits |= 1 << (d % 64);
+                }
+            }
+        }
+    }
+    let free = taken.iter().enumerate().find_map(|(w, &bits)| {
+        (bits != u64::MAX).then(|| w as u64 * 64 + u64::from((!bits).trailing_zeros()))
+    })?;
+    Some(i64::MIN.wrapping_add(free.cast_signed()))
+}
 
 /// How a column's rows map to its `values`.
 #[derive(Clone, Copy)]
@@ -213,6 +293,7 @@ impl ColumnView {
             value_start: 0,
             len,
             bounds,
+            null_value: None,
         };
         ColumnView::with_header(context, header, len)
     }
@@ -266,6 +347,7 @@ impl ColumnView {
             value_start: 0,
             len,
             bounds: Cell::new(UNKNOWN),
+            null_value: None,
         };
         ColumnView::with_header(context, header, row_count)
     }
@@ -298,6 +380,7 @@ impl ColumnView {
             value_start: values.start,
             len: values.len,
             bounds: Cell::new(header.bounds.get()),
+            null_value: header.null_value,
         }
     }
 
@@ -316,6 +399,13 @@ impl ColumnView {
         Ok(ColumnView { header: block, start: 0, row_count })
     }
 
+    /// The header, while this is its only view.
+    fn header_mut(&mut self) -> &mut Header {
+        check!(self.header.is_unique());
+        // SAFETY: as in `header`, and no other view shares it.
+        unsafe { header_in(&self.header).as_mut() }
+    }
+
     fn header(&self) -> &Header {
         // SAFETY: a `Header` was written in the block when the view was made,
         // and is dropped only with the last view.
@@ -329,6 +419,51 @@ impl ColumnView {
         check!(!self.is_lazy());
         self.header().bounds.set(bounds);
         self
+    }
+
+    /// `values`, `Int64`s, null where `validity` says, as `new` makes them,
+    /// with every null's value set to one no other value has, so kernels can
+    /// find nulls by it rather than by validity: see `null_value`. `bounds`,
+    /// if known, bound the values that aren't null. Only this sets a null
+    /// value, so none can be wrong.
+    pub fn int64s_with_nulls(
+        context: &mut Context,
+        mut values: Buffer,
+        validity: Buffer,
+        bounds: Option<Bounds>,
+    ) -> Result<ColumnView, AllocError> {
+        let words = values.as_mut_slice::<i64>();
+        let rows = words.len();
+        let null_value = if rows <= NULL_VALUE_ROWS_MAX {
+            let mut valid = [0_u64; NULL_VALUE_ROWS_MAX / 64];
+            #[expect(clippy::cast_possible_truncation, reason = "checked just above")]
+            let bits = Validity { bits: validity.as_slice(), start: 0, row_count: rows as u32 };
+            bits.copy_to(&mut valid);
+            let mode = NULL_VALUES.load(Ordering::Relaxed);
+            free_value(words, &valid, bounds, mode).inspect(|&null| {
+                for (words, &valid) in words.chunks_mut(64).zip(&valid) {
+                    for (i, word) in words.iter_mut().enumerate() {
+                        let keep = -i64::from(valid >> i & 1 != 0);
+                        *word = *word & keep | null & !keep;
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let mut column = ColumnView::new(context, DataType::Int64, values, Some(validity))?;
+        column.header_mut().null_value = null_value;
+        Ok(match bounds {
+            Some(bounds) => column.with_bounds(bounds),
+            None => column,
+        })
+    }
+
+    /// The value every null of an `Int64` column holds, and no value that
+    /// isn't null does, if it's known: then `value == null_value` says
+    /// whether a value is null, without reading validity.
+    pub fn null_value(&self) -> Option<i64> {
+        self.header().null_value
     }
 
     /// Bounds every value that isn't null is within, if known.
@@ -436,8 +571,9 @@ impl ColumnView {
         if let Some(bytes) = &values.header.bytes {
             return ColumnView::strings(context, out, bytes.clone(), validity);
         }
-        let flat = ColumnView::new(context, self.data_type(), out, validity)?;
+        let mut flat = ColumnView::new(context, self.data_type(), out, validity)?;
         flat.header().bounds.set(self.header().bounds.get());
+        flat.header_mut().null_value = self.header().null_value;
         Ok(flat)
     }
 
@@ -672,6 +808,46 @@ mod tests {
         let slice = column.slice(1, 2);
         assert_eq!(slice.int64s(), [2, 3]);
         assert!(slice.is_null(1));
+    }
+
+    #[test]
+    fn finds_a_value_no_other_has() {
+        let (on, not_least, off) =
+            (NullValues::On as u8, NullValues::NotLeast as u8, NullValues::Off as u8);
+        let all = [u64::MAX; 1];
+        let words = [i64::MIN, i64::MIN + 1, i64::MIN + 3, i64::MAX];
+        // Bounds that rule out the least `Int64` make it the null value.
+        let bounds = Some(Bounds { min: 5, max: 5 });
+        assert_eq!(free_value(&[5], &all, bounds, on), Some(i64::MIN));
+        assert_eq!(free_value(&words, &all, None, off), None);
+        // Else the greatest, if none has it.
+        assert_eq!(free_value(&[i64::MIN, 5], &all, None, on), Some(i64::MAX));
+        // Else the least value none has.
+        assert_eq!(free_value(&words, &all, None, on), Some(i64::MIN + 2));
+        // A null's value doesn't count.
+        assert_eq!(free_value(&words, &[0b1110], None, on), Some(i64::MIN));
+        assert_eq!(free_value(&words, &[0b1110], None, not_least), Some(i64::MIN + 2));
+        // Every value from the least taken: one past them.
+        let packed = [i64::MIN + 1, i64::MIN + 2, i64::MIN, i64::MAX];
+        assert_eq!(free_value(&packed, &all, None, not_least), Some(i64::MIN + 3));
+    }
+
+    #[test]
+    fn sets_every_nulls_value_to_the_null_value() {
+        let mut values = Buffer::allocate(&Heap, 4 * 8).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&[i64::MIN, 7, 8, 9]);
+        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+        validity.as_mut_slice::<u8>()[0] = 0b0101;
+        let column =
+            ColumnView::int64s_with_nulls(&mut Context::new(&Heap), values, validity, None)
+                .unwrap();
+        let null = column.null_value();
+        if let Some(null) = null {
+            assert_eq!(column.int64s(), [i64::MIN, null, 8, null]);
+            assert!(null != i64::MIN && null != 8);
+        }
+        // Views made of it keep it.
+        assert_eq!(column.slice(1, 2).null_value(), null);
     }
 
     #[test]

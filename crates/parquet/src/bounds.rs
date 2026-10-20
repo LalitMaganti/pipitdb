@@ -1,9 +1,32 @@
 //! Bounds of a chunk's integers, from their type and the chunk's
 //! statistics.
 
+use pipit_kernel::allocator::AllocError;
+use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{Bounds, ColumnView, DataType};
+use pipit_kernel::context::Context;
 
 use crate::footer::{Chunk, Column, Logical, Physical};
+
+/// A flat column of `values`, of `data_type`, null where `validity` says,
+/// with `bounds` if known: its nulls set to a value no other has, for
+/// integers, so kernels can find them by it.
+pub(crate) fn column(
+    context: &mut Context,
+    data_type: DataType,
+    values: Buffer,
+    validity: Option<Buffer>,
+    bounds: Option<Bounds>,
+) -> Result<ColumnView, AllocError> {
+    match (data_type, validity) {
+        (DataType::Int64, Some(validity)) => {
+            ColumnView::int64s_with_nulls(context, values, validity, bounds)
+        }
+        (_, validity) => {
+            Ok(bounded(ColumnView::new(context, data_type, values, validity)?, bounds))
+        }
+    }
+}
 
 /// `column`, with `bounds` if known.
 pub(crate) fn bounded(column: ColumnView, bounds: Option<Bounds>) -> ColumnView {

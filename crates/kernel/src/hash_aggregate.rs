@@ -202,18 +202,20 @@ impl Breaker for HashAggregate {
         for (a, call) in self.spec.aggregates.iter().enumerate() {
             let function = make_aggregate_function(call.function, call.data_type);
             let mut buffers = AggregateInputLoader::default();
-            let mut loaded = AggregateInput { values: &[], valid: None, rows, bounds: None };
+            let mut loaded =
+                AggregateInput { values: &[], valid: None, null: None, rows, bounds: None };
             if function.reads_input() {
                 loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
             }
             let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(group_count, loaded.valid.is_some())?
+                at_mut!(seen, a)
+                    .get(group_count, loaded.valid.is_some() || loaded.null.is_some())?
             } else {
                 None
             };
             let states = Self::states(base, stride, offset, seen);
             match found {
-                Some((groups, starts, true)) if loaded.valid.is_none() => {
+                Some((groups, starts, true)) if loaded.valid.is_none() && loaded.null.is_none() => {
                     function.update_runs(&loaded, groups, starts, states, &mut overflow);
                 }
                 Some((groups, _, _)) => function.update(&loaded, groups, states, &mut overflow),

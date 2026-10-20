@@ -167,7 +167,9 @@ library_benchmark_group!(name = clickbench_group, benchmarks = [clickbench]);
 // gungraun clears benchmarks' environment: `PIPIT_CLICKBENCH` says where the
 // ClickBench file is, and that it must be there.
 main!(
-    config = LibraryBenchmarkConfig::default().pass_through_env("PIPIT_CLICKBENCH");
+    config = LibraryBenchmarkConfig::default()
+        .pass_through_env("PIPIT_CLICKBENCH")
+        .pass_through_env("NULL_VALUES");
     library_benchmark_groups = lexer_group,
     parser_group,
     small_group,
