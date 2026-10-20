@@ -145,10 +145,18 @@ impl GroupTable {
             // Two keys, the commonest after one, compared without a loop.
             // SAFETY: as above, and `stored` is a group's record, of three
             // words or more.
-            let equal = |stored: *const i64, row: usize| unsafe {
-                ((*stored).cast_unsigned() == null(row))
-                    & (*stored.add(1) == *first.get_unchecked(row))
+            let both = |stored: *const i64, row: usize| unsafe {
+                (*stored.add(1) == *first.get_unchecked(row))
                     & (*stored.add(2) == *second.get_unchecked(row))
+            };
+            if nulls.is_none() {
+                // SAFETY: as above.
+                let equal = |stored: *const i64, row| unsafe { *stored == 0 } & both(stored, row);
+                return self.find_hashed(keys, |_| 0, hash, equal, numbers);
+            }
+            let equal = |stored: *const i64, row| {
+                // SAFETY: as above.
+                (unsafe { *stored }.cast_unsigned() == null(row)) & both(stored, row)
             };
             return self.find_hashed(keys, null, hash, equal, numbers);
         }
