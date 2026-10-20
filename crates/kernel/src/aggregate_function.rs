@@ -27,11 +27,6 @@ pub(crate) struct AggregateInput<'a> {
 }
 
 impl AggregateInput<'_> {
-    /// Whether row `row` holds a value.
-    fn is_valid(&self, row: usize) -> bool {
-        self.valid.is_none_or(|valid| *at!(valid, row / 64) >> (row % 64) & 1 != 0)
-    }
-
     /// How many rows hold a value.
     fn count_valid(&self) -> usize {
         let Some(valid) = self.valid else { return self.rows };
@@ -335,29 +330,36 @@ fn batch_sum(input: &AggregateInput) -> i128 {
             .checked_mul(values.len() as u64)
             .is_some_and(|reach| reach <= i64::MAX.cast_unsigned())
     });
-    if fits && input.valid.is_none() {
-        return i128::from(values.iter().fold(0_i64, |sum, &value| sum.wrapping_add(value)));
+    if fits {
+        let mut sum = 0_i64;
+        each(input, |value, valid| sum = sum.wrapping_add(value & mask(valid)));
+        return i128::from(sum);
     }
     let (mut high, mut low) = (0_i64, 0_u64);
+    each(input, |value, valid| {
+        let value = value & mask(valid);
+        high += value >> 32;
+        low += value.cast_unsigned() & 0xffff_ffff;
+    });
+    (i128::from(high) << 32) + i128::from(low)
+}
+
+/// Calls `f` with each of `input`'s values and whether it holds one, a word
+/// of validity at a time rather than a bit for each row, so the loop
+/// vectorizes.
+#[inline]
+fn each(input: &AggregateInput, mut f: impl FnMut(i64, bool)) {
+    let values = at!(input.values, ..input.rows);
     match input.valid {
-        None => {
-            for &value in values {
-                high += value >> 32;
-                low += value.cast_unsigned() & 0xffff_ffff;
-            }
-        }
-        // A word of validity at a time, rather than a bit for each row.
+        None => values.iter().for_each(|&value| f(value, true)),
         Some(valid) => {
             for (values, &valid) in values.chunks(64).zip(valid) {
                 for (i, &value) in values.iter().enumerate() {
-                    let value = value & mask(valid >> i & 1 != 0);
-                    high += value >> 32;
-                    low += value.cast_unsigned() & 0xffff_ffff;
+                    f(value, valid >> i & 1 != 0);
                 }
             }
         }
     }
-    (i128::from(high) << 32) + i128::from(low)
 }
 
 /// A word that's 0 if not `valid`, and all ones if so.
@@ -604,9 +606,7 @@ impl AggregateFunction for Extreme {
         _: &mut bool,
     ) {
         let mut best = states.word(group).cast_unsigned();
-        for (row, &value) in at!(input.values, ..input.rows).iter().enumerate() {
-            best = best.max(self.encode(value, input.is_valid(row)));
-        }
+        each(input, |value, valid| best = best.max(self.encode(value, valid)));
         *states.word_mut(group) = best.cast_signed();
         states.mark(group, input.count_valid() != 0);
     }
@@ -657,9 +657,7 @@ impl AggregateFunction for FloatSum {
         _: &mut bool,
     ) {
         let mut total = float(states.word(group));
-        for (row, &value) in at!(input.values, ..input.rows).iter().enumerate() {
-            total += float(value & mask(input.is_valid(row)));
-        }
+        each(input, |value, valid| total += float(value & mask(valid)));
         *states.word_mut(group) = word(total);
         states.mark(group, input.count_valid() != 0);
     }
@@ -744,10 +742,9 @@ impl AggregateFunction for Avg {
         mut states: GroupStates,
         _: &mut bool,
     ) {
-        let values = at!(input.values, ..input.rows).iter().enumerate();
         let sum = if self.float {
-            let total = values
-                .fold(0.0, |total, (row, &value)| total + float(value & mask(input.is_valid(row))));
+            let mut total = 0.0;
+            each(input, |value, valid| total += float(value & mask(valid)));
             i128::from(word(total))
         } else {
             batch_sum(input)
@@ -806,10 +803,23 @@ fn validity(
     let Some(validity) = column.validity() else { return Ok(None) };
     let mut words = context.small_buffer(rows.div_ceil(64) * 8)?;
     let out = words.as_mut_slice::<u64>();
-    out.fill(0);
-    for i in 0..rows {
-        let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-        *at_mut!(out, i / 64) |= u64::from(is_valid(validity, row)) << (i % 64);
+    if select.is_empty() {
+        check!(rows == validity.row_count() as usize);
+        validity.copy_to(out);
+        return Ok(Some(words));
+    }
+    check!(select.len() >= rows);
+    // Rows kept are in increasing order, so the last is the greatest.
+    check!(
+        select.get(rows.wrapping_sub(1)).is_none_or(|&row| u32::from(row) < validity.row_count())
+    );
+    for (word, select) in out.iter_mut().zip(at!(select, ..rows).chunks(64)) {
+        let bits = select.iter().enumerate();
+        *word = bits.fold(0, |word, (i, &row)| {
+            // SAFETY: every row kept is below the greatest, checked above.
+            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+            word | u64::from(valid) << i
+        });
     }
     Ok(Some(words))
 }

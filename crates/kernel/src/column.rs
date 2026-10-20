@@ -611,6 +611,30 @@ impl<'a> Validity<'a> {
         (at!(self.bits, self.start as usize / 8..), self.start % 8)
     }
 
+    /// Writes the bits of the rows, a word for each 64 from the first, to
+    /// `out`, which has room for them: a word at a time, rather than a bit.
+    /// Bits past the last row are 0.
+    pub fn copy_to(self, out: &mut [u64]) {
+        let rows = self.row_count as usize;
+        let (bytes, shift) = self.bits();
+        let out = at_mut!(out, ..rows.div_ceil(64));
+        for (w, word) in out.iter_mut().enumerate() {
+            // Sixteen bytes hold 64 bits from any of the first eight.
+            let mut window = [0_u8; 16];
+            let from = bytes.get(w * 8..).unwrap_or_default();
+            let n = from.len().min(16);
+            at_mut!(window, ..n).copy_from_slice(at!(from, ..n));
+            #[expect(clippy::cast_possible_truncation, reason = "the low word")]
+            let bits = (u128::from_le_bytes(window) >> shift) as u64;
+            *word = bits;
+        }
+        if let Some(last) = out.last_mut()
+            && !rows.is_multiple_of(64)
+        {
+            *last &= (1 << (rows % 64)) - 1;
+        }
+    }
+
     /// Whether `row` isn't null, without checking it's a row.
     ///
     /// # Safety
@@ -648,6 +672,23 @@ mod tests {
         let slice = column.slice(1, 2);
         assert_eq!(slice.int64s(), [2, 3]);
         assert!(slice.is_null(1));
+    }
+
+    #[test]
+    fn copies_validity_a_word_at_a_time() {
+        let values: alloc::vec::Vec<i64> = (0..200).collect();
+        let nulls: alloc::vec::Vec<usize> = (0..200).filter(|i| i % 3 == 0 || i % 7 == 0).collect();
+        let column = int64s(&values, &nulls);
+        for (start, rows) in [(0, 200), (5, 150), (64, 64), (13, 1), (199, 1)] {
+            let slice = column.slice(start, rows);
+            let mut words = [u64::MAX; 4];
+            slice.validity().unwrap().copy_to(&mut words);
+            for row in 0..4 * 64 {
+                let expected = row < rows && !slice.is_null(row);
+                let bit = words[row as usize / 64] >> (row % 64) & 1 != 0;
+                assert_eq!(bit, expected || row as usize >= rows.div_ceil(64) as usize * 64);
+            }
+        }
     }
 
     #[test]
