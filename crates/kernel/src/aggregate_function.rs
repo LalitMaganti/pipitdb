@@ -794,7 +794,7 @@ pub(crate) fn is_valid(validity: Validity, row: usize) -> bool {
 
 /// Which of `column`'s rows `select` keeps, all if empty, aren't null: a bit
 /// for each of `rows`, from the first. `None` if none are.
-fn validity(
+pub(crate) fn validity(
     context: &mut Context,
     column: &ColumnView,
     select: &[u16],

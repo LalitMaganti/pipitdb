@@ -1,7 +1,7 @@
 //! `GroupTable`: numbers rows by their keys, as Perfetto's does, for the
 //! operators that group rows.
 
-use crate::aggregate_function::{gathered, is_valid};
+use crate::aggregate_function::{gathered, is_valid, validity};
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType};
@@ -39,6 +39,8 @@ pub(crate) struct GroupTable {
     stride: usize,
     /// How many keys there are.
     keys: usize,
+    /// With one key, the group of its nulls, once a row has been null.
+    null_group: Option<u32>,
 }
 
 impl GroupTable {
@@ -61,6 +63,7 @@ impl GroupTable {
             )?,
             stride,
             keys,
+            null_group: None,
         })
     }
 
@@ -95,6 +98,18 @@ impl GroupTable {
     ) -> Result<(), Error> {
         check!(columns.len() == self.keys);
         let count = numbers.groups.len();
+        if let [column] = columns
+            && column.has_nulls()
+        {
+            // Nulls are one group, found without hashing, so the rest are
+            // found by their values, as with no nulls.
+            let mut copy = None;
+            let keys = gathered(context, select, column.int64s(), &mut copy)?;
+            let Some(valid) = validity(context, column, select, count)? else { failed!() };
+            self.grow(context.allocator(), self.len() + count)?;
+            numbers.runs = 0;
+            return self.find_values_or_null(keys, valid.as_slice(), numbers);
+        }
         // Each key as a word a row, 0 where null, and a word a row of which
         // keys are null, unless none are.
         let mut copies = [const { None }; KEYS_MAX];
@@ -188,11 +203,42 @@ impl GroupTable {
     /// values directly.
     #[inline(never)]
     fn find_values(&mut self, keys: &[i64], numbers: &mut Numbers) -> Result<(), Error> {
+        self.find_by_value(keys, |_| true, numbers)
+    }
+
+    /// As `find_values`, for a single key that's null where its bit of
+    /// `valid` isn't set: those rows are the null group.
+    #[inline(never)]
+    fn find_values_or_null(
+        &mut self,
+        keys: &[i64],
+        valid: &[u64],
+        numbers: &mut Numbers,
+    ) -> Result<(), Error> {
+        check!(valid.len() * 64 >= numbers.groups.len());
+        // SAFETY: checked above, for every row.
+        let valid = |row: usize| unsafe { *valid.get_unchecked(row / 64) } >> (row % 64) & 1 != 0;
+        self.find_by_value(keys, valid, numbers)
+    }
+
+    /// `find_values`, with each row's key null unless `valid` says not.
+    #[inline]
+    fn find_by_value(
+        &mut self,
+        keys: &[i64],
+        valid: impl Fn(usize) -> bool,
+        numbers: &mut Numbers,
+    ) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         let count = numbers.groups.len();
         check!(keys.len() >= count);
         let mut row = 0;
         while row < count {
+            if !valid(row) {
+                let group = self.null_group()?;
+                row = numbers.run(row, group, |row| !valid(row));
+                continue;
+            }
             // SAFETY: checked above.
             let key = unsafe { *keys.get_unchecked(row) };
             let hash = mix(SEED, key.cast_unsigned());
@@ -208,9 +254,29 @@ impl GroupTable {
                 Err(at) => self.add(at, hash, &[0, key])?,
             };
             // SAFETY: checked above.
-            row = numbers.run(row, group, |row| unsafe { *keys.get_unchecked(row) } == key);
+            row = numbers
+                .run(row, group, |row| valid(row) && unsafe { *keys.get_unchecked(row) } == key);
         }
         Ok(())
+    }
+
+    /// The group of a single key's nulls, keyed as `find_hashed` keys it:
+    /// its null bit set, and its key 0.
+    fn null_group(&mut self) -> Result<u32, Error> {
+        if let Some(group) = self.null_group {
+            return Ok(group);
+        }
+        // SAFETY: the key has a word for row 0.
+        let hash = unsafe { hash_row(&[&[0]], 0, 1) };
+        let (records, stride) = (self.records.as_ptr(), self.stride);
+        // SAFETY: a group in a slot has a record.
+        let group =
+            match probe(&self.slots, hash, |group| unsafe { *records.add(group * stride) } == 1) {
+                Ok(group) => group,
+                Err(at) => self.add(at, hash, &[1, 0])?,
+            };
+        self.null_group = Some(group);
+        Ok(group)
     }
 
     /// Adds a group for `key`, its null word and keys, hashed as `hash`, in
