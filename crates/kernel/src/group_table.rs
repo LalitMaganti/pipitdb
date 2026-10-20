@@ -1,7 +1,7 @@
 //! `GroupTable`: numbers rows by their keys, as Perfetto's does, for the
 //! operators that group rows.
 
-use crate::aggregate_function::{gathered, is_valid, validity};
+use crate::aggregate_function::{gathered, validity};
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType};
@@ -138,12 +138,12 @@ impl GroupTable {
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
         // SAFETY: each key has a word for each row, checked above.
         let hash = |row: usize| unsafe { hash_row(keys, row, null(row)) };
-        if let (None, &[first, second]) = (nulls, keys) {
+        if let &[first, second] = keys {
             // Two keys, the commonest after one, compared without a loop.
             // SAFETY: as above, and `stored` is a group's record, of three
             // words or more.
             let equal = |stored: *const i64, row: usize| unsafe {
-                (*stored == 0)
+                ((*stored).cast_unsigned() == null(row))
                     & (*stored.add(1) == *first.get_unchecked(row))
                     & (*stored.add(2) == *second.get_unchecked(row))
             };
@@ -399,10 +399,11 @@ fn load_key_words(
     nulls: &mut Option<Buffer>,
 ) -> Result<(), Error> {
     let values = column.int64s();
-    let Some(validity) = column.validity() else {
+    let Some(valid) = validity(context, column, select, count)? else {
         gathered(context, select, values, copy)?;
         return Ok(());
     };
+    let valid = valid.as_slice::<u64>();
     if nulls.is_none() {
         let mut words = context.values_buffer(count * 8)?;
         words.as_mut_slice::<u64>().fill(0);
@@ -412,8 +413,8 @@ fn load_key_words(
     let out = copy.insert(context.values_buffer(count * 8)?).as_mut_slice::<i64>();
     for (i, (out, null)) in out.iter_mut().zip(nulls.as_mut_slice::<u64>()).enumerate() {
         let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-        let valid = is_valid(validity, row);
-        *out = if valid { *at!(values, row) } else { 0 };
+        let valid = *at!(valid, i / 64) >> (i % 64) & 1 != 0;
+        *out = *at!(values, row) & -i64::from(valid);
         *null |= u64::from(!valid) << k;
     }
     Ok(())

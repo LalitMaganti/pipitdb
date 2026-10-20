@@ -5,7 +5,7 @@
 use crate::aggregate::Function;
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column::{Bounds, ColumnView, DataType, Validity};
+use crate::column::{Bounds, ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
 use crate::group_table::GROUPS_MAX;
@@ -780,16 +780,6 @@ fn words(column: &ColumnView) -> &[i64] {
     let (before, words, after) = unsafe { column.value_bytes().align_to::<i64>() };
     check!(before.is_empty() && after.is_empty());
     words
-}
-
-/// Whether `row` isn't null by `validity`.
-pub(crate) fn is_valid(validity: Validity, row: usize) -> bool {
-    check!(row < validity.row_count() as usize);
-    #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
-    // SAFETY: checked just above.
-    unsafe {
-        validity.is_valid_unchecked(row as u32)
-    }
 }
 
 /// Which of `column`'s rows `select` keeps, all if empty, aren't null: a bit
