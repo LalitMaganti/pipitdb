@@ -419,3 +419,81 @@ pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -
     }
     kept
 }
+
+/// A column's value for row `i`, and every how many rows, from which, it's
+/// null.
+type NullableColumn = (fn(i64) -> i64, i64, i64);
+
+/// The table `n`.
+struct Nullable(DynScannable<'static>);
+
+impl Catalog for Nullable {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        (name == "n").then_some(&self.0)
+    }
+}
+
+/// A table `n` of `row_groups` full row groups, whose columns are null now
+/// and then, about one row in 50, scattered, as TPC-DS's are: `k`, of 1,000
+/// keys, `w`, of 7, `v`, of 10,000 values, and `s`, of a million. Each column
+/// has bounds, as Parquet's statistics give. Kept for the rest of the run.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn nullable_table(row_groups: usize) -> &'static dyn Catalog {
+    let rows = BATCH_ROWS_MAX as usize;
+    let columns: [NullableColumn; 4] = [
+        (|i| (i * 7919) % 1000, 50, 7),
+        (|i| (i * 31) % 7, 29, 3),
+        (|i| (i * 7907) % 10_000, 43, 5),
+        (|i| (i * 7901) % 1_000_000, 61, 11),
+    ];
+    let mut groups = Vec::new();
+    for group in 0..row_groups {
+        let first = i64::try_from(group * rows).expect("small");
+        let views = columns.map(|(value, every, at)| {
+            let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+            let mut validity = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+            validity.as_mut_slice::<u8>().fill(0);
+            let (mut min, mut max) = (i64::MAX, i64::MIN);
+            for (row, slot) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
+                let i = first + i64::try_from(row).expect("small");
+                *slot = value(i);
+                if i % every != at {
+                    validity.as_mut_slice::<u8>()[row / 8] |= 1 << (row % 8);
+                    (min, max) = (min.min(*slot), max.max(*slot));
+                }
+            }
+            let column =
+                ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity))
+                    .expect("allocates");
+            column.with_bounds(pipit_kernel::column::Bounds { min, max })
+        });
+        groups.push(views);
+    }
+    let groups: Vec<&[ColumnView]> = groups.iter().map(<[ColumnView; 4]>::as_slice).collect();
+    let schema = [
+        ("k", DataType::Int64),
+        ("w", DataType::Int64),
+        ("v", DataType::Int64),
+        ("s", DataType::Int64),
+    ];
+    let table = Table::new(&Heap, &schema, &groups).expect("allocates");
+    Box::leak(Box::new(Nullable(DynScannable::new(&Heap, table).expect("allocates"))))
+}
+
+/// Queries over `nullable_table`, by name: grouping by a nullable key or
+/// two, aggregating nullable values, filtering them, and sorting by them.
+pub const NULLABLE_QUERIES: [(&str, &str); 5] = [
+    ("group", "FROM n |> AGGREGATE count(*), sum(v) GROUP BY k"),
+    ("group_two", "FROM n |> AGGREGATE count(*) GROUP BY k, w"),
+    ("values", "FROM n |> AGGREGATE count(v), sum(v), min(v), max(v)"),
+    ("filter", "FROM n |> WHERE v < 5000 |> AGGREGATE count(*)"),
+    ("sort", "FROM n |> ORDER BY k, s |> LIMIT 10"),
+];
+
+/// The query called `name` of `NULLABLE_QUERIES`, over `nullable_table(rows)`,
+/// planned once.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn nullable_plan(row_groups: usize, name: &str) -> PhysicalPlan<'static> {
+    let (_, query) = NULLABLE_QUERIES.iter().find(|(n, _)| *n == name).expect("a query");
+    plan(nullable_table(row_groups), query).expect("compiles")
+}

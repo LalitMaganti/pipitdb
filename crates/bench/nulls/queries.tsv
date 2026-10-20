@@ -1,0 +1,26 @@
+ssStore	FROM store_sales |> AGGREGATE count(*), count(ss_quantity), sum(ss_quantity) GROUP BY ss_store_sk	SELECT ss_store_sk, count(*), count(ss_quantity), sum(ss_quantity) FROM store_sales GROUP BY ss_store_sk
+ssCustomer	FROM store_sales |> AGGREGATE count(*), sum(ss_quantity) GROUP BY ss_customer_sk	SELECT ss_customer_sk, count(*), sum(ss_quantity) FROM store_sales GROUP BY ss_customer_sk
+ssStorePromo	FROM store_sales |> AGGREGATE count(*) GROUP BY ss_store_sk, ss_promo_sk	SELECT ss_store_sk, ss_promo_sk, count(*) FROM store_sales GROUP BY ss_store_sk, ss_promo_sk
+ssValues	FROM store_sales |> AGGREGATE count(ss_quantity), sum(ss_quantity), min(ss_quantity), max(ss_quantity), min(ss_customer_sk), max(ss_customer_sk)	SELECT count(ss_quantity), sum(ss_quantity), min(ss_quantity), max(ss_quantity), min(ss_customer_sk), max(ss_customer_sk) FROM store_sales
+ssLess	FROM store_sales |> WHERE ss_quantity < 20 |> AGGREGATE count(*)	SELECT count(*) FROM store_sales WHERE ss_quantity < 20
+ssNotEqual	FROM store_sales |> WHERE ss_customer_sk != 1000 |> AGGREGATE count(*)	SELECT count(*) FROM store_sales WHERE ss_customer_sk <> 1000
+ssIsNull	FROM store_sales |> WHERE ss_customer_sk IS NULL |> AGGREGATE count(*), sum(ss_quantity)	SELECT count(*), sum(ss_quantity) FROM store_sales WHERE ss_customer_sk IS NULL
+ssDateStore	FROM store_sales |> WHERE ss_sold_date_sk >= 2451000 |> AGGREGATE sum(ss_quantity), max(ss_customer_sk) GROUP BY ss_store_sk	SELECT ss_store_sk, sum(ss_quantity), max(ss_customer_sk) FROM store_sales WHERE ss_sold_date_sk >= 2451000 GROUP BY ss_store_sk
+ssSort	FROM store_sales |> WHERE ss_ticket_number < 2000 |> ORDER BY ss_customer_sk, ss_ticket_number, ss_item_sk |> LIMIT 20 |> SELECT ss_customer_sk, ss_ticket_number, ss_item_sk	SELECT ss_customer_sk, ss_ticket_number, ss_item_sk FROM store_sales WHERE ss_ticket_number < 2000 ORDER BY ss_customer_sk NULLS FIRST, ss_ticket_number, ss_item_sk LIMIT 20
+ssTopCustomers	FROM store_sales |> AGGREGATE count(*) AS c GROUP BY ss_customer_sk |> ORDER BY c DESC, ss_customer_sk |> LIMIT 10	SELECT ss_customer_sk, count(*) AS c FROM store_sales GROUP BY ss_customer_sk ORDER BY c DESC, ss_customer_sk NULLS FIRST LIMIT 10
+csCustomer	FROM catalog_sales |> AGGREGATE count(*), sum(cs_quantity), min(cs_ship_date_sk) GROUP BY cs_bill_customer_sk	SELECT cs_bill_customer_sk, count(*), sum(cs_quantity), min(cs_ship_date_sk) FROM catalog_sales GROUP BY cs_bill_customer_sk
+csWarehouse	FROM catalog_sales |> WHERE cs_ship_date_sk <= 2451500 |> AGGREGATE count(*), max(cs_quantity) GROUP BY cs_warehouse_sk	SELECT cs_warehouse_sk, count(*), max(cs_quantity) FROM catalog_sales WHERE cs_ship_date_sk <= 2451500 GROUP BY cs_warehouse_sk
+cBirth	FROM customer |> AGGREGATE count(*) GROUP BY c_birth_year, c_birth_month	SELECT c_birth_year, c_birth_month, count(*) FROM customer GROUP BY c_birth_year, c_birth_month
+sliceParent	FROM slice |> AGGREGATE count(*), sum(dur) GROUP BY parent_id	SELECT parent_id, count(*), sum(dur) FROM slice GROUP BY parent_id
+sliceDepth	FROM slice |> AGGREGATE count(*), count(thread_dur), sum(thread_dur), max(arg_set_id) GROUP BY depth	SELECT depth, count(*), count(thread_dur), sum(thread_dur), max(arg_set_id) FROM slice GROUP BY depth
+sliceSort	FROM slice |> WHERE depth = 3 |> ORDER BY parent_id, id |> LIMIT 20 |> SELECT parent_id, id	SELECT parent_id, id FROM slice WHERE depth = 3 ORDER BY parent_id NULLS FIRST, id LIMIT 20
+stateCpu	FROM thread_state |> AGGREGATE count(*), sum(dur) GROUP BY cpu	SELECT cpu, count(*), sum(dur) FROM thread_state GROUP BY cpu
+stateCpuWaker	FROM thread_state |> AGGREGATE count(*), max(dur) GROUP BY cpu, waker_utid	SELECT cpu, waker_utid, count(*), max(dur) FROM thread_state GROUP BY cpu, waker_utid
+argsValues	FROM args |> AGGREGATE count(*), count(int_value), min(int_value), max(int_value)	SELECT count(*), count(int_value), min(int_value), max(int_value) FROM args
+argsLess	FROM args |> WHERE int_value < 100 |> AGGREGATE count(*)	SELECT count(*) FROM args WHERE int_value < 100
+collideTop	FROM collide |> AGGREGATE count(*) AS c GROUP BY h |> ORDER BY c DESC, h |> LIMIT 5	SELECT h, count(*) AS c FROM collide GROUP BY h ORDER BY c DESC, h NULLS FIRST LIMIT 5
+collideKey	FROM collide |> AGGREGATE count(*), count(v), sum(v), min(v), max(v) GROUP BY k	SELECT k, count(*), count(v), sum(v), min(v), max(v) FROM collide GROUP BY k
+collideValues	FROM collide |> AGGREGATE count(h), min(h), max(h), min(k), max(k)	SELECT count(h), min(h), max(h), min(k), max(k) FROM collide
+collideLess	FROM collide |> WHERE h < 0 |> AGGREGATE count(*)	SELECT count(*) FROM collide WHERE h < 0
+collideLeast	FROM collide |> WHERE k < -9223372036854775807 |> AGGREGATE count(*)	SELECT count(*) FROM collide WHERE k < -9223372036854775807
+collideSort	FROM collide |> WHERE v = 17 |> ORDER BY k, h |> LIMIT 20 |> SELECT k, h	SELECT k, h FROM collide WHERE v = 17 ORDER BY k NULLS FIRST, h NULLS FIRST LIMIT 20

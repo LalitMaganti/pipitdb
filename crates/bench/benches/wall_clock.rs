@@ -133,6 +133,17 @@ fn filter(c: &mut Criterion) {
     group.finish();
 }
 
+/// Queries over 100 row groups whose columns are null one row in 50.
+fn nulls(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nulls");
+    group.throughput(Throughput::Elements(100 * 2048));
+    for (name, _) in pipitdb_bench::NULLABLE_QUERIES {
+        let plan = pipitdb_bench::nullable_plan(100, name);
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run(black_box(plan.pipeline()))));
+    }
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -140,6 +151,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter
+    targets = lexer, parser, query, small, pipeline, scan, slices, filter, nulls
 }
 criterion_main!(benches);

@@ -89,6 +89,20 @@ fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
 
 library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan, filter, predicate]);
 
+// Queries over 100 row groups whose columns are null one row in 50, by
+// `NULLABLE_QUERIES`'s names. (gungraun allows no doc comment here.)
+#[library_benchmark]
+#[bench::group(pipitdb_bench::nullable_plan(100, "group"))]
+#[bench::group_two(pipitdb_bench::nullable_plan(100, "group_two"))]
+#[bench::values(pipitdb_bench::nullable_plan(100, "values"))]
+#[bench::filter(pipitdb_bench::nullable_plan(100, "filter"))]
+#[bench::sort(pipitdb_bench::nullable_plan(100, "sort"))]
+fn nulls(plan: PhysicalPlan<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(plan.pipeline())))
+}
+
+library_benchmark_group!(name = nulls_group, benchmarks = [nulls]);
+
 /// The table `hits`, over ClickBench's first file.
 struct Hits(DynScannable<'static>);
 
@@ -158,5 +172,6 @@ main!(
     parser_group,
     small_group,
     pipeline_group,
+    nulls_group,
     clickbench_group
 );

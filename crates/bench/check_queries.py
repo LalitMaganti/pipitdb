@@ -5,12 +5,14 @@ pipitdb runs. Floats match if they're within a relative 1e-9, and rows in any
 order.
 
 Suites are ours over ClickBench's data, in clickbench/queries.tsv;
-ClickBench's own 43 queries, in clickbench/official.tsv; and TPC-H and TPC-DS,
-in tpc/, whose files tpc/generate.py makes. A query pipitdb can't run yet has
+ClickBench's own 43 queries, in clickbench/official.tsv; TPC-H and TPC-DS,
+in tpc/, whose files tpc/generate.py makes; and queries over nullable
+columns, in nulls/, over TPC-DS's tables and those nulls/generate.py and
+nulls/perfetto.py make. A query pipitdb can't run yet has
 no PipeSQL there.
 
 Usage: crates/bench/check_queries.py SUITE FILE...
-SUITE is clickbench, clickbench-official, tpch or tpcds. Each file is a
+SUITE is clickbench, clickbench-official, tpch, tpcds or nulls. Each file is a
 table named after it, less a trailing `_N`, as the `suite` example names
 them.
 """
@@ -26,6 +28,7 @@ QUERIES = {
     "clickbench-official": HERE / "clickbench/official.tsv",
     "tpch": HERE / "tpc/tpch.tsv",
     "tpcds": HERE / "tpc/tpcds.tsv",
+    "nulls": HERE / "nulls/queries.tsv",
 }
 
 
