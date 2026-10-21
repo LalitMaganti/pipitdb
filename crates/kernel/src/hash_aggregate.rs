@@ -557,6 +557,20 @@ mod tests {
     }
 
     #[test]
+    fn keeps_zero_apart_from_an_earlier_batchs_nulls() {
+        // The second batch has no nulls, so its keys are found by value alone,
+        // past the group of the first's nulls, stored with a key of 0.
+        let batches = [[None, Some(5)], [Some(0), Some(5)]].map(|keys| {
+            let key = column(&keys);
+            alloc::vec![key.clone(), key]
+        });
+        let mut counts = spec(&[0]);
+        counts.aggregates.retain(|call| call.function == Function::CountStar);
+        let expected = [[None, Some(1)], [Some(0), Some(1)], [Some(5), Some(2)]];
+        assert_eq!(run(Columns(batches.into()), counts).unwrap(), expected);
+    }
+
+    #[test]
     fn sums_fail_past_int64() {
         for keys in [&[][..], &[0]] {
             // The least `Int64` fits; one less doesn't.
