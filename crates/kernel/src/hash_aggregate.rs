@@ -545,6 +545,66 @@ mod tests {
         );
     }
 
+    /// As `column`, and also with a null value, if any are null.
+    fn both_forms(rows: &[Option<i64>]) -> [ColumnView; 2] {
+        let bitmap = column(rows);
+        if !bitmap.has_nulls() {
+            return [bitmap.clone(), bitmap];
+        }
+        let mut words = Buffer::allocate(&Heap, rows.len() * 8).unwrap();
+        let mut bits = Buffer::allocate(&Heap, rows.len().div_ceil(8)).unwrap();
+        bits.as_mut_slice::<u8>().fill(0);
+        for (i, value) in rows.iter().enumerate() {
+            words.as_mut_slice::<i64>()[i] = value.unwrap_or(0);
+            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
+        }
+        let context = &mut Context::new(&Heap);
+        let valued = ColumnView::int64s_with_nulls(context, words, bits, None).unwrap();
+        assert!(valued.null_value().is_some());
+        [bitmap, valued]
+    }
+
+    /// `COUNT(*)` of each group, by the key at 0 once or twice.
+    fn counts(batches: &[&[Option<i64>]], keys: &[u32]) -> Vec<Vec<Option<i64>>> {
+        let mut out = Vec::new();
+        for form in 0..2 {
+            let columns = batches.iter().map(|keys| {
+                let key = both_forms(keys)[form].clone();
+                alloc::vec![key.clone(), key]
+            });
+            let mut counts = spec(keys);
+            counts.aggregates.retain(|call| call.function == Function::CountStar);
+            let groups = run(Columns(columns.collect()), counts).unwrap();
+            assert!(form == 0 || groups == out);
+            out = groups;
+        }
+        out
+    }
+
+    #[test]
+    fn keeps_zero_apart_from_an_earlier_batchs_nulls() {
+        // The second batch has no nulls, so its keys are found by value alone,
+        // past the group of the first's nulls, stored with a key of 0.
+        let batches: [&[_]; 2] = [&[None, Some(5)], &[Some(0), Some(5)]];
+        let expected = [[None, Some(1)], [Some(0), Some(1)], [Some(5), Some(2)]];
+        assert_eq!(counts(&batches, &[0]), expected);
+    }
+
+    #[test]
+    fn finds_nulls_across_words() {
+        // Nulls are read a word of 64 rows at a time: those at a word's edges
+        // and in a part word are found.
+        let keys: Vec<_> =
+            (0..130).map(|i| (![0, 63, 64, 127, 129].contains(&i)).then_some(i + 1)).collect();
+        let mut expected: Vec<_> =
+            keys.iter().flatten().map(|&k| alloc::vec![Some(k), Some(1)]).collect();
+        expected.insert(0, alloc::vec![None, Some(5)]);
+        assert_eq!(counts(&[&keys], &[0]), expected);
+        let by_both: Vec<_> =
+            expected.iter().map(|row| alloc::vec![row[0], row[0], row[1]]).collect();
+        assert_eq!(counts(&[&keys], &[0, 0]), by_both);
+    }
+
     #[test]
     fn sums_fail_past_int64() {
         for keys in [&[][..], &[0]] {
