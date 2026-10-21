@@ -17,7 +17,7 @@ pub(crate) const KEYS_MAX: usize = 64;
 pub(crate) const GROUPS_MAX: usize = 1 << 26;
 
 /// The top bits of a hash, which a slot keeps.
-fn salt(hash: u64) -> u64 {
+const fn salt(hash: u64) -> u64 {
     hash >> 48 << 48
 }
 
@@ -268,12 +268,10 @@ impl GroupTable {
             let key = unsafe { *keys.get_unchecked(row) };
             let hash = mix(SEED, key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
-            // A stored group is its null bits, zero here, then its key.
+            // A stored group is its null bits, then its key. Only the null
+            // group's bits aren't zero, and its salt differs from its key's.
             // SAFETY: a group in a slot has a record, of at least two words.
-            let equal = |group: usize| unsafe {
-                let stored = records.add(group * stride);
-                *stored == 0 && *stored.add(1) == key
-            };
+            let equal = |group: usize| unsafe { *records.add(group * stride + 1) == key };
             let group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
                 Err(at) => self.add(at, hash, &[0, key])?,
@@ -488,12 +486,15 @@ fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32,
 /// What a group's keys are hashed from.
 const SEED: u64 = 0x243f_6a88_85a3_08d3;
 
+// `find_by_value` tells the null group from key 0 by salt alone.
+const _: () = assert!(salt(mix(SEED, 0)) != salt(mix(mix(SEED, 0), 1)));
+
 /// `hash` with `word` mixed in: their xor multiplied out to 128 bits, and
 /// the halves folded, so every bit of the word reaches both the low bits a
 /// slot is picked by and the top ones it keeps.
 #[inline]
-fn mix(hash: u64, word: u64) -> u64 {
-    let product = u128::from(hash ^ word) * u128::from(0x9e37_79b9_7f4a_7c15_u64);
+const fn mix(hash: u64, word: u64) -> u64 {
+    let product = (hash ^ word) as u128 * 0x9e37_79b9_7f4a_7c15_u128;
     #[expect(clippy::cast_possible_truncation, reason = "folded")]
     let folded = product as u64 ^ (product >> 64) as u64;
     folded
