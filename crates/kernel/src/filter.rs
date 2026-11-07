@@ -66,16 +66,24 @@ pub fn compare(
             check!(column.data_type() == DataType::Int64);
             let cells = column.values().int64s();
             #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            if dropped.is_none()
-                && matches!(column.form(), Form::Flat)
-                && column.validity().is_none()
-                && selection.is_prefix()
-            {
+            if dropped.is_none() && matches!(column.form(), Form::Flat) && selection.is_prefix() {
                 let cells = at!(cells, ..selection.len() as usize);
+                let validity = column.validity();
+                let valid = validity.map(crate::column::Validity::bits);
                 // SAFETY: `keep_prefix` asks for eights below `len()`, which
                 // `cells` has a cell for each of.
-                let eight = |at| unsafe { range.eight(cells, at) };
-                return selection.keep_prefix(eight, |row| range.contains(*at!(cells, row)));
+                let kept = |at| unsafe { range.eight(cells, at) };
+                #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+                let one = |row: usize| {
+                    // SAFETY: `row` is below `len()`, a row of `column`.
+                    let valid = validity
+                        .is_none_or(|validity| unsafe { validity.is_valid_unchecked(row as u32) });
+                    valid & range.contains(*at!(cells, row))
+                };
+                let Some((bits, shift)) = valid else {
+                    return selection.keep_prefix(kept, one);
+                };
+                return selection.keep_prefix(|at| kept(at) & eight_valid(bits, shift, at), one);
             }
             compare_form(column, cells, |cell| cell, range, selection, dropped);
         }
@@ -396,6 +404,21 @@ impl Range {
     }
 }
 
+/// Which of the eight rows from `at` aren't null, as the bits of a byte, from
+/// a bitmap whose first row is bit `shift` of its first byte.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
+    let low = *at!(bits, at / 8);
+    if shift == 0 {
+        return low;
+    }
+    // Rows past the first byte's are in the next, which covers them.
+    let high = *at!(bits, at / 8 + 1);
+    #[expect(clippy::cast_possible_truncation, reason = "8 bits")]
+    let eight = ((u16::from(low) | u16::from(high) << 8) >> shift) as u8;
+    eight
+}
+
 /// `compare` for `cells`, the values of `column`, whose keys are `key`.
 fn compare_cells<T: Copy>(
     column: &ColumnView,
@@ -594,7 +617,7 @@ mod tests {
     #[test]
     fn compares_eight_rows_at_a_time() {
         // Groups of eight and the rows after them, with the ends of the range
-        // among values spread over it.
+        // among values spread over it, and every third row null.
         let ends = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
         let cells: Vec<i64> = (0..1003_u64)
             .map(|i| match i % 9 {
@@ -602,10 +625,19 @@ mod tests {
                 _ => i.wrapping_mul(0x9e37_79b9_7f4a_7c15).cast_signed(),
             })
             .collect();
-        let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
-        values.as_mut_slice::<i64>().copy_from_slice(&cells);
-        let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+        let column = |nulls: bool| {
+            let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
+            values.as_mut_slice::<i64>().copy_from_slice(&cells);
+            let validity = nulls.then(|| {
+                let mut validity = Buffer::allocate(&Heap, cells.len().div_ceil(8)).unwrap();
+                validity.as_mut_slice::<u8>().fill(0);
+                for row in (0..cells.len()).filter(|row| !row.is_multiple_of(3)) {
+                    validity.as_mut_slice::<u8>()[row / 8] |= 1 << (row % 8);
+                }
+                validity
+            });
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+        };
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
             (Comparison::NotEqual, i64::ne),
@@ -614,18 +646,31 @@ mod tests {
             (Comparison::Greater, i64::gt),
             (Comparison::GreaterEqual, i64::ge),
         ];
-        for (comparison, holds) in comparisons {
-            for value in ends.into_iter().chain([cells[7], cells[500]]) {
-                let mut selection = Selection::all(1003);
-                compare(&column, comparison, Value::Int64(value), &mut selection, None);
-                let rows: Vec<u16> = match selection.kept() {
-                    Kept::Prefix => (0..u16::try_from(selection.len()).unwrap()).collect(),
-                    Kept::None => Vec::new(),
-                    Kept::Select(rows) => rows.to_vec(),
-                };
-                let expected: Vec<u16> =
-                    (0..1003).filter(|&row| holds(&cells[usize::from(row)], &value)).collect();
-                assert_eq!(rows, expected, "{comparison:?} {value}");
+        // No nulls; nulls; and nulls in a column whose first row isn't the
+        // first bit of a byte.
+        for (column, first) in
+            [(column(false), None), (column(true), Some(0)), (column(true).slice(3, 1000), Some(3))]
+        {
+            let rows = column.row_count();
+            let valid = |row: usize| first.is_none_or(|first| !(first + row).is_multiple_of(3));
+            for (comparison, holds) in comparisons {
+                for value in ends.into_iter().chain([cells[7], cells[500]]) {
+                    let mut selection = Selection::all(rows);
+                    compare(&column, comparison, Value::Int64(value), &mut selection, None);
+                    let kept: Vec<u16> = match selection.kept() {
+                        Kept::Prefix => (0..u16::try_from(selection.len()).unwrap()).collect(),
+                        Kept::None => Vec::new(),
+                        Kept::Select(rows) => rows.to_vec(),
+                    };
+                    let shift = first.unwrap_or(0);
+                    let expected: Vec<u16> = (0..u16::try_from(rows).unwrap())
+                        .filter(|&row| {
+                            let row = usize::from(row);
+                            valid(row) && holds(&cells[shift + row], &value)
+                        })
+                        .collect();
+                    assert_eq!(kept, expected, "{comparison:?} {value} {first:?}");
+                }
             }
         }
     }
