@@ -1,6 +1,5 @@
 //! `OrderByOp`: its child's rows sorted by keys, as `ORDER BY` does.
 
-use crate::column::DataType;
 use crate::lower::{self, LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::plan::{Op, PlanNode};
@@ -10,7 +9,7 @@ use crate::step::Step;
 use crate::top_k::top_k;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
-/// the first first, which must be columns of numbers: as they are, if
+/// the first first: as they are, if
 /// they're known to be in that order already, and only as many as are read
 /// if a LIMIT reads only the first. It reads every column, so
 /// each is made flat before it's held.
@@ -30,7 +29,6 @@ impl<'c> Op<'c> for OrderByOp {
         if lowering.query_arranged(&[], &self.keys) {
             return Ok(());
         }
-        check!(self.keys.iter().all(|key| lowering.query_type(key.column) != DataType::String));
         let allocator = lowering.allocator();
         let keys = self.keys.iter().map(|key| SortKey {
             column: lowering.query_position(key.column),

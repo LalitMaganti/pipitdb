@@ -264,7 +264,7 @@ fn value_of(compiler: &Compiler<'_, '_>, value: Node) -> Result<NamedColumn, Err
 }
 
 /// `ORDER BY a, b DESC`: the rows sorted by `a`, then `b` descending,
-/// stably. Keys are integer or float columns.
+/// stably. Keys are columns.
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let allocator = compiler.allocator();
@@ -277,9 +277,6 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
             return Err(unsupported);
         }
         let column = compiler.find_column(column)?.id;
-        if at!(compiler.plan.columns, column as usize).data_type.has_bytes() {
-            return Err(unsupported);
-        }
         keys.push(SortKey { column, descending: key.descending() })?;
     }
     let order_by = DynOp::new(allocator, OrderByOp { keys })?;

@@ -360,6 +360,7 @@ mod tests {
     fn orders_rows() {
         assert_eq!(kept("FROM t |> ORDER BY a DESC |> SELECT b"), [20.0, 10.0]);
         assert_eq!(kept("FROM t |> ORDER BY f |> SELECT s"), [4.0, 0.0]);
+        assert_eq!(kept("FROM t |> ORDER BY s |> SELECT a"), [2.0, 1.0]);
         let top = "FROM t |> AGGREGATE count(*) AS n GROUP BY b |> ORDER BY b DESC |> LIMIT 1";
         assert_eq!(run(top)[0].1, [20.0]);
     }
@@ -399,7 +400,6 @@ mod tests {
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
-        assert_eq!(error("FROM t |> ORDER BY s"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
