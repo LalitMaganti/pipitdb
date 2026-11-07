@@ -66,9 +66,10 @@ fn describe(found: &str, error: &Error) -> Message {
             "the list is too long".into(),
             format!("lists are limited to {} items", crate::parser::LIST_MAX),
         ),
-        ErrorCode::ExpectedWord => {
-            (format!("expected another word, found {found}"), "such as `NULL` after `IS`".into())
-        }
+        ErrorCode::ExpectedWord => (
+            format!("expected another word, found {found}"),
+            "such as `NULL` after `IS`, or `BY` after `GROUP`".into(),
+        ),
         ErrorCode::ExpectedAs => {
             (format!("expected `AS`, found {found}"), "expected `AS` here".into())
         }
