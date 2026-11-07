@@ -122,6 +122,27 @@ impl Selection {
         }
     }
 
+    /// Keeps `count` of the rows kept, from the `first`.
+    #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
+    pub fn keep_range(&mut self, first: u32, count: u32) {
+        check!(first + count <= self.len);
+        if first != 0 {
+            let indices = self.indices.as_mut_ptr().cast::<u16>();
+            for i in 0..count as usize {
+                let at = first as usize + i;
+                // SAFETY: `at` and `i` are below `len`, checked above, and unless
+                // `prefix` the first `len` indices were written. Each is written
+                // at or before where it's read.
+                unsafe {
+                    let row = if self.prefix { at as u16 } else { indices.add(at).read() };
+                    indices.add(i).write(row);
+                }
+            }
+            self.prefix = false;
+        }
+        self.len = count;
+    }
+
     /// Adds the rows `added` keeps, which must be none of these.
     #[expect(clippy::cast_possible_truncation, reason = "at most `BATCH_ROWS_MAX` rows")]
     pub fn union(&mut self, added: &Selection) {
@@ -298,6 +319,19 @@ mod tests {
         assert_eq!((kept.kept(), kept.len()), (Kept::Prefix, 4));
         kept.subtract(&dropped);
         assert_eq!(kept.kept(), Kept::None);
+    }
+
+    #[test]
+    fn keeps_a_range() {
+        let mut first = Selection::all(10);
+        first.keep_range(0, 3);
+        assert_eq!((first.kept(), first.len()), (Kept::Prefix, 3));
+        first.keep_range(1, 2);
+        assert_eq!(rows(&first), [1, 2]);
+        let mut even = Selection::all(10);
+        even.retain(|row| row % 2 == 0);
+        even.keep_range(2, 2);
+        assert_eq!(rows(&even), [4, 6]);
     }
 
     #[test]
