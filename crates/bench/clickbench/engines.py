@@ -9,6 +9,11 @@ Each engine runs in-process, best of RUNS after a warm-up, in ms. "1" is
 one thread, ClickHouse's parsing and download threads limited too; "N" is
 the engine's default.
 
+Pivot is a server, so its times include sending the rows to this process,
+which in-process engines never pay. pivot-cold clears Pivot's caches of
+compressed and decompressed pages before each timed run, as its own
+benchmark's cold runs do; the OS page cache stays warm for every engine.
+
 Needs `pip install duckdb chdb datafusion polars psycopg[binary]`, and Pivot
 from `curl https://pivotlake.io | sh`, in $PIVOT_HOME or ~/.pivot.
 
@@ -31,7 +36,7 @@ import tempfile
 import time
 
 HERE = pathlib.Path(__file__).parent
-ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot"]
+ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot", "pivot-cold"]
 
 
 def queries():
@@ -114,7 +119,7 @@ def connect(engine, threads, directory):
         import polars
         ctx = polars.SQLContext(hits=polars.scan_parquet(files))
         return (lambda sql: ctx.execute(sql).collect()), polars.__version__
-    if engine == "pivot":
+    if engine in ("pivot", "pivot-cold"):
         return connect_pivot(threads, directory)
     raise ValueError(engine)
 
@@ -165,9 +170,11 @@ def connect_pivot(threads, directory):
     def run(sql):
         if state["server"].poll() is not None:
             start()
-        with state["con"].cursor() as cursor:
-            cursor.execute(sql)
-            return cursor.fetchall()
+        # Rows left in libpq: decoding them in Python would cost more than
+        # Pivot does. Pivot doesn't send binary rows yet.
+        result = state["con"].pgconn.exec_params(sql.encode(), [])
+        if result.status != psycopg.pq.ExecStatus.TUPLES_OK:
+            raise RuntimeError(result.error_message.decode())
     return run, version.removeprefix("pivot ")
 
 
@@ -188,6 +195,8 @@ def run_one(engine, threads, runs, directory, name):
             run(sql)
             best = float("inf")
             for _ in range(runs):
+                if engine == "pivot-cold":
+                    run("SELECT drop_cache()")
                 start = time.perf_counter()
                 run(sql)
                 best = min(best, time.perf_counter() - start)
