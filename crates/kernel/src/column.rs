@@ -590,6 +590,11 @@ impl<'a> Strings<'a> {
         let (start, len) = (*at!(self.views, 2 * row) as usize, *at!(self.views, 2 * row + 1));
         at!(self.bytes, start..start + len as usize)
     }
+
+    /// What the strings are in.
+    pub fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 /// A view's bitmap of the rows that aren't null.
