@@ -564,6 +564,58 @@ mod tests {
         assert!(!lowering.query_arranged(&keys[..8], &[]));
     }
 
+    /// The steps of `Ab` scanned, its rows counted by `groups` of its
+    /// columns first, if given, then ordered by `keys`, by column.
+    fn ordered(groups: Option<&[usize]>, keys: &[(usize, bool)]) -> alloc::string::String {
+        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut bindings = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b")] {
+            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            bindings.push(binding);
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let mut input = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        if let Some(groups) = groups {
+            let binding = plan.add_column("n", DataType::Int64).unwrap();
+            let function = crate::aggregate::Function::CountStar;
+            let aggregate = crate::aggregate::Aggregate { function, input: None, binding };
+            let aggregate = crate::aggregate::AggregateOp {
+                keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
+                aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),
+            };
+            let aggregate = DynOp::new(&Heap, aggregate).unwrap();
+            let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
+            input = plan.add_node(aggregate, children).unwrap();
+        }
+        let sort_keys =
+            keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
+        let order_by =
+            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
+        let order_by = DynOp::new(&Heap, order_by).unwrap();
+        plan.add_node(order_by, SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap()).unwrap();
+        assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
+        lower(&Heap, &plan).unwrap().pipeline().describe()
+    }
+
+    #[test]
+    fn sorts_only_rows_not_known_to_be_in_order() {
+        // `Ab` is sorted by `a` and then `b`.
+        assert_eq!(ordered(None, &[(0, false)]), "Scan");
+        assert_eq!(ordered(None, &[(0, false), (1, false)]), "Scan");
+        assert_eq!(ordered(None, &[(1, false)]), "Scan | Sort");
+        assert_eq!(ordered(None, &[(0, true)]), "Scan | Sort");
+    }
+
+    #[test]
+    fn aggregates_keep_their_keys_order() {
+        // Groups come out in the order first seen, so in `a`'s order.
+        assert_eq!(ordered(Some(&[0]), &[(0, false)]), "Scan | HashAggregate");
+        assert_eq!(ordered(Some(&[1]), &[(1, false)]), "Scan | HashAggregate | Sort");
+    }
+
     /// `Ab` scanned with `output` as the plan's output, and pruned.
     fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
         let table = DynScannable::new(&Heap, Ab).unwrap();
