@@ -79,7 +79,9 @@ def connect(engine, threads, directory):
         if threads:
             con.execute(f"SET threads={threads}")
         con.execute(f"CREATE VIEW hits AS SELECT * FROM read_parquet('{files}', binary_as_string=true)")
-        return (lambda sql: con.execute(sql).fetch_arrow_table()), duckdb.__version__
+        # DuckDB 2 renamed fetch_arrow_table to to_arrow_table.
+        fetch = "to_arrow_table" if hasattr(duckdb.DuckDBPyConnection, "to_arrow_table") else "fetch_arrow_table"
+        return (lambda sql: getattr(con.execute(sql), fetch)()), duckdb.__version__
     if engine == "clickhouse":
         import chdb
         from chdb import session

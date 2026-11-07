@@ -1,0 +1,36 @@
+# polars 2.1.0, one thread, best of 2 after a warm-up, ms
+# Apple M4, 10 cores, macOS 26.5.1, 2026-11-07, 100 files
+# load 4.47 before, 2.75 after
+0	10.3
+1	33.5
+2	167.5
+3	129.3
+6	21.5
+40	22.8
+41	19.9
+41all	969.9
+pAdv	170.6
+pRefresh	291.9
+4	871.5
+s1	783.3
+s2	44.6
+s3	3607.4
+s4	915.8
+s5	3813.7
+gAdv	490.9
+gCounter	570.0
+gRegion	751.2
+gWindow	1250.9
+gUser	1532.0
+gEngineIp	2623.4
+gUrlDate	2648.7
+f1	31.0
+fAdv	168.7
+f40	20.7
+f41	18.5
+fPhone	174.4
+fIpad	130.3
+fSearch	796.3
+fCounter	10.9
+fCounterFew	10.8
+fGoogle	failed

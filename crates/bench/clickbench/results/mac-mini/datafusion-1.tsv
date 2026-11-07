@@ -1,0 +1,36 @@
+# datafusion 55.0.0, one thread, best of 2 after a warm-up, ms
+# Apple M4, 10 cores, macOS 26.5.1, 2026-11-07, 100 files
+# load 5.58 before, 2.76 after
+0	0.5
+1	47.0
+2	239.3
+3	204.2
+6	0.5
+40	16.5
+41	14.4
+41all	1234.1
+pAdv	330.5
+pRefresh	407.3
+4	1291.5
+s1	727.9
+s2	176.5
+s3	3834.4
+s4	925.5
+s5	3798.0
+gAdv	675.6
+gCounter	612.1
+gRegion	748.2
+gWindow	1499.8
+gUser	1879.3
+gEngineIp	2432.2
+gUrlDate	2391.4
+f1	48.0
+fAdv	326.3
+f40	14.1
+f41	12.9
+fPhone	330.1
+fIpad	338.0
+fSearch	878.4
+fCounter	2.4
+fCounterFew	2.3
+fGoogle	4584.2
