@@ -122,14 +122,15 @@ def connect(engine, threads, directory):
 def connect_pivot(threads, directory):
     """Pivot is a server: one is started for this process, with `threads`
     workers, its table over the Parquet files where they are, as Pivot's own
-    ClickBench setup has it, and stopped when the process exits. Its memory is
-    capped where systemd can, so a query that runs out fails alone, and the
-    server is started again for the next."""
+    ClickBench setup has it, and stopped when the process exits. A query
+    that runs out of memory fails alone: the server is capped where systemd
+    can, and started again for the next."""
     import psycopg
     binary = pathlib.Path(os.environ.get("PIVOT_HOME", pathlib.Path.home() / ".pivot")) / "cli/latest/pivot"
     work = pathlib.Path(tempfile.mkdtemp(prefix="pivot-"))
     port = 54329
-    config = (f"server:\n  bind: 127.0.0.1:{port}\n"
+    # Pivot's buffer pool takes most of free memory unless told otherwise.
+    config = (f"memory: 16g\nserver:\n  bind: 127.0.0.1:{port}\n"
               f"datastores:\n  default:\n    kind: pivot\n    location: {work}/catalog\n    default: true\n")
     if threads:
         config = f"workers: {threads}\n" + config
@@ -138,7 +139,7 @@ def connect_pivot(threads, directory):
     schema = "\n".join(line for line in schema.splitlines() if not line.startswith("--"))
     # Pivot prepares each statement on its own.
     statements = [s for s in schema.split(";") if s.strip()]
-    cap = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=20G"] if shutil.which("systemd-run") else []
+    cap = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=24G"] if shutil.which("systemd-run") else []
     state = {}
 
     def start():
