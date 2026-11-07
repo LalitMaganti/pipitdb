@@ -29,9 +29,13 @@ pub mod pipeline;
 pub mod plan;
 pub mod predicate;
 pub mod query_allocators;
+#[allow(dead_code, reason = "the sort breaker uses it")]
+mod radix_sort;
 pub mod row_batch;
 #[allow(dead_code, reason = "the sort breaker uses it")]
 mod row_layout;
+#[allow(dead_code, reason = "the sort breaker uses it")]
+mod row_layout_sort;
 pub mod scannable;
 pub mod selection;
 pub mod slow_vec;
