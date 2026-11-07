@@ -129,6 +129,13 @@ impl<'a> RowBatch<'a> {
         self.column_count
     }
 
+    /// Whether column `index` borrows what it views, which outlives the
+    /// batch.
+    pub(crate) fn is_borrowed(&self, index: u32) -> bool {
+        check!(index < self.column_count);
+        self.borrowed & 1 << index != 0
+    }
+
     pub fn column(&self, index: u32) -> &ColumnView {
         check!(index < self.column_count);
         // SAFETY: columns below `column_count` are initialized.

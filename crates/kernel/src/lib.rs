@@ -36,6 +36,8 @@ pub mod row_batch;
 mod row_layout;
 #[allow(dead_code, reason = "the sort breaker uses it")]
 mod row_layout_sort;
+#[allow(dead_code, reason = "the sort breaker uses it")]
+mod row_store;
 pub mod scannable;
 pub mod selection;
 pub mod slow_vec;

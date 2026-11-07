@@ -541,6 +541,13 @@ impl<'a> Values<'a> {
         self.slice_of()
     }
 
+    /// The values of a column of integers or floats, as words: integers, or
+    /// floats' bits.
+    pub(crate) fn words(self) -> &'a [i64] {
+        check!(!self.header.data_type.has_bytes());
+        self.slice_of()
+    }
+
     pub fn strings(self) -> Strings<'a> {
         check!(self.header.data_type == DataType::String);
         let Some(bytes) = &self.header.bytes else { failed!() };
