@@ -173,6 +173,8 @@ pub struct Entries {
     bits: Option<SlowVec<u64>>,
     /// How many bits are set.
     matched: u32,
+    /// The entry whose bit is set, if it's the only one.
+    only: u32,
 }
 
 impl Entries {
@@ -192,6 +194,13 @@ impl Entries {
             let mut bits = SlowVec::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
             set(values, &mut bits);
             self.matched = bits.iter().map(|word| word.count_ones()).sum();
+            if self.matched == 1 {
+                for (word, &set) in (0..).zip(bits.iter()) {
+                    if set != 0 {
+                        self.only = word * 64 + set.trailing_zeros();
+                    }
+                }
+            }
             (self.dictionary, self.want, self.bits) = (Some(column.clone()), want, Some(bits));
         }
         Ok(self)
@@ -238,10 +247,16 @@ pub fn keep_entries(
     if entries.matched == column.values().len() {
         return keep_all(selection, dropped);
     }
+    let only = entries.matched == 1;
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
         // index each.
         let e = unsafe { cell(indices, row) };
+        // One entry, as an equality's, is tested as Perfetto tests an interned
+        // string: by comparing each row's index with it.
+        if only {
+            return e == entries.only;
+        }
         // An index past the entries fails the check, as when read anywhere.
         (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
     });
