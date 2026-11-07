@@ -269,6 +269,14 @@ pub fn keep_entries(
         return keep_all(selection, dropped);
     }
     let only = entries.matched == 1;
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if only && dropped.is_none() && selection.is_prefix() {
+        let indices = at!(indices, ..selection.len() as usize);
+        // SAFETY: `keep_prefix` asks for eights below `len()`, which
+        // `indices` has an index for each of.
+        let eight = |at| unsafe { eight_equal(indices, at, entries.only) };
+        return selection.keep_prefix(eight, |row| *at!(indices, row) == entries.only);
+    }
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
         // index each.
@@ -281,6 +289,29 @@ pub fn keep_entries(
         // An index past the entries fails the check, as when read anywhere.
         (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
     });
+}
+
+/// Which of the eight `indices` from `at` are `index`, as the bits of a byte.
+///
+/// # Safety
+///
+/// `indices` must have an index at `at + 7`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn eight_equal(indices: &[u32], at: usize, index: u32) -> u8 {
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_set1_epi32,
+    };
+    // SAFETY: the build has AVX2, and the caller that the indices are there.
+    unsafe {
+        #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
+        let eight = _mm256_loadu_si256(indices.as_ptr().add(at).cast::<__m256i>());
+        let equal = _mm256_cmpeq_epi32(eight, _mm256_set1_epi32(index.cast_signed()));
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
+        let byte = _mm256_movemask_ps(_mm256_castsi256_ps(equal)) as u8;
+        byte
+    }
 }
 
 /// `compare` for any form of `column`, whose values `cells` reads.

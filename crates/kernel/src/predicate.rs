@@ -633,7 +633,9 @@ mod tests {
     fn filters_string_dictionaries_as_their_strings() {
         // Entries out of order, one null, used in any order.
         let entries = strings(&[Some("c"), None, Some("a"), Some("b"), Some("")]);
-        let indices = [3, 1, 0, 2, 4, 3, 0, 1];
+        // Three groups of eight rows, and three after them.
+        let indices = [[3, 1, 0, 2, 4, 3, 0, 1].as_slice(); 3].concat();
+        let indices = [indices.as_slice(), &[2, 3, 0]].concat();
         let dictionary = indexed(&entries, &indices);
         let mut flat = dictionary.clone();
         flat.make_in(&mut Context::new(&Heap), Forms::FLAT).unwrap();
@@ -652,8 +654,12 @@ mod tests {
                 assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
             }
         }
-        // `x LIKE '_'` and `NOT x LIKE '_'`: neither keeps the null.
-        for (not, expected) in [(false, [0, 2, 3, 5, 6].as_slice()), (true, &[4])] {
+        // `x LIKE '_'` keeps entries 0, 2 and 3, and `NOT x LIKE '_'` entry 4:
+        // neither keeps the null, entry 1.
+        let rows_of = |kept: &[u32]| -> StdVec<u16> {
+            (0..).zip(&indices).filter(|(_, e)| kept.contains(e)).map(|(row, _)| row).collect()
+        };
+        for (not, expected) in [(false, rows_of(&[0, 2, 3])), (true, rows_of(&[4]))] {
             let nodes = [Node::Leaf(Leaf::Like { column: 0, start: 0, len: 1 }), Node::Not(0)];
             let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
             let pattern = SlowVec::fixed_from(&Heap, b"_".iter().copied()).unwrap();
