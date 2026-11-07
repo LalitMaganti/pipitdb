@@ -776,7 +776,7 @@ mod tests {
         ) -> Result<(), Error> {
             let column = input.column(0).int64s();
             match input.selection().kept() {
-                Kept::All => values.extend_from_slice(column),
+                Kept::Prefix => values.extend_from_slice(column),
                 Kept::None => {}
                 Kept::Select(rows) => {
                     values.extend(rows.iter().map(|&row| column[usize::from(row)]));

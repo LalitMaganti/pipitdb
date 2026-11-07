@@ -588,7 +588,7 @@ mod tests {
         ) -> Result<ColumnView, Error> {
             let (handle, _) = lazy.handle();
             let rows: StdVec<u16> = match selection.kept() {
-                Kept::All => (0..4).collect(),
+                Kept::Prefix => (0..4).collect(),
                 Kept::None => StdVec::new(),
                 Kept::Select(rows) => rows.into(),
             };

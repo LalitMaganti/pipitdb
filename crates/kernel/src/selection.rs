@@ -4,15 +4,16 @@ use core::mem::MaybeUninit;
 
 use crate::row_batch::BATCH_ROWS_MAX;
 
-/// The rows a batch keeps: all of them, none, or a selection of them by
+/// The rows a batch keeps: the first of them, or a selection of them by
 /// index. Filters narrow it in place, so a batch's columns are never copied.
 pub struct Selection {
-    /// How many rows are kept: all of them, if `all`.
+    /// How many rows are kept.
     len: u32,
-    all: bool,
+    /// Whether the rows kept are the first `len`, so need no indices.
+    prefix: bool,
     /// How many rows the batch has: every kept row is below it.
     rows: u32,
-    // Unless `all`, the first `len` are the kept rows, in increasing order;
+    // Unless `prefix`, the first `len` are the kept rows, in increasing order;
     // only those are written. Kept whatever the state, so narrowing never
     // sets it up again.
     indices: [MaybeUninit<u16>; BATCH_ROWS_MAX as usize],
@@ -21,7 +22,8 @@ pub struct Selection {
 /// What a `Selection` keeps.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kept<'a> {
-    All,
+    /// The first `len()` rows.
+    Prefix,
     None,
     /// These rows, in increasing order.
     Select(&'a [u16]),
@@ -33,19 +35,19 @@ impl Selection {
         check!(rows <= BATCH_ROWS_MAX);
         Selection {
             len: rows,
-            all: true,
+            prefix: true,
             rows,
             indices: [MaybeUninit::uninit(); BATCH_ROWS_MAX as usize],
         }
     }
 
     pub fn kept(&self) -> Kept<'_> {
-        match (self.len, self.all) {
+        match (self.len, self.prefix) {
             (0, _) => Kept::None,
-            (_, true) => Kept::All,
+            (_, true) => Kept::Prefix,
             (len, false) => {
                 let indices = at!(self.indices, ..len as usize);
-                // SAFETY: unless `all`, the first `len` indices were written.
+                // SAFETY: unless `prefix`, the first `len` indices were written.
                 Kept::Select(unsafe { &*(core::ptr::from_ref(indices) as *const [u16]) })
             }
         }
@@ -74,9 +76,9 @@ impl Selection {
         check!(len <= self.indices.len());
         let indices = self.indices.as_mut_ptr().cast::<u16>();
         let mut kept = 0;
-        // Two loops, so neither checks `all` for each row. In both, `kept`
+        // Two loops, so neither checks `prefix` for each row. In both, `kept`
         // never passes `i`, which is below `len`, so every index is in bounds.
-        if self.all {
+        if self.prefix {
             for i in 0..len {
                 let row = i as u16;
                 // SAFETY: see above.
@@ -92,8 +94,8 @@ impl Selection {
                 kept += usize::from(keep(row));
             }
         }
-        // Every row still kept stays `all`, which needs no indices.
-        self.all &= kept == self.len as usize;
+        // A prefix all of whose rows are kept stays one, which needs no indices.
+        self.prefix &= kept == self.len as usize;
         self.len = kept as u32;
     }
 
@@ -102,7 +104,11 @@ impl Selection {
         check!(removed.rows == self.rows);
         match removed.kept() {
             Kept::None => {}
-            Kept::All => self.len = 0,
+            // A prefix among these can only be all of them.
+            Kept::Prefix => {
+                check!(removed.len == self.len);
+                self.len = 0;
+            }
             Kept::Select(removed) => {
                 // Both are in increasing order, so one pass over each.
                 let mut next = 0;
@@ -122,19 +128,23 @@ impl Selection {
         check!(added.rows == self.rows);
         let added = match added.kept() {
             Kept::None => return,
-            Kept::All => {
+            // A prefix can only be added to none.
+            Kept::Prefix => {
                 check!(self.len == 0);
-                self.reset(self.rows);
+                self.len = added.len;
+                self.prefix = true;
                 return;
             }
             Kept::Select(added) => added,
         };
-        // Disjoint from all rows, `added` would be empty, which it isn't.
-        check!(!self.all);
+        // Disjoint from a prefix's rows, `added` would be after them, and only
+        // added to none.
+        check!(!self.prefix || self.len == 0);
+        self.prefix = false;
+        let indices = self.indices.as_mut_ptr().cast::<u16>();
         let (mine, theirs) = (self.len as usize, added.len());
         let total = mine + theirs;
         check!(total <= self.rows as usize);
-        let indices = self.indices.as_mut_ptr().cast::<u16>();
         // Merges from the back, so no index is overwritten before it's read:
         // the next write is always past the next unread one of `self`.
         let (mut i, mut j) = (mine, theirs);
@@ -166,7 +176,7 @@ impl Selection {
         let indices = self.indices.as_mut_ptr().cast::<u16>();
         let others = dropped.indices.as_mut_ptr().cast::<u16>();
         let (mut kept, mut out) = (0, 0);
-        // As in `retain`: two loops, so neither checks `all` for each row, and
+        // As in `retain`: two loops, so neither checks `prefix` for each row, and
         // `kept` and `out` never pass `i`, below `len`.
         let mut put = |row: u16| {
             let keeps = keep(row);
@@ -178,17 +188,17 @@ impl Selection {
             kept += usize::from(keeps);
             out += usize::from(!keeps);
         };
-        if self.all {
+        if self.prefix {
             (0..len).for_each(|i| put(i as u16));
         } else {
             // SAFETY: see above; the first `len` indices were written.
             (0..len).for_each(|i| put(unsafe { indices.add(i).read() }));
         }
-        // Either side is all rows if it got every one of all of them.
-        let all = self.all;
-        self.all = all && kept == len;
+        // Either side is a prefix if it got every row of one.
+        let prefix = self.prefix;
+        self.prefix = prefix && kept == len;
         self.len = kept as u32;
-        dropped.all = all && out == len;
+        dropped.prefix = prefix && out == len;
         dropped.len = out as u32;
         dropped.rows = self.rows;
     }
@@ -205,7 +215,7 @@ impl Selection {
         // are read until written.
         unsafe {
             (&raw mut (*selection).len).write(rows);
-            (&raw mut (*selection).all).write(true);
+            (&raw mut (*selection).prefix).write(true);
             (&raw mut (*selection).rows).write(rows);
         }
     }
@@ -214,7 +224,7 @@ impl Selection {
     pub(crate) fn reset(&mut self, rows: u32) {
         check!(rows <= BATCH_ROWS_MAX);
         self.len = rows;
-        self.all = true;
+        self.prefix = true;
         self.rows = rows;
     }
 }
@@ -226,12 +236,12 @@ impl Clone for Selection {
         selection
     }
 
-    /// Copies only the indices in use: none, if all rows are kept.
+    /// Copies only the indices in use: none, for a prefix.
     fn clone_from(&mut self, other: &Selection) {
         self.len = other.len;
-        self.all = other.all;
+        self.prefix = other.prefix;
         self.rows = other.rows;
-        if !other.all {
+        if !other.prefix {
             let len = other.len as usize;
             at_mut!(self.indices, ..len).copy_from_slice(at!(other.indices, ..len));
         }
@@ -244,7 +254,7 @@ mod tests {
 
     fn rows(selection: &Selection) -> alloc::vec::Vec<u16> {
         match selection.kept() {
-            Kept::All => (0..u16::try_from(selection.rows()).unwrap()).collect(),
+            Kept::Prefix => (0..u16::try_from(selection.len()).unwrap()).collect(),
             Kept::None => alloc::vec::Vec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }
@@ -271,6 +281,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_prefixes_shorter_than_the_batch() {
+        let prefix = |len| {
+            let mut selection = Selection::all(10);
+            selection.len = len;
+            selection
+        };
+        let mut odd = prefix(4);
+        odd.retain(|row| row % 2 == 1);
+        assert_eq!(rows(&odd), [1, 3]);
+        let mut kept = prefix(4);
+        let mut dropped = Selection::all(0);
+        kept.partition(&mut dropped, |row| row > 9);
+        assert_eq!((kept.kept(), dropped.kept(), dropped.len()), (Kept::None, Kept::Prefix, 4));
+        kept.union(&dropped);
+        assert_eq!((kept.kept(), kept.len()), (Kept::Prefix, 4));
+        kept.subtract(&dropped);
+        assert_eq!(kept.kept(), Kept::None);
+    }
+
+    #[test]
     fn partitions_in_one_pass() {
         let mut kept = Selection::all(10);
         let mut dropped = Selection::all(0);
@@ -281,15 +311,15 @@ mod tests {
 
         let mut none = Selection::all(10);
         none.partition(&mut dropped, |_| false);
-        assert_eq!((none.kept(), dropped.kept()), (Kept::None, Kept::All));
+        assert_eq!((none.kept(), dropped.kept()), (Kept::None, Kept::Prefix));
     }
 
     #[test]
     fn narrows_in_place() {
         let mut selection = Selection::all(10);
-        assert_eq!((selection.len(), selection.kept()), (10, Kept::All));
+        assert_eq!((selection.len(), selection.kept()), (10, Kept::Prefix));
         selection.retain(|_| true);
-        assert_eq!(selection.kept(), Kept::All);
+        assert_eq!(selection.kept(), Kept::Prefix);
         selection.retain(|row| row % 2 == 0);
         assert_eq!(selection.kept(), Kept::Select(&[0, 2, 4, 6, 8]));
         selection.retain(|row| row > 3);

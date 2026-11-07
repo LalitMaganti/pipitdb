@@ -251,7 +251,7 @@ mod tests {
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
         while execution.next(&mut batch).unwrap() {
             let rows: StdVec<usize> = match batch.selection().kept() {
-                Kept::All => (0..batch.row_count() as usize).collect(),
+                Kept::Prefix => (0..batch.row_count() as usize).collect(),
                 Kept::None => StdVec::new(),
                 Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
             };

@@ -149,7 +149,7 @@ mod tests {
         while execution.next(&mut batch).unwrap() {
             let values = batch.column(0).int64s();
             match batch.selection().kept() {
-                Kept::All => rows.extend_from_slice(values),
+                Kept::Prefix => rows.extend_from_slice(values),
                 Kept::Select(kept) => rows.extend(kept.iter().map(|&row| values[usize::from(row)])),
                 Kept::None => {}
             }
