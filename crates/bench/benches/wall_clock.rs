@@ -133,6 +133,18 @@ fn filter(c: &mut Criterion) {
     group.finish();
 }
 
+/// Perfetto's `filter_benchmark.cc`, on the same 2^20 rows: a scan of `id`
+/// and the filtered column, filtered.
+fn perfetto_filter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perfetto_filter");
+    group.throughput(Throughput::Elements(1 << 20));
+    for (i, (name, _)) in pipitdb_bench::PERFETTO_FILTERS.iter().enumerate() {
+        let plan = pipitdb_bench::perfetto_filter_plan(i);
+        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run(black_box(plan.pipeline()))));
+    }
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -140,6 +152,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter
+    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter
 }
 criterion_main!(benches);
