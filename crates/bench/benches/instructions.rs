@@ -156,6 +156,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::g_user(hits_query("gUser"))]
 #[bench::q15(hits_query("15"))]
 #[bench::q24t(hits_query("24t"))]
+#[bench::q25(hits_query("25"))]
 fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
     plan.map_or(0, |plan| black_box(pipitdb_bench::run(black_box(plan.pipeline()))))
 }
