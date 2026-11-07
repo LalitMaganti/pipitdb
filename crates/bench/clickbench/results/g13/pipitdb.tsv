@@ -1,0 +1,31 @@
+# pipitdb, build at 10bef05, one thread, best of 3, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 1.36 before, 1.32 after
+0	8.0
+1	35.5
+6	47.7
+40	29.4
+41	22.6
+41all	2282.3
+s1	1369.1
+s2	140.0
+s3	6031.3
+s4	1625.9
+s5	5469.8
+gAdv	724.4
+gCounter	707.9
+gRegion	1087.0
+gWindow	2836.4
+gUser	4686.0
+gEngineIp	6959.3
+gUrlDate	9111.7
+f1	41.9
+fAdv	355.4
+f40	18.3
+f41	15.8
+fPhone	628.7
+fIpad	419.6
+fSearch	1701.3
+fCounter	1.9
+fCounterFew	1.0
+fGoogle	8834.0

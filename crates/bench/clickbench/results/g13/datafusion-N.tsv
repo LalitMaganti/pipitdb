@@ -1,0 +1,36 @@
+# datafusion 55.0.0, default threads, best of 2 after a warm-up, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 0.88 before, 10.43 after
+0	1.4
+1	24.2
+2	73.3
+3	159.6
+6	1.4
+40	26.3
+41	24.8
+41all	693.8
+pAdv	226.2
+pRefresh	250.1
+4	1412.4
+s1	301.4
+s2	58.2
+s3	1891.3
+s4	360.3
+s5	2325.8
+gAdv	142.1
+gCounter	137.8
+gRegion	199.2
+gWindow	848.9
+gUser	2059.4
+gEngineIp	2207.7
+gUrlDate	3136.9
+f1	26.4
+fAdv	226.5
+f40	23.3
+f41	19.8
+fPhone	217.0
+fIpad	185.3
+fSearch	482.1
+fCounter	8.1
+fCounterFew	7.6
+fGoogle	2320.3

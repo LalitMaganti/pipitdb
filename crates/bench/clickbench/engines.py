@@ -9,7 +9,13 @@ Each engine runs in-process, best of RUNS after a warm-up, in ms. "1" is
 one thread, ClickHouse's parsing and download threads limited too; "N" is
 the engine's default.
 
-Needs `pip install duckdb chdb datafusion polars`.
+Pivot is a server, so its times include sending the rows to this process,
+which in-process engines never pay. pivot-cold clears Pivot's caches of
+compressed and decompressed pages before each timed run, as its own
+benchmark's cold runs do; the OS page cache stays warm for every engine.
+
+Needs `pip install duckdb chdb datafusion polars psycopg[binary]`, and Pivot
+from `curl https://pivotlake.io | sh`, in $PIVOT_HOME or ~/.pivot.
 
 Usage: crates/bench/clickbench/engines.py DIR --machine NAME
        [--engines duckdb,...] [--threads 1,N] [--runs 2] [--quiet LOAD]
@@ -18,16 +24,19 @@ stays below LOAD before starting.
 """
 
 import argparse
+import atexit
 import datetime
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = pathlib.Path(__file__).parent
-ENGINES = ["duckdb", "clickhouse", "datafusion", "polars"]
+ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot", "pivot-cold"]
 
 
 def queries():
@@ -110,7 +119,63 @@ def connect(engine, threads, directory):
         import polars
         ctx = polars.SQLContext(hits=polars.scan_parquet(files))
         return (lambda sql: ctx.execute(sql).collect()), polars.__version__
+    if engine in ("pivot", "pivot-cold"):
+        return connect_pivot(threads, directory)
     raise ValueError(engine)
+
+
+def connect_pivot(threads, directory):
+    """Pivot is a server: one is started for this process, with `threads`
+    workers, its table over the Parquet files where they are, as Pivot's own
+    ClickBench setup has it, and stopped when the process exits. A query
+    that runs out of memory fails alone: the server is capped where systemd
+    can, and started again for the next."""
+    import psycopg
+    binary = pathlib.Path(os.environ.get("PIVOT_HOME", pathlib.Path.home() / ".pivot")) / "cli/latest/pivot"
+    work = pathlib.Path(tempfile.mkdtemp(prefix="pivot-"))
+    port = 54329
+    # Pivot's buffer pool takes most of free memory unless told otherwise.
+    config = (f"memory: 16g\nserver:\n  bind: 127.0.0.1:{port}\n"
+              f"datastores:\n  default:\n    kind: pivot\n    location: {work}/catalog\n    default: true\n")
+    if threads:
+        config = f"workers: {threads}\n" + config
+    (work / "config.yaml").write_text(config)
+    schema = (HERE / "pivot.sql").read_text().replace("{source}", str(pathlib.Path(directory).resolve()))
+    schema = "\n".join(line for line in schema.splitlines() if not line.startswith("--"))
+    # Pivot prepares each statement on its own.
+    statements = [s for s in schema.split(";") if s.strip()]
+    cap = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=24G"] if shutil.which("systemd-run") else []
+    state = {}
+
+    def start():
+        log = open(work / "server.log", "a")
+        server = subprocess.Popen(cap + [binary, "server", "--config", work / "config.yaml"], stdout=log, stderr=log)
+        atexit.register(server.wait)
+        atexit.register(server.terminate)
+        for _ in range(300):
+            try:
+                con = psycopg.connect(f"host=127.0.0.1 port={port} user=pivot dbname=postgres", autocommit=True)
+                break
+            except psycopg.OperationalError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError(f"Pivot didn't start: {(work / 'server.log').read_text()[-500:]}")
+        for statement in statements:
+            con.execute(statement)
+        state["server"], state["con"] = server, con
+
+    start()
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
+
+    def run(sql):
+        if state["server"].poll() is not None:
+            start()
+        # Rows left in libpq: decoding them in Python would cost more than
+        # Pivot does. Pivot doesn't send binary rows yet.
+        result = state["con"].pgconn.exec_params(sql.encode(), [])
+        if result.status != psycopg.pq.ExecStatus.TUPLES_OK:
+            raise RuntimeError(result.error_message.decode())
+    return run, version.removeprefix("pivot ")
 
 
 def run_one(engine, threads, runs, directory, name):
@@ -130,6 +195,8 @@ def run_one(engine, threads, runs, directory, name):
             run(sql)
             best = float("inf")
             for _ in range(runs):
+                if engine == "pivot-cold":
+                    run("SELECT drop_cache()")
                 start = time.perf_counter()
                 run(sql)
                 best = min(best, time.perf_counter() - start)

@@ -1,0 +1,36 @@
+# polars 2.1.0, default threads, best of 2 after a warm-up, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 1.49 before, 9.81 after
+0	8.2
+1	12.5
+2	89.9
+3	256.8
+6	42.9
+40	23.4
+41	21.0
+41all	792.1
+pAdv	118.0
+pRefresh	139.7
+4	949.5
+s1	413.5
+s2	17.1
+s3	2153.2
+s4	420.4
+s5	3022.2
+gAdv	143.8
+gCounter	184.7
+gRegion	240.0
+gWindow	898.7
+gUser	1391.8
+gEngineIp	1914.7
+gUrlDate	2952.0
+f1	12.9
+fAdv	117.7
+f40	20.9
+f41	19.5
+fPhone	136.3
+fIpad	124.0
+fSearch	417.8
+fCounter	8.2
+fCounterFew	8.2
+fGoogle	failed

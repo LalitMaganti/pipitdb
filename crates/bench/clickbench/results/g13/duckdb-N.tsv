@@ -1,0 +1,36 @@
+# duckdb 2.0.0, default threads, best of 2 after a warm-up, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 1.11 before, 11.57 after
+0	28.8
+1	34.4
+2	83.1
+3	158.5
+6	55.4
+40	37.5
+41	33.9
+41all	400.5
+pAdv	168.0
+pRefresh	195.0
+4	647.7
+s1	330.3
+s2	45.7
+s3	2007.4
+s4	364.9
+s5	1821.3
+gAdv	125.5
+gCounter	122.7
+gRegion	173.1
+gWindow	490.8
+gUser	1406.7
+gEngineIp	1327.2
+gUrlDate	1957.1
+f1	41.6
+fAdv	178.9
+f40	40.7
+f41	36.2
+fPhone	230.7
+fIpad	184.9
+fSearch	726.6
+fCounter	29.8
+fCounterFew	32.6
+fGoogle	2020.8

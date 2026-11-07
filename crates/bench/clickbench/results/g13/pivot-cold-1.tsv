@@ -1,0 +1,36 @@
+# pivot-cold 0.1.1, one thread, best of 2 after a warm-up, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 6.46 before, 1.05 after
+0	0.3
+1	114.1
+2	487.7
+3	682.2
+6	200.7
+40	52.2
+41	28.7
+41all	2198.4
+pAdv	833.0
+pRefresh	994.1
+4	2012.9
+s1	1485.2
+s2	356.8
+s3	6435.8
+s4	1732.0
+s5	7224.6
+gAdv	1201.0
+gCounter	1187.6
+gRegion	1422.3
+gWindow	2694.1
+gUser	10819.2
+gEngineIp	11338.4
+gUrlDate	20269.5
+f1	233.3
+fAdv	1038.3
+f40	55.6
+f41	52.4
+fPhone	2555.2
+fIpad	2067.4
+fSearch	5237.6
+fCounter	22.3
+fCounterFew	4.1
+fGoogle	7636.0
