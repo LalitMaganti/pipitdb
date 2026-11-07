@@ -135,6 +135,10 @@ pub fn like(
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
 ) {
+    if let Some(needle) = crate::like::contained(pattern) {
+        let contains = crate::like::Contains::new(column.values().strings().bytes(), needle);
+        return keep_strings(column, &|cell| contains.within(cell) == want, selection, dropped);
+    }
     keep_strings(column, &|cell| crate::like::like(cell, pattern) == want, selection, dropped);
 }
 

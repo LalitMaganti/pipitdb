@@ -4,6 +4,8 @@
 //! string, the last must end it, and the others are found in order between.
 //! There's no escape character, as in DuckDB by default.
 
+use core::cell::Cell;
+
 /// Whether `text` matches `pattern`.
 #[inline(never)]
 pub fn like(text: &[u8], pattern: &[u8]) -> bool {
@@ -27,6 +29,62 @@ pub fn like(text: &[u8], pattern: &[u8]) -> bool {
         middle = at!(middle, at + segment.len()..);
     }
     true
+}
+
+/// The middle of a pattern `%middle%`, if the middle has no `%` or `_`: the
+/// strings it matches are those containing the middle.
+pub fn contained(pattern: &[u8]) -> Option<&[u8]> {
+    let middle = pattern.strip_prefix(b"%")?.strip_suffix(b"%")?;
+    let plain = !middle.is_empty() && !middle.iter().any(|&byte| byte == b'%' || byte == b'_');
+    plain.then_some(middle)
+}
+
+/// Which strings of one buffer contain a needle. Each search runs on past
+/// the string it's for, to the needle's next place, which answers every
+/// string between: strings in order, as a page's are, are searched in one
+/// pass, not one each, as Pivot's `NeedleSearcher` does.
+pub struct Contains<'a> {
+    bytes: &'a [u8],
+    needle: &'a [u8],
+    /// Where the last search started.
+    from: Cell<usize>,
+    /// Where the last search ended: the needle's first place after `from`
+    /// is `next`, if it's before here.
+    until: Cell<usize>,
+    /// The needle's first place after `from`, or `usize::MAX` if it isn't
+    /// before `until`.
+    next: Cell<usize>,
+}
+
+impl<'a> Contains<'a> {
+    /// How far a search goes past the string it's for, which bounds what a
+    /// batch's last search reads past its last string.
+    const AHEAD: usize = 4096;
+
+    pub fn new(bytes: &'a [u8], needle: &'a [u8]) -> Self {
+        check!(!needle.is_empty());
+        let (from, until, next) = (Cell::new(usize::MAX), Cell::new(0), Cell::new(usize::MAX));
+        Contains { bytes, needle, from, until, next }
+    }
+
+    /// Whether `text`, a string in the bytes, contains the needle.
+    #[inline(never)]
+    pub fn within(&self, text: &[u8]) -> bool {
+        let start = text.as_ptr().addr().wrapping_sub(self.bytes.as_ptr().addr());
+        let end = start.wrapping_add(text.len());
+        check!(start <= end && end <= self.bytes.len());
+        let next = self.next.get();
+        let known = self.from.get() <= start
+            && if next == usize::MAX { end <= self.until.get() } else { next >= start };
+        if !known {
+            let until = end.max(start.saturating_add(Self::AHEAD).min(self.bytes.len()));
+            let found = find(at!(self.bytes, start..until), self.needle);
+            self.from.set(start);
+            self.until.set(until);
+            self.next.set(found.map_or(usize::MAX, |at| start + at));
+        }
+        self.next.get().saturating_add(self.needle.len()) <= end
+    }
 }
 
 /// Whether `text` starts with `segment`, whose `_`s match any byte.
@@ -108,6 +166,31 @@ mod tests {
                 expected,
                 "{text} LIKE {pattern}"
             );
+        }
+    }
+
+    #[test]
+    fn contains_as_like_does() {
+        assert_eq!(contained(b"%google%"), Some(&b"google"[..]));
+        assert_eq!(contained(b"%goo_le%"), None);
+        assert_eq!(contained(b"%a%b%"), None);
+        assert_eq!(contained(b"%%"), None);
+        assert_eq!(contained(b"google%"), None);
+
+        // Strings back to back, one with the needle across its end, then
+        // one past a search's reach, then the same again out of order.
+        let mut bytes = alloc::vec::Vec::from(&b"xgooglexgoogxgooglexx"[..]);
+        bytes.extend([b'_'; 2 * Contains::AHEAD]);
+        bytes.extend(b"google");
+        let ranges =
+            [0..8, 8..12, 12..14, 14..21, 21..bytes.len() - 6, bytes.len() - 7..bytes.len()];
+        let mut order: alloc::vec::Vec<usize> = (0..ranges.len()).collect();
+        order.extend([5, 0, 3, 1, 4, 2]);
+        let contains = Contains::new(&bytes, b"google");
+        for i in order {
+            let range = ranges[i].clone();
+            let expected = like(&bytes[range.clone()], b"%google%");
+            assert_eq!(contains.within(&bytes[range.clone()]), expected, "{range:?}");
         }
     }
 }
