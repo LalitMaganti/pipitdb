@@ -64,7 +64,7 @@ pub const SET: Rule = Rule {
 pub const LIMIT: Rule = Rule {
     keyword: "limit",
     point: Point::Stage,
-    items: &[Item::One(Shared::Expr), Item::Clause("offset", Shared::Expr)],
+    items: &[Item::One(Shared::Expr), Item::Clause(&["offset"], Shared::Expr)],
     compile: compile_limit,
 };
 
@@ -268,7 +268,15 @@ mod tests {
 
     use super::*;
 
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL]);
+    /// `KEEP a GROUP BY b`: a stage whose clause is two words, only parsed.
+    const KEEP: Rule = Rule {
+        keyword: "keep",
+        point: Point::Stage,
+        items: &[Item::List(Shared::Expr), Item::Clause(&["group", "by"], Shared::Name)],
+        compile: compile_limit,
+    };
+
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, &[KEEP]]);
 
     /// Renders the tree as an s-expression.
     fn render(source: &str, ast: &Ast, index: u32) -> String {
@@ -327,6 +335,11 @@ mod tests {
             "(Query (FROM t) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
              (SET (List (Named b a))))"
         );
+        assert_eq!(
+            parse("FROM t |> KEEP a group BY b, c"),
+            "(Query (FROM t) (KEEP (List a) (List b c)))"
+        );
+        assert_eq!(parse("FROM t |> KEEP a"), "(Query (FROM t) (KEEP (List a) (List )))");
     }
 
     #[test]
@@ -337,6 +350,7 @@ mod tests {
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
         assert_eq!(error("FROM t |> WHERE a IS 1"), (ErrorCode::ExpectedWord, 21));
+        assert_eq!(error("FROM t |> KEEP a GROUP b"), (ErrorCode::ExpectedWord, 23));
         assert_eq!(error("FROM t |> RENAME a b"), (ErrorCode::ExpectedAs, 19));
         assert_eq!(error("FROM t |> SET a b"), (ErrorCode::ExpectedToken, 16));
     }

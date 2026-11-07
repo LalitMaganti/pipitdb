@@ -436,7 +436,7 @@ impl Parser<'_> {
             *at_mut!(children, i) = match *item {
                 Item::One(shared) => self.shared(shared)?,
                 Item::List(shared) => self.list_of(shared)?,
-                Item::Clause(word, shared) => self.clause(word, shared)?,
+                Item::Clause(words, shared) => self.clause(words, shared)?,
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));
@@ -493,13 +493,20 @@ impl Parser<'_> {
         }
     }
 
-    /// `word`, then one or more `shared`, or an empty list if `word` isn't
-    /// next.
-    fn clause(&mut self, word: &str, shared: Shared) -> Result<Node, Error> {
-        if !self.at_word(word) {
+    /// `words`, then one or more `shared`, or an empty list if the first word
+    /// isn't next.
+    fn clause(&mut self, words: &[&str], shared: Shared) -> Result<Node, Error> {
+        let Some((first, rest)) = words.split_first() else { pipit_kernel::failed!() };
+        if !self.at_word(first) {
             return Ok(self.list(Tag::List, &[]));
         }
         self.advance()?;
+        for word in rest {
+            if !self.at_word(word) {
+                return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+            }
+            self.advance()?;
+        }
         self.list_of(shared)
     }
 
