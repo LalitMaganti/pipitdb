@@ -1,0 +1,36 @@
+# clickhouse 4.4.0, default threads, best of 2 after a warm-up, ms
+# Apple M4, 10 cores, macOS 26.5.1, 2026-11-07, 100 files
+# load 2.45 before, 5.89 after
+0	3.3
+1	17.0
+2	34.0
+3	38.3
+6	15.7
+40	17.5
+41	17.1
+41all	219.7
+pAdv	41.2
+pRefresh	85.0
+4	251.4
+s1	123.3
+s2	50.3
+s3	483.9
+s4	188.3
+s5	1029.9
+gAdv	88.5
+gCounter	66.5
+gRegion	121.1
+gWindow	289.0
+gUser	666.3
+gEngineIp	840.2
+gUrlDate	1134.5
+f1	42.1
+fAdv	78.1
+f40	14.9
+f41	14.8
+fPhone	182.9
+fIpad	139.7
+fSearch	1745.9
+fCounter	5.2
+fCounterFew	4.9
+fGoogle	580.9

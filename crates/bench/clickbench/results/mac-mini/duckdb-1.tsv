@@ -1,0 +1,36 @@
+# duckdb 2.0.0, one thread, best of 2 after a warm-up, ms
+# Apple M4, 10 cores, macOS 26.5.1, 2026-11-07, 100 files
+# load 1.33 before, 2.05 after
+0	19.4
+1	59.3
+2	255.6
+3	255.6
+6	168.7
+40	20.2
+41	17.3
+41all	1045.3
+pAdv	223.7
+pRefresh	421.7
+4	1458.9
+s1	1214.7
+s2	108.8
+s3	7803.4
+s4	1373.7
+s5	3374.3
+gAdv	367.9
+gCounter	350.5
+gRegion	626.1
+gWindow	1325.7
+gUser	2030.3
+gEngineIp	2326.6
+gUrlDate	3120.1
+f1	61.2
+fAdv	231.8
+f40	19.5
+f41	16.5
+fPhone	307.1
+fIpad	271.2
+fSearch	1666.4
+fCounter	8.6
+fCounterFew	8.5
+fGoogle	4967.1
