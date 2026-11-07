@@ -64,7 +64,20 @@ pub fn compare(
     match value {
         Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
-            compare_form(column, column.values().int64s(), |cell| cell, range, selection, dropped);
+            let cells = column.values().int64s();
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            if dropped.is_none()
+                && matches!(column.form(), Form::Flat)
+                && column.validity().is_none()
+                && selection.is_prefix()
+            {
+                let cells = at!(cells, ..selection.len() as usize);
+                // SAFETY: `keep_prefix` asks for eights below `len()`, which
+                // `cells` has a cell for each of.
+                let eight = |at| unsafe { range.eight(cells, at) };
+                return selection.keep_prefix(eight, |row| range.contains(*at!(cells, row)));
+            }
+            compare_form(column, cells, |cell| cell, range, selection, dropped);
         }
         Value::Float64(_) => {
             check!(column.data_type() == DataType::Float64);
@@ -349,6 +362,38 @@ impl Range {
     pub(crate) fn contains(self, key: i64) -> bool {
         key.wrapping_sub(self.lo).cast_unsigned() <= self.span
     }
+
+    /// Whether each of the eight `cells` from `at` is in the range, as the
+    /// bits of a byte: `contains` for four at a time, twice. Its unsigned
+    /// comparison is a signed one with each top bit flipped, which AVX2 has.
+    ///
+    /// # Safety
+    ///
+    /// `cells` must have a cell at `at + 7`.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline]
+    unsafe fn eight(self, cells: &[i64], at: usize) -> u8 {
+        use core::arch::x86_64::{
+            __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256,
+            _mm256_movemask_pd, _mm256_set1_epi64x, _mm256_sub_epi64, _mm256_xor_si256,
+        };
+        // SAFETY: the build has AVX2, and the caller that the cells are there.
+        unsafe {
+            let top = _mm256_set1_epi64x(i64::MIN);
+            let lo = _mm256_set1_epi64x(self.lo);
+            let span = _mm256_xor_si256(_mm256_set1_epi64x(self.span.cast_signed()), top);
+            let outside = |cells: *const i64| {
+                #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
+                let keys = _mm256_loadu_si256(cells.cast::<__m256i>());
+                let offsets = _mm256_xor_si256(_mm256_sub_epi64(keys, lo), top);
+                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(offsets, span)))
+            };
+            let first = cells.as_ptr().add(at);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
+            let outside = (outside(first) | outside(first.add(4)) << 4) as u8;
+            !outside
+        }
+    }
 }
 
 /// `compare` for `cells`, the values of `column`, whose keys are `key`.
@@ -542,6 +587,45 @@ mod tests {
                     (expected, others),
                     "{comparison:?} {value}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn compares_eight_rows_at_a_time() {
+        // Groups of eight and the rows after them, with the ends of the range
+        // among values spread over it.
+        let ends = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        let cells: Vec<i64> = (0..1003_u64)
+            .map(|i| match i % 9 {
+                0..7 => ends[(i % 7) as usize],
+                _ => i.wrapping_mul(0x9e37_79b9_7f4a_7c15).cast_signed(),
+            })
+            .collect();
+        let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&cells);
+        let column =
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+        let comparisons: [(Comparison, Holds); 6] = [
+            (Comparison::Equal, i64::eq),
+            (Comparison::NotEqual, i64::ne),
+            (Comparison::Less, i64::lt),
+            (Comparison::LessEqual, i64::le),
+            (Comparison::Greater, i64::gt),
+            (Comparison::GreaterEqual, i64::ge),
+        ];
+        for (comparison, holds) in comparisons {
+            for value in ends.into_iter().chain([cells[7], cells[500]]) {
+                let mut selection = Selection::all(1003);
+                compare(&column, comparison, Value::Int64(value), &mut selection, None);
+                let rows: Vec<u16> = match selection.kept() {
+                    Kept::Prefix => (0..u16::try_from(selection.len()).unwrap()).collect(),
+                    Kept::None => Vec::new(),
+                    Kept::Select(rows) => rows.to_vec(),
+                };
+                let expected: Vec<u16> =
+                    (0..1003).filter(|&row| holds(&cells[usize::from(row)], &value)).collect();
+                assert_eq!(rows, expected, "{comparison:?} {value}");
             }
         }
     }

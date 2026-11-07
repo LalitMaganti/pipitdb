@@ -4,6 +4,28 @@ use core::mem::MaybeUninit;
 
 use crate::row_batch::BATCH_ROWS_MAX;
 
+/// For each 4 bits, the positions of those set, from the lowest, then zeros,
+/// each in 16 bits: where the rows of four that they keep are. Adding a
+/// group's first row to each lane at once gives the rows.
+static POSITIONS: [u64; 16] = positions();
+
+const fn positions() -> [u64; 16] {
+    let mut table = [0; 16];
+    let mut bits = 0;
+    while bits < 16 {
+        let (mut bit, mut set) = (0, 0);
+        while bit < 4 {
+            if bits >> bit & 1 == 1 {
+                table[bits] |= bit << (16 * set);
+                set += 1;
+            }
+            bit += 1;
+        }
+        bits += 1;
+    }
+    table
+}
+
 /// The rows a batch keeps: the first of them, or a selection of them by
 /// index. Filters narrow it in place, so a batch's columns are never copied.
 pub struct Selection {
@@ -96,6 +118,45 @@ impl Selection {
         }
         // A prefix all of whose rows are kept stays one, which needs no indices.
         self.prefix &= kept == self.len as usize;
+        self.len = kept as u32;
+    }
+
+    /// Whether the rows kept are the first `len()`, as before any filter.
+    pub fn is_prefix(&self) -> bool {
+        self.prefix
+    }
+
+    /// As `retain`, for a prefix: `eight(at)` says which of the eight rows
+    /// from `at` to keep, as the bits of a byte, and `one(row)` whether to keep
+    /// each row after the last eight. Each eight's kept rows are written
+    /// together, at a cost that doesn't depend on how many are kept.
+    #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
+    pub fn keep_prefix(&mut self, eight: impl Fn(usize) -> u8, one: impl Fn(usize) -> bool) {
+        check!(self.prefix);
+        let len = self.len as usize;
+        let indices = self.indices.as_mut_ptr().cast::<u16>();
+        let mut kept = 0;
+        let full = len - len % 8;
+        for at in (0..full).step_by(8) {
+            let byte = eight(at);
+            for half in [0, 4] {
+                let bits = byte >> half & 15;
+                // The first row in each 16-bit lane: rows are below 2^11 and
+                // positions below 4, so no lane carries into the next.
+                let first = (at + half) as u64 * 0x0001_0001_0001_0001;
+                let rows = at!(POSITIONS, usize::from(bits)) + first;
+                // SAFETY: `kept` is at most `at + half`, so the four are below
+                // `at + half + 4`, at most `len`.
+                unsafe { indices.add(kept).cast::<u64>().write_unaligned(rows.to_le()) };
+                kept += bits.count_ones() as usize;
+            }
+        }
+        for row in full..len {
+            // SAFETY: as above.
+            unsafe { indices.add(kept).write(row as u16) };
+            kept += usize::from(one(row));
+        }
+        self.prefix = kept == len;
         self.len = kept as u32;
     }
 
