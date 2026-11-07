@@ -73,7 +73,7 @@ pub const LIMIT: Rule = Rule {
 pub const AGGREGATE: Rule = Rule {
     keyword: "aggregate",
     point: Point::Stage,
-    items: &[Item::List(Shared::Expr), Item::Clause(&["group", "by"], Shared::Name)],
+    items: &[Item::List(Shared::Aliased), Item::Clause(&["group", "by"], Shared::Aliased)],
     compile: compile_aggregate,
 };
 
@@ -139,21 +139,31 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     }
     let list = compiler.node(stage.first_child());
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
-        let (value, alias) = match item.tag() {
-            Tag::Named => {
-                (compiler.node(item.first_child()), Some(compiler.node(item.first_child() + 1)))
-            }
-            _ => (item, None),
-        };
-        let mut column = value_of(compiler, value)?;
-        if let Some(alias) = alias {
-            column.name = compiler.plan.names.add(compiler.text(alias.span()))?;
-        }
-        scope.push(column)?;
+        let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
+        let column = value_of(compiler, value)?;
+        scope.push(named(compiler, column, alias)?)?;
     }
     compiler.scope = scope;
     Ok(())
+}
+
+/// `item`, and its name if it's a `Named`.
+fn unalias(compiler: &Compiler<'_, '_>, item: Node) -> (Node, Option<Node>) {
+    if item.tag() != Tag::Named {
+        return (item, None);
+    }
+    (compiler.node(item.first_child()), Some(compiler.node(item.first_child() + 1)))
+}
+
+/// `column`, under the name `alias` if there is one.
+fn named(
+    compiler: &mut Compiler<'_, '_>,
+    column: NamedColumn,
+    alias: Option<Node>,
+) -> Result<NamedColumn, Error> {
+    let Some(alias) = alias else { return Ok(column) };
+    let name = compiler.plan.names.add(compiler.text(alias.span()))?;
+    Ok(NamedColumn { name, id: column.id })
 }
 
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
@@ -296,17 +306,20 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
     let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
-        let key = compiler.node(by.first_child() + i);
+        let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
+        if key.tag() != Tag::Name {
+            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
+        }
         let column = compiler.find_column(key)?;
         if at!(compiler.plan.columns, column.id as usize).data_type != DataType::Int64 {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
         keys.push(column.id)?;
-        scope.push(column)?;
+        scope.push(named(compiler, column, alias)?)?;
     }
     let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
+        let (item, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let span = compiler.span(item);
         let unsupported = Error::unsupported(Unsupported::Aggregate, span);
         if item.tag() != Tag::Call || item.child_count() != 2 {
@@ -330,7 +343,10 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
-        let name = compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?;
+        let name = match alias {
+            Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
+            None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
+        };
         let binding = compiler.plan.add_named_column(name, DataType::Int64)?;
         aggregates.push(Aggregate { function, input, binding })?;
         scope.push(binding)?;
@@ -430,6 +446,10 @@ mod tests {
             parse("FROM t |> AGGREGATE count(*)"),
             "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
         );
+        assert_eq!(
+            parse("FROM t |> AGGREGATE count(*) AS n GROUP BY a AS k"),
+            "(Query (FROM t) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
+        );
     }
 
     #[test]
@@ -443,7 +463,10 @@ mod tests {
         assert_eq!(error("FROM t |> RENAME a b"), (ErrorCode::ExpectedAs, 19));
         assert_eq!(error("FROM t |> SET a b"), (ErrorCode::ExpectedToken, 16));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP a"), (ErrorCode::ExpectedWord, 35));
-        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY"), (ErrorCode::ExpectedToken, 37));
+        assert_eq!(
+            error("FROM t |> AGGREGATE count(*) GROUP BY"),
+            (ErrorCode::ExpectedExpression, 37)
+        );
         assert_eq!(error("FROM t |> ORDER a"), (ErrorCode::ExpectedWord, 16));
     }
 }
