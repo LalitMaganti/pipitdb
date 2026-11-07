@@ -30,6 +30,8 @@ pub mod plan;
 pub mod predicate;
 pub mod query_allocators;
 pub mod row_batch;
+#[allow(dead_code, reason = "the sort breaker uses it")]
+mod row_layout;
 pub mod scannable;
 pub mod selection;
 pub mod slow_vec;
