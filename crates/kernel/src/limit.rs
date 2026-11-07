@@ -22,7 +22,13 @@ impl<'c> Op<'c> for LimitOp {
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        lowering.lower(*at!(node.children, 0))?;
+        let read = self.offset.checked_add(self.count);
+        let took = lowering.lower_first(*at!(node.children, 0), read)?;
+        // The child makes no more rows than read, so with no offset, they're
+        // the rows wanted.
+        if took && self.offset == 0 {
+            return Ok(());
+        }
         let limit = Limit { count: self.count, offset: self.offset };
         lowering
             .add_order_independent(Step::Operator(DynOperator::new(lowering.allocator(), limit)?))

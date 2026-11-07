@@ -116,6 +116,10 @@ pub struct Lowering<'p, 'c> {
     /// these, replaced when a step replaces them.
     arrangements: [Arrangement; ARRANGEMENTS_MAX],
     arranged: usize,
+    /// How many of its first rows are read of the node being lowered, if not
+    /// all, until it lowers its children; and whether it makes no more.
+    first_read: Option<u64>,
+    took_first_read: bool,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -129,8 +133,37 @@ impl<'p, 'c> Lowering<'p, 'c> {
 
     /// Lowers `node`, such as a child of the node being lowered.
     pub fn lower(&mut self, node: PlanNodeId) -> Result<(), LowerError> {
+        self.lower_first(node, None)?;
+        Ok(())
+    }
+
+    /// Lowers `node`, of whose rows only the first `count` are read, if
+    /// given, as by a LIMIT, which it may make use of. Returns whether it
+    /// makes no more rows than that.
+    pub fn lower_first(
+        &mut self,
+        node: PlanNodeId,
+        count: Option<u64>,
+    ) -> Result<bool, LowerError> {
         let node = at!(self.plan.nodes, node as usize);
-        node.op.lower(node, self)
+        self.first_read = count;
+        let outer = core::mem::replace(&mut self.took_first_read, false);
+        let lowered = node.op.lower(node, self);
+        self.first_read = None;
+        let took = core::mem::replace(&mut self.took_first_read, outer);
+        lowered.map(|()| took)
+    }
+
+    /// How many of the first rows of the node being lowered are read, if not
+    /// all. Only known before it lowers its children.
+    pub fn query_first_read(&self) -> Option<u64> {
+        self.first_read
+    }
+
+    /// Records that the node being lowered makes no more rows than
+    /// `query_first_read` said are read.
+    pub fn declare_only_first_read(&mut self) {
+        self.took_first_read = true;
     }
 
     /// Makes `source` the pipeline's.
@@ -291,6 +324,8 @@ pub fn lower<'c>(
         column_count: 0,
         arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
         arranged: 0,
+        first_read: None,
+        took_first_read: false,
     };
     lowering.lower(plan.root)?;
 
@@ -552,6 +587,8 @@ mod tests {
             column_count: 0,
             arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
             arranged: 0,
+            first_read: None,
+            took_first_read: false,
         };
         let key = |column| SortKey { column, descending: false };
         let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
@@ -567,6 +604,15 @@ mod tests {
     /// The steps of `Ab` scanned, its rows counted by `groups` of its
     /// columns first, if given, then ordered by `keys`, by column.
     fn ordered(groups: Option<&[usize]>, keys: &[(usize, bool)]) -> alloc::string::String {
+        ordered_limited(groups, keys, None)
+    }
+
+    /// As `ordered`, then limited to `(count, offset)` rows, if given.
+    fn ordered_limited(
+        groups: Option<&[usize]>,
+        keys: &[(usize, bool)],
+        limit: Option<(u64, u64)>,
+    ) -> alloc::string::String {
         let table = DynScannable::new(&Heap, Ab).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
@@ -595,7 +641,13 @@ mod tests {
         let order_by =
             crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
         let order_by = DynOp::new(&Heap, order_by).unwrap();
-        plan.add_node(order_by, SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap()).unwrap();
+        let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
+        let ordered = plan.add_node(order_by, children).unwrap();
+        if let Some((count, offset)) = limit {
+            let limit = DynOp::new(&Heap, crate::limit::LimitOp { count, offset }).unwrap();
+            plan.add_node(limit, SlowVec::fixed_from(&Heap, [ordered].into_iter()).unwrap())
+                .unwrap();
+        }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
         lower(&Heap, &plan).unwrap().pipeline().describe()
     }
@@ -607,6 +659,16 @@ mod tests {
         assert_eq!(ordered(None, &[(0, false), (1, false)]), "Scan");
         assert_eq!(ordered(None, &[(1, false)]), "Scan | Sort");
         assert_eq!(ordered(None, &[(0, true)]), "Scan | Sort");
+    }
+
+    #[test]
+    fn keeps_only_the_first_rows_a_limit_reads() {
+        assert_eq!(ordered_limited(None, &[(1, false)], Some((10, 0))), "Scan | TopK");
+        assert_eq!(ordered_limited(None, &[(1, false)], Some((10, 5))), "Scan | TopK | Limit");
+        // Rows already in order are only limited.
+        assert_eq!(ordered_limited(None, &[(0, false)], Some((10, 0))), "Scan | Limit");
+        let grouped = ordered_limited(Some(&[1]), &[(1, true)], Some((1, 0)));
+        assert_eq!(grouped, "Scan | HashAggregate | TopK");
     }
 
     #[test]
