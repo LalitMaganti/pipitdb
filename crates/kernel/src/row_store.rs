@@ -9,6 +9,7 @@ use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
+use core::ops::Range;
 
 /// The bits of a row's place that say which row of its batch it is.
 const ROW_BITS: u32 = 11;
@@ -73,11 +74,7 @@ impl RowStore {
             return self.hold(context, batch);
         }
         let columns = (0..batch.column_count()).map(|c| batch.column(c));
-        let rows = match batch.selection().kept() {
-            Kept::None => return Ok(()),
-            Kept::Prefix => Rows::Prefix,
-            Kept::Select(rows) => Rows::Select(rows),
-        };
+        let kept = batch.selection().kept();
         let mut done = 0;
         while done < count {
             let take = (count - done).min(BATCH_ROWS_MAX - self.packed);
@@ -87,7 +84,7 @@ impl RowStore {
                 }
             }
             for (packing, column) in self.packing.iter_mut().zip(columns.clone()) {
-                packing.append(column, rows.range(done, take))?;
+                packing.append(column, kept, done..done + take)?;
             }
             (self.packed, done) = (self.packed + take, done + take);
             if self.packed == BATCH_ROWS_MAX {
@@ -196,26 +193,11 @@ fn shares(batch: &RowBatch) -> bool {
         || (0..batch.column_count()).all(|c| batch.is_borrowed(c))
 }
 
-/// The rows of a batch a selection keeps.
-#[derive(Clone, Copy)]
-enum Rows<'a> {
-    /// The first rows.
-    Prefix,
-    /// These rows, in increasing order.
-    Select(&'a [u16]),
-}
-
-impl Rows<'_> {
-    /// The `count` rows from the `first`th, as row numbers.
-    fn range(self, first: u32, count: u32) -> impl Iterator<Item = u32> + Clone {
-        let (first, end) = (first as usize, (first + count) as usize);
-        let (prefix, select) = match self {
-            Rows::Prefix => (Some(first..end), None),
-            Rows::Select(rows) => (None, Some(at!(rows, first..end))),
-        };
-        #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
-        let prefix = prefix.into_iter().flatten().map(|row| row as u32);
-        prefix.chain(select.into_iter().flatten().map(|&row| u32::from(row)))
+/// The `i`th row `kept` keeps.
+fn kept_row(kept: Kept, i: u32) -> u32 {
+    match kept {
+        Kept::Select(rows) => u32::from(*at!(rows, i as usize)),
+        Kept::Prefix | Kept::None => i,
     }
 }
 
@@ -246,14 +228,11 @@ impl Packing {
     }
 
     /// Packs `column`'s rows `rows`, after those packed.
-    fn append(
-        &mut self,
-        column: &ColumnView,
-        rows: impl Iterator<Item = u32>,
-    ) -> Result<(), Error> {
+    fn append(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
         check!(matches!(column.form(), Form::Flat));
         let values = column.values();
-        for row in rows {
+        for i in rows {
+            let row = kept_row(kept, i);
             let at = self.rows as usize;
             let valid = !values.is_null(row);
             *at_mut!(self.validity.as_mut_slice::<u8>(), at / 8) |= u8::from(valid) << (at % 8);
@@ -313,26 +292,29 @@ fn gather<'c>(
     let mut validity = context.small_buffer(rows.div_ceil(8))?;
     let bits = validity.as_mut_slice::<u8>();
     bits.fill(0);
-    let mut nulls = false;
-    for r in 0..rows {
+    let (mut nulls, mut total) = (false, 0);
+    let strings = data_type.has_bytes();
+    // Each row's validity, and its word or its string's length.
+    for (r, out) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
         let (column, row) = source(r);
-        let valid = !column.values().is_null(row);
+        let values = column.values();
+        let valid = !values.is_null(row);
         *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
         nulls |= !valid;
+        if strings {
+            total += values.strings().get(row as usize).len();
+        } else {
+            *out = *at!(values.words(), row as usize);
+        }
     }
     let validity = nulls.then_some(validity);
-    if !data_type.has_bytes() {
-        for (r, out) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
-            let (column, row) = source(r);
-            *out = *at!(column.values().words(), row as usize);
-        }
+    if !strings {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
     let string = |r: usize| {
         let (column, row) = source(r);
         column.values().strings().get(row as usize)
     };
-    let total: usize = (0..rows).map(|r| string(r).len()).sum();
     let mut bytes = context.bytes_buffer(total)?;
     let out = bytes.as_mut_slice::<u8>();
     let mut start = 0;

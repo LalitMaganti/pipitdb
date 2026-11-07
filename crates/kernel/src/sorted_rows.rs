@@ -9,7 +9,7 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use crate::row_layout::{self, RowLayout};
+use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::sort_row_layout;
 use crate::row_store::RowStore;
 use crate::selection::Kept;
@@ -249,21 +249,18 @@ pub(crate) fn lay_out_keys(
     for (k, key) in keys.iter().enumerate() {
         let column = batch.column(key.column);
         let slot = layout.slot(k);
-        let valid = |i: u32| !column.values().is_null(row(i));
-        match column.data_type() {
-            DataType::Int64 => {
-                let values = column.int64s();
-                let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
-                RowLayout::write(slot, count, get, rows);
-            }
-            DataType::Float64 => {
-                let values = column.float64s();
-                let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
-                RowLayout::write(slot, count, get, rows);
-            }
-            // Laid out by `sort`, once every string is in and ranked.
-            DataType::String => {}
+        // Laid out by `sort`, once every string is in and ranked.
+        if column.data_type() == DataType::String {
+            continue;
         }
+        // Integers and floats as words, so one loop lays out both.
+        let (values, float) = (column.values(), column.data_type() == DataType::Float64);
+        let words = values.words();
+        let get = |i| {
+            let row = row(i);
+            (!values.is_null(row)).then(|| Word { bits: *at!(words, row as usize), float })
+        };
+        RowLayout::write(slot, count, get, rows);
     }
 }
 

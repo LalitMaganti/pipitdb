@@ -128,6 +128,23 @@ impl Encode for i64 {
     }
 }
 
+/// An integer, or a float's bits, as a column of either holds it.
+#[derive(Clone, Copy)]
+pub(crate) struct Word {
+    pub(crate) bits: i64,
+    pub(crate) float: bool,
+}
+
+impl Encode for Word {
+    const SIZE: usize = 8;
+    /// As `f64`'s if a float, and `i64`'s if not.
+    fn encode(self) -> u64 {
+        let negative_float = (self.bits >> 63).cast_unsigned() >> 1;
+        let flip = if self.float { negative_float } else { 0 };
+        (self.bits ^ flip.cast_signed()).encode()
+    }
+}
+
 impl Encode for f64 {
     const SIZE: usize = 8;
     /// A negative float's bits but its sign are flipped too, so they order
