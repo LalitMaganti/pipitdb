@@ -47,7 +47,7 @@ impl Breaker for Sort {
     }
 
     fn finalize(&self, context: &mut Context, sorting: &mut Sorting) -> Result<(), Error> {
-        sorting.rows.sort(context.allocator())
+        sorting.rows.sort(context)
     }
 
     fn serve(
@@ -236,20 +236,33 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn top_k_keeps_the_first_rows_a_sort_would() {
+        // Names that tie, share prefixes, and include the empty one.
+        const NAMES: [&str; 7] = ["", "a", "ab", "abc", "b", "ba", "\u{e9}"];
         // Keys at random, ascending and descending, with ties and nulls, over
         // sparse batches; sorted by both keys, and by the first alone, so
         // ties must keep their order.
         let shapes: [fn(i64) -> i64; 3] = [|i| (i * 7919) % 1000, |i| i / 3, |i| -(i / 3)];
-        let by_key = || {
-            SlowVec::fixed_from(&Heap, [SortKey { column: 0, descending: false }].into_iter())
-                .unwrap()
+        let by = |keys: &[(u32, bool)]| {
+            let keys = keys.iter().map(|&(column, descending)| SortKey { column, descending });
+            SlowVec::fixed_from(&Heap, keys).unwrap()
         };
         for shape in shapes {
-            let rows: Vec<Row> =
-                (0..9000).map(|i| ((i % 97 != 5).then(|| shape(i)), i, "x")).collect();
+            let rows: Vec<Row> = (0..9000)
+                .map(|i| {
+                    (
+                        (i % 97 != 5).then(|| shape(i)),
+                        i,
+                        NAMES[usize::try_from(i * 31 % 7).unwrap()],
+                    )
+                })
+                .collect();
             let batches: Vec<Vec<Row>> = rows.chunks(2048).map(<[Row]>::to_vec).collect();
             let rows = || Rows { batches: batches.clone(), drop: Some(5) };
-            for keys in [keys(), by_key()] {
+            let by_name = by(&[(2, false)]);
+            let sorted = run(rows(), sort(&Heap, by(&[(2, false)])).unwrap());
+            // By name, then in the order rows came, as their values are.
+            assert!(sorted.windows(2).all(|w| (&w[0].2, w[0].1) < (&w[1].2, w[1].1)));
+            for keys in [keys(), by(&[(0, false)]), by_name, by(&[(2, true), (0, false)])] {
                 let all = run(
                     rows(),
                     sort(&Heap, SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap()).unwrap(),

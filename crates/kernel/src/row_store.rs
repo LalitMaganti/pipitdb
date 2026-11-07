@@ -117,8 +117,9 @@ impl RowStore {
         Ok(())
     }
 
-    /// Holds the rows packed so far as one batch.
-    fn flush(&mut self, context: &mut Context) -> Result<(), Error> {
+    /// Holds the rows packed so far as one batch, so every row held is in a
+    /// batch.
+    pub(crate) fn flush(&mut self, context: &mut Context) -> Result<(), Error> {
         if self.packed == 0 {
             return Ok(());
         }
@@ -130,6 +131,17 @@ impl RowStore {
         while self.packing.pop().is_some() {}
         self.packed = 0;
         self.hold(context, &batch)
+    }
+
+    /// The string of the held row `row` in column `column`, a string column,
+    /// if not null. Rows packed must be flushed first.
+    pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
+        check!(self.packed == 0);
+        let place = *at!(self.places, row as usize);
+        let held = at!(self.batches, (place >> ROW_BITS) as usize);
+        let values = at!(held, column as usize).values();
+        let row = place & ((1 << ROW_BITS) - 1);
+        (!values.is_null(row)).then(|| values.strings().get(row as usize))
     }
 
     /// Fills `out` with up to a batch's worth of `rows`, in that order and

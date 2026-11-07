@@ -7,6 +7,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::DataType;
 use crate::context::Context;
 use crate::error::Error;
+use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{self, RowLayout};
 use crate::row_layout_sort::sort_row_layout;
@@ -27,6 +28,9 @@ pub(crate) struct SortedRows {
     layout: Option<RowLayout>,
     /// Each key's type, which every batch's must match.
     types: SlowVec<DataType>,
+    /// By key, its column if it's a string key, whose ranks among the rows'
+    /// strings are laid out only once all are in.
+    strings: SlowVec<Option<u32>>,
     /// Each row's keys, one row after another.
     keys: SlowVec<u8>,
     /// The rows themselves.
@@ -40,6 +44,7 @@ impl SortedRows {
         Ok(SortedRows {
             layout: None,
             types: SlowVec::new(allocator, 1 << 6)?,
+            strings: SlowVec::new(allocator, 1 << 6)?,
             keys: SlowVec::new(allocator, 1 << 31)?,
             rows: RowStore::new(allocator)?,
             order: SlowVec::new(allocator, 1 << 31)?,
@@ -114,10 +119,38 @@ impl SortedRows {
         if keys.iter().zip(self.types.iter()).any(|(key, &t)| data_type(key) != t) {
             return Err(Error::Unsupported);
         }
+        if self.layout.is_none() {
+            for key in keys {
+                let string = batch.column(key.column).data_type() == DataType::String;
+                self.strings.push(string.then_some(key.column))?;
+            }
+        }
         Ok(match &mut self.layout {
             Some(layout) => layout,
             layout => layout.insert(lay_out(allocator, batch, keys)?),
         })
+    }
+
+    /// How keys are laid out, once the first batch's are checked.
+    pub(crate) fn layout(&self) -> &RowLayout {
+        let Some(layout) = &self.layout else { failed!() };
+        layout
+    }
+
+    /// By key, its column if it's a string key, once the first batch says.
+    pub(crate) fn string_columns(&self) -> &[Option<u32>] {
+        &self.strings
+    }
+
+    /// Holds the rows packed so far, so `string` can read every row.
+    pub(crate) fn flush(&mut self, context: &mut Context) -> Result<(), Error> {
+        self.rows.flush(context)
+    }
+
+    /// The string of the held row `row` in column `column`, a string column,
+    /// if not null. Rows must be flushed first.
+    pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
+        self.rows.string(column, row)
     }
 
     /// The keys of the held row `row`, laid out.
@@ -143,12 +176,21 @@ impl SortedRows {
 
     /// Resets the order to the order rows came in, then sorts it stably by
     /// the keys. Nulls sort as in SQLite: first ascending, last descending.
-    pub(crate) fn sort(&mut self, allocator: &dyn Allocator) -> Result<(), Error> {
+    /// Strings sort by their bytes.
+    pub(crate) fn sort(&mut self, context: &mut Context) -> Result<(), Error> {
+        let allocator = context.allocator();
         while self.order.pop().is_some() {}
         for row in 0..self.rows.len() {
             self.order.push(row)?;
         }
         let Some(layout) = &self.layout else { return Ok(()) };
+        self.rows.flush(context)?;
+        for (k, column) in self.strings.iter().enumerate() {
+            let Some(column) = *column else { continue };
+            let ranks = rank_strings(allocator, &self.rows, column)?;
+            let get = |row: u32| self.rows.string(column, row).map(|_| *at!(ranks, row as usize));
+            RowLayout::write(layout.slot(k), self.rows.len(), get, &mut self.keys);
+        }
         if layout.stride() > 0 {
             sort_row_layout(allocator, &self.keys, layout.stride(), &mut self.order)?;
         }
@@ -167,6 +209,28 @@ impl SortedRows {
         let rows = at!(self.order, (at as usize).min(end)..end);
         self.rows.gather(context, out, rows)
     }
+}
+
+/// Each held row's rank among the strings of `column`, a string column, of
+/// the rows held: equal strings rank equally. Null rows' ranks are any.
+fn rank_strings(
+    allocator: &dyn Allocator,
+    rows: &RowStore,
+    column: u32,
+) -> Result<SlowVec<u32>, Error> {
+    let string = |row: &u32| rows.string(column, *row).unwrap_or_default();
+    let mut order = SlowVec::fixed_from(allocator, 0..rows.len())?;
+    let mut scratch = SlowVec::<u32>::zeroed(allocator, rows.len() as usize)?;
+    msd_radix_sort(allocator, &mut order, &mut scratch, string)?;
+    let mut ranks = SlowVec::<u32>::zeroed(allocator, rows.len() as usize)?;
+    let mut rank = 0;
+    for (i, row) in order.iter().enumerate() {
+        if i > 0 && string(row) != string(at!(order, i - 1)) {
+            rank += 1;
+        }
+        *at_mut!(ranks, *row as usize) = rank;
+    }
+    Ok(ranks)
 }
 
 /// Lays out at `rows` the keys of each row `batch` keeps, by `layout`.
@@ -197,7 +261,8 @@ pub(crate) fn lay_out_keys(
                 let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
                 RowLayout::write(slot, count, get, rows);
             }
-            DataType::String => failed!(),
+            // Laid out by `sort`, once every string is in and ranked.
+            DataType::String => {}
         }
     }
 }
@@ -214,7 +279,7 @@ fn lay_out(
         let data_type = match batch.column(key.column).data_type() {
             DataType::Int64 => row_layout::Type::Int64,
             DataType::Float64 => row_layout::Type::Float64,
-            DataType::String => return Err(Error::Unsupported),
+            DataType::String => row_layout::Type::Uint32,
         };
         columns.push(row_layout::Column {
             data_type,

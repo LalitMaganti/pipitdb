@@ -9,6 +9,8 @@ use crate::slow_vec::SlowVec;
 /// What a slot holds.
 #[derive(Clone, Copy)]
 pub(crate) enum Type {
+    /// A string's rank among the strings sorted.
+    Uint32,
     Int64,
     Float64,
 }
@@ -87,11 +89,12 @@ impl RowLayout {
                 #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
                 let byte = u8::from(value.is_some()).wrapping_neg() ^ invert as u8;
                 *at_mut!(to, 0) = byte;
-                let bits = value.map_or(0, |value| value.encode() ^ invert);
-                at_mut!(to, 1..9).copy_from_slice(&bits.to_be_bytes());
+                let bits = value.map_or(0, |value| value.encode() ^ invert).to_be_bytes();
+                at_mut!(to, 1..=T::SIZE).copy_from_slice(at!(bits, 8 - T::SIZE..));
             } else {
                 let Some(value) = get(i) else { failed!() };
-                at_mut!(to, ..8).copy_from_slice(&(value.encode() ^ invert).to_be_bytes());
+                let bits = (value.encode() ^ invert).to_be_bytes();
+                at_mut!(to, ..T::SIZE).copy_from_slice(at!(bits, 8 - T::SIZE..));
             }
         }
     }
@@ -99,22 +102,34 @@ impl RowLayout {
 
 fn value_size(data_type: Type) -> u32 {
     match data_type {
+        Type::Uint32 => 4,
         Type::Int64 | Type::Float64 => 8,
     }
 }
 
-/// A value as bits whose unsigned order is the value's.
+/// A value as bits whose unsigned order is the value's, in the low `SIZE`
+/// bytes.
 pub(crate) trait Encode: Copy {
+    const SIZE: usize;
     fn encode(self) -> u64;
 }
 
+impl Encode for u32 {
+    const SIZE: usize = 4;
+    fn encode(self) -> u64 {
+        u64::from(self)
+    }
+}
+
 impl Encode for i64 {
+    const SIZE: usize = 8;
     fn encode(self) -> u64 {
         (self ^ i64::MIN).cast_unsigned()
     }
 }
 
 impl Encode for f64 {
+    const SIZE: usize = 8;
     /// A negative float's bits but its sign are flipped too, so they order
     /// backwards.
     fn encode(self) -> u64 {
@@ -164,6 +179,11 @@ mod tests {
         expect_ordered(Type::Int64, &ints.map(Some), false);
         let floats = [f64::NEG_INFINITY, -1e300, -1.5, -0.0, 1e-300, 1.5, 1e300, f64::INFINITY];
         expect_ordered(Type::Float64, &floats.map(Some), false);
+    }
+
+    #[test]
+    fn ranks_sort_as_values() {
+        expect_ordered(Type::Uint32, &[0, 1, 255, 256, u32::MAX].map(Some), true);
     }
 
     #[test]

@@ -184,6 +184,79 @@ pub(crate) fn insertion_sort(elements: &mut [KeyedIndex]) {
     }
 }
 
+/// Below this many, a bucket of strings is sorted by insertion.
+const MSD_INSERTION_SORT: usize = 24;
+
+/// A bucket of `msd_radix_sort`'s still to sort: `elements[start..end]`, by
+/// their keys' bytes from `depth` on.
+#[derive(Clone, Copy)]
+struct Bucket {
+    start: usize,
+    end: usize,
+    depth: usize,
+}
+
+/// Sorts `elements` by `key`, a string of bytes, with a most significant
+/// digit first radix sort, as Perfetto's `MsdRadixSort` does: the elements
+/// are split into buckets by their key's byte at a depth, each then by the
+/// next, from a stack rather than by recursion. Equal keys end up in any
+/// order. `scratch` must be at least as long.
+pub(crate) fn msd_radix_sort<'k, T: Copy>(
+    allocator: &dyn Allocator,
+    elements: &mut [T],
+    scratch: &mut [T],
+    key: impl Fn(&T) -> &'k [u8],
+) -> Result<(), AllocError> {
+    if elements.len() <= 1 {
+        return Ok(());
+    }
+    // The byte of `key` at `depth`, plus one, or 0 for keys that short.
+    let digit =
+        |element: &T, depth: usize| key(element).get(depth).map_or(0, |&b| usize::from(b) + 1);
+    let mut stack = SlowVec::new(allocator, 1 << 24)?;
+    stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
+    while let Some(bucket) = stack.pop() {
+        let items = at_mut!(elements, bucket.start..bucket.end);
+        if items.len() <= MSD_INSERTION_SORT {
+            for i in 1..items.len() {
+                let mut j = i;
+                while j > 0
+                    && at!(key(at!(items, j - 1)), bucket.depth.min(key(at!(items, j - 1)).len())..)
+                        > at!(key(at!(items, j)), bucket.depth.min(key(at!(items, j)).len())..)
+                {
+                    items.swap(j - 1, j);
+                    j -= 1;
+                }
+            }
+            continue;
+        }
+        let copy = at_mut!(scratch, bucket.start..bucket.end);
+        copy.copy_from_slice(items);
+        let mut counts = [0_usize; 258];
+        for element in copy.iter() {
+            *at_mut!(counts, digit(element, bucket.depth) + 1) += 1;
+        }
+        for d in 1..counts.len() {
+            *at_mut!(counts, d) += *at!(counts, d - 1);
+        }
+        let starts = counts;
+        for element in copy.iter() {
+            let at = at_mut!(counts, digit(element, bucket.depth));
+            *at_mut!(items, *at) = *element;
+            *at += 1;
+        }
+        // Keys that end at this depth are all equal: only longer ones go on.
+        for d in (1..257).rev() {
+            let (start, end) = (*at!(starts, d), *at!(starts, d + 1));
+            if end - start > 1 {
+                let start = bucket.start + start;
+                stack.push(Bucket { start, end: bucket.start + end, depth: bucket.depth + 1 })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
@@ -235,6 +308,30 @@ mod tests {
                 sorted(elements, |e, s| stable_sort_keyed_indices(&Heap, e, s, key_bits).unwrap());
             assert_eq!(either, expected, "either, {count} of {key_bits} bits");
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
+    fn sorts_strings_by_their_bytes() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let strings: Vec<Vec<u8>> = (0..2000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                // Short strings of a few bytes, so many share prefixes or tie.
+                let len = (seed % 6) as usize;
+                (0..len).map(|i| b"ab\xffz"[((seed >> (8 * i)) % 4) as usize]).collect()
+            })
+            .collect();
+        let mut order: Vec<u32> = (0..2000).collect();
+        let mut scratch = order.clone();
+        msd_radix_sort(&Heap, &mut order, &mut scratch, |&i| strings[i as usize].as_slice())
+            .unwrap();
+        let sorted: Vec<&Vec<u8>> = order.iter().map(|&i| &strings[i as usize]).collect();
+        let mut expected: Vec<&Vec<u8>> = strings.iter().collect();
+        expected.sort();
+        assert_eq!(sorted, expected);
     }
 
     #[test]
