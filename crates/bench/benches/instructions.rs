@@ -54,6 +54,18 @@ fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
 
 library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
 
+// Perfetto's `filter_benchmark.cc`, on the same 2^20 rows, planned first.
+#[library_benchmark]
+#[bench::eq_uint32(pipitdb_bench::perfetto_filter_plan(0))]
+#[bench::lt_int64(pipitdb_bench::perfetto_filter_plan(1))]
+#[bench::eq_nullable(pipitdb_bench::perfetto_filter_plan(2))]
+#[bench::eq_string(pipitdb_bench::perfetto_filter_plan(3))]
+fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(plan.pipeline())))
+}
+
+library_benchmark_group!(name = perfetto_filter_group, benchmarks = [perfetto_filter]);
+
 #[library_benchmark]
 #[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
 #[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
@@ -154,6 +166,7 @@ main!(
     library_benchmark_groups = lexer_group,
     parser_group,
     small_group,
+    perfetto_filter_group,
     pipeline_group,
     clickbench_group
 );

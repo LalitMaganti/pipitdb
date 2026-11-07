@@ -419,3 +419,88 @@ pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -
     }
     kept
 }
+
+/// The table `slices`.
+struct PerfettoSlices(DynScannable<'static>);
+
+impl Catalog for PerfettoSlices {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        (name == "slices").then_some(&self.0)
+    }
+}
+
+/// The table Perfetto's `filter_benchmark.cc` filters, row for row: 2^20 rows
+/// of `id`, `dur`, `cpu`, `depth`, a fifth null, and `name`, a dictionary of
+/// 64 strings shared by every row group, as Perfetto's string pool is.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn perfetto_slices() -> &'static dyn Catalog {
+    let rows = BATCH_ROWS_MAX as usize;
+    let mut context = Context::new(&Heap);
+    let names: Vec<String> = (0..64).map(|i| format!("name{i}")).collect();
+    let mut views = Buffer::allocate(&Heap, names.len() * 8).expect("allocates");
+    let mut bytes = Vec::new();
+    for (view, name) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&names) {
+        let start = u32::try_from(bytes.len()).expect("small");
+        view.copy_from_slice(&[start, u32::try_from(name.len()).expect("small")]);
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+    let entries = ColumnView::strings(&mut context, views, stored, None).expect("allocates");
+    let hash = |i: usize| u32::try_from(i).expect("small").wrapping_mul(2_654_435_761);
+    let mut groups = Vec::new();
+    for group in 0..(1 << 20) / rows {
+        let first = group * rows;
+        let int = |value: &dyn Fn(usize) -> i64, valid: Option<&dyn Fn(usize) -> bool>| {
+            let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+            for (i, slot) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
+                *slot = value(first + i);
+            }
+            let validity = valid.map(|valid| {
+                let mut bits = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+                bits.as_mut_slice::<u8>().fill(0);
+                for i in 0..rows {
+                    bits.as_mut_slice::<u8>()[i / 8] |= u8::from(valid(first + i)) << (i % 8);
+                }
+                bits
+            });
+            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity)
+                .expect("allocates")
+        };
+        let id = int(&|i| i64::try_from(i).expect("small"), None);
+        let dur = int(&|i| i64::from((hash(i) >> 12) % 1000), None);
+        let cpu = int(&|i| i64::from((hash(i) >> 8) % 8), None);
+        let depth = int(&|i| i64::from((hash(i) >> 4) % 16), Some(&|i| hash(i) % 5 != 0));
+        let mut indices = Buffer::allocate(&Heap, rows * 4).expect("allocates");
+        for (i, index) in indices.as_mut_slice::<u32>().iter_mut().enumerate() {
+            *index = (hash(first + i) >> 16) % 64;
+        }
+        let name = ColumnView::dictionary(&mut context, &entries, indices).expect("allocates");
+        groups.push(vec![id, dur, cpu, depth, name]);
+    }
+    let groups: Vec<&[ColumnView]> = groups.iter().map(Vec::as_slice).collect();
+    let schema = [
+        ("id", DataType::Int64),
+        ("dur", DataType::Int64),
+        ("cpu", DataType::Int64),
+        ("depth", DataType::Int64),
+        ("name", DataType::String),
+    ];
+    let table = Table::new(&Heap, &schema, &groups).expect("allocates");
+    Box::leak(Box::new(PerfettoSlices(DynScannable::new(&Heap, table).expect("allocates"))))
+}
+
+/// The filters Perfetto's `filter_benchmark.cc` times, by its names, over
+/// `perfetto_slices`. pipitdb has no `Uint32`, so `cpu` is an `Int64`.
+pub const PERFETTO_FILTERS: [(&str, &str); 4] = [
+    ("eq_uint32", "FROM slices |> WHERE cpu = 3 |> SELECT id"),
+    ("lt_int64", "FROM slices |> WHERE dur < 500 |> SELECT id"),
+    ("eq_nullable", "FROM slices |> WHERE depth = 3 |> SELECT id"),
+    ("eq_string", "FROM slices |> WHERE name = 'name7' |> SELECT id"),
+];
+
+/// `PERFETTO_FILTERS`' `i`th query over `perfetto_slices`, planned once.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
+    plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
+}
