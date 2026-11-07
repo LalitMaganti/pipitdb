@@ -1,0 +1,36 @@
+# clickhouse 4.4.0, default threads, best of 2 after a warm-up, ms
+# x86_64, 15 cores, Linux-7.2.14-arch1-1-x86_64-with-glibc2.44, 2026-11-07, 100 files
+# load 2.80 before, 12.89 after
+0	5.4
+1	44.5
+2	82.0
+3	225.5
+6	35.5
+40	40.9
+41	39.0
+41all	604.1
+pAdv	143.3
+pRefresh	199.1
+4	732.0
+s1	441.3
+s2	146.8
+s3	2298.9
+s4	619.4
+s5	6709.6
+gAdv	150.4
+gCounter	178.6
+gRegion	225.5
+gWindow	720.2
+gUser	2093.4
+gEngineIp	2162.9
+gUrlDate	3645.5
+f1	89.2
+fAdv	190.3
+f40	39.4
+f41	39.1
+fPhone	389.8
+fIpad	323.1
+fSearch	3965.0
+fCounter	10.2
+fCounterFew	9.6
+fGoogle	3040.4
