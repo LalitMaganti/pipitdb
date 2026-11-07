@@ -10,6 +10,7 @@ use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, DataType, Form, Values};
+use crate::eight;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -65,14 +66,17 @@ pub fn compare(
         Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
             let cells = column.values().int64s();
-            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-            if dropped.is_none() && matches!(column.form(), Form::Flat) && selection.is_prefix() {
+            if eight::EIGHT_AT_A_TIME
+                && dropped.is_none()
+                && matches!(column.form(), Form::Flat)
+                && selection.is_prefix()
+            {
                 let cells = at!(cells, ..selection.len() as usize);
                 let validity = column.validity();
                 let valid = validity.map(crate::column::Validity::bits);
                 // SAFETY: `keep_prefix` asks for eights below `len()`, which
                 // `cells` has a cell for each of.
-                let kept = |at| unsafe { range.eight(cells, at) };
+                let kept = |at| unsafe { eight::in_range(cells, at, range.lo, range.span) };
                 #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
                 let one = |row: usize| {
                     // SAFETY: `row` is below `len()`, a row of `column`.
@@ -269,13 +273,12 @@ pub fn keep_entries(
         return keep_all(selection, dropped);
     }
     let only = entries.matched == 1;
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    if only && dropped.is_none() && selection.is_prefix() {
+    if eight::EIGHT_AT_A_TIME && only && dropped.is_none() && selection.is_prefix() {
         let indices = at!(indices, ..selection.len() as usize);
         // SAFETY: `keep_prefix` asks for eights below `len()`, which
         // `indices` has an index for each of.
-        let eight = |at| unsafe { eight_equal(indices, at, entries.only) };
-        return selection.keep_prefix(eight, |row| *at!(indices, row) == entries.only);
+        let equal = |at| unsafe { eight::equal(indices, at, entries.only) };
+        return selection.keep_prefix(equal, |row| *at!(indices, row) == entries.only);
     }
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
@@ -289,29 +292,6 @@ pub fn keep_entries(
         // An index past the entries fails the check, as when read anywhere.
         (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
     });
-}
-
-/// Which of the eight `indices` from `at` are `index`, as the bits of a byte.
-///
-/// # Safety
-///
-/// `indices` must have an index at `at + 7`.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline]
-unsafe fn eight_equal(indices: &[u32], at: usize, index: u32) -> u8 {
-    use core::arch::x86_64::{
-        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
-        _mm256_set1_epi32,
-    };
-    // SAFETY: the build has AVX2, and the caller that the indices are there.
-    unsafe {
-        #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
-        let eight = _mm256_loadu_si256(indices.as_ptr().add(at).cast::<__m256i>());
-        let equal = _mm256_cmpeq_epi32(eight, _mm256_set1_epi32(index.cast_signed()));
-        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
-        let byte = _mm256_movemask_ps(_mm256_castsi256_ps(equal)) as u8;
-        byte
-    }
 }
 
 /// `compare` for any form of `column`, whose values `cells` reads.
@@ -401,43 +381,10 @@ impl Range {
     pub(crate) fn contains(self, key: i64) -> bool {
         key.wrapping_sub(self.lo).cast_unsigned() <= self.span
     }
-
-    /// Whether each of the eight `cells` from `at` is in the range, as the
-    /// bits of a byte: `contains` for four at a time, twice. Its unsigned
-    /// comparison is a signed one with each top bit flipped, which AVX2 has.
-    ///
-    /// # Safety
-    ///
-    /// `cells` must have a cell at `at + 7`.
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    #[inline]
-    unsafe fn eight(self, cells: &[i64], at: usize) -> u8 {
-        use core::arch::x86_64::{
-            __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256,
-            _mm256_movemask_pd, _mm256_set1_epi64x, _mm256_sub_epi64, _mm256_xor_si256,
-        };
-        // SAFETY: the build has AVX2, and the caller that the cells are there.
-        unsafe {
-            let top = _mm256_set1_epi64x(i64::MIN);
-            let lo = _mm256_set1_epi64x(self.lo);
-            let span = _mm256_xor_si256(_mm256_set1_epi64x(self.span.cast_signed()), top);
-            let outside = |cells: *const i64| {
-                #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
-                let keys = _mm256_loadu_si256(cells.cast::<__m256i>());
-                let offsets = _mm256_xor_si256(_mm256_sub_epi64(keys, lo), top);
-                _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(offsets, span)))
-            };
-            let first = cells.as_ptr().add(at);
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
-            let outside = (outside(first) | outside(first.add(4)) << 4) as u8;
-            !outside
-        }
-    }
 }
 
 /// Which of the eight rows from `at` aren't null, as the bits of a byte, from
 /// a bitmap whose first row is bit `shift` of its first byte.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
     let low = *at!(bits, at / 8);
     if shift == 0 {
