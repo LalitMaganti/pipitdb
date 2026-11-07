@@ -36,35 +36,39 @@ impl<'c> Op<'c> for LimitOp {
     fn reads(&self, _: &mut Needed) {}
 }
 
-/// Keeps rows by narrowing each batch's selection, and reads no values.
+/// Drops the first `offset` rows, then keeps up to `count` rows, in order, by
+/// narrowing each batch's selection: nothing is copied, and no values read.
 struct Limit {
     count: u64,
     offset: u64,
 }
 
-/// How many rows are still to skip, and then to keep.
-struct Left {
-    skip: u64,
-    keep: u64,
+/// How many rows of the offset are dropped, and how many are kept.
+struct Counted {
+    skipped: u64,
+    kept: u64,
 }
 
 impl Operator for Limit {
-    type State = Left;
+    type State = Counted;
 
-    fn new_state(&self, _: &mut Context) -> Result<Left, Error> {
-        Ok(Left { skip: self.offset, keep: self.count })
+    fn new_state(&self, _: &mut Context) -> Result<Counted, Error> {
+        Ok(Counted { skipped: 0, kept: 0 })
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "at most a batch's rows")]
     fn execute(
         &self,
         _: &mut Context,
-        left: &mut Left,
+        counted: &mut Counted,
         input: &RowBatch,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
-        if left.keep == 0 {
-            return Ok(Progress::Done);
-        }
+        let size = u64::from(input.selection().len());
+        let skip = (self.offset - counted.skipped).min(size);
+        counted.skipped += skip;
+        let keep = (size - skip).min(self.count - counted.kept);
+        counted.kept += keep;
         output.reset(input.row_count());
         for i in 0..input.column_count() {
             let Ok(()) = output.push_column(input.column(i).clone()) else {
@@ -72,19 +76,18 @@ impl Operator for Limit {
             };
         }
         output.selection_mut().clone_from(input.selection());
-        output.selection_mut().retain(|_| {
-            if left.skip > 0 {
-                left.skip -= 1;
-                return false;
-            }
-            let kept = left.keep > 0;
-            left.keep -= u64::from(kept);
-            kept
-        });
-        Ok(if left.keep == 0 { Progress::Done } else { Progress::NeedInput })
+        if keep != size {
+            output.selection_mut().keep_range(skip as u32, keep as u32);
+        }
+        Ok(if counted.kept == self.count { Progress::Done } else { Progress::NeedInput })
     }
 
-    fn finish(&self, _: &mut Context, _: &mut Left, _: &mut RowBatch) -> Result<Progress, Error> {
+    fn finish(
+        &self,
+        _: &mut Context,
+        _: &mut Counted,
+        _: &mut RowBatch,
+    ) -> Result<Progress, Error> {
         Ok(Progress::Done)
     }
 }
@@ -149,7 +152,7 @@ mod tests {
         while execution.next(&mut batch).unwrap() {
             let values = batch.column(0).int64s();
             match batch.selection().kept() {
-                Kept::Prefix => rows.extend_from_slice(values),
+                Kept::Prefix => rows.extend_from_slice(&values[..batch.selection().len() as usize]),
                 Kept::Select(kept) => rows.extend(kept.iter().map(|&row| values[usize::from(row)])),
                 Kept::None => {}
             }
@@ -164,5 +167,8 @@ mod tests {
         assert_eq!(limited(3, 1), ([1, 2, 3].to_vec(), 2));
         assert_eq!(limited(100, 8), ([8, 9].to_vec(), 5));
         assert_eq!(limited(0, 0), (Vec::new(), 1));
+        // Kept rows are a prefix of the batch, or a range of it after an offset.
+        assert_eq!(limited(1, 0), ([0].to_vec(), 1));
+        assert_eq!(limited(3, 3), ([3, 4, 5].to_vec(), 3));
     }
 }
