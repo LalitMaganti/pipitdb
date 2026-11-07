@@ -14,6 +14,7 @@ pub mod bytes;
 pub mod column;
 pub mod condition;
 pub mod context;
+mod eight;
 mod erase;
 pub mod error;
 pub mod filter;
