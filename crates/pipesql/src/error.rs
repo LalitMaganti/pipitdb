@@ -81,6 +81,8 @@ pub enum Unsupported {
     AggregateType = 7,
     /// A key to group by that isn't an `Int64` column.
     GroupKey = 8,
+    /// `ORDER BY`, which nothing sorts for yet.
+    OrderBy = 9,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

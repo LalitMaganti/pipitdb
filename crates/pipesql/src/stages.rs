@@ -77,8 +77,15 @@ pub const AGGREGATE: Rule = Rule {
     compile: compile_aggregate,
 };
 
+pub const ORDER_BY: Rule = Rule {
+    keyword: "order",
+    point: Point::Stage,
+    items: &[Item::After(&["by"], Shared::Ordered)],
+    compile: compile_order_by,
+};
+
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, LIMIT];
+pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
@@ -244,6 +251,13 @@ fn value_of(compiler: &Compiler<'_, '_>, value: Node) -> Result<NamedColumn, Err
     compiler.find_column(value)
 }
 
+/// `ORDER BY a, b DESC`: parsed, but nothing sorts yet.
+fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let keys = compiler.node(stage.first_child());
+    let first = compiler.node(keys.first_child());
+    Err(Error::unsupported(Unsupported::OrderBy, compiler.span(first)))
+}
+
 /// `LIMIT 10 OFFSET 20`: the first 10 rows after skipping 20. Both are
 /// integers.
 fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
@@ -358,6 +372,7 @@ mod tests {
                 (rule.keyword.to_uppercase(), u32::try_from(rule.items.len()).unwrap())
             }
             Tag::Named => ("Named".to_string(), 2),
+            Tag::SortKey => ((if node.descending() { "DESC" } else { "ASC" }).to_string(), 1),
             Tag::Unary => (format!("{:?}", node.operator()), 1),
             Tag::Binary => (format!("{:?}", node.operator()), 2),
             _ => {
@@ -399,6 +414,10 @@ mod tests {
         assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
         assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
         assert_eq!(
+            parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10"),
+            "(Query (FROM t) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
+        );
+        assert_eq!(
             parse("FROM t |> SELECT a AS b, c |> RENAME b as d |> SET a = b"),
             "(Query (FROM t) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
              (SET (List (Named b a))))"
@@ -417,7 +436,7 @@ mod tests {
     fn reports_errors() {
         assert_eq!(error("WHERE x"), (ErrorCode::ExpectedSource, 0));
         assert_eq!(error("FROM t |> FROM u"), (ErrorCode::UnexpectedSource, 10));
-        assert_eq!(error("FROM t |> ORDER x"), (ErrorCode::UnknownStage, 10));
+        assert_eq!(error("FROM t |> SORT x"), (ErrorCode::UnknownStage, 10));
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
         assert_eq!(error("FROM t |> WHERE a IS 1"), (ErrorCode::ExpectedWord, 21));
@@ -425,5 +444,6 @@ mod tests {
         assert_eq!(error("FROM t |> SET a b"), (ErrorCode::ExpectedToken, 16));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP a"), (ErrorCode::ExpectedWord, 35));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY"), (ErrorCode::ExpectedToken, 37));
+        assert_eq!(error("FROM t |> ORDER a"), (ErrorCode::ExpectedWord, 16));
     }
 }

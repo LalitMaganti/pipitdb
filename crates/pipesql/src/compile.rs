@@ -370,6 +370,7 @@ mod tests {
         assert_eq!(error("FROM t |> RENAME a AS b, A AS c"), (ErrorCode::ListedTwice, 25));
         assert_eq!(error("FROM t |> SET a = a + 1"), (ErrorCode::Unsupported, 18));
         assert_eq!(error("FROM t |> EXTEND a |> SELECT a"), (ErrorCode::AmbiguousColumn, 29));
+        assert_eq!(error("FROM t |> ORDER BY a"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
