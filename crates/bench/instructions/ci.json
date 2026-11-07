@@ -13,8 +13,8 @@
   "clickbench.g_region": 97042611,
   "clickbench.g_user": 127315639,
   "clickbench.g_window": 226969078,
-  "clickbench.q15": 118547163,
-  "clickbench.q24t": 207795880,
+  "clickbench.q15": 108361164,
+  "clickbench.q24t": 160085923,
   "filter.greater": 733802,
   "filter.greater_nulls": 1068853,
   "lexer.long_text": 102853,
@@ -32,6 +32,6 @@
   "predicate.or": 4627523,
   "query.typical": 830162,
   "scan.table": 194578,
-  "small.point": 33332,
+  "small.point": 33346,
   "small_planned.point": 4167
 }
