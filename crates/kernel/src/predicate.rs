@@ -521,7 +521,7 @@ mod tests {
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
         predicate.select(&Heap, &mut scratch, &mut entries, &mut batch).unwrap();
         match batch.selection().kept() {
-            Kept::All => (0..6).collect(),
+            Kept::Prefix => (0..6).collect(),
             Kept::None => StdVec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
         }
@@ -623,7 +623,7 @@ mod tests {
         assert!(batch.push_column(column.clone()).is_ok());
         predicate.select(&Heap, &mut scratch, entries, &mut batch).unwrap();
         match batch.selection().kept() {
-            Kept::All => (0..u16::try_from(column.row_count()).unwrap()).collect(),
+            Kept::Prefix => (0..u16::try_from(column.row_count()).unwrap()).collect(),
             Kept::None => StdVec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }

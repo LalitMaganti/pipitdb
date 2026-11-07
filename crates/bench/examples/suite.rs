@@ -254,7 +254,7 @@ fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec
     let mut batch = RowBatch::new();
     while execution.next(&mut batch).map_err(|e| format!("{e:?}"))? {
         let kept: Vec<u32> = match batch.selection().kept() {
-            Kept::All => (0..batch.row_count()).collect(),
+            Kept::Prefix => (0..batch.selection().len()).collect(),
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| u32::from(row)).collect(),
         };

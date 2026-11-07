@@ -467,7 +467,7 @@ mod tests {
         let mut selection = Selection::all(10);
         filter(&mut selection);
         match selection.kept() {
-            Kept::All => (0..10).collect(),
+            Kept::Prefix => (0..10).collect(),
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }
@@ -515,7 +515,7 @@ mod tests {
                     Some(&mut dropped),
                 );
                 let rows = |selection: &Selection| match selection.kept() {
-                    Kept::All => (0..7).collect(),
+                    Kept::Prefix => (0..7).collect(),
                     Kept::None => Vec::new(),
                     Kept::Select(rows) => rows.to_vec(),
                 };
@@ -542,7 +542,7 @@ mod tests {
             let mut selection = Selection::all(6);
             compare(&column, comparison, Value::Float64(value), &mut selection, None);
             match selection.kept() {
-                Kept::All => (0..6).collect(),
+                Kept::Prefix => (0..6).collect(),
                 Kept::None => Vec::new(),
                 Kept::Select(rows) => rows.to_vec(),
             }

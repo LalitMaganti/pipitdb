@@ -135,7 +135,7 @@ impl<'b, 'r> Flat<'b, 'r> {
     fn select(&self) -> &[u16] {
         match self.batch.selection().kept() {
             Kept::Select(select) => select,
-            Kept::All | Kept::None => &[],
+            Kept::Prefix | Kept::None => &[],
         }
     }
 }

@@ -858,7 +858,7 @@ mod tests {
             let (handle, start) = lazy.handle();
             let (column, batch) = (handle[0], handle[1]);
             let rows: StdVec<u16> = match selection.kept() {
-                Kept::All => (0..4).collect(),
+                Kept::Prefix => (0..4).collect(),
                 Kept::None => StdVec::new(),
                 Kept::Select(rows) => rows.into(),
             };
@@ -922,7 +922,7 @@ mod tests {
         while execution.next(&mut batch).unwrap() {
             rows += batch.row_count();
             let selected: StdVec<u16> = match batch.selection().kept() {
-                Kept::All => (0..4).collect(),
+                Kept::Prefix => (0..4).collect(),
                 Kept::None => StdVec::new(),
                 Kept::Select(rows) => rows.into(),
             };
