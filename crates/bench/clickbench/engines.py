@@ -9,7 +9,8 @@ Each engine runs in-process, best of RUNS after a warm-up, in ms. "1" is
 one thread, ClickHouse's parsing and download threads limited too; "N" is
 the engine's default.
 
-Needs `pip install duckdb chdb datafusion polars`.
+Needs `pip install duckdb chdb datafusion polars psycopg[binary]`, and Pivot
+from `curl https://pivotlake.io | sh`, in $PIVOT_HOME or ~/.pivot.
 
 Usage: crates/bench/clickbench/engines.py DIR --machine NAME
        [--engines duckdb,...] [--threads 1,N] [--runs 2] [--quiet LOAD]
@@ -18,16 +19,18 @@ stays below LOAD before starting.
 """
 
 import argparse
+import atexit
 import datetime
 import os
 import pathlib
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = pathlib.Path(__file__).parent
-ENGINES = ["duckdb", "clickhouse", "datafusion", "polars"]
+ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot"]
 
 
 def queries():
@@ -110,7 +113,44 @@ def connect(engine, threads, directory):
         import polars
         ctx = polars.SQLContext(hits=polars.scan_parquet(files))
         return (lambda sql: ctx.execute(sql).collect()), polars.__version__
+    if engine == "pivot":
+        return connect_pivot(threads, directory)
     raise ValueError(engine)
+
+
+def connect_pivot(threads, directory):
+    """Pivot is a server: one is started for this process, with `threads`
+    workers, its table over the Parquet files where they are, as Pivot's own
+    ClickBench setup has it, and stopped when the process exits."""
+    import psycopg
+    binary = pathlib.Path(os.environ.get("PIVOT_HOME", pathlib.Path.home() / ".pivot")) / "cli/latest/pivot"
+    work = pathlib.Path(tempfile.mkdtemp(prefix="pivot-"))
+    port = 54329
+    config = (f"server:\n  bind: 127.0.0.1:{port}\n"
+              f"datastores:\n  default:\n    kind: pivot\n    location: {work}/catalog\n    default: true\n")
+    if threads:
+        config = f"workers: {threads}\n" + config
+    (work / "config.yaml").write_text(config)
+    log = open(work / "server.log", "w")
+    server = subprocess.Popen([binary, "server", "--config", work / "config.yaml"], stdout=log, stderr=log)
+    atexit.register(server.wait)
+    atexit.register(server.terminate)
+    for _ in range(300):
+        try:
+            con = psycopg.connect(f"host=127.0.0.1 port={port} user=pivot dbname=postgres", autocommit=True)
+            break
+        except psycopg.OperationalError:
+            time.sleep(0.1)
+    else:
+        raise RuntimeError(f"Pivot didn't start: {(work / 'server.log').read_text()[-500:]}")
+    con.execute((HERE / "pivot.sql").read_text().replace("{source}", str(pathlib.Path(directory).resolve())))
+    version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
+
+    def run(sql):
+        with con.cursor() as cursor:
+            cursor.execute(sql)
+            return cursor.fetchall()
+    return run, version.removeprefix("pivot ")
 
 
 def run_one(engine, threads, runs, directory, name):
