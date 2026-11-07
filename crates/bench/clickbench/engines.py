@@ -24,6 +24,7 @@ import datetime
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -121,7 +122,9 @@ def connect(engine, threads, directory):
 def connect_pivot(threads, directory):
     """Pivot is a server: one is started for this process, with `threads`
     workers, its table over the Parquet files where they are, as Pivot's own
-    ClickBench setup has it, and stopped when the process exits."""
+    ClickBench setup has it, and stopped when the process exits. Its memory is
+    capped where systemd can, so a query that runs out fails alone, and the
+    server is started again for the next."""
     import psycopg
     binary = pathlib.Path(os.environ.get("PIVOT_HOME", pathlib.Path.home() / ".pivot")) / "cli/latest/pivot"
     work = pathlib.Path(tempfile.mkdtemp(prefix="pivot-"))
@@ -131,23 +134,37 @@ def connect_pivot(threads, directory):
     if threads:
         config = f"workers: {threads}\n" + config
     (work / "config.yaml").write_text(config)
-    log = open(work / "server.log", "w")
-    server = subprocess.Popen([binary, "server", "--config", work / "config.yaml"], stdout=log, stderr=log)
-    atexit.register(server.wait)
-    atexit.register(server.terminate)
-    for _ in range(300):
-        try:
-            con = psycopg.connect(f"host=127.0.0.1 port={port} user=pivot dbname=postgres", autocommit=True)
-            break
-        except psycopg.OperationalError:
-            time.sleep(0.1)
-    else:
-        raise RuntimeError(f"Pivot didn't start: {(work / 'server.log').read_text()[-500:]}")
-    con.execute((HERE / "pivot.sql").read_text().replace("{source}", str(pathlib.Path(directory).resolve())))
+    schema = (HERE / "pivot.sql").read_text().replace("{source}", str(pathlib.Path(directory).resolve()))
+    schema = "\n".join(line for line in schema.splitlines() if not line.startswith("--"))
+    # Pivot prepares each statement on its own.
+    statements = [s for s in schema.split(";") if s.strip()]
+    cap = ["systemd-run", "--user", "--scope", "--quiet", "-p", "MemoryMax=20G"] if shutil.which("systemd-run") else []
+    state = {}
+
+    def start():
+        log = open(work / "server.log", "a")
+        server = subprocess.Popen(cap + [binary, "server", "--config", work / "config.yaml"], stdout=log, stderr=log)
+        atexit.register(server.wait)
+        atexit.register(server.terminate)
+        for _ in range(300):
+            try:
+                con = psycopg.connect(f"host=127.0.0.1 port={port} user=pivot dbname=postgres", autocommit=True)
+                break
+            except psycopg.OperationalError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError(f"Pivot didn't start: {(work / 'server.log').read_text()[-500:]}")
+        for statement in statements:
+            con.execute(statement)
+        state["server"], state["con"] = server, con
+
+    start()
     version = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout.strip()
 
     def run(sql):
-        with con.cursor() as cursor:
+        if state["server"].poll() is not None:
+            start()
+        with state["con"].cursor() as cursor:
             cursor.execute(sql)
             return cursor.fetchall()
     return run, version.removeprefix("pivot ")
