@@ -59,48 +59,52 @@ impl SortedRows {
         batch: &RowBatch,
         keys: &[SortKey],
     ) -> Result<(), Error> {
+        self.store(context, batch, keys, None)
+    }
+
+    /// As `append`, with the rows' keys at `laid_out` as `lay_out_keys` lays
+    /// them out, which saves doing so again.
+    pub(crate) fn append_laid_out(
+        &mut self,
+        context: &mut Context,
+        batch: &RowBatch,
+        keys: &[SortKey],
+        laid_out: &[u8],
+    ) -> Result<(), Error> {
+        self.store(context, batch, keys, Some(laid_out))
+    }
+
+    fn store(
+        &mut self,
+        context: &mut Context,
+        batch: &RowBatch,
+        keys: &[SortKey],
+        laid_out: Option<&[u8]>,
+    ) -> Result<(), Error> {
         let count = batch.selection().len();
         if count == 0 {
             return Ok(());
         }
-        self.check_types(batch, keys)?;
-        let layout = match &self.layout {
-            Some(layout) => layout,
-            None => self.layout.insert(lay_out(context.allocator(), batch, keys)?),
-        };
-        let stride = layout.stride() as usize;
+        let stride = self.check_keys(context.allocator(), batch, keys)?.stride() as usize;
         let at = self.keys.len();
         self.keys.extend_zeroed(count as usize * stride)?;
         let rows = at_mut!(self.keys, at..);
-        let kept = batch.selection().kept();
-        let row = |i: u32| match kept {
-            Kept::Select(rows) => u32::from(*at!(rows, i as usize)),
-            Kept::Prefix | Kept::None => i,
-        };
-        for (k, key) in keys.iter().enumerate() {
-            let column = batch.column(key.column);
-            let slot = layout.slot(k);
-            let valid = |i: u32| !column.values().is_null(row(i));
-            match column.data_type() {
-                DataType::Int64 => {
-                    let values = column.int64s();
-                    let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
-                    RowLayout::write(slot, count, get, rows);
-                }
-                DataType::Float64 => {
-                    let values = column.float64s();
-                    let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
-                    RowLayout::write(slot, count, get, rows);
-                }
-                DataType::String => failed!(),
-            }
+        match (laid_out, &self.layout) {
+            (Some(laid_out), _) => rows.copy_from_slice(at!(laid_out, ..rows.len())),
+            (None, Some(layout)) => lay_out_keys(layout, batch, keys, rows),
+            (None, None) => failed!(),
         }
         self.rows.append(context, batch)
     }
 
-    /// Fails unless each key's column has the type it had in the first batch,
-    /// as Perfetto checks.
-    fn check_types(&mut self, batch: &RowBatch, keys: &[SortKey]) -> Result<(), Error> {
+    /// How keys are laid out, fixed by the first batch's keys' types, which
+    /// every batch's must match, as Perfetto checks.
+    pub(crate) fn check_keys(
+        &mut self,
+        allocator: &dyn Allocator,
+        batch: &RowBatch,
+        keys: &[SortKey],
+    ) -> Result<&RowLayout, Error> {
         let data_type = |key: &SortKey| batch.column(key.column).data_type();
         if self.types.is_empty() {
             for key in keys {
@@ -110,7 +114,31 @@ impl SortedRows {
         if keys.iter().zip(self.types.iter()).any(|(key, &t)| data_type(key) != t) {
             return Err(Error::Unsupported);
         }
-        Ok(())
+        Ok(match &mut self.layout {
+            Some(layout) => layout,
+            layout => layout.insert(lay_out(allocator, batch, keys)?),
+        })
+    }
+
+    /// The keys of the held row `row`, laid out.
+    pub(crate) fn keys_of(&self, row: u32) -> &[u8] {
+        let Some(layout) = &self.layout else { failed!() };
+        let stride = layout.stride() as usize;
+        at!(self.keys, row as usize * stride..(row as usize + 1) * stride)
+    }
+
+    /// How many rows the order has.
+    pub(crate) fn order_len(&self) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most 2^31")]
+        let len = self.order.len() as u32;
+        len
+    }
+
+    /// Keeps only the first `count` rows of the order.
+    pub(crate) fn truncate_order(&mut self, count: u32) {
+        while self.order.len() > count as usize {
+            self.order.pop();
+        }
     }
 
     /// Resets the order to the order rows came in, then sorts it stably by
@@ -138,6 +166,39 @@ impl SortedRows {
         let end = self.order.len().min(at as usize + BATCH_ROWS_MAX as usize);
         let rows = at!(self.order, (at as usize).min(end)..end);
         self.rows.gather(context, out, rows)
+    }
+}
+
+/// Lays out at `rows` the keys of each row `batch` keeps, by `layout`.
+pub(crate) fn lay_out_keys(
+    layout: &RowLayout,
+    batch: &RowBatch,
+    keys: &[SortKey],
+    rows: &mut [u8],
+) {
+    let count = batch.selection().len();
+    let kept = batch.selection().kept();
+    let row = |i: u32| match kept {
+        Kept::Select(rows) => u32::from(*at!(rows, i as usize)),
+        Kept::Prefix | Kept::None => i,
+    };
+    for (k, key) in keys.iter().enumerate() {
+        let column = batch.column(key.column);
+        let slot = layout.slot(k);
+        let valid = |i: u32| !column.values().is_null(row(i));
+        match column.data_type() {
+            DataType::Int64 => {
+                let values = column.int64s();
+                let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
+                RowLayout::write(slot, count, get, rows);
+            }
+            DataType::Float64 => {
+                let values = column.float64s();
+                let get = |i| valid(i).then(|| *at!(values, row(i) as usize));
+                RowLayout::write(slot, count, get, rows);
+            }
+            DataType::String => failed!(),
+        }
     }
 }
 

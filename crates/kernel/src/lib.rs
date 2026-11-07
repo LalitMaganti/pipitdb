@@ -42,3 +42,4 @@ pub mod sort;
 mod sorted_rows;
 pub mod spill;
 pub mod step;
+pub mod top_k;

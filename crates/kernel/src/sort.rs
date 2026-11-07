@@ -57,7 +57,7 @@ impl Breaker for Sort {
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
         sorting.emitted += sorting.rows.gather(context, output, sorting.emitted)?;
-        Ok(sorting.emitted < sorting.rows.len())
+        Ok(sorting.emitted < sorting.rows.order_len())
     }
 }
 
@@ -73,6 +73,7 @@ mod tests {
     use crate::query_allocators::QueryAllocators;
     use crate::selection::Kept;
     use crate::step::{DynSource, Source, Step};
+    use crate::top_k::top_k;
 
     /// Rows of a key, maybe null, a value and a name.
     type Row = (Option<i64>, i64, &'static str);
@@ -143,8 +144,13 @@ mod tests {
 
     /// Each row out, in order.
     fn sorted(rows: Rows) -> Vec<(Option<i64>, i64, Vec<u8>)> {
+        run(rows, sort(&Heap, keys()).unwrap())
+    }
+
+    /// Each row out of `step`, in order.
+    fn run(rows: Rows, step: DynOperator<'static>) -> Vec<(Option<i64>, i64, Vec<u8>)> {
         let mut steps = SlowVec::new(&Heap, 1).unwrap();
-        assert!(steps.push(Step::Operator(sort(&Heap, keys()).unwrap())).is_ok());
+        assert!(steps.push(Step::Operator(step)).is_ok());
         let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
         let query = QueryAllocators::new(&Heap);
         let mut execution = pipeline.start(&query).unwrap();
@@ -225,5 +231,42 @@ mod tests {
         let out = sorted(Rows { batches: many(), drop: None });
         assert_eq!(out.len(), 2100);
         assert!(out.windows(2).all(|w| (w[0].0, -w[0].1) <= (w[1].0, -w[1].1)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
+    fn top_k_keeps_the_first_rows_a_sort_would() {
+        // Keys at random, ascending and descending, with ties and nulls, over
+        // sparse batches; sorted by both keys, and by the first alone, so
+        // ties must keep their order.
+        let shapes: [fn(i64) -> i64; 3] = [|i| (i * 7919) % 1000, |i| i / 3, |i| -(i / 3)];
+        let by_key = || {
+            SlowVec::fixed_from(&Heap, [SortKey { column: 0, descending: false }].into_iter())
+                .unwrap()
+        };
+        for shape in shapes {
+            let rows: Vec<Row> =
+                (0..9000).map(|i| ((i % 97 != 5).then(|| shape(i)), i, "x")).collect();
+            let batches: Vec<Vec<Row>> = rows.chunks(2048).map(<[Row]>::to_vec).collect();
+            let rows = || Rows { batches: batches.clone(), drop: Some(5) };
+            for keys in [keys(), by_key()] {
+                let all = run(
+                    rows(),
+                    sort(&Heap, SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap()).unwrap(),
+                );
+                for count in [0, 1, 100, 3000, 20_000, 1 << 31, u32::MAX] {
+                    let top = run(
+                        rows(),
+                        top_k(
+                            &Heap,
+                            SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                            count,
+                        )
+                        .unwrap(),
+                    );
+                    assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
+                }
+            }
+        }
     }
 }
