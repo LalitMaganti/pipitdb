@@ -18,6 +18,7 @@
   "clickbench.q25": 113123833,
   "filter.greater": 733802,
   "filter.greater_nulls": 1068853,
+  "flat_hash_map.find": 209237,
   "lexer.long_text": 102853,
   "lexer.typical": 312939,
   "parser.expression": 420782,
