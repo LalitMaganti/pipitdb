@@ -22,7 +22,13 @@ impl<'c> Op<'c> for LimitOp {
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        lowering.lower(*at!(node.children, 0))?;
+        let read = self.offset.checked_add(self.count).and_then(|read| u32::try_from(read).ok());
+        let took = lowering.lower_first(*at!(node.children, 0), read)?;
+        // The child makes no more rows than read, so with no offset, they're
+        // the rows wanted.
+        if took && self.offset == 0 {
+            return Ok(());
+        }
         let limit = Limit { count: self.count, offset: self.offset };
         lowering
             .add_order_independent(Step::Operator(DynOperator::new(lowering.allocator(), limit)?))
@@ -69,13 +75,7 @@ impl Operator for Limit {
         counted.skipped += skip;
         let keep = (size - skip).min(self.count - counted.kept);
         counted.kept += keep;
-        output.reset(input.row_count());
-        for i in 0..input.column_count() {
-            let Ok(()) = output.push_column(input.column(i).clone()) else {
-                failed!();
-            };
-        }
-        output.selection_mut().clone_from(input.selection());
+        output.copy_from(input);
         if keep != size {
             output.selection_mut().keep_range(skip as u32, keep as u32);
         }

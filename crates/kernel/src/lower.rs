@@ -116,6 +116,10 @@ pub struct Lowering<'p, 'c> {
     /// these, replaced when a step replaces them.
     arrangements: [Arrangement; ARRANGEMENTS_MAX],
     arranged: usize,
+    /// How many of its first rows are read of the node being lowered, if not
+    /// all, until it lowers its children; and whether it makes no more.
+    first_read: Option<u32>,
+    took_first_read: bool,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -129,8 +133,33 @@ impl<'p, 'c> Lowering<'p, 'c> {
 
     /// Lowers `node`, such as a child of the node being lowered.
     pub fn lower(&mut self, node: PlanNodeId) -> Result<(), LowerError> {
+        self.lower_first(node, None).map(drop)
+    }
+
+    /// Lowers `node`, of whose rows only the first `count` are read, if
+    /// given, as by a LIMIT, which it may make use of. Returns whether it
+    /// makes no more rows than that.
+    pub fn lower_first(
+        &mut self,
+        node: PlanNodeId,
+        count: Option<u32>,
+    ) -> Result<bool, LowerError> {
         let node = at!(self.plan.nodes, node as usize);
-        node.op.lower(node, self)
+        self.first_read = count;
+        node.op.lower(node, self)?;
+        Ok(core::mem::take(&mut self.took_first_read))
+    }
+
+    /// How many of the first rows of the node being lowered are read, if not
+    /// all. Only known before it lowers its children.
+    pub fn query_first_read(&self) -> Option<u32> {
+        self.first_read
+    }
+
+    /// Records that the node being lowered makes no more rows than
+    /// `query_first_read` said are read. Only once its children are lowered.
+    pub fn declare_only_first_read(&mut self) {
+        self.took_first_read = true;
     }
 
     /// Makes `source` the pipeline's.
@@ -291,6 +320,8 @@ pub fn lower<'c>(
         column_count: 0,
         arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
         arranged: 0,
+        first_read: None,
+        took_first_read: false,
     };
     lowering.lower(plan.root)?;
 
@@ -552,6 +583,8 @@ mod tests {
             column_count: 0,
             arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
             arranged: 0,
+            first_read: None,
+            took_first_read: false,
         };
         let key = |column| SortKey { column, descending: false };
         let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
@@ -562,6 +595,75 @@ mod tests {
         let keys: StdVec<ColumnId> = (0..9).collect();
         lowering.declare_grouped(&keys);
         assert!(!lowering.query_arranged(&keys[..8], &[]));
+    }
+
+    /// The steps of `Ab` scanned, its rows counted by `groups` of its
+    /// columns first, if given, then ordered by `keys`, by column, then
+    /// limited to `(count, offset)` rows, if given.
+    fn ordered(
+        groups: Option<&[usize]>,
+        keys: &[(usize, bool)],
+        limit: Option<(u64, u64)>,
+    ) -> alloc::string::String {
+        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut bindings = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b")] {
+            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            bindings.push(binding);
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let mut input = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        if let Some(groups) = groups {
+            let binding = plan.add_column("n", DataType::Int64).unwrap();
+            let function = crate::aggregate::Function::CountStar;
+            let aggregate = crate::aggregate::Aggregate { function, input: None, binding };
+            let aggregate = crate::aggregate::AggregateOp {
+                keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
+                aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),
+            };
+            let aggregate = DynOp::new(&Heap, aggregate).unwrap();
+            let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
+            input = plan.add_node(aggregate, children).unwrap();
+        }
+        let sort_keys =
+            keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
+        let order_by =
+            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
+        let order_by = DynOp::new(&Heap, order_by).unwrap();
+        let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
+        let ordered = plan.add_node(order_by, children).unwrap();
+        if let Some((count, offset)) = limit {
+            let limit = DynOp::new(&Heap, crate::limit::LimitOp { count, offset }).unwrap();
+            plan.add_node(limit, SlowVec::fixed_from(&Heap, [ordered].into_iter()).unwrap())
+                .unwrap();
+        }
+        assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
+        lower(&Heap, &plan).unwrap().pipeline().describe()
+    }
+
+    #[test]
+    fn sorts_only_rows_not_known_to_be_in_order() {
+        // `Ab` is sorted by `a` and then `b`.
+        assert_eq!(ordered(None, &[(0, false)], None), "Scan");
+        assert_eq!(ordered(None, &[(0, false), (1, false)], None), "Scan");
+        assert_eq!(ordered(None, &[(1, false)], None), "Scan | Sort");
+        assert_eq!(ordered(None, &[(0, true)], None), "Scan | Sort");
+        // Groups come out in the order first seen, so in `a`'s order.
+        assert_eq!(ordered(Some(&[0]), &[(0, false)], None), "Scan | HashAggregate");
+        assert_eq!(ordered(Some(&[1]), &[(1, false)], None), "Scan | HashAggregate | Sort");
+    }
+
+    #[test]
+    fn keeps_only_the_first_rows_a_limit_reads() {
+        assert_eq!(ordered(None, &[(1, false)], Some((10, 0))), "Scan | TopK");
+        assert_eq!(ordered(None, &[(1, false)], Some((10, 5))), "Scan | TopK | Limit");
+        // Rows already in order are only limited.
+        assert_eq!(ordered(None, &[(0, false)], Some((10, 0))), "Scan | Limit");
+        let grouped = ordered(Some(&[1]), &[(1, true)], Some((1, 0)));
+        assert_eq!(grouped, "Scan | HashAggregate | TopK");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
