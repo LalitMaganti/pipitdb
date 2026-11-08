@@ -1,6 +1,6 @@
 {
   "clickbench.f1": 7004844,
-  "clickbench.f40": 75011784,
+  "clickbench.f40": 72750164,
   "clickbench.f41": 69571801,
   "clickbench.f_adv": 34402736,
   "clickbench.f_counter": 8239789,
@@ -13,7 +13,7 @@
   "clickbench.g_region": 97040168,
   "clickbench.g_user": 127313272,
   "clickbench.g_window": 226966665,
-  "clickbench.q15": 110335965,
+  "clickbench.q15": 110335949,
   "clickbench.q24t": 161785854,
   "clickbench.q25": 113130700,
   "filter.greater": 733802,
@@ -21,7 +21,7 @@
   "flat_hash_map.find": 209237,
   "lexer.long_text": 102853,
   "lexer.typical": 312939,
-  "parser.expression": 420782,
+  "parser.expression": 432912,
   "perfetto_filter.eq_nullable": 5654304,
   "perfetto_filter.eq_string": 3040721,
   "perfetto_filter.eq_uint32": 3939104,
@@ -32,8 +32,8 @@
   "predicate.and": 1506450,
   "predicate.not": 791642,
   "predicate.or": 4629150,
-  "query.typical": 830162,
+  "query.typical": 829362,
   "scan.table": 194578,
-  "small.point": 33703,
+  "small.point": 33810,
   "small_planned.point": 4194
 }
