@@ -348,9 +348,21 @@ mod tests {
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
         assert_eq!(groups, [(b"max(b)".to_vec(), [20.0].to_vec())]);
+        let aliased = run("FROM t |> AGGREGATE count(*) AS n, sum(b) AS total GROUP BY a AS k");
+        let names: StdVec<&[u8]> = aliased.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(names, [b"k".as_slice(), b"n", b"total"]);
         let mut keys = kept("FROM t |> AGGREGATE count(*) GROUP BY a |> SELECT a");
         keys.sort_by(f64::total_cmp);
         assert_eq!(keys, [1.0, 2.0]);
+    }
+
+    #[test]
+    fn orders_rows() {
+        assert_eq!(kept("FROM t |> ORDER BY a DESC |> SELECT b"), [20.0, 10.0]);
+        assert_eq!(kept("FROM t |> ORDER BY f |> SELECT s"), [4.0, 0.0]);
+        assert_eq!(kept("FROM t |> ORDER BY s |> SELECT a"), [2.0, 1.0]);
+        let top = "FROM t |> AGGREGATE count(*) AS n GROUP BY b |> ORDER BY b DESC |> LIMIT 1";
+        assert_eq!(run(top)[0].1, [20.0]);
     }
 
     #[test]
@@ -388,6 +400,7 @@ mod tests {
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
+        assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));

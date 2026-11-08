@@ -34,6 +34,8 @@ pub enum Item {
     /// If the query has these words next, a list of the rest after them, as
     /// `List` does; if not, an empty `List`. Words are matched ignoring case.
     Clause(&'static [&'static str], Shared),
+    /// These words, then a list, as `List` does: `Clause`, but required.
+    After(&'static [&'static str], Shared),
 }
 
 /// The pieces of grammar stages are built from.
@@ -48,6 +50,8 @@ pub enum Shared {
     Renamed,
     /// A name, `=`, and an expression for it, as a `Named`.
     Assigned,
+    /// An expression, then `ASC` or `DESC`, as a `SortKey`.
+    Ordered,
 }
 
 #[derive(Clone, Copy, Debug)]

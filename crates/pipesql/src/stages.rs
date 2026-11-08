@@ -4,6 +4,8 @@
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
 use pipit_kernel::limit::LimitOp;
+use pipit_kernel::lower::SortKey;
+use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -73,12 +75,19 @@ pub const LIMIT: Rule = Rule {
 pub const AGGREGATE: Rule = Rule {
     keyword: "aggregate",
     point: Point::Stage,
-    items: &[Item::List(Shared::Expr), Item::Clause(&["group", "by"], Shared::Name)],
+    items: &[Item::List(Shared::Aliased), Item::Clause(&["group", "by"], Shared::Aliased)],
     compile: compile_aggregate,
 };
 
+pub const ORDER_BY: Rule = Rule {
+    keyword: "order",
+    point: Point::Stage,
+    items: &[Item::After(&["by"], Shared::Ordered)],
+    compile: compile_order_by,
+};
+
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, LIMIT];
+pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
@@ -132,21 +141,31 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     }
     let list = compiler.node(stage.first_child());
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
-        let (value, alias) = match item.tag() {
-            Tag::Named => {
-                (compiler.node(item.first_child()), Some(compiler.node(item.first_child() + 1)))
-            }
-            _ => (item, None),
-        };
-        let mut column = value_of(compiler, value)?;
-        if let Some(alias) = alias {
-            column.name = compiler.plan.names.add(compiler.text(alias.span()))?;
-        }
-        scope.push(column)?;
+        let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
+        let column = value_of(compiler, value)?;
+        scope.push(named(compiler, column, alias)?)?;
     }
     compiler.scope = scope;
     Ok(())
+}
+
+/// `item`, and its name if it's a `Named`.
+fn unalias(compiler: &Compiler<'_, '_>, item: Node) -> (Node, Option<Node>) {
+    if item.tag() != Tag::Named {
+        return (item, None);
+    }
+    (compiler.node(item.first_child()), Some(compiler.node(item.first_child() + 1)))
+}
+
+/// `column`, under the name `alias` if there is one.
+fn named(
+    compiler: &mut Compiler<'_, '_>,
+    column: NamedColumn,
+    alias: Option<Node>,
+) -> Result<NamedColumn, Error> {
+    let Some(alias) = alias else { return Ok(column) };
+    let name = compiler.plan.names.add(compiler.text(alias.span()))?;
+    Ok(NamedColumn { name, id: column.id })
 }
 
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
@@ -244,6 +263,28 @@ fn value_of(compiler: &Compiler<'_, '_>, value: Node) -> Result<NamedColumn, Err
     compiler.find_column(value)
 }
 
+/// `ORDER BY a, b DESC`: the rows sorted by `a`, then `b` descending,
+/// stably. Keys are columns.
+fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let list = compiler.node(stage.first_child());
+    let allocator = compiler.allocator();
+    let mut keys = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    for i in 0..list.child_count() {
+        let key = compiler.node(list.first_child() + i);
+        let column = compiler.node(key.first_child());
+        let unsupported = Error::unsupported(Unsupported::OrderBy, compiler.span(column));
+        if column.tag() != Tag::Name {
+            return Err(unsupported);
+        }
+        let column = compiler.find_column(column)?.id;
+        keys.push(SortKey { column, descending: key.descending() })?;
+    }
+    let order_by = DynOp::new(allocator, OrderByOp { keys })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(order_by, children)?;
+    Ok(())
+}
+
 /// `LIMIT 10 OFFSET 20`: the first 10 rows after skipping 20. Both are
 /// integers.
 fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
@@ -282,17 +323,20 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
     let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
-        let key = compiler.node(by.first_child() + i);
+        let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
+        if key.tag() != Tag::Name {
+            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
+        }
         let column = compiler.find_column(key)?;
         if at!(compiler.plan.columns, column.id as usize).data_type != DataType::Int64 {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
         keys.push(column.id)?;
-        scope.push(column)?;
+        scope.push(named(compiler, column, alias)?)?;
     }
     let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
     for i in 0..list.child_count() {
-        let item = compiler.node(list.first_child() + i);
+        let (item, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let span = compiler.span(item);
         let unsupported = Error::unsupported(Unsupported::Aggregate, span);
         if item.tag() != Tag::Call || item.child_count() != 2 {
@@ -316,7 +360,10 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
-        let name = compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?;
+        let name = match alias {
+            Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
+            None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
+        };
         let binding = compiler.plan.add_named_column(name, DataType::Int64)?;
         aggregates.push(Aggregate { function, input, binding })?;
         scope.push(binding)?;
@@ -358,6 +405,7 @@ mod tests {
                 (rule.keyword.to_uppercase(), u32::try_from(rule.items.len()).unwrap())
             }
             Tag::Named => ("Named".to_string(), 2),
+            Tag::SortKey => ((if node.descending() { "DESC" } else { "ASC" }).to_string(), 1),
             Tag::Unary => (format!("{:?}", node.operator()), 1),
             Tag::Binary => (format!("{:?}", node.operator()), 2),
             _ => {
@@ -399,6 +447,10 @@ mod tests {
         assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
         assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
         assert_eq!(
+            parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10"),
+            "(Query (FROM t) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
+        );
+        assert_eq!(
             parse("FROM t |> SELECT a AS b, c |> RENAME b as d |> SET a = b"),
             "(Query (FROM t) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
              (SET (List (Named b a))))"
@@ -411,19 +463,27 @@ mod tests {
             parse("FROM t |> AGGREGATE count(*)"),
             "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
         );
+        assert_eq!(
+            parse("FROM t |> AGGREGATE count(*) AS n GROUP BY a AS k"),
+            "(Query (FROM t) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
+        );
     }
 
     #[test]
     fn reports_errors() {
         assert_eq!(error("WHERE x"), (ErrorCode::ExpectedSource, 0));
         assert_eq!(error("FROM t |> FROM u"), (ErrorCode::UnexpectedSource, 10));
-        assert_eq!(error("FROM t |> ORDER x"), (ErrorCode::UnknownStage, 10));
+        assert_eq!(error("FROM t |> SORT x"), (ErrorCode::UnknownStage, 10));
         assert_eq!(error("FROM t WHERE x"), (ErrorCode::UnexpectedToken, 7));
         assert_eq!(error("FROM t |> SELECT"), (ErrorCode::ExpectedExpression, 16));
         assert_eq!(error("FROM t |> WHERE a IS 1"), (ErrorCode::ExpectedWord, 21));
         assert_eq!(error("FROM t |> RENAME a b"), (ErrorCode::ExpectedAs, 19));
         assert_eq!(error("FROM t |> SET a b"), (ErrorCode::ExpectedToken, 16));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP a"), (ErrorCode::ExpectedWord, 35));
-        assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY"), (ErrorCode::ExpectedToken, 37));
+        assert_eq!(
+            error("FROM t |> AGGREGATE count(*) GROUP BY"),
+            (ErrorCode::ExpectedExpression, 37)
+        );
+        assert_eq!(error("FROM t |> ORDER a"), (ErrorCode::ExpectedWord, 16));
     }
 }
