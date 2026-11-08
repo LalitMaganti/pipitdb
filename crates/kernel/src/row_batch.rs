@@ -84,6 +84,16 @@ impl<'a> RowBatch<'a> {
         (columns, &mut self.selection)
     }
 
+    /// Makes this a copy of `other`, sharing its columns' buffers, as
+    /// Perfetto's `CopyFrom` does.
+    pub fn copy_from(&mut self, other: &RowBatch) {
+        self.reset(other.row_count());
+        for i in 0..other.column_count() {
+            let Ok(()) = self.push_column(other.column(i).clone()) else { failed!() };
+        }
+        self.selection_mut().clone_from(other.selection());
+    }
+
     /// Fails, giving `column` back, if the batch has `BATCH_COLUMNS_MAX`
     /// columns.
     pub fn push_column(&mut self, column: ColumnView) -> Result<(), ColumnView> {
@@ -127,6 +137,13 @@ impl<'a> RowBatch<'a> {
 
     pub fn column_count(&self) -> u32 {
         self.column_count
+    }
+
+    /// Whether column `index` borrows what it views, which outlives the
+    /// batch.
+    pub(crate) fn is_borrowed(&self, index: u32) -> bool {
+        check!(index < self.column_count);
+        self.borrowed & 1 << index != 0
     }
 
     pub fn column(&self, index: u32) -> &ColumnView {
