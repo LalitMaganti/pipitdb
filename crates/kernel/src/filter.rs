@@ -11,6 +11,8 @@ use core::cmp::Ordering;
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, DataType, Form, Values};
 use crate::eight;
+use crate::flat_hash_map::{FlatHashMap, Key};
+use crate::murmur_hash;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 
@@ -96,6 +98,134 @@ pub fn compare(
             compare_form(column, column.values().float64s(), float_key, range, selection, dropped);
         }
     }
+}
+
+/// The most values an `IN` list can have for each row to be compared with
+/// each: Perfetto's `kFilterInKeyScanThreshold`. Longer lists are kept in a
+/// hash map, as Perfetto's are.
+pub const IN_SCAN_MAX: usize = 16;
+
+/// A value of a longer `IN` list, in its set: its hash, and the value, an
+/// integer, or a string's place in the predicate's strings. It's found by
+/// what it stands for, with `FlatHashMap::find_by`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Listed {
+    pub hash: u64,
+    pub value: i64,
+}
+
+impl Key for Listed {
+    fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// Narrows `selection` to the rows where `column`, an integer column, is one
+/// of `values` if `want`, or none of them if not, writing the rows it drops
+/// to `dropped`, if given. Null rows are dropped either way. A list of more
+/// than `IN_SCAN_MAX` values is looked up in `set`, which holds them.
+pub fn is_in(
+    column: &ColumnView,
+    values: &[i64],
+    set: Option<&FlatHashMap<Listed, ()>>,
+    want: bool,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check!(!values.is_empty());
+    check_covers(column, selection);
+    check!(column.data_type() == DataType::Int64);
+    let cells = column.values().int64s();
+    match column.form() {
+        Form::Flat => {}
+        // One value for every row: kept or dropped together.
+        Form::Constant if !column.is_null(0) && values.contains(at!(cells, 0)) == want => {
+            return keep_all(selection, dropped);
+        }
+        Form::Constant => return drop_all(selection, dropped),
+        // Only string conditions take dictionaries: see `FilterOp::accepts`.
+        Form::Dictionary(_) => failed!(),
+    }
+    // One loop for each case, which keeps rows: those dropped are found from
+    // what's left.
+    let mut dropped = dropped;
+    if let Some(dropped) = dropped.as_deref_mut() {
+        dropped.clone_from(selection);
+    }
+    // SAFETY: checked above that every row is a row of `column`.
+    let at = |row| unsafe { cell(cells, row) };
+    if values.len() > IN_SCAN_MAX {
+        let Some(set) = set else { failed!() };
+        let listed = |cell: i64| {
+            set.find_by(murmur_hash::mix(cell.cast_unsigned()), |held| held.value == cell).is_some()
+        };
+        let valid = valid_rows(column);
+        retain(selection, None, |row| valid(row) && listed(at(row)) == want);
+    } else {
+        // Each row is compared with all of a list of fixed length, which
+        // compilers keep in registers and compare without a branch: 4 values,
+        // or 16, padded with copies of the first.
+        let mut list = [*at!(values, 0); IN_SCAN_MAX];
+        at_mut!(list, ..values.len()).copy_from_slice(values);
+        match list.first_chunk::<4>() {
+            Some(&four) if values.len() <= 4 => scan(column, selection, cells, four, want),
+            _ => scan(column, selection, cells, list, want),
+        }
+    }
+    if let Some(dropped) = dropped {
+        dropped.subtract(selection);
+    }
+}
+
+/// Narrows `selection` to the rows of `column`, a flat integer column whose
+/// values `cells` are, that are among `list` if `want`, or not if not.
+fn scan<const N: usize>(
+    column: &ColumnView,
+    selection: &mut Selection,
+    cells: &[i64],
+    list: [i64; N],
+    want: bool,
+) {
+    #[expect(clippy::needless_bitwise_bool, reason = "without a branch")]
+    let listed = move |row| {
+        // SAFETY: `is_in` checked every row is a row of `column`.
+        let cell = unsafe { cell(cells, row) };
+        list.iter().fold(false, |found, &value| found | (value == cell)) == want
+    };
+    match column.validity() {
+        None => retain(selection, None, listed),
+        Some(validity) => retain(selection, None, |row| {
+            // SAFETY: as for `cell`.
+            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+            valid & listed(row)
+        }),
+    }
+}
+
+/// Narrows `selection` to the rows of `column`, a string column that isn't a
+/// dictionary, whose string `listed` is true for if `want`, or false for if
+/// not, writing the rows it drops to `dropped`, if given. Null rows are
+/// dropped either way.
+pub fn is_in_strings(
+    column: &ColumnView,
+    listed: &dyn Fn(&[u8]) -> bool,
+    want: bool,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    keep_strings(column, &|cell| listed(cell) == want, selection, dropped);
+}
+
+/// Sets the bit of each of a dictionary's entries, `values`, that `listed`
+/// is `want` for, as `is_in_strings` keeps rows.
+pub fn in_strings_bits(
+    values: Values<'_>,
+    listed: &dyn Fn(&[u8]) -> bool,
+    want: bool,
+    bits: &mut [u64],
+) {
+    let entries = values.strings();
+    set(bits, values, |e| listed(entries.get(e as usize)) == want);
 }
 
 /// Narrows `selection` to the rows where `column <comparison> string`, a
@@ -346,6 +476,7 @@ pub fn is_null(
         None => keep_all(selection, dropped),
         Some(validity) => retain(selection, dropped, move |row| {
             // SAFETY: `check_covers` checked every row is a row of `column`.
+            // SAFETY: as for `cell`.
             let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
             valid != nulls
         }),
@@ -441,6 +572,7 @@ fn retain_valid(
         None => retain(selection, dropped, test),
         Some(validity) => retain(selection, dropped, move |row| {
             // SAFETY: callers check with `check_covers` first.
+            // SAFETY: as for `cell`.
             let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
             valid & test(row)
         }),
