@@ -181,6 +181,7 @@ enum Pending {
     Unary(Operator),
     Binary(Operator, Node),
     Parenthesis,
+    In(Node),
     Call(Node),
     Argument(Node),
 }
@@ -239,6 +240,16 @@ impl Parser<'_> {
                     operand = self.is_null(operand)?;
                     continue;
                 }
+                // `a IN (1, 2)`'s list is parsed as a call's arguments are,
+                // and nothing binds to it before the `IN` is done.
+                if COMPARISON > min_power && self.at_word("in") {
+                    let token = self.advance()?;
+                    stack.push(Pending::In(operand), min_power, token)?;
+                    let paren = self.expect(TokenKind::LeftParen)?;
+                    stack.push(Pending::Call(leaf(token)?), u8::MAX, paren)?;
+                    min_power = 0;
+                    continue 'operand;
+                }
                 if let Some((operator, power)) = self.infix(self.current())
                     && power > min_power
                 {
@@ -271,6 +282,7 @@ impl Parser<'_> {
                     Pending::Binary(operator, left) => {
                         self.operation(Tag::Binary, operator, &[left, operand])
                     }
+                    Pending::In(left) => self.in_list(left, operand),
                     Pending::Parenthesis => {
                         self.expect(TokenKind::RightParen)?;
                         operand
@@ -281,6 +293,26 @@ impl Parser<'_> {
                 };
             }
         }
+    }
+
+    /// `left IN (a, b)`, from `list`, the call holding `a` and `b`, as
+    /// `left = a OR left = b`, which is true, false and null for the same
+    /// rows.
+    fn in_list(&mut self, left: Node, list: Node) -> Node {
+        // The items may not be in the tree if it couldn't grow.
+        if self.failed.is_some() {
+            return list;
+        }
+        let equal = |parser: &mut Self, i| {
+            let item = parser.nodes.get(list.first_child() + i);
+            parser.operation(Tag::Binary, Operator::Equal, &[left, item])
+        };
+        let mut or = equal(self, 1);
+        for i in 2..list.child_count() {
+            let next = equal(self, i);
+            or = self.operation(Tag::Binary, Operator::Or, &[or, next]);
+        }
+        or
     }
 
     /// `operand IS NULL` or `operand IS NOT NULL`, from the `IS`.
@@ -592,6 +624,21 @@ mod tests {
             parse("(a - b) - c * (d / 2.5)"),
             "(Subtract (Subtract a b) (Multiply c (Divide d 2.5)))"
         );
+    }
+
+    #[test]
+    fn parses_in_lists() {
+        assert_eq!(
+            parse("a IN (-1, 6) AND b in ('x')"),
+            "(And (Or (Equal a (Negate 1)) (Equal a 6)) (Equal b 'x'))"
+        );
+        // Once the tree couldn't grow, the list's items aren't read back.
+        let mut parser = Parser::new(&Heap, b"").unwrap();
+        parser.failed = Some(ErrorCode::OutOfMemory);
+        let list = Node::list(Tag::Call, 3, u32::MAX - 3);
+        assert_eq!(parser.in_list(Node::empty(), list), list);
+        assert_eq!(error("a IN ()"), (ErrorCode::ExpectedExpression, 6));
+        assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
     }
 
     #[test]

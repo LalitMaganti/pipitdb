@@ -20,7 +20,7 @@
   "filter.greater_nulls": 1068853,
   "lexer.long_text": 102853,
   "lexer.typical": 312939,
-  "parser.expression": 420782,
+  "parser.expression": 429736,
   "perfetto_filter.eq_nullable": 5644629,
   "perfetto_filter.eq_string": 3026747,
   "perfetto_filter.eq_uint32": 3929429,

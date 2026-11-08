@@ -304,6 +304,9 @@ mod tests {
         assert_eq!(kept("FROM t |> WHERE a > 5 |> SELECT a"), []);
         // An integer compared with a float column, which holds it exactly.
         assert_eq!(kept("FROM t |> WHERE f > 1 AND f < 3 |> SELECT f"), [2.5]);
+        assert_eq!(kept("FROM t |> WHERE a IN (-1, 2) AND s in ('', 'x') |> SELECT b"), [20.0]);
+        // As in SQL, a null is in no list, and not out of one either.
+        assert_eq!(kept("FROM n |> WHERE NOT x IN (2, 3) |> SELECT x"), [1.0]);
     }
 
     #[test]
