@@ -51,6 +51,16 @@ pub enum Kept<'a> {
     Select(&'a [u16]),
 }
 
+impl Kept<'_> {
+    /// The `i`th row kept.
+    pub fn row(self, i: u32) -> u32 {
+        match self {
+            Kept::Select(rows) => u32::from(*at!(rows, i as usize)),
+            Kept::Prefix | Kept::None => i,
+        }
+    }
+}
+
 impl Selection {
     /// All of `rows` rows.
     pub fn all(rows: u32) -> Selection {
