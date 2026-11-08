@@ -3,6 +3,11 @@
 2		SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
 3		SELECT AVG(UserID) FROM hits
 6	FROM hits |> AGGREGATE min(EventDate), max(EventDate)	SELECT MIN(EventDate), MAX(EventDate) FROM hits
+7	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*) AS c GROUP BY AdvEngineID |> ORDER BY c DESC	SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC
+15	FROM hits |> AGGREGATE count(*) AS c GROUP BY UserID |> ORDER BY c DESC |> LIMIT 10	SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10
+24t	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY EventTime, WatchID |> SELECT SearchPhrase |> LIMIT 10	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, WatchID LIMIT 10
+25	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY SearchPhrase |> SELECT SearchPhrase |> LIMIT 10	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10
+26	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY EventTime, SearchPhrase |> SELECT SearchPhrase |> LIMIT 10	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime, SearchPhrase LIMIT 10
 40	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND (TraficSourceID = -1 OR TraficSourceID = 6) AND RefererHash = 3594120000172545465 |> AGGREGATE count(*) GROUP BY URLHash, EventDate	SELECT URLHash, EventDate, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND TraficSourceID IN (-1, 6) AND RefererHash = 3594120000172545465 GROUP BY URLHash, EventDate
 41	FROM hits |> WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 |> AGGREGATE count(*) GROUP BY WindowClientWidth, WindowClientHeight	SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID = 62 AND EventDate >= 15887 AND EventDate <= 15917 AND IsRefresh = 0 AND DontCountHits = 0 AND URLHash = 2868770270353813622 GROUP BY WindowClientWidth, WindowClientHeight
 41all	FROM hits |> WHERE CounterID >= 0 |> AGGREGATE count(*) GROUP BY WindowClientWidth, WindowClientHeight	SELECT WindowClientWidth, WindowClientHeight, COUNT(*) FROM hits WHERE CounterID >= 0 GROUP BY WindowClientWidth, WindowClientHeight
