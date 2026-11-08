@@ -383,7 +383,8 @@ impl<'p> Run<'p> {
             Err(error) => return self.fail(error),
         };
         segment.status = *at!(at!(NEXT, progress as usize), segment.status as usize);
-        Made::Batch
+        // As in Perfetto, the steps after an operator see only batches with rows.
+        if output.selection().is_empty() { Made::Nothing } else { Made::Batch }
     }
 
     fn segment(&self, k: usize) -> *mut Segment {
@@ -908,6 +909,13 @@ mod tests {
             batches(&mut pipeline.start(&query).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
+    }
+
+    #[test]
+    fn steps_after_an_operator_see_only_batches_with_rows() {
+        let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards), transform(SkipOdd)]);
+        let query = QueryAllocators::new(&Heap);
+        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), [[[5], [4]], [[1], [0]]]);
     }
 
     #[test]
