@@ -559,8 +559,12 @@ impl AggregateFunction for Avg {
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
         for (value, &group) in values.iter_mut().zip(groups) {
             let state = Avg::state(&states, group);
+            let (low, high) = (*at!(state, 0), *at!(state, 1));
+            // i128 to f64 is a slow library call, and few sums need it.
             #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
-            let mean = int128(state) as f64 / *at!(state, AVG_COUNT) as f64;
+            let sum = if high == low >> 63 { low as f64 } else { int128(state) as f64 };
+            #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
+            let mean = sum / *at!(state, AVG_COUNT) as f64;
             *value = mean.to_bits().cast_signed();
         }
         for (byte, groups) in valid.iter_mut().zip(groups.chunks(8)) {
