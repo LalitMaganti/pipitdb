@@ -22,8 +22,7 @@ pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Pred
     let mut nodes = SlowVec::new(compiler.allocator(), PREDICATE_NODES_MAX)?;
     let mut strings = SlowVec::new(compiler.allocator(), STRINGS_MAX)?;
     add(compiler, &mut nodes, &mut strings, node)?;
-    let strings = (!strings.is_empty()).then_some(strings);
-    Ok(Predicate::with_strings(nodes, strings))
+    Ok(Predicate::with_literals(compiler.allocator(), nodes, &strings, &[])?)
 }
 
 /// Adds `node`'s predicate nodes, children first, and returns the index of

@@ -388,8 +388,7 @@ pub fn string_dictionary() -> ColumnView {
 pub fn ipad_predicate() -> Predicate {
     let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, start: 0, len: 4 };
     let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).expect("allocates");
-    let strings = SlowVec::fixed_from(&Heap, b"iPad".iter().copied()).expect("allocates");
-    Predicate::with_strings(nodes, Some(strings))
+    Predicate::with_literals(&Heap, nodes, b"iPad", &[]).expect("allocates")
 }
 
 /// Keeps `iPad`s: 1 in 8.
