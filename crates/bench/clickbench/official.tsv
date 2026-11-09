@@ -2,12 +2,12 @@
 1	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
 2	FROM hits |> AGGREGATE sum(AdvEngineID), count(*), avg(ResolutionWidth)	SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
 3	FROM hits |> AGGREGATE avg(UserID)	SELECT AVG(UserID) FROM hits
-4		SELECT COUNT(DISTINCT UserID) FROM hits
+4	FROM hits |> AGGREGATE count(DISTINCT UserID)	SELECT COUNT(DISTINCT UserID) FROM hits
 5		SELECT COUNT(DISTINCT SearchPhrase) FROM hits
 6		SELECT MIN(EventDate), MAX(EventDate) FROM hits
 7	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*) AS c GROUP BY AdvEngineID |> ORDER BY c DESC	SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC
-8		SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10
-9		SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10
+8	FROM hits |> AGGREGATE count(DISTINCT UserID) AS u GROUP BY RegionID |> ORDER BY u DESC |> LIMIT 10	SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10
+9	FROM hits |> AGGREGATE sum(AdvEngineID), count(*) AS c, avg(ResolutionWidth), count(DISTINCT UserID) GROUP BY RegionID |> ORDER BY c DESC |> LIMIT 10	SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10
 10		SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10
 11		SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10
 12		SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
