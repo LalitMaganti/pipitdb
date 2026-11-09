@@ -11,7 +11,7 @@ use crate::slow_vec::SlowVec;
 use crate::step::Step;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
-/// `Int64` values and makes an `Int64`.
+/// `Int64` values, and makes an `Int64` but for `Avg`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Function {
     /// How many rows there are.
@@ -24,6 +24,16 @@ pub enum Function {
     Min,
     /// The greatest value that isn't null, null if there are none.
     Max,
+    /// The mean of the values that aren't null, a `Float64`, null if there
+    /// are none. Perfetto has no `AVG`: #170.
+    Avg,
+}
+
+impl Function {
+    /// The type of what it makes.
+    pub fn output_type(self) -> DataType {
+        if self == Function::Avg { DataType::Float64 } else { DataType::Int64 }
+    }
 }
 
 /// An aggregate in a plan: its function, the column it reads, `None` only for
