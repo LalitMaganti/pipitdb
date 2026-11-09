@@ -353,6 +353,7 @@ mod tests {
         let sum = (b"sum(b)".to_vec(), [30.0].to_vec());
         let least = (b"min(a)".to_vec(), [1.0].to_vec());
         assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), min(a)"), [count, sum, least]);
+        assert_eq!(run("FROM t |> AGGREGATE avg(b)"), [(b"avg(b)".to_vec(), [15.0].to_vec())]);
         // Each `a` is a group, of one row; the keys come first.
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
