@@ -619,7 +619,8 @@ mod tests {
         if let Some(groups) = groups {
             let binding = plan.add_column("n", DataType::Int64).unwrap();
             let function = crate::aggregate::Function::CountStar;
-            let aggregate = crate::aggregate::Aggregate { function, input: None, binding };
+            let aggregate =
+                crate::aggregate::Aggregate { function, input: None, distinct: false, binding };
             let aggregate = crate::aggregate::AggregateOp {
                 keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
                 aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),

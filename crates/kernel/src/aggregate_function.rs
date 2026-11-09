@@ -26,7 +26,7 @@ pub(crate) struct AggregateInput<'a> {
 
 impl AggregateInput<'_> {
     /// Whether row `row` holds a value.
-    fn is_valid(&self, row: usize) -> bool {
+    pub(crate) fn is_valid(&self, row: usize) -> bool {
         self.valid.is_none_or(|valid| *at!(valid, row / 64) >> (row % 64) & 1 != 0)
     }
 

@@ -37,11 +37,13 @@ impl Function {
 }
 
 /// An aggregate in a plan: its function, the column it reads, `None` only for
-/// `COUNT(*)`, and the column it makes.
+/// `COUNT(*)`, whether it reads only each group's distinct values, and the
+/// column it makes.
 #[derive(Clone, Copy)]
 pub struct Aggregate {
     pub function: Function,
     pub input: Option<ColumnId>,
+    pub distinct: bool,
     pub binding: NamedColumn,
 }
 
@@ -76,6 +78,7 @@ impl<'c> Op<'c> for AggregateOp {
         let key_columns = SlowVec::fixed_from(allocator, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
             function: aggregate.function,
+            distinct: aggregate.distinct,
             column: aggregate.input.map_or(0, |id| lowering.query_position(id)),
         });
         let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
@@ -141,4 +144,7 @@ pub struct AggregateCall {
     pub function: Function,
     /// Where the column it reads is in batches: unused by `COUNT(*)`.
     pub column: u32,
+    /// Whether it reads only the values of each group it hasn't before, as
+    /// `COUNT(DISTINCT x)` does. Perfetto's has no such flag: #288.
+    pub distinct: bool,
 }
