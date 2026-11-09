@@ -8,10 +8,13 @@ use crate::aggregate_function::{
     make_aggregate_function,
 };
 use crate::allocator::{AllocError, Allocator};
+use crate::buffer::Buffer;
 use crate::column::{ColumnView, Forms};
 use crate::context::Context;
 use crate::error::Error;
+use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::group_table::{GroupTable, KEYS_MAX};
+use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
@@ -47,6 +50,8 @@ struct State {
     consumed: bool,
     /// For each aggregate, which groups have seen a value.
     seen: SlowVec<SeenBytes>,
+    /// For each `DISTINCT` aggregate, the values of each group it's read.
+    distinct: SlowVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
 }
@@ -98,6 +103,45 @@ impl HashAggregate {
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
     }
+}
+
+/// A value of a group, as a `DISTINCT` aggregate keeps the ones it's read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GroupValue {
+    group: u32,
+    value: i64,
+}
+
+impl Key for GroupValue {
+    fn hash(&self) -> u64 {
+        murmur_hash::mix(self.value.cast_unsigned() ^ murmur_hash::mix(u64::from(self.group)))
+    }
+}
+
+/// The values of `input`'s rows that aren't null and that their group, in
+/// `groups`, all 0 if `None`, hadn't had before, adding them to `set`; and
+/// each one's group, and how many there are.
+fn first_values(
+    context: &mut Context,
+    set: &mut FlatHashMap<GroupValue, ()>,
+    input: &AggregateInput,
+    groups: Option<&[u32]>,
+) -> Result<(Buffer, Buffer, usize), Error> {
+    let mut values = context.values_buffer(input.rows * 8)?;
+    let mut firsts = context.indices_buffer(input.rows * 4)?;
+    let (kept_values, kept_groups) = (values.as_mut_slice::<i64>(), firsts.as_mut_slice::<u32>());
+    let mut kept = 0;
+    for (row, &value) in at!(input.values, ..input.rows).iter().enumerate() {
+        let group = groups.map_or(0, |groups| *at!(groups, row));
+        if input.is_valid(row)
+            && set.insert(context.allocator(), GroupValue { group, value }, ())?.1
+        {
+            *at_mut!(kept_values, kept) = value;
+            *at_mut!(kept_groups, kept) = group;
+            kept += 1;
+        }
+    }
+    Ok((values, firsts, kept))
 }
 
 /// A batch whose columns this reads are flat: they're in whatever form the
@@ -152,7 +196,13 @@ impl Breaker for HashAggregate {
         for _ in 0..self.spec.aggregates.len() {
             seen.push(SeenBytes::new(allocator)?)?;
         }
-        Ok(State { groups, total, consumed: false, seen, emitted: 0 })
+        let mut distinct = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
+        for call in self.spec.aggregates.iter() {
+            check!(!call.distinct || call.function != Function::CountStar);
+            let set = if call.distinct { Some(FlatHashMap::for_len(allocator, 0)?) } else { None };
+            distinct.push(set)?;
+        }
+        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0 })
     }
 
     fn consume(
@@ -181,7 +231,7 @@ impl Breaker for HashAggregate {
             state.groups.find_or_create(context, keys, input.select(), groups)?;
         }
         let group_count = self.group_count(state);
-        let State { groups, total, seen, .. } = state;
+        let State { groups, total, seen, distinct, .. } = state;
         let (base, stride) = self.state_base(groups, total);
         let mut overflow = false;
         let mut offset = 0;
@@ -199,10 +249,22 @@ impl Breaker for HashAggregate {
             };
             let states = Self::states(base, stride, offset, seen);
             offset += function.state_words();
-            match &numbers {
-                Some(numbers) => {
-                    function.update(&loaded, numbers.as_slice(), states, &mut overflow);
+            let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
+            if let Some(set) = at_mut!(distinct, a) {
+                // Only the rows with values their group hasn't had, as if the
+                // batch were only those.
+                let (values, firsts, rows) = first_values(context, set, &loaded, numbers)?;
+                let kept = at!(values.as_slice::<i64>(), ..rows);
+                let values = AggregateInput { values: kept, valid: None, rows };
+                let firsts = at!(firsts.as_slice::<u32>(), ..rows);
+                match numbers {
+                    Some(_) => function.update(&values, firsts, states, &mut overflow),
+                    None => function.update_group(&values, 0, states, &mut overflow),
                 }
+                continue;
+            }
+            match numbers {
+                Some(numbers) => function.update(&loaded, numbers, states, &mut overflow),
                 None => function.update_group(&loaded, 0, states, &mut overflow),
             }
         }
@@ -321,8 +383,11 @@ mod tests {
     fn spec(keys: &[u32]) -> HashAggregateSpec {
         let functions =
             [Function::CountStar, Function::Count, Function::Sum, Function::Min, Function::Max];
-        let aggregates =
-            functions.into_iter().map(|function| AggregateCall { function, column: 1 });
+        let aggregates = functions.into_iter().map(|function| AggregateCall {
+            function,
+            column: 1,
+            distinct: false,
+        });
         HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
             aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
@@ -442,8 +507,11 @@ mod tests {
                 dropped: alloc::vec![1],
             };
             let functions = [Function::Avg, Function::CountStar];
-            let aggregates =
-                functions.into_iter().map(|function| AggregateCall { function, column: 1 });
+            let aggregates = functions.into_iter().map(|function| AggregateCall {
+                function,
+                column: 1,
+                distinct: false,
+            });
             let spec = HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
                 aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
@@ -456,12 +524,62 @@ mod tests {
         }
         // With no rows, the mean is null.
         let rows = Rows { batches: Vec::new(), dropped: Vec::new() };
-        let call = AggregateCall { function: Function::Avg, column: 1 };
+        let call = AggregateCall { function: Function::Avg, column: 1, distinct: false };
         let spec = HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
             aggregates: SlowVec::fixed_from(&Heap, [call].into_iter()).unwrap(),
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
+    }
+
+    #[test]
+    fn reads_each_groups_distinct_values() {
+        // `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, `COUNT(*)` and `SUM(x)`, by
+        // the key and not.
+        let calls = [
+            (Function::Count, true),
+            (Function::Sum, true),
+            (Function::CountStar, false),
+            (Function::Sum, false),
+        ];
+        let spec = |keys: &[u32]| {
+            let calls =
+                calls.map(|(function, distinct)| AggregateCall { function, column: 1, distinct });
+            HashAggregateSpec {
+                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
+            }
+        };
+        // Repeats within and across batches, a null, row 3 of each batch
+        // dropped, and key 2's only value null.
+        let rows = || Rows {
+            batches: alloc::vec![
+                alloc::vec![
+                    (Some(1), Some(5)),
+                    (Some(1), Some(5)),
+                    (Some(1), None),
+                    (Some(1), Some(9))
+                ],
+                alloc::vec![
+                    (Some(1), Some(7)),
+                    (Some(1), Some(5)),
+                    (Some(2), None),
+                    (Some(3), Some(5))
+                ],
+            ],
+            dropped: alloc::vec![3],
+        };
+        assert_eq!(
+            run(rows(), spec(&[])).unwrap(),
+            [alloc::vec![Some(2), Some(12), Some(6), Some(22)]]
+        );
+        assert_eq!(
+            run(rows(), spec(&[0])).unwrap(),
+            [
+                alloc::vec![Some(1), Some(2), Some(12), Some(5), Some(22)],
+                alloc::vec![Some(2), Some(0), None, Some(1), None],
+            ]
+        );
     }
 
     #[test]

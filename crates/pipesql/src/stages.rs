@@ -366,7 +366,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
         };
         let binding = compiler.plan.add_named_column(name, function.output_type())?;
-        aggregates.push(Aggregate { function, input, binding })?;
+        aggregates.push(Aggregate { function, input, distinct: false, binding })?;
         scope.push(binding)?;
     }
     let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates })?;
