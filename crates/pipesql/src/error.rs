@@ -79,7 +79,8 @@ pub enum Unsupported {
     /// An aggregate of a column whose type it can't take, such as a string's
     /// sum.
     AggregateType = 7,
-    /// A key to group by that isn't an `Int64` column.
+    /// A key to group by, or a column `DISTINCT` compares, that isn't an
+    /// `Int64` column.
     GroupKey = 8,
     /// An `ORDER BY` key that isn't a column.
     OrderBy = 9,

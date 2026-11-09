@@ -163,6 +163,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::g_region(hits_query("gRegion"))]
 #[bench::g_window(hits_query("gWindow"))]
 #[bench::g_user(hits_query("gUser"))]
+#[bench::q8(hits_query("8"))]
 #[bench::q15(hits_query("15"))]
 #[bench::q24t(hits_query("24t"))]
 #[bench::q25(hits_query("25"))]

@@ -354,6 +354,7 @@ mod tests {
         let least = (b"min(a)".to_vec(), [1.0].to_vec());
         assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), min(a)"), [count, sum, least]);
         assert_eq!(run("FROM t |> AGGREGATE avg(b)"), [(b"avg(b)".to_vec(), [15.0].to_vec())]);
+        assert_eq!(kept("FROM t |> SELECT a |> DISTINCT |> SELECT a"), [1.0, 2.0]);
         // Each `a` is a group, of one row; the keys come first.
         let mut groups = run("FROM t |> WHERE b > 10 |> AGGREGATE max(b) GROUP BY a");
         assert_eq!(groups.remove(0), (b"a".to_vec(), [2.0].to_vec()));
@@ -418,6 +419,8 @@ mod tests {
         assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
+        // `t` has string and float columns.
+        assert_eq!(error("FROM t |> DISTINCT"), (ErrorCode::Unsupported, 10));
     }
 
     #[test]

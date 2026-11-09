@@ -486,7 +486,12 @@ impl Parser<'_> {
                 Item::After(words, shared) => self.clause(words, shared, true)?,
             };
         }
-        let first_child = self.write(at!(children, ..rule.items.len()));
+        // A stage of no items has its keyword, so it has a place to report.
+        let first_child = if rule.items.is_empty() {
+            self.write(&[Node::leaf(Tag::Name, keyword.span)])
+        } else {
+            self.write(at!(children, ..rule.items.len()))
+        };
         Ok(Node::stage(id, first_child))
     }
 

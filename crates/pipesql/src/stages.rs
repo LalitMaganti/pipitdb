@@ -3,6 +3,7 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
+use pipit_kernel::distinct::{DistinctOp, KEYS_MAX};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::lower::SortKey;
 use pipit_kernel::order_by::OrderByOp;
@@ -79,6 +80,9 @@ pub const AGGREGATE: Rule = Rule {
     compile: compile_aggregate,
 };
 
+pub const DISTINCT: Rule =
+    Rule { keyword: "distinct", point: Point::Stage, items: &[], compile: compile_distinct };
+
 pub const ORDER_BY: Rule = Rule {
     keyword: "order",
     point: Point::Stage,
@@ -87,7 +91,8 @@ pub const ORDER_BY: Rule = Rule {
 };
 
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
+pub const RELATIONAL: &[Rule] =
+    &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, DISTINCT, ORDER_BY, LIMIT];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
@@ -115,6 +120,24 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(filter, children)?;
+    Ok(())
+}
+
+/// `DISTINCT`: the first of each set of rows equal in every column in
+/// scope, as Perfetto's, which can compare 64 `Int64` columns.
+fn compile_distinct(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let span = compiler.span(stage);
+    let columns = &compiler.plan.columns;
+    let int64 =
+        |column: &NamedColumn| at!(columns, column.id as usize).data_type == DataType::Int64;
+    if compiler.scope.len() > KEYS_MAX || !compiler.scope.iter().all(int64) {
+        return Err(Error::unsupported(Unsupported::GroupKey, span));
+    }
+    let allocator = compiler.allocator();
+    let columns = SlowVec::fixed_from(allocator, compiler.scope.iter().map(|column| column.id))?;
+    let distinct = DynOp::new(allocator, DistinctOp { columns })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(distinct, children)?;
     Ok(())
 }
 
