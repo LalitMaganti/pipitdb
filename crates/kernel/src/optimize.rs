@@ -143,9 +143,10 @@ enum Load {
     Never,
 }
 
-/// Where `column` is first read above `maker`, the node with that id: below a
-/// node, above the root, or nowhere; whether a node is passed first; and the
-/// forms every reader above accepts, as each passes it on as it is.
+/// Walks up from `maker`, the node with that id, until an op doesn't pass
+/// `column` through. Returns where `column` is first read: below a node,
+/// above the root, or nowhere; whether that's higher than `maker`'s parent;
+/// and the forms accepted by every op on the way that reads it.
 fn first_read(
     nodes: &[PlanNode<'_>],
     parents: &[Option<(PlanNodeId, usize)>],
@@ -157,9 +158,16 @@ fn first_read(
     let (mut at, mut above_parent) = (*at!(parents, maker), false);
     let (mut first, mut accepted) = (None, OUTPUT_FORMS | Forms::LAZY);
     while let Some((parent, slot)) = at {
+        let op = &at!(nodes, parent as usize).op;
         if at!(reads, parent as usize).is_needed(column) {
-            accepted = accepted & at!(nodes, parent as usize).op.accepts(column);
+            accepted = accepted & op.accepts(column);
             first.get_or_insert((Load::Below(parent, slot), above_parent));
+        }
+        if !op.passes_through(column) {
+            return match first {
+                Some((load, above_parent)) => (load, above_parent, accepted),
+                None => (Load::Never, above_parent, Forms::FLAT),
+            };
         }
         (at, above_parent) = (*at!(parents, parent as usize), true);
     }
@@ -248,4 +256,83 @@ pub fn choose_forms(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::*;
+    use crate::allocator::Heap;
+    use crate::column::DataType;
+    use crate::lower::{LowerError, Lowering};
+    use crate::plan::{DynOp, LogicalPlan, Op, PlanNode};
+
+    /// Makes column 0, and records the forms it's allowed in.
+    struct Maker<'a>(&'a Cell<Forms>);
+
+    /// Reads column 0 in the forms `accepts`, and passes it through if
+    /// `passes_through`.
+    struct Reader {
+        accepts: Forms,
+        passes_through: bool,
+    }
+
+    impl<'c> Op<'c> for Maker<'_> {
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
+        }
+
+        fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+            if column == 0 {
+                self.0.set(allowed);
+            }
+            Forms::FLAT
+        }
+    }
+
+    impl<'c> Op<'c> for Reader {
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
+        }
+
+        fn accepts(&self, _: ColumnId) -> Forms {
+            self.accepts
+        }
+
+        fn passes_through(&self, _: ColumnId) -> bool {
+            self.passes_through
+        }
+    }
+
+    /// Plans a maker, then a reader that takes dictionaries, then one that
+    /// only takes flat columns, and returns the forms the maker is allowed.
+    fn allowed(passes_through: bool) -> Forms {
+        let allowed = Cell::new(Forms::FLAT);
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let column = plan.add_column("a", DataType::String).unwrap();
+        let mut node = plan
+            .add_node(
+                DynOp::new(&Heap, Maker(&allowed)).unwrap(),
+                SlowVec::fixed(&Heap, 0).unwrap(),
+            )
+            .unwrap();
+        let readers = [
+            Reader { accepts: Forms::FLAT | Forms::DICTIONARY, passes_through },
+            Reader { accepts: Forms::FLAT, passes_through: true },
+        ];
+        for reader in readers {
+            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
+            node = plan.add_node(DynOp::new(&Heap, reader).unwrap(), children).unwrap();
+        }
+        assert!(plan.output.push(column).is_ok());
+        choose_forms(&Heap, &mut plan).unwrap();
+        allowed.get()
+    }
+
+    #[test]
+    fn forms_ignore_readers_above_an_op_that_does_not_pass_the_column_through() {
+        assert!(allowed(false).contains(Forms::DICTIONARY));
+        assert!(!allowed(true).contains(Forms::DICTIONARY));
+    }
 }

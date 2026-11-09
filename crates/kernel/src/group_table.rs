@@ -183,9 +183,9 @@ impl GroupTable {
         Ok(())
     }
 
-    /// Adds a group for `key`, its null word and keys, hashed as `hash`, in
-    /// slot `at`, and returns its number. Out of line, so the loops that find
-    /// groups keep what they read in registers.
+    /// Adds a group for row `row` of `keys`, with null word `null`, hashed as
+    /// `hash`, in slot `at`, and returns its number. Out of line, so the loops
+    /// that find groups keep what they read in registers.
     #[cold]
     #[inline(never)]
     fn add(&mut self, at: usize, hash: u64, key: &[i64]) -> Result<u32, Error> {

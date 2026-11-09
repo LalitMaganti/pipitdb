@@ -102,6 +102,11 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(())
     }
 
+    /// False for its keys, which come out one row per group.
+    fn passes_through(&self, column: ColumnId) -> bool {
+        !self.keys.contains(&column)
+    }
+
     /// Drops the aggregates nothing reads, keeping one if there are no keys:
     /// a batch with no columns has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {

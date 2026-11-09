@@ -76,6 +76,15 @@ pub trait Op<'c> {
         Forms::FLAT
     }
 
+    /// Whether this op hands `column` on to the ops above it, as a filter
+    /// does. False for an aggregate's keys, which come out one row per
+    /// group. When false, ops above don't affect which forms, such as
+    /// dictionary, the column can be loaded in. True by default.
+    fn passes_through(&self, column: ColumnId) -> bool {
+        let _ = column;
+        true
+    }
+
     /// Tells this, if it makes `column`, the forms the plan allows it in,
     /// and returns those of them it will make it in. By default, flat only.
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
@@ -167,6 +176,7 @@ struct OpFunctions<'c> {
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
     accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
+    passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
     give_condition: GiveCondition,
     takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
@@ -187,6 +197,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
         // SAFETY: as for `lower`.
         accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
+        // SAFETY: as for `lower`.
+        passes_through: |op, column| unsafe { value_of::<T>(op).passes_through(column) },
         // SAFETY: as for `prune`.
         allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
         // SAFETY: as for `prune`.
@@ -235,6 +247,11 @@ impl<'c> DynOp<'c> {
     pub(crate) fn accepts(&self, column: ColumnId) -> Forms {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.accepts)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn passes_through(&self, column: ColumnId) -> bool {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.passes_through)(self.op.as_ptr(), column) }
     }
 
     pub(crate) fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
