@@ -249,7 +249,8 @@ impl Breaker for HashAggregate {
             };
             let states = Self::states(base, stride, offset, seen);
             offset += function.state_words();
-            let column = finalize_to_buffer(context, function, states, numbers)?;
+            let output_type = call.function.output_type();
+            let column = finalize_to_buffer(context, function, output_type, states, numbers)?;
             let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
@@ -328,7 +329,8 @@ mod tests {
         }
     }
 
-    /// Each row out, its columns as integers, or `None` if null, sorted.
+    /// Each row out, its columns as integers, or floats' bits, or `None` if
+    /// null, sorted.
     fn run(rows: Rows, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let mut steps = SlowVec::new(&Heap, 1).unwrap();
         assert!(steps.push(Step::Operator(hash_aggregate(&Heap, spec).unwrap())).is_ok());
@@ -341,7 +343,12 @@ mod tests {
             for row in 0..batch.row_count() {
                 let values = (0..batch.column_count()).map(|i| {
                     let column = batch.column(i);
-                    (!column.is_null(row)).then(|| column.int64s()[row as usize])
+                    (!column.is_null(row)).then(|| match column.data_type() {
+                        DataType::Float64 => {
+                            column.values().float64s()[row as usize].to_bits().cast_signed()
+                        }
+                        _ => column.int64s()[row as usize],
+                    })
                 });
                 out.push(values.collect());
             }
@@ -419,6 +426,42 @@ mod tests {
         };
         let expected = [alloc::vec![Some(5), Some(4), Some(-4), Some(-half), Some(half)]];
         assert_eq!(run(rows, spec(&[])).unwrap(), expected);
+    }
+
+    #[test]
+    fn averages_exactly_past_int64() {
+        // Keyed and not, with a null, a dropped row, and a sum past `Int64`
+        // whose mean isn't.
+        let big = i64::MAX - 1;
+        for keys in [&[][..], &[0]] {
+            let rows = Rows {
+                batches: alloc::vec![
+                    alloc::vec![(Some(1), Some(big)), (Some(1), Some(7)), (Some(1), None)],
+                    alloc::vec![(Some(1), Some(big))],
+                ],
+                dropped: alloc::vec![1],
+            };
+            let functions = [Function::Avg, Function::CountStar];
+            let aggregates =
+                functions.into_iter().map(|function| AggregateCall { function, column: 1 });
+            let spec = HashAggregateSpec {
+                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
+            };
+            let out = run(rows, spec).unwrap();
+            let mean = out[0][keys.len()].map(|bits| f64::from_bits(bits.cast_unsigned()));
+            #[expect(clippy::cast_precision_loss, reason = "the mean expected")]
+            let expected = big as f64;
+            assert_eq!((mean, out[0][keys.len() + 1]), (Some(expected), Some(3)));
+        }
+        // With no rows, the mean is null.
+        let rows = Rows { batches: Vec::new(), dropped: Vec::new() };
+        let call = AggregateCall { function: Function::Avg, column: 1 };
+        let spec = HashAggregateSpec {
+            key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
+            aggregates: SlowVec::fixed_from(&Heap, [call].into_iter()).unwrap(),
+        };
+        assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
     }
 
     #[test]

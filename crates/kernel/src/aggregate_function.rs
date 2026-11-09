@@ -195,13 +195,16 @@ pub(crate) fn make_aggregate_function(function: Function) -> &'static dyn Aggreg
         Function::Min => &Extreme { mask: !(1 << 63) },
         // Flips the sign: words order as the values do, the least being zero.
         Function::Max => &Extreme { mask: 1 << 63 },
+        Function::Avg => &Avg,
     }
 }
 
-/// `function`'s result for each of `groups`, in buffers from `context`.
+/// `function`'s result, of `data_type`, for each of `groups`, in buffers from
+/// `context`.
 pub(crate) fn finalize_to_buffer(
     context: &mut Context,
     function: &dyn AggregateFunction,
+    data_type: DataType,
     states: GroupStates,
     groups: &[u32],
 ) -> Result<ColumnView, Error> {
@@ -213,7 +216,7 @@ pub(crate) fn finalize_to_buffer(
     let (whole, last) = (rows / 8, rows % 8);
     let all = at!(bits, ..whole).iter().all(|&byte| byte == u8::MAX)
         && (last == 0 || !*at!(bits, whole) & ((1 << last) - 1) == 0);
-    Ok(ColumnView::new(context, DataType::Int64, values, (!all).then_some(valid))?)
+    Ok(ColumnView::new(context, data_type, values, (!all).then_some(valid))?)
 }
 
 /// Writes to `valid` a bit for each of `groups`, set if it's seen a value.
@@ -269,6 +272,34 @@ fn scatter(
             }
         }
     }
+}
+
+/// The sum of `input`'s values that aren't null, exactly. The high and low
+/// 32 bits of the values are summed apart, which can't overflow for a batch
+/// and vectorizes, unlike checking each addition.
+fn batch_sum(input: &AggregateInput) -> i128 {
+    check!(input.rows <= BATCH_ROWS_MAX as usize);
+    let values = at!(input.values, ..input.rows);
+    let (mut high, mut low) = (0_i64, 0_u64);
+    match input.valid {
+        None => {
+            for &value in values {
+                high += value >> 32;
+                low += value.cast_unsigned() & 0xffff_ffff;
+            }
+        }
+        // A word of validity at a time, rather than a bit for each row.
+        Some(valid) => {
+            for (values, &valid) in values.chunks(64).zip(valid) {
+                for (i, &value) in values.iter().enumerate() {
+                    let value = value & mask(valid >> i & 1 != 0);
+                    high += value >> 32;
+                    low += value.cast_unsigned() & 0xffff_ffff;
+                }
+            }
+        }
+    }
+    (i128::from(high) << 32) + i128::from(low)
 }
 
 /// A word that's 0 if not `valid`, and all ones if so.
@@ -397,37 +428,10 @@ impl AggregateFunction for Sum {
         mut states: GroupStates,
         overflow: &mut bool,
     ) {
-        // The high and low 32 bits of the values are summed apart, which can't
-        // overflow for a batch and vectorizes, unlike checking each addition.
-        check!(input.rows <= BATCH_ROWS_MAX as usize);
-        let values = at!(input.values, ..input.rows);
-        let (mut high, mut low) = (0_i64, 0_u64);
-        match input.valid {
-            None => {
-                for &value in values {
-                    high += value >> 32;
-                    low += value.cast_unsigned() & 0xffff_ffff;
-                }
-            }
-            // A word of validity at a time, rather than a bit for each row.
-            Some(valid) => {
-                for (values, &valid) in values.chunks(64).zip(valid) {
-                    for (i, &value) in values.iter().enumerate() {
-                        let value = value & mask(valid >> i & 1 != 0);
-                        high += value >> 32;
-                        low += value.cast_unsigned() & 0xffff_ffff;
-                    }
-                }
-            }
-        }
-        // The sum is high * 2^32 + low, which fits in 64 bits if, once low's
-        // carry is in high, high fits in 32.
-        high += (low >> 32).cast_signed();
-        let fits = i32::try_from(high).is_ok();
-        let sum = (high.cast_unsigned() << 32 | low & 0xffff_ffff).cast_signed();
-        let (total, o) = states.word(group).overflowing_add(sum);
+        let sum = i64::try_from(batch_sum(input));
+        let (total, o) = states.word(group).overflowing_add(sum.unwrap_or(0));
         *states.word_mut(group) = total;
-        *overflow |= !fits || o;
+        *overflow |= sum.is_err() || o;
         states.mark(group, input.count_valid() != 0);
     }
 
@@ -494,6 +498,76 @@ impl AggregateFunction for Extreme {
             *value = (states.word(group).cast_unsigned() ^ self.mask).cast_signed();
         }
         write_seen(valid, groups, &states);
+    }
+}
+
+/// `AVG`: the mean of a group's values, a float, null if it holds none. The
+/// state is the sum, in two words, low then high, so it can't overflow, then
+/// how many values there are: a mean fits where the sum it's of may not, as
+/// with `AVG(UserID)` over ClickBench's 100M rows.
+struct Avg;
+
+/// Where the count is in an `Avg` state.
+const AVG_COUNT: usize = 2;
+
+/// The two words of a sum, low then high, as one.
+fn int128(state: &[i64]) -> i128 {
+    i128::from(*at!(state, 1)) << 64 | i128::from(at!(state, 0).cast_unsigned())
+}
+
+/// Writes `sum` to its two words.
+fn set_int128(state: &mut [i64], sum: i128) {
+    #[expect(clippy::cast_possible_truncation, reason = "split in two")]
+    at_mut!(state, ..2).copy_from_slice(&[sum as i64, (sum >> 64) as i64]);
+}
+
+impl Avg {
+    /// Group `group`'s state.
+    fn state<'s>(states: &'s GroupStates, group: u32) -> &'s [i64] {
+        let start = group as usize * states.stride;
+        at!(states.words, start..=start + AVG_COUNT)
+    }
+}
+
+impl AggregateFunction for Avg {
+    fn state_words(&self) -> usize {
+        AVG_COUNT + 1
+    }
+
+    fn reads_input(&self) -> bool {
+        true
+    }
+
+    fn tracks_seen(&self) -> bool {
+        false
+    }
+
+    fn update(&self, input: &AggregateInput, groups: &[u32], states: GroupStates, _: &mut bool) {
+        scatter(input, groups, states, AVG_COUNT + 1, |state, value, valid| {
+            set_int128(state, int128(state) + i128::from(value & mask(valid)));
+            *at_mut!(state, AVG_COUNT) += i64::from(valid);
+        });
+    }
+
+    fn update_group(&self, input: &AggregateInput, group: u32, states: GroupStates, _: &mut bool) {
+        let start = group as usize * states.stride;
+        let state = at_mut!(states.words, start..=start + AVG_COUNT);
+        set_int128(state, int128(state) + batch_sum(input));
+        *at_mut!(state, AVG_COUNT) += i64::try_from(input.count_valid()).unwrap_or(0);
+    }
+
+    fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
+        for (value, &group) in values.iter_mut().zip(groups) {
+            let state = Avg::state(&states, group);
+            #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
+            let mean = int128(state) as f64 / *at!(state, AVG_COUNT) as f64;
+            *value = mean.to_bits().cast_signed();
+        }
+        for (byte, groups) in valid.iter_mut().zip(groups.chunks(8)) {
+            let held = |group| *at!(Avg::state(&states, group), AVG_COUNT) != 0;
+            *byte =
+                (0..).zip(groups).fold(0, |byte, (i, &group)| byte | u8::from(held(group)) << i);
+        }
     }
 }
 
