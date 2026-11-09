@@ -180,6 +180,7 @@ enum Keyword {
     Or,
     Not,
     Like,
+    Distinct,
 }
 
 #[derive(Clone, Copy)]
@@ -235,6 +236,13 @@ impl Parser<'_> {
             let mut operand = match self.prefix(token)? {
                 Step::Operand(operand) => operand,
                 Step::Push(pending, power) => {
+                    // `DISTINCT` only starts a call's argument.
+                    let top = stack.depth.checked_sub(1).map(|top| at!(stack.frames, top).pending);
+                    if let Pending::Unary(Operator::Distinct) = pending
+                        && !matches!(top, Some(Pending::Call(_) | Pending::Argument(_)))
+                    {
+                        return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
+                    }
                     stack.push(pending, min_power, token)?;
                     min_power = power;
                     continue;
@@ -386,6 +394,8 @@ impl Parser<'_> {
                 }
                 Keyword::None => Step::Operand(leaf(token)?),
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
+                // Over all that follows, as in `count(DISTINCT a)`.
+                Keyword::Distinct => Step::Push(Pending::Unary(Operator::Distinct), 0),
                 Keyword::And | Keyword::Or | Keyword::Like => {
                     return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
                 }
@@ -402,7 +412,7 @@ impl Parser<'_> {
             Keyword::And => Some((Operator::And, AND)),
             Keyword::Or => Some((Operator::Or, OR)),
             Keyword::Like => Some((Operator::Like, COMPARISON)),
-            Keyword::Not | Keyword::None => None,
+            Keyword::Not | Keyword::Distinct | Keyword::None => None,
         }
     }
 
@@ -414,6 +424,7 @@ impl Parser<'_> {
             3 if text[0].eq_ignore_ascii_case(&b'a') => (Keyword::And, b"and".as_slice()),
             3 => (Keyword::Not, b"not".as_slice()),
             4 => (Keyword::Like, b"like".as_slice()),
+            8 => (Keyword::Distinct, b"distinct".as_slice()),
             _ => return Keyword::None,
         };
         if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }
@@ -654,6 +665,16 @@ mod tests {
         assert_eq!(error("a IN (-'x')"), (ErrorCode::ExpectedExpression, 7));
         assert_eq!(error("a IN (1 2)"), (ErrorCode::ExpectedToken, 8));
         assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
+    }
+
+    #[test]
+    fn parses_distinct_arguments() {
+        assert_eq!(parse("count(DISTINCT a)"), "(Call count (Distinct a))");
+        assert_eq!(parse("sum(distinct a + 1)"), "(Call sum (Distinct (Add a 1)))");
+        // Only as the start of a call's argument, and errors point at it.
+        assert_eq!(error("count((DISTINCT a))"), (ErrorCode::ExpectedExpression, 7));
+        assert_eq!(error("count(1 + DISTINCT a)"), (ErrorCode::ExpectedExpression, 10));
+        assert_eq!(error("DISTINCT a"), (ErrorCode::ExpectedExpression, 0));
     }
 
     #[test]

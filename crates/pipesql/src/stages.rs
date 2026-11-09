@@ -9,7 +9,7 @@ use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
-use crate::ast::{Node, Tag};
+use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::condition::compile_condition;
 use crate::error::{Error, ErrorCode, Unsupported};
@@ -350,9 +350,13 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         else {
             return Err(Error::new(ErrorCode::UnknownFunction, name));
         };
-        let argument = compiler.node(item.first_child() + 1);
+        let mut argument = compiler.node(item.first_child() + 1);
+        let distinct = argument.tag() == Tag::Unary && argument.operator() == Operator::Distinct;
+        if distinct {
+            argument = compiler.node(argument.first_child());
+        }
         let (function, input) = match argument.tag() {
-            Tag::Star if function == Function::Count => (Function::CountStar, None),
+            Tag::Star if function == Function::Count && !distinct => (Function::CountStar, None),
             Tag::Name => (function, Some(compiler.find_column(argument)?.id)),
             _ => return Err(unsupported),
         };
@@ -361,12 +365,19 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
+        let distinct_word = if distinct { "DISTINCT " } else { "" };
         let name = match alias {
             Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
-            None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
+            None => compiler.plan.names.add_parts(&[
+                function_name,
+                "(",
+                distinct_word,
+                argument,
+                ")",
+            ])?,
         };
         let binding = compiler.plan.add_named_column(name, function.output_type())?;
-        aggregates.push(Aggregate { function, input, distinct: false, binding })?;
+        aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
     let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates })?;
