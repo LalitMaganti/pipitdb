@@ -7,6 +7,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
+use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
 
@@ -166,7 +167,7 @@ impl GroupTable {
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         for (&key, group) in keys.iter().zip(groups) {
-            let hash = fmix(key.cast_unsigned());
+            let hash = mix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
             // SAFETY: a group in a slot has a record, of at least two words.
@@ -314,23 +315,13 @@ fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32,
     }
 }
 
-/// `fmix64` from Murmur hash 3, as Perfetto hashes a key.
-#[inline]
-fn fmix(word: u64) -> u64 {
-    let mut h = word ^ word >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^ h >> 33
-}
-
 /// What Perfetto's `MurmurHashCombiner` starts from.
 const SEED: u64 = 0xe17a_1465;
 
 /// `hash` with `word` combined in, as Perfetto's `MurmurHashCombiner` does.
 #[inline]
 fn combine(hash: u64, word: u64) -> u64 {
-    hash ^ fmix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
+    hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
 /// The hash of row `row` of `keys`, whose null word is `null`, as Perfetto's
@@ -344,7 +335,7 @@ unsafe fn hash_row(keys: &[&[i64]], row: usize, null: u64) -> u64 {
     // SAFETY: as the caller promises.
     let key = |keys: &[i64]| unsafe { keys.get_unchecked(row) }.cast_unsigned();
     if let ([keys], 0) = (keys, null) {
-        return fmix(key(keys));
+        return mix(key(keys));
     }
     let hash = keys.iter().fold(SEED, |hash, keys| combine(hash, key(keys)));
     if null == 0 { hash } else { combine(hash, null) }

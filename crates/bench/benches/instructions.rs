@@ -99,7 +99,16 @@ fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
     black_box(pipitdb_bench::run_predicate(black_box(&predicate), &column, 100))
 }
 
-library_benchmark_group!(name = pipeline_group, benchmarks = [pipeline, scan, filter, predicate]);
+#[library_benchmark]
+#[bench::find(pipitdb_bench::hash_map(1000))]
+fn flat_hash_map(map: pipit_kernel::flat_hash_map::FlatHashMap<i64, ()>) -> u64 {
+    black_box(pipitdb_bench::find_keys(black_box(&map), 4000))
+}
+
+library_benchmark_group!(
+    name = pipeline_group,
+    benchmarks = [pipeline, scan, filter, predicate, flat_hash_map]
+);
 
 /// The table `hits`, over ClickBench's first file.
 struct Hits(DynScannable<'static>);

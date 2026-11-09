@@ -11,6 +11,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
+use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
@@ -43,6 +44,22 @@ pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
         return 0;
     }
     batch.column(0).int64s().iter().sum()
+}
+
+/// How many of the numbers below `count` a map of the even ones has, less
+/// those of them below `erased`, which it erases.
+#[unsafe(no_mangle)]
+pub extern "C" fn hash_map_found(count: i64, erased: i64) -> usize {
+    let Ok(mut map) = FlatHashMap::for_len(&Heap, 0) else { return 0 };
+    for key in (0..count).step_by(2) {
+        if map.insert(&Heap, key, ()).is_err() {
+            return 0;
+        }
+    }
+    (0..erased).for_each(|key| _ = map.erase(key));
+    let found = (0..count).filter(|&key| map.find(key).is_some()).count();
+    map.clear();
+    found + map.len()
 }
 
 /// `value` doubled, through a `Box`.

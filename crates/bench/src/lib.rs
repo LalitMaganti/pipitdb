@@ -6,6 +6,7 @@ use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::filter::{self, Comparison, Value};
+use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::pipeline::Pipeline;
@@ -311,6 +312,21 @@ pub fn run_filter(
 /// Keeps values over 500: about half.
 pub fn greater(column: &ColumnView, selection: &mut Selection) {
     filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
+}
+
+/// A map whose keys are the first `len` even numbers.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn hash_map(len: i64) -> FlatHashMap<i64, ()> {
+    let mut map = FlatHashMap::for_len(&Heap, 0).expect("allocates");
+    for key in 0..len {
+        map.insert(&Heap, key * 2, ()).expect("allocates");
+    }
+    map
+}
+
+/// How many of the numbers below `count` `map` has.
+pub fn find_keys(map: &FlatHashMap<i64, ()>, count: i64) -> u64 {
+    (0..count).map(|key| u64::from(map.find(key).is_some())).sum()
 }
 
 /// The phone models `string_column` holds.
