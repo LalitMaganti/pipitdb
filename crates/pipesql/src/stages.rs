@@ -93,11 +93,12 @@ pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
 
 /// The aggregate functions, by name.
-const FUNCTIONS: [(&str, Function); 4] = [
+const FUNCTIONS: [(&str, Function); 5] = [
     ("count", Function::Count),
     ("sum", Function::Sum),
     ("min", Function::Min),
     ("max", Function::Max),
+    ("avg", Function::Avg),
 ];
 
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
@@ -364,7 +365,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
             None => compiler.plan.names.add_parts(&[function_name, "(", argument, ")"])?,
         };
-        let binding = compiler.plan.add_named_column(name, DataType::Int64)?;
+        let binding = compiler.plan.add_named_column(name, function.output_type())?;
         aggregates.push(Aggregate { function, input, binding })?;
         scope.push(binding)?;
     }

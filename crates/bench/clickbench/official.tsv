@@ -1,7 +1,7 @@
 0	FROM hits |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits
 1	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0
-2		SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
-3		SELECT AVG(UserID) FROM hits
+2	FROM hits |> AGGREGATE sum(AdvEngineID), count(*), avg(ResolutionWidth)	SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits
+3	FROM hits |> AGGREGATE avg(UserID)	SELECT AVG(UserID) FROM hits
 4		SELECT COUNT(DISTINCT UserID) FROM hits
 5		SELECT COUNT(DISTINCT SearchPhrase) FROM hits
 6		SELECT MIN(EventDate), MAX(EventDate) FROM hits
