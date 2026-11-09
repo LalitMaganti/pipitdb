@@ -148,14 +148,7 @@ impl GroupTable {
             });
             *group = match found {
                 Ok(group) => group,
-                Err(at) => {
-                    let mut key = [0_i64; 1 + KEYS_MAX];
-                    *at_mut!(key, 0) = null(row).cast_signed();
-                    for (word, keys) in at_mut!(key, 1..).iter_mut().zip(keys) {
-                        *word = *at!(keys, row);
-                    }
-                    self.add(at, hash, at!(key, ..=self.keys))?
-                }
+                Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
         }
         Ok(())
@@ -188,6 +181,32 @@ impl GroupTable {
     /// that find groups keep what they read in registers.
     #[cold]
     #[inline(never)]
+    fn add_row(
+        &mut self,
+        at: usize,
+        hash: u64,
+        keys: &[&[i64]],
+        row: usize,
+        null: u64,
+    ) -> Result<u32, Error> {
+        let group = self.len();
+        if group == GROUPS_MAX {
+            return Err(Error::OutOfMemory);
+        }
+        self.hashes.push(hash)?;
+        let start = self.records.len();
+        self.records.extend_zeroed(self.stride)?;
+        *at_mut!(self.records, start) = null.cast_signed();
+        for (word, keys) in at_mut!(self.records, start + 1..).iter_mut().zip(keys) {
+            *word = *at!(keys, row);
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+        let group = group as u32;
+        *at_mut!(self.slots, at) = salt(hash) | (u64::from(group) + 1);
+        Ok(group)
+    }
+
+    /// As `add_row`, given the group's null word and keys together in `key`.
     fn add(&mut self, at: usize, hash: u64, key: &[i64]) -> Result<u32, Error> {
         let group = self.len();
         if group == GROUPS_MAX {
