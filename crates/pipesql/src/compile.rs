@@ -304,6 +304,12 @@ mod tests {
         assert_eq!(kept("FROM t |> WHERE a > 5 |> SELECT a"), []);
         // An integer compared with a float column, which holds it exactly.
         assert_eq!(kept("FROM t |> WHERE f > 1 AND f < 3 |> SELECT f"), [2.5]);
+        assert_eq!(kept("FROM t |> WHERE a IN (-1, 2) |> SELECT b"), [20.0]);
+        // Long enough to be kept in a set.
+        let long = (2..100).map(|i| format!("{i}")).collect::<StdVec<_>>().join(", ");
+        assert_eq!(kept(&format!("FROM t |> WHERE a IN ({long}) |> SELECT b")), [20.0]);
+        // As in SQL, a null is in no list, and not out of one either.
+        assert_eq!(kept("FROM n |> WHERE NOT x IN (2, 3) |> SELECT x"), [1.0]);
     }
 
     #[test]
@@ -319,6 +325,9 @@ mod tests {
         // Either way round, and byte by byte: `i` is after `I`.
         assert_eq!(kept("FROM t |> WHERE 'I' < s |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> WHERE s >= '' AND NOT s > 'it' |> SELECT a"), [2.0]);
+        assert_eq!(kept("FROM t |> WHERE s IN ('it''s', 'x') |> SELECT a"), [1.0]);
+        let long = (0..100).map(|i| format!("'{i}'")).collect::<StdVec<_>>().join(", ");
+        assert_eq!(kept(&format!("FROM t |> WHERE NOT s IN ({long}, '') |> SELECT a")), [1.0]);
     }
 
     #[test]
@@ -399,6 +408,9 @@ mod tests {
         let wide = (0..40).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
+        assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 22));
+        assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::Unsupported, 27));
+        assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::Unsupported, 22));
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));

@@ -10,6 +10,7 @@ use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::allocator::Allocator;
 use pipit_kernel::buffer::Buffer;
+use pipit_kernel::slow_vec::SlowVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
@@ -17,6 +18,9 @@ pub const NESTING_MAX: usize = 64;
 
 /// How many stages a query, or items a list, can have.
 pub const LIST_MAX: usize = 64;
+
+/// How many values an `IN` list can have.
+pub const IN_LIST_MAX: usize = 1 << 16;
 
 /// Parses `source` as a query, with the stages in `registry`.
 pub fn parse_query(
@@ -45,6 +49,8 @@ pub fn parse_expression(allocator: &dyn Allocator, source: &[u8]) -> Result<Ast,
 }
 
 pub(crate) struct Parser<'a> {
+    /// What lists too long for the stack are gathered with.
+    allocator: &'a dyn Allocator,
     source: &'a [u8],
     lexer: Lexer<'a>,
     current: Token,
@@ -53,13 +59,13 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(allocator: &dyn Allocator, source: &'a [u8]) -> Result<Parser<'a>, Error> {
+    pub(crate) fn new(allocator: &'a dyn Allocator, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
         // SAFETY: nodes are read only once written.
         let first = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { source, lexer, current, nodes: Nodes::new(first), failed: None })
+        Ok(Parser { allocator, source, lexer, current, nodes: Nodes::new(first), failed: None })
     }
 
     /// The token the parser is on.
@@ -239,6 +245,10 @@ impl Parser<'_> {
                     operand = self.is_null(operand)?;
                     continue;
                 }
+                if COMPARISON > min_power && self.at_word("in") {
+                    operand = self.in_list(operand)?;
+                    continue;
+                }
                 if let Some((operator, power)) = self.infix(self.current())
                     && power > min_power
                 {
@@ -281,6 +291,42 @@ impl Parser<'_> {
                 };
             }
         }
+    }
+
+    /// `operand IN (1, -2, 'a')`, from the `IN`. The list holds literals
+    /// only, so it can be long without nesting: they're gathered as they're
+    /// read, and written next to each other once it ends.
+    fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
+        self.advance()?;
+        self.expect(TokenKind::LeftParen)?;
+        let mut items = SlowVec::new(self.allocator, IN_LIST_MAX)?;
+        loop {
+            let negative = self.current().kind == TokenKind::Minus;
+            if negative {
+                self.advance()?;
+            }
+            let token = self.advance()?;
+            let number = matches!(token.kind, TokenKind::Integer | TokenKind::Float);
+            if !number && (negative || token.kind != TokenKind::String) {
+                return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
+            }
+            let mut item = leaf(token)?;
+            if negative {
+                item = self.operation(Tag::Unary, Operator::Negate, &[item]);
+            }
+            if items.len() == IN_LIST_MAX {
+                return Err(Error::new(ErrorCode::ListTooLong, token.span));
+            }
+            items.push(item)?;
+            let token = self.advance()?;
+            match token.kind {
+                TokenKind::RightParen => break,
+                TokenKind::Comma => {}
+                _ => return Err(Error::expected(TokenKind::RightParen, token.span)),
+            }
+        }
+        let list = self.list(Tag::List, &items);
+        Ok(self.operation(Tag::Binary, Operator::In, &[operand, list]))
     }
 
     /// `operand IS NULL` or `operand IS NOT NULL`, from the `IS`.
@@ -559,11 +605,11 @@ mod tests {
                 render(source, ast, node.first_child()),
                 render(source, ast, node.first_child() + 1)
             ),
-            Tag::Call => {
+            Tag::Call | Tag::List => {
                 let children = (0..node.child_count())
                     .map(|i| render(source, ast, node.first_child() + i))
                     .collect::<alloc::vec::Vec<_>>();
-                format!("(Call {})", children.join(" "))
+                format!("({:?} {})", node.tag(), children.join(" "))
             }
             _ => {
                 let span = node.span();
@@ -592,6 +638,22 @@ mod tests {
             parse("(a - b) - c * (d / 2.5)"),
             "(Subtract (Subtract a b) (Multiply c (Divide d 2.5)))"
         );
+    }
+
+    #[test]
+    fn parses_in_lists() {
+        assert_eq!(
+            parse("NOT a IN (-1, 6) AND b in ('x')"),
+            "(And (Not (In a (List (Negate 1) 6))) (In b (List 'x')))"
+        );
+        // Lists hold only literals, and can be longer than calls can.
+        let long = (0..1000).map(|i| format!("{i}")).collect::<alloc::vec::Vec<_>>().join(", ");
+        assert!(parse(&format!("a IN ({long})")).starts_with("(In a (List 0 1 2 "));
+        assert_eq!(error("a IN ()"), (ErrorCode::ExpectedExpression, 6));
+        assert_eq!(error("a IN (b)"), (ErrorCode::ExpectedExpression, 6));
+        assert_eq!(error("a IN (-'x')"), (ErrorCode::ExpectedExpression, 7));
+        assert_eq!(error("a IN (1 2)"), (ErrorCode::ExpectedToken, 8));
+        assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
     }
 
     #[test]

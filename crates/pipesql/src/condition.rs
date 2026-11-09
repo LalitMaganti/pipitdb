@@ -1,28 +1,44 @@
 //! Conditions, such as `WHERE`'s, compiled to a `Predicate`.
 //!
 //! A condition is comparisons of a column with an integer, or of a string
-//! column with a string or a `LIKE` pattern, and `IS [NOT] NULL`s, combined
-//! with `AND`, `OR`, `NOT` and parentheses.
+//! column with a string or a `LIKE` pattern, `IN` lists of these, and
+//! `IS [NOT] NULL`s, combined with `AND`, `OR`, `NOT` and parentheses.
 //! Anything else is `Unsupported`.
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::filter::{Comparison, Value};
-use pipit_kernel::predicate::{Leaf, Node as PredicateNode, PREDICATE_NODES_MAX, Predicate};
+use pipit_kernel::predicate::{Leaf, Node as PredicateNode, PREDICATE_NODES_MAX, Predicate, place};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
+use crate::parser::IN_LIST_MAX;
 
 /// The most bytes a condition's strings can have, together.
 const STRINGS_MAX: usize = 1 << 16;
 
+/// The most values a condition's `IN` lists can have, together.
+const VALUES_MAX: usize = IN_LIST_MAX;
+
 /// `node`, a condition, as a predicate over the plan's columns.
 pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Predicate, Error> {
     let mut nodes = SlowVec::new(compiler.allocator(), PREDICATE_NODES_MAX)?;
-    let mut strings = SlowVec::new(compiler.allocator(), STRINGS_MAX)?;
-    add(compiler, &mut nodes, &mut strings, node)?;
-    Ok(Predicate::with_literals(compiler.allocator(), nodes, &strings, &[])?)
+    let mut literals = Literals {
+        strings: SlowVec::new(compiler.allocator(), STRINGS_MAX)?,
+        values: SlowVec::new(compiler.allocator(), VALUES_MAX)?,
+    };
+    add(compiler, &mut nodes, &mut literals, node)?;
+    let Literals { strings, values } = &literals;
+    Ok(Predicate::with_literals(compiler.allocator(), nodes, strings, values)?)
+}
+
+/// What a predicate's leaves compare with.
+struct Literals {
+    /// The bytes of its strings.
+    strings: SlowVec<u8>,
+    /// The values of its `IN` lists.
+    values: SlowVec<i64>,
 }
 
 /// Adds `node`'s predicate nodes, children first, and returns the index of
@@ -30,11 +46,11 @@ pub fn compile_condition(compiler: &Compiler<'_, '_>, node: Node) -> Result<Pred
 fn add(
     compiler: &Compiler<'_, '_>,
     nodes: &mut SlowVec<PredicateNode>,
-    strings: &mut SlowVec<u8>,
+    literals: &mut Literals,
     node: Node,
 ) -> Result<u32, Error> {
     let child = |i: u32| compiler.node(node.first_child() + i);
-    let mut add = |node: Node| add(compiler, nodes, strings, node);
+    let mut add = |node: Node| add(compiler, nodes, literals, node);
     let added = match node.tag() {
         Tag::Unary if node.operator() == Operator::Not => PredicateNode::Not(add(child(0))?),
         Tag::Unary if matches!(node.operator(), Operator::IsNull | Operator::IsNotNull) => {
@@ -55,7 +71,10 @@ fn add(
         Tag::Binary if node.operator() == Operator::Or => {
             PredicateNode::Or(add(child(0))?, add(child(1))?)
         }
-        Tag::Binary => PredicateNode::Leaf(compare(compiler, strings, node)?),
+        Tag::Binary if node.operator() == Operator::In => {
+            PredicateNode::Leaf(in_list(compiler, literals, node)?)
+        }
+        Tag::Binary => PredicateNode::Leaf(compare(compiler, &mut literals.strings, node)?),
         _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(node))),
     };
     push(compiler, nodes, added, node)
@@ -123,6 +142,49 @@ fn like(compiler: &Compiler<'_, '_>, strings: &mut SlowVec<u8>, node: Node) -> R
     }
     let (start, len) = string(compiler, strings, right)?;
     Ok(Leaf::Like { column: column.id, start, len })
+}
+
+/// `column IN (1, 2)`, an integer column and a list of integers, or a string
+/// column and a list of strings, which go in `literals`.
+fn in_list(
+    compiler: &Compiler<'_, '_>,
+    literals: &mut Literals,
+    node: Node,
+) -> Result<Leaf, Error> {
+    let (column, list) = (compiler.node(node.first_child()), compiler.node(node.first_child() + 1));
+    let unsupported = |node| Error::unsupported(Unsupported::Where, compiler.span(node));
+    if column.tag() != Tag::Name {
+        return Err(unsupported(node));
+    }
+    let column = compiler.find_column(column)?;
+    let data_type = at!(compiler.plan.columns, column.id as usize).data_type;
+    let len = list.child_count();
+    if literals.values.len() + len as usize > VALUES_MAX {
+        return Err(Error::new(ErrorCode::ConditionTooLarge, compiler.span(list)));
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `VALUES_MAX`")]
+    let start = literals.values.len() as u32;
+    for i in 0..len {
+        let item = compiler.node(list.first_child() + i);
+        let value = match data_type {
+            DataType::Int64 => {
+                let Value::Int64(value) = value(compiler, item, false, data_type)? else {
+                    pipit_kernel::failed!()
+                };
+                value
+            }
+            DataType::String if item.tag() == Tag::String => {
+                let (start, len) = string(compiler, &mut literals.strings, item)?;
+                place(start, len)
+            }
+            DataType::String | DataType::Float64 => return Err(unsupported(item)),
+        };
+        literals.values.push(value)?;
+    }
+    Ok(match data_type {
+        DataType::String => Leaf::InStrings { column: column.id, start, len },
+        _ => Leaf::In { column: column.id, start, len },
+    })
 }
 
 /// Adds the bytes of `node`, a string literal, to `strings`, a quote for
