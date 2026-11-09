@@ -19,7 +19,20 @@ pub(crate) const GROUPS_MAX: usize = 1 << 26;
 
 /// The top bits of a hash, which a slot keeps.
 fn salt(hash: u64) -> u64 {
-    hash >> 48 << 48
+    hash >> GROUP_BITS << GROUP_BITS
+}
+
+/// How many of a slot's low bits hold the group number plus one.
+const GROUP_BITS: u32 = 27;
+
+/// The slot that `hash` starts probing from, out of `slots`, a power of two.
+/// It's picked by the hash's top bits, which a slot stores, so growing the
+/// table doesn't need to hash any key again.
+#[inline]
+fn slot_of(hash: u64, slots: usize) -> usize {
+    #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
+    let at = (hash >> (slots.leading_zeros() + 1)) as usize;
+    at
 }
 
 /// Hash table that assigns a number to each distinct key, in the order keys
@@ -27,11 +40,10 @@ fn salt(hash: u64) -> u64 {
 /// top bits of the group's hash, and keys are only compared when those match.
 /// Nulls are equal to each other and to nothing else.
 pub(crate) struct GroupTable {
-    /// The hash table. An empty slot is 0. A used slot holds the top 16 bits
-    /// of the group's hash and the group number plus one.
+    /// The hash table. An empty slot is 0. A used slot holds the top bits
+    /// of the group's hash, then the group number plus one in the low
+    /// `GROUP_BITS` bits.
     slots: SlowVec<u64>,
-    /// The hash of each group.
-    hashes: SlowVec<u64>,
     /// Each group's null bits, then its keys, then its payload, `stride`
     /// words each. Keeping them together means comparing a group reads one
     /// cache line.
@@ -54,7 +66,6 @@ impl GroupTable {
         let stride = 1 + keys + payload_words;
         Ok(GroupTable {
             slots: SlowVec::new(allocator, 1)?,
-            hashes: SlowVec::new(allocator, GROUPS_MAX)?,
             // A `SlowVec` holds at most 2^31 values.
             records: SlowVec::new(
                 allocator,
@@ -66,7 +77,7 @@ impl GroupTable {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.hashes.len()
+        self.records.len() / self.stride
     }
 
     /// The payloads: group g's starts at `g * row_stride()`.
@@ -193,7 +204,6 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
-        self.hashes.push(hash)?;
         let start = self.records.len();
         self.records.extend_zeroed(self.stride)?;
         *at_mut!(self.records, start) = null.cast_signed();
@@ -212,7 +222,6 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
-        self.hashes.push(hash)?;
         let start = self.records.len();
         self.records.extend_zeroed(self.stride)?;
         at_mut!(self.records, start..start + key.len()).copy_from_slice(key);
@@ -233,16 +242,17 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
-        self.slots = SlowVec::zeroed(allocator, capacity)?;
+        let mut slots = SlowVec::zeroed(allocator, capacity)?;
         let mask = capacity - 1;
-        for (group, &hash) in (1..).zip(self.hashes.iter()) {
-            #[expect(clippy::cast_possible_truncation, reason = "masked")]
-            let mut at = hash as usize & mask;
-            while *at!(self.slots, at) != 0 {
+        // No need to hash the keys again: `slot_of` only uses bits a slot has.
+        for &slot in self.slots.iter().filter(|&&slot| slot != 0) {
+            let mut at = slot_of(slot, capacity);
+            while *at!(slots, at) != 0 {
                 at = (at + 1) & mask;
             }
-            *at_mut!(self.slots, at) = salt(hash) | group;
+            *at_mut!(slots, at) = slot;
         }
+        self.slots = slots;
         Ok(())
     }
 
@@ -317,8 +327,7 @@ fn load_key_words(
 fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32, usize> {
     check!(slots.len().is_power_of_two());
     let mask = slots.len() - 1;
-    #[expect(clippy::cast_possible_truncation, reason = "masked")]
-    let mut at = hash as usize & mask;
+    let mut at = slot_of(hash, slots.len());
     loop {
         // SAFETY: masked below the slots' count, a power of two.
         let slot = unsafe { *slots.get_unchecked(at) };
