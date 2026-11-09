@@ -12,7 +12,7 @@ use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
 
 /// The most keys a grouping can have: one bit each says which are null.
-pub(crate) const KEYS_MAX: usize = 64;
+pub const KEYS_MAX: usize = 64;
 
 /// The most groups a table can hold.
 pub(crate) const GROUPS_MAX: usize = 1 << 26;
