@@ -48,6 +48,7 @@ fn small(catalog: &'static dyn Catalog, query: &str) -> u64 {
 
 #[library_benchmark]
 #[bench::point(pipitdb_bench::small_plan(100, POINT))]
+#[bench::order(pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b"))]
 fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(plan.pipeline())))
 }

@@ -45,6 +45,10 @@ fn small(c: &mut Criterion) {
     group.bench_function("point_planned", |b| {
         b.iter(|| pipitdb_bench::run(black_box(plan.pipeline())));
     });
+    let order = pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b");
+    group.bench_function("order", |b| {
+        b.iter(|| pipitdb_bench::run(black_box(order.pipeline())));
+    });
     group.finish();
 }
 
