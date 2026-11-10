@@ -102,9 +102,10 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(())
     }
 
-    /// False for its keys, which come out one row per group.
-    fn passes_through(&self, column: ColumnId) -> bool {
-        !self.keys.contains(&column)
+    /// False for every column: what comes out is one row per group, and any
+    /// column it doesn't output is gone.
+    fn passes_through(&self, _: ColumnId) -> bool {
+        false
     }
 
     /// Drops the aggregates nothing reads, keeping one if there are no keys:
