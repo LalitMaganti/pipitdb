@@ -250,8 +250,11 @@ pub fn compare_string(
     // Equality needn't order: most cells differ in length, so aren't read.
     // One test for both `=` and `<>`, so the loop isn't copied.
     let equal = comparison == Comparison::Equal;
+    let len = string.len();
     retain(selection, dropped, |row| {
-        valid(row) && (strings.get(usize::from(row)) == string) == equal
+        let at = usize::from(row);
+        let same = strings.len_of(at) == len && (len == 0 || strings.get(at) == string);
+        valid(row) && same == equal
     });
 }
 

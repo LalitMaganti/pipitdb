@@ -592,6 +592,12 @@ impl<'a> Strings<'a> {
         self.len() == 0
     }
 
+    /// The length of string `row`, found without touching its bytes.
+    #[inline]
+    pub fn len_of(self, row: usize) -> usize {
+        *at!(self.views, 2 * row + 1) as usize
+    }
+
     #[inline]
     pub fn get(self, row: usize) -> &'a [u8] {
         let (start, len) = (*at!(self.views, 2 * row) as usize, *at!(self.views, 2 * row + 1));
