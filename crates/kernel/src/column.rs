@@ -124,6 +124,87 @@ struct Header {
     bounds: Cell<Bounds>,
 }
 
+/// Where a flat view's values are, flat enough to read in a loop, as
+/// Perfetto's `GatherSource`: row `row` is the word and the bit at
+/// `start + row`. Valid for as long as the view's buffers are.
+#[derive(Clone, Copy)]
+pub(crate) struct GatherSource {
+    /// The values, a word each: an integer, a float's bits, or a string's
+    /// view.
+    data: *const i64,
+    /// Which values aren't null, or null if none are.
+    validity: *const u8,
+    /// What a string column's views are into, or null for other columns.
+    bytes: *const u8,
+    /// Where the view's rows start among the values.
+    start: u32,
+}
+
+impl GatherSource {
+    pub(crate) fn of(view: &ColumnView) -> GatherSource {
+        view.check_flat();
+        let header = view.header();
+        GatherSource {
+            data: header.values.as_ptr(),
+            validity: header.validity.as_ref().map_or(core::ptr::null(), Buffer::as_ptr),
+            bytes: header.bytes.as_ref().map_or(core::ptr::null(), Buffer::as_ptr),
+            start: header.value_start + view.start,
+        }
+    }
+
+    /// The word of row `row`.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be a row of the view, whose buffers must be alive.
+    #[inline]
+    pub(crate) unsafe fn word(self, row: u32) -> i64 {
+        // SAFETY: the caller's.
+        unsafe { *self.data.add((self.start + row) as usize) }
+    }
+
+    /// Whether row `row` isn't null.
+    ///
+    /// # Safety
+    ///
+    /// As `word`.
+    #[inline]
+    pub(crate) unsafe fn is_valid(self, row: u32) -> bool {
+        if self.validity.is_null() {
+            return true;
+        }
+        let bit = (self.start + row) as usize;
+        // SAFETY: the caller's, and `ColumnView::new` checked the bitmap
+        // covers every row.
+        unsafe { *self.validity.add(bit / 8) >> (bit % 8) & 1 != 0 }
+    }
+
+    /// The start and length of the string of row `row`.
+    ///
+    /// # Safety
+    ///
+    /// As `word`, and the view must be a string column's.
+    #[inline]
+    pub(crate) unsafe fn string_view(self, row: u32) -> [u32; 2] {
+        let at = (self.start + row) as usize;
+        // SAFETY: the caller's: a word is a string's start and length.
+        unsafe { *self.data.cast::<[u32; 2]>().add(at) }
+    }
+
+    /// The `len` bytes from `start` of a string column's bytes.
+    ///
+    /// # Safety
+    ///
+    /// `start` and `len` must be a `string_view` of the view, whose buffers
+    /// must be alive for `'a`.
+    #[inline]
+    pub(crate) unsafe fn string<'a>(self, start: u32, len: u32) -> &'a [u8] {
+        // SAFETY: the caller's: `ColumnView::strings` checked views are
+        // within its bytes.
+        unsafe { core::slice::from_raw_parts(self.bytes.add(start as usize), len as usize) }
+    }
+}
+
 /// Each is its bit in `Forms`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
