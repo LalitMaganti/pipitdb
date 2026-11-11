@@ -189,7 +189,12 @@ impl Breaker for HashAggregate {
 
     fn new_state(&self, context: &mut Context) -> Result<State, Error> {
         let allocator = context.allocator();
-        let groups = GroupTable::new(allocator, self.spec.key_columns.len(), self.state_words)?;
+        let groups = GroupTable::new(
+            allocator,
+            self.spec.key_columns.len(),
+            self.spec.string_keys,
+            self.state_words,
+        )?;
         let mut total = SlowVec::new(allocator, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
         let mut seen = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
@@ -322,6 +327,8 @@ impl Breaker for HashAggregate {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+    use alloc::string::String;
     use alloc::vec::Vec;
 
     use super::*;
@@ -378,6 +385,55 @@ mod tests {
         }
     }
 
+    /// A string column of `values`, null where `None`.
+    fn strings(values: &[Option<String>]) -> ColumnView {
+        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+        let mut bytes = Vec::new();
+        for (i, value) in values.iter().enumerate() {
+            let value = value.as_deref().unwrap_or_default();
+            let view = [u32::try_from(bytes.len()).unwrap(), u32::try_from(value.len()).unwrap()];
+            views.as_mut_slice::<u32>()[2 * i..2 * i + 2].copy_from_slice(&view);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        for (i, value) in values.iter().enumerate() {
+            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
+        }
+        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+        let validity = values.iter().any(Option::is_none).then_some(bits);
+        ColumnView::strings(&mut Context::new(&Heap), views, stored, validity).unwrap()
+    }
+
+    /// `Rows`, with its key `k` as a string column, of each key's digits.
+    struct StringKeys(Rows);
+
+    impl Source for StringKeys {
+        type State = usize;
+
+        fn new_state(&self, context: &mut Context) -> Result<usize, Error> {
+            self.0.new_state(context)
+        }
+
+        fn next<'s>(
+            &'s self,
+            context: &mut Context,
+            i: &mut usize,
+            batch: &mut RowBatch<'s>,
+        ) -> Result<bool, Error> {
+            if !self.0.next(context, i, batch)? {
+                return Ok(false);
+            }
+            let keys = batch.column(0);
+            let digits = |row: u32| format!("{}", keys.int64s()[row as usize]);
+            let texts: Vec<_> = (0..keys.row_count())
+                .map(|row| (!keys.is_null(row)).then(|| digits(row)))
+                .collect();
+            batch.set_column(0, strings(&texts));
+            Ok(true)
+        }
+    }
+
     /// By the columns at `keys`, `COUNT(*)`, then `COUNT`, `SUM`, `MIN` and
     /// `MAX` of the column at 1.
     fn spec(keys: &[u32]) -> HashAggregateSpec {
@@ -390,13 +446,17 @@ mod tests {
         });
         HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+            string_keys: 0,
             aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
         }
     }
 
-    /// Each row out, its columns as integers, or floats' bits, or `None` if
-    /// null, sorted.
-    fn run(rows: Rows, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
+    /// Each row out, its columns as integers, or floats' bits, or strings'
+    /// digits, or `None` if null, sorted.
+    fn run<S: Source + 'static>(
+        rows: S,
+        spec: HashAggregateSpec,
+    ) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let mut steps = SlowVec::new(&Heap, 1).unwrap();
         assert!(steps.push(Step::Operator(hash_aggregate(&Heap, spec).unwrap())).is_ok());
         let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
@@ -412,7 +472,11 @@ mod tests {
                         DataType::Float64 => {
                             column.values().float64s()[row as usize].to_bits().cast_signed()
                         }
-                        _ => column.int64s()[row as usize],
+                        DataType::String => {
+                            let digits = column.values().strings().get(row as usize);
+                            core::str::from_utf8(digits).unwrap().parse().unwrap()
+                        }
+                        DataType::Int64 => column.int64s()[row as usize],
                     })
                 });
                 out.push(values.collect());
@@ -472,6 +536,29 @@ mod tests {
     }
 
     #[test]
+    fn groups_by_strings_as_by_the_integers_they_spell() {
+        let rows = || Rows {
+            batches: alloc::vec![
+                alloc::vec![(Some(1), Some(1)), (Some(12), Some(2)), (None, Some(1))],
+                alloc::vec![(Some(12), Some(4)), (None, None), (Some(-3), Some(1))],
+                Vec::new(),
+            ],
+            dropped: alloc::vec![1],
+        };
+        for keys in [&[0][..], &[0, 1], &[1, 0]] {
+            let mut by_strings = spec(keys);
+            by_strings.string_keys = 1 << keys.iter().position(|&key| key == 0).unwrap();
+            let expected = run(rows(), spec(keys)).unwrap();
+            assert_eq!(expected.len(), 4);
+            assert_eq!(run(StringKeys(rows()), by_strings).unwrap(), expected);
+        }
+        let mut by_strings = spec(&[0]);
+        by_strings.string_keys = 1;
+        let none = StringKeys(Rows { batches: Vec::new(), dropped: Vec::new() });
+        assert!(run(none, by_strings).unwrap().is_empty());
+    }
+
+    #[test]
     fn aggregates_all_rows_without_keys() {
         let rows = Rows { batches: Vec::new(), dropped: Vec::new() };
         // With no rows, `COUNT` is 0 and the rest are null.
@@ -514,6 +601,7 @@ mod tests {
             });
             let spec = HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                string_keys: 0,
                 aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
             };
             let out = run(rows, spec).unwrap();
@@ -527,6 +615,7 @@ mod tests {
         let call = AggregateCall { function: Function::Avg, column: 1, distinct: false };
         let spec = HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
+            string_keys: 0,
             aggregates: SlowVec::fixed_from(&Heap, [call].into_iter()).unwrap(),
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
@@ -547,6 +636,7 @@ mod tests {
                 calls.map(|(function, distinct)| AggregateCall { function, column: 1, distinct });
             HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                string_keys: 0,
                 aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
             }
         };

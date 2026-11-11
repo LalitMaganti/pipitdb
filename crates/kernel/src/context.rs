@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::query_allocators::QueryAllocators;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
+use crate::string_pool::StringPool;
 
 /// The most scratch selections a run can have.
 pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
@@ -19,6 +20,8 @@ pub struct Context<'a> {
     small: &'a dyn Allocator,
     /// Made when first reserved: most runs need none.
     selections: Option<SlowVec<Selection>>,
+    /// Made when first used: most runs intern no strings.
+    string_pool: Option<StringPool>,
 }
 
 impl<'a> Context<'a> {
@@ -26,7 +29,7 @@ impl<'a> Context<'a> {
     /// `allocator`, for steps run outside a pipeline, such as in tests.
     pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
         let (values, indices, small) = (allocator, allocator, allocator);
-        Context { allocator, values, indices, small, selections: None }
+        Context { allocator, values, indices, small, selections: None, string_pool: None }
     }
 
     /// A query's context, which allocates from `query`'s allocators.
@@ -37,6 +40,7 @@ impl<'a> Context<'a> {
             indices: &query.indices,
             small: &query.small,
             selections: None,
+            string_pool: None,
         }
     }
 
@@ -93,6 +97,16 @@ impl<'a> Context<'a> {
     /// whatever the last step left in them.
     pub fn selections(&mut self) -> &mut [Selection] {
         self.selections.as_deref_mut().unwrap_or_default()
+    }
+
+    /// The run's string pool, so the ids of strings interned anywhere in it
+    /// can be compared.
+    pub fn string_pool(&mut self) -> Result<&mut StringPool, AllocError> {
+        if self.string_pool.is_none() {
+            self.string_pool = Some(StringPool::new(self.allocator)?);
+        }
+        let Some(pool) = &mut self.string_pool else { failed!() };
+        Ok(pool)
     }
 }
 

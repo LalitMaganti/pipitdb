@@ -1,5 +1,6 @@
 //! `GroupTable`: numbers rows by their keys, as Perfetto's does, for the
-//! operators that group rows.
+//! operators that group rows. A string key is grouped by its id in the
+//! run's `StringPool`.
 
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::{AllocError, Allocator};
@@ -10,6 +11,7 @@ use crate::error::Error;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
+use crate::string_pool::Id;
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -52,14 +54,19 @@ pub(crate) struct GroupTable {
     stride: usize,
     /// How many keys there are.
     keys: usize,
+    /// Bit `k` set if key `k` is a string, stored as its id, which is 0 if
+    /// null: as in Perfetto, a null string is a key, not a null one.
+    string_keys: u64,
 }
 
 impl GroupTable {
-    /// A table of `keys` keys, with `payload_words` zeroed words after each
-    /// group's keys for the caller to store per-group data.
+    /// A table of `keys` keys, those in `string_keys` strings, with
+    /// `payload_words` zeroed words after each group's keys for the caller
+    /// to store per-group data.
     pub(crate) fn new(
         allocator: &dyn Allocator,
         keys: usize,
+        string_keys: u64,
         payload_words: usize,
     ) -> Result<GroupTable, AllocError> {
         check!(keys <= KEYS_MAX);
@@ -73,6 +80,7 @@ impl GroupTable {
             )?,
             stride,
             keys,
+            string_keys,
         })
     }
 
@@ -93,7 +101,8 @@ impl GroupTable {
 
     /// Writes the group of each row `select` keeps of `columns`, all if it's
     /// empty, to `groups`, with `columns` as the key. New keys get new
-    /// groups. Each column is a flat `Int64`.
+    /// groups. Each column is flat: a string for a string key, else an
+    /// `Int64`.
     pub(crate) fn find_or_create(
         &mut self,
         context: &mut Context,
@@ -108,7 +117,11 @@ impl GroupTable {
         let mut copies = [const { None }; KEYS_MAX];
         let mut nulls: Option<Buffer> = None;
         for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
-            load_key_words(context, column, select, count, k, copy, &mut nulls)?;
+            if self.string_keys >> k & 1 != 0 {
+                load_string_ids(context, column, select, count, copy)?;
+            } else {
+                load_key_words(context, column, select, count, k, copy, &mut nulls)?;
+            }
         }
         let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
         for ((keys, copy), column) in keys.iter_mut().zip(&copies).zip(columns) {
@@ -256,7 +269,7 @@ impl GroupTable {
         Ok(())
     }
 
-    /// Key `k` of the groups in `range`, as an `Int64` column.
+    /// Key `k` of the groups in `range`, as a column of its type.
     pub(crate) fn write_keys(
         &self,
         context: &mut Context,
@@ -266,6 +279,9 @@ impl GroupTable {
         let stride = self.stride;
         let records = at!(self.records, range.start * stride..range.end * stride);
         let rows = range.len();
+        if self.string_keys >> k & 1 != 0 {
+            return write_strings(context, records, stride, k);
+        }
         let mut values = context.values_buffer(rows * 8)?;
         let out = values.as_mut_slice::<i64>().iter_mut();
         let mut nulls = false;
@@ -285,6 +301,69 @@ impl GroupTable {
         }
         Ok(ColumnView::new(context, DataType::Int64, values, Some(validity))?)
     }
+}
+
+/// Loads `count` rows that `select` keeps of string key column `column`, all
+/// if it's empty, to `copy` as the ids the run's string pool has for them.
+fn load_string_ids(
+    context: &mut Context,
+    column: &ColumnView,
+    select: &[u16],
+    count: usize,
+    copy: &mut Option<Buffer>,
+) -> Result<(), Error> {
+    check!(column.data_type() == DataType::String);
+    let (strings, validity) = (column.values().strings(), column.validity());
+    let mut ids = context.values_buffer(count * 8)?;
+    let allocator = context.allocator();
+    let pool = context.string_pool()?;
+    let string = |i: usize| {
+        let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+        validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
+    };
+    let out = ids.as_mut_slice::<i64>();
+    pool.intern_strings(allocator, count, string, |i, id| {
+        *at_mut!(out, i) = i64::from(id.raw_id());
+    })?;
+    *copy = Some(ids);
+    Ok(())
+}
+
+/// Key `k`, a string key, of `records`, `stride` words each, as a string
+/// column.
+#[inline(never)]
+fn write_strings(
+    context: &mut Context,
+    records: &[i64],
+    stride: usize,
+    k: usize,
+) -> Result<ColumnView, Error> {
+    let rows = records.len() / stride;
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
+    let id = |row: usize| Id::raw(*at!(records, row * stride + 1 + k) as u32);
+    let mut views = context.values_buffer(rows * 8)?;
+    let mut validity = context.small_buffer(rows.div_ceil(8))?;
+    let valid = validity.as_mut_slice::<u8>();
+    valid.fill(0);
+    let (views_out, _) = views.as_mut_slice::<u32>().as_chunks_mut::<2>();
+    let pool = context.string_pool()?;
+    let (mut bytes, mut nulls) = (0_u32, false);
+    for (row, view) in views_out.iter_mut().enumerate() {
+        let string = pool.get(id(row));
+        nulls |= string.is_none();
+        *at_mut!(valid, row / 8) |= u8::from(string.is_some()) << (row % 8);
+        let len = u32::try_from(string.map_or(0, <[u8]>::len)).map_err(|_| Error::OutOfMemory)?;
+        *view = [bytes, len];
+        bytes = bytes.checked_add(len).ok_or(Error::OutOfMemory)?;
+    }
+    let mut stored = context.bytes_buffer(bytes as usize)?;
+    let pool = context.string_pool()?;
+    let out = stored.as_mut_slice::<u8>();
+    for (row, &[start, len]) in views_out.iter().enumerate() {
+        let string = pool.get(id(row)).unwrap_or_default();
+        at_mut!(out, start as usize..(start + len) as usize).copy_from_slice(string);
+    }
+    Ok(ColumnView::strings(context, views, stored, nulls.then_some(validity))?)
 }
 
 /// Loads `count` rows that `select` keeps of key column `column`, all if

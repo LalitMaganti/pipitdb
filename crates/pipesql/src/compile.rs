@@ -366,6 +366,10 @@ mod tests {
         let mut keys = kept("FROM t |> AGGREGATE count(*) GROUP BY a |> SELECT a");
         keys.sort_by(f64::total_cmp);
         assert_eq!(keys, [1.0, 2.0]);
+        // A string key, shown as its length.
+        let strings = run("FROM t |> AGGREGATE count(*) GROUP BY s");
+        let s = (b"s".to_vec(), [4.0, 0.0].to_vec());
+        assert_eq!(strings, [s, (b"count(*)".to_vec(), [1.0, 1.0].to_vec())]);
     }
 
     #[test]
