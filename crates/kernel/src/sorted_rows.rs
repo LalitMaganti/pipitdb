@@ -211,7 +211,17 @@ impl SortedRows {
         for (row, i) in rows.iter_mut().zip(at.min(end)..end) {
             *row = self.order.row(i);
         }
-        self.rows.gather(context, out, at!(rows, ..(end - at.min(end)) as usize))
+        self.rows.gather(context, out, at!(rows, ..(end - at.min(end)) as usize), at)
+    }
+
+    /// Copies the columns `RowStore::scatter` can into the order, once
+    /// sorted, so gathering them only views them. Rows still in the order
+    /// they're held are viewed where they are anyway.
+    pub(crate) fn scatter(&mut self, context: &mut Context) -> Result<(), Error> {
+        let Sorted::Words { words, packing } = &mut self.order else { return Ok(()) };
+        let packing = *packing;
+        let words = at_mut!(words, ..self.order_len as usize);
+        self.rows.scatter(context, words, |word| packing.row(word))
     }
 }
 

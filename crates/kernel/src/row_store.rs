@@ -22,6 +22,23 @@ const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
 /// batches, about 4 billion rows.
 const BATCHES_MAX: usize = 1 << (32 - ROW_BITS);
 
+/// `scatter` puts this many output rows in order at a time, so a column's
+/// values for them stay in cache.
+const REGION_BITS: u32 = 16;
+
+/// `scatter` copies only between these many rows, the most whose numbers
+/// fit the bits of a word below `POSITION_SHIFT`, and only once it can copy
+/// this many columns.
+const SCATTER_ROWS: Range<usize> = 1 << 16..1 << POSITION_SHIFT;
+const SCATTER_COLUMNS_MIN: usize = 3;
+
+/// Where `scatter` keeps, in each row's word, where that row goes, and in
+/// each slot's word, where in its region the value that arrived in the slot
+/// goes.
+const POSITION_SHIFT: u32 = 24;
+const OFFSET_SHIFT: u32 = 48;
+const POSITION_MASK: u64 = (1 << POSITION_SHIFT) - 1;
+
 /// Rows are numbered from 0, in the order they were appended. Every column
 /// appended must be flat, as planning makes the columns a breaker holds.
 ///
@@ -52,6 +69,11 @@ pub(crate) struct RowStore {
     /// By column, a bit for whether any batch held has nulls in it; the
     /// last bit is for every column from there on.
     nullable: u64,
+    /// By column, a bit for whether `scatter` copied it.
+    scattered: u64,
+    /// The columns `scatter` copied, in output order: by column copied, a
+    /// view of each batch's worth.
+    copies: SlowVec<ColumnView>,
 }
 
 impl RowStore {
@@ -65,6 +87,8 @@ impl RowStore {
             packing: SlowVec::new(allocator, 1 << 6)?,
             packed: 0,
             nullable: 0,
+            scattered: 0,
+            copies: SlowVec::new(allocator, 1 << 24)?,
         })
     }
 
@@ -165,12 +189,14 @@ impl RowStore {
     /// Fills `out` with up to a batch's worth of `rows`, in that order and
     /// repeats included, returning how many. Rows held one after another in
     /// one batch are viewed where they are held; any others are copied into
-    /// buffers from `context`.
+    /// buffers from `context`. `at` is where `rows` start in the order
+    /// `scatter` was given, if it was.
     pub(crate) fn gather(
         &mut self,
         context: &mut Context,
         out: &mut RowBatch,
         rows: &[u32],
+        at: u32,
     ) -> Result<u32, Error> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         let count = rows.len().min(BATCH_ROWS_MAX as usize) as u32;
@@ -186,14 +212,16 @@ impl RowStore {
         let places = at!(places, ..count as usize);
         let first_place = *at!(places, 0);
         let (held, start) = self.find(first_place);
+        let scattered = |c: usize| self.copied(c, at, count);
         // Rows from `start` on in one batch, not running past its last.
         let run = start + count <= 1 << ROW_BITS
             && (0..count)
                 .zip(rows.iter().zip(places))
                 .all(|(r, (&row, &place))| row == first + r && place == first_place + r);
         if run {
-            for held in held {
-                let Ok(()) = out.push_column(held.view().slice(start, count)) else { failed!() };
+            for (c, held) in held.iter().enumerate() {
+                let column = scattered(c).unwrap_or_else(|| held.view().slice(start, count));
+                let Ok(()) = out.push_column(column) else { failed!() };
             }
             return Ok(count);
         }
@@ -201,12 +229,116 @@ impl RowStore {
         let width = self.width as usize;
         check!(self.held.len() == self.batches as usize * width);
         for c in 0..width {
-            let nullable = self.nullable >> c.min(63) & 1 != 0;
-            let data_type = at!(held, c).view().data_type();
-            let column = gather(context, data_type, (&self.held, width, c), places, nullable)?;
+            let column = if let Some(column) = scattered(c) {
+                column
+            } else {
+                let nullable = self.nullable >> c.min(63) & 1 != 0;
+                let data_type = at!(held, c).view().data_type();
+                gather(context, data_type, (&self.held, width, c), places, nullable)?
+            };
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
+    }
+
+    /// Column `column`'s `count` values from `at` in the order `scatter` was
+    /// given, if it copied the column.
+    #[inline(never)]
+    fn copied(&self, column: usize, at: u32, count: u32) -> Option<ColumnView> {
+        if column >= 63 || self.scattered >> column & 1 == 0 {
+            return None;
+        }
+        let k = (self.scattered & ((1 << column) - 1)).count_ones() as usize;
+        check!(at.is_multiple_of(BATCH_ROWS_MAX));
+        let batch = k * self.batches as usize + (at / BATCH_ROWS_MAX) as usize;
+        Some(at!(self.copies, batch).slice(0, count))
+    }
+
+    /// Copies each column it can, of words with no nulls, into the order the
+    /// rows will be gathered in, letting go of each held batch's values once
+    /// they're copied. `words` are the rows in that order, each word's row
+    /// `row_of` it, in bits below `POSITION_SHIFT`; it uses the bits above.
+    /// Rows are appended to the region of output rows they go to, a held
+    /// batch at a time, which reads and writes in order rather than at
+    /// random; then each region, which fits in cache, is put in order.
+    /// It only pays for many rows and a few columns.
+    pub(crate) fn scatter(
+        &mut self,
+        context: &mut Context,
+        words: &mut [u64],
+        row_of: impl Fn(u64) -> u32,
+    ) -> Result<(), Error> {
+        self.flush(context)?;
+        let (width, rows) = (self.width as usize, words.len());
+        let allocator = context.allocator();
+        // A bit for each column to copy, and each column's type.
+        let (mut copy, mut types) = (0_u64, [DataType::Int64; 63]);
+        for c in 0..width.min(63) {
+            *at_mut!(types, c) = at!(self.held, c).view().data_type();
+            if self.nullable >> c & 1 == 0 && !at!(types, c).has_bytes() {
+                copy |= 1 << c;
+            }
+        }
+        let columns = || (0..63).filter(move |c| copy >> c & 1 != 0);
+        // Every row is then held in order, a full batch at a time.
+        let dense = self.dense as usize == rows && self.len() as usize == rows;
+        if !dense
+            || !SCATTER_ROWS.contains(&rows)
+            || (copy.count_ones() as usize) < SCATTER_COLUMNS_MIN
+        {
+            return Ok(());
+        }
+        // 1. Where each row goes, in its own word.
+        for at in 0..rows {
+            let word = at_mut!(words, row_of(*at!(words, at)) as usize);
+            *word = *word & !(POSITION_MASK << POSITION_SHIFT) | (at as u64) << POSITION_SHIFT;
+        }
+        // 2. Each held batch's rows to the next slots of their regions, then
+        // its values are let go of. A region's slots fill from its start, so
+        // an output batch's buffer is taken when its first slot is: by then
+        // about as many held batches are let go of, whose buffers it reuses.
+        let mut next: [usize; 256] = core::array::from_fn(|r| r << REGION_BITS);
+        let mut copies = Copies::new(allocator, copy.count_ones() as usize, rows)?;
+        // What's held in place of a column copied, which is never read.
+        let nothing = context.values_buffer(BATCH_ROWS_MAX as usize * 8)?;
+        let empty = ColumnView::new(context, DataType::Int64, nothing, None)?;
+        let mut slots = [0_usize; BATCH_ROWS_MAX as usize];
+        for b in 0..rows.div_ceil(BATCH_ROWS_MAX as usize) {
+            let first = b * BATCH_ROWS_MAX as usize;
+            let count = (rows - first).min(BATCH_ROWS_MAX as usize);
+            for (slot, row) in slots.iter_mut().zip(first..first + count) {
+                let position = (*at!(words, row) >> POSITION_SHIFT & POSITION_MASK) as usize;
+                let region = position >> REGION_BITS;
+                *slot = *at!(next, region);
+                // So every slot is written once.
+                check!(*slot < rows.min((region + 1) << REGION_BITS));
+                *at_mut!(next, region) += 1;
+                if slot.is_multiple_of(BATCH_ROWS_MAX as usize) {
+                    copies.take(context, *slot)?;
+                }
+                let offset = (position & ((1 << REGION_BITS) - 1)) as u64;
+                let word = at_mut!(words, *slot);
+                *word = *word & !(u64::MAX << OFFSET_SHIFT) | offset << OFFSET_SHIFT;
+            }
+            for (k, c) in columns().enumerate() {
+                let source = at!(self.held, b * width + c);
+                for (row, &slot) in (0..).zip(at!(slots, ..count)) {
+                    copies.write(k, slot, source.word(row));
+                }
+                *at_mut!(self.held, b * width + c) = GatherSource::of(&empty);
+            }
+        }
+        // 3. Each region in order.
+        copies.put_in_order(allocator, words)?;
+        self.copies = SlowVec::fixed(allocator, copies.buffers.len())?;
+        for (c, buffers) in columns().zip(copies.buffers.chunks_mut(copies.batches)) {
+            for buffer in buffers {
+                let Some(buffer) = buffer.take() else { failed!() };
+                self.copies.push(ColumnView::new(context, *at!(types, c), buffer, None)?)?;
+            }
+        }
+        self.scattered = copy;
+        Ok(())
     }
 
     /// Where row `row` is: its batch, shifted up `ROW_BITS`, and its row in it.
@@ -219,6 +351,78 @@ impl RowStore {
         let width = self.width as usize;
         let first = (place >> ROW_BITS) as usize * width;
         (at!(self.held, first..first + width), place & ROW_MASK)
+    }
+}
+
+/// What `scatter` copies columns into: by column copied, then batch of
+/// output rows, a buffer once its first row is taken.
+struct Copies {
+    buffers: SlowVec<Option<Buffer>>,
+    rows: usize,
+    batches: usize,
+}
+
+impl Copies {
+    fn new(allocator: &dyn Allocator, columns: usize, rows: usize) -> Result<Copies, Error> {
+        let batches = rows.div_ceil(BATCH_ROWS_MAX as usize);
+        let buffers = SlowVec::fixed_from(allocator, (0..columns * batches).map(|_| None))?;
+        Ok(Copies { buffers, rows, batches })
+    }
+
+    /// Takes every column's buffer for the batch output row `first`, a
+    /// batch's first, is in.
+    #[inline(never)]
+    fn take(&mut self, context: &mut Context, first: usize) -> Result<(), Error> {
+        let batch = first / BATCH_ROWS_MAX as usize;
+        let len = (self.rows - first).min(BATCH_ROWS_MAX as usize);
+        for k in 0..self.buffers.len() / self.batches {
+            *at_mut!(self.buffers, k * self.batches + batch) =
+                Some(context.values_buffer(len * 8)?);
+        }
+        Ok(())
+    }
+
+    /// Where column `k` holds output row `at`, whose batch's buffer is taken.
+    fn slot(&self, k: usize, at: usize) -> *mut i64 {
+        check!(at < self.rows);
+        let Some(buffer) = at!(self.buffers, k * self.batches + at / BATCH_ROWS_MAX as usize)
+        else {
+            failed!()
+        };
+        // SAFETY: a batch's buffer holds a word for each row from its first
+        // to the last, or a batch's.
+        unsafe { buffer.as_non_null().cast::<i64>().as_ptr().add(at % BATCH_ROWS_MAX as usize) }
+    }
+
+    fn write(&self, k: usize, at: usize, value: i64) {
+        // SAFETY: as in `slot`, and the buffer isn't shared yet.
+        unsafe { self.slot(k, at).write(value) };
+    }
+
+    /// Puts each region of output rows in order, through a copy that stays
+    /// in cache: each slot's word in `words` says where in its region the
+    /// value that arrived in it goes.
+    fn put_in_order(&self, allocator: &dyn Allocator, words: &[u64]) -> Result<(), Error> {
+        let mut values = SlowVec::<i64>::zeroed(allocator, 1 << REGION_BITS)?;
+        for first in (0..self.rows).step_by(1 << REGION_BITS) {
+            let end = self.rows.min(first + (1 << REGION_BITS));
+            for k in 0..self.buffers.len() / self.batches {
+                let values = at_mut!(values, ..end - first);
+                for (value, at) in values.iter_mut().zip(first..) {
+                    *value = self.read(k, at);
+                }
+                for (&value, &word) in values.iter().zip(at!(words, first..end)) {
+                    self.write(k, first + (word >> OFFSET_SHIFT) as usize, value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Output row `at` of column `k`, once written.
+    fn read(&self, k: usize, at: usize) -> i64 {
+        // SAFETY: as in `slot`.
+        unsafe { *self.slot(k, at) }
     }
 }
 
@@ -480,7 +684,10 @@ mod tests {
         let all: Vec<u32> = (0..store.len()).collect();
         let mut got = Vec::new();
         for chunk in all.chunks(BATCH_ROWS_MAX as usize) {
-            assert_eq!(store.gather(&mut context, &mut out, chunk).unwrap() as usize, chunk.len());
+            assert_eq!(
+                store.gather(&mut context, &mut out, chunk, 0).unwrap() as usize,
+                chunk.len()
+            );
             if chunk[0] == 0 {
                 // The first batch's rows, in order, are viewed where held.
                 assert!(out.column(0).shares_values(first.as_ref().unwrap()));
@@ -492,7 +699,7 @@ mod tests {
         let backwards: Vec<u32> = (0..store.len()).rev().step_by(3).collect();
         let mut got = Vec::new();
         for chunk in backwards.chunks(BATCH_ROWS_MAX as usize) {
-            store.gather(&mut context, &mut out, chunk).unwrap();
+            store.gather(&mut context, &mut out, chunk, 0).unwrap();
             got.extend(read(&out));
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
@@ -511,10 +718,58 @@ mod tests {
         let last = BATCH_ROWS_MAX * 2 - 1;
         let rows = [last, 3, BATCH_ROWS_MAX, 0];
         let mut out = RowBatch::new();
-        store.gather(&mut context, &mut out, &rows).unwrap();
+        store.gather(&mut context, &mut out, &rows, 0).unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let null = (None, b"v0".to_vec());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
         assert_eq!(read(&out), [int(newest), null, int(10_000), int(0)]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
+    fn scatters_columns_into_an_order() {
+        let mut context = Context::new(&Heap);
+        let mut store = RowStore::new(&Heap).unwrap();
+        let batches = 40;
+        for b in 0..batches {
+            let mut batch = batch_without_nulls(&mut context, i64::from(b) * 10_000);
+            // Two more integer columns, so there are enough to copy.
+            for k in 1..3 {
+                let column = batch.column(0).clone();
+                let mut values = context.values_buffer(BATCH_ROWS_MAX as usize * 8).unwrap();
+                for (out, &value) in values.as_mut_slice::<i64>().iter_mut().zip(column.int64s()) {
+                    *out = value * 10 + k;
+                }
+                let view = ColumnView::new(&mut context, DataType::Int64, values, None).unwrap();
+                batch.push_column(view).ok().unwrap();
+            }
+            store.append(&mut context, &batch).unwrap();
+        }
+        let n = store.len();
+        // Every row once, out of order.
+        let order = |i: u32| u32::try_from(u64::from(i) * 48_271 % u64::from(n)).unwrap();
+        let rows: Vec<u32> = (0..n).map(order).collect();
+        let mut sorted = rows.clone();
+        sorted.sort_unstable();
+        assert!(sorted.iter().copied().eq(0..n));
+        let mut words: Vec<u64> = rows.iter().map(|&row| u64::from(row) | 0xdead << 30).collect();
+        store.scatter(&mut context, &mut words, |word| (word & 0xff_ffff) as u32).unwrap();
+        assert_eq!(store.scattered.count_ones(), 3);
+
+        let mut out = RowBatch::new();
+        let value =
+            |row: u32| i64::from(row / BATCH_ROWS_MAX) * 10_000 + i64::from(row % BATCH_ROWS_MAX);
+        for (chunk, at) in
+            rows.chunks(BATCH_ROWS_MAX as usize).zip((0..).step_by(BATCH_ROWS_MAX as usize))
+        {
+            store.gather(&mut context, &mut out, chunk, at).unwrap();
+            for (r, &row) in chunk.iter().enumerate() {
+                assert_eq!(out.column(0).int64s()[r], value(row));
+                assert_eq!(out.column(2).int64s()[r], value(row) * 10 + 1);
+                assert_eq!(out.column(3).int64s()[r], value(row) * 10 + 2);
+                let string = out.column(1).string_values().get(r).to_vec();
+                assert_eq!(string, format!("v{}", value(row)).into_bytes());
+            }
+        }
     }
 }

@@ -152,7 +152,7 @@ impl Words {
         word >> self.row_bits
     }
 
-    fn row(self, word: u64) -> u32 {
+    pub(crate) fn row(self, word: u64) -> u32 {
         #[expect(clippy::cast_possible_truncation, reason = "at most 31 bits")]
         let row = (word & ((1 << self.row_bits) - 1)) as u32;
         row

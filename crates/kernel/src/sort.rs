@@ -47,7 +47,8 @@ impl Breaker for Sort {
     }
 
     fn finalize(&self, context: &mut Context, sorting: &mut Sorting) -> Result<(), Error> {
-        sorting.rows.sort(context)
+        sorting.rows.sort(context)?;
+        sorting.rows.scatter(context)
     }
 
     fn serve(
