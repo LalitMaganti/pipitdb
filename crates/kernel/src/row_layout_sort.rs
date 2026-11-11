@@ -1,23 +1,20 @@
 //! `sort_row_layout`: stably sorts rows laid out by a `RowLayout`, as
 //! Perfetto's `core/util/row_layout_sort.cc` does. It sorts on the bytes
-//! which differ between rows, the first 8 of them packed into one integer
-//! per row so that sorting doesn't read the rows again. Rows which agree on
-//! those 8 bytes are then sorted on the next 8, and so on, with the same
-//! sort.
+//! which differ between rows, as many as fit packed above the row's number
+//! in one word, so that sorting doesn't read the rows again. Rows which
+//! agree on those bytes are then sorted on the next, and so on, with the
+//! same sort.
 
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
-use crate::radix_sort::{KeyedIndex, insertion_sort, merge, stable_sort_keyed_indices};
+use crate::radix_sort::{insertion_sort, merge, sort_words};
 use crate::slow_vec::SlowVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
 /// rather than sorted.
 const MAX_MERGED_RUNS: usize = 32;
 const ROWS_PER_MERGED_RUN: usize = 256;
-
-/// The most bytes packed into a key.
-const MAX_KEY_BYTES: usize = 8;
 
 /// Below this size, a group of tied rows is sorted by insertion.
 const INSERTION_SORT_TIES: usize = 16;
@@ -132,15 +129,57 @@ fn pack_key(row: &[u8], varying: &[u32]) -> u64 {
     varying.iter().fold(0, |key, &b| (key << 8) | u64::from(*at!(row, b as usize)))
 }
 
-/// Merges pairs of the runs `tokens` starts with at `runs`, earlier run
-/// first so ties keep their order, until one is left. Returns whether the
-/// result is in `scratch` rather than `tokens`.
-fn merge_runs(
-    tokens: &mut [KeyedIndex],
-    scratch: &mut [KeyedIndex],
-    order: &mut ExistingOrder,
-) -> bool {
-    let (mut source, mut dest) = (tokens, scratch);
+/// How a row's bytes and number are packed into a word.
+#[derive(Clone, Copy)]
+struct Words {
+    /// The low bits, which hold the row's number.
+    row_bits: u32,
+    /// How many of its varying bytes a word holds above them.
+    key_bytes: usize,
+}
+
+impl Words {
+    /// For at least 2 rows.
+    fn of(count: u32) -> Words {
+        let row_bits = u32::BITS - (count - 1).leading_zeros();
+        Words { row_bits, key_bytes: ((u64::BITS - row_bits) / 8) as usize }
+    }
+
+    /// The word of row `r`, `row`, holding its bytes at `varying`, at most
+    /// `key_bytes`.
+    fn word(self, row: &[u8], varying: &[u32], r: u32) -> u64 {
+        pack_key(row, varying) << self.row_bits | u64::from(r)
+    }
+
+    fn key(self, word: u64) -> u64 {
+        word >> self.row_bits
+    }
+
+    fn row(self, word: u64) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most 31 bits")]
+        let row = (word & ((1 << self.row_bits) - 1)) as u32;
+        row
+    }
+
+    /// Sorts `words`, those with equal keys in order already, on their keys
+    /// of `key_bytes` bytes. Returns whether they're in `scratch` instead.
+    fn sort(
+        self,
+        allocator: &dyn Allocator,
+        words: &mut [u64],
+        scratch: &mut [u64],
+        key_bytes: usize,
+    ) -> Result<bool, AllocError> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most 64 bits")]
+        let key_bits = key_bytes as u32 * 8;
+        sort_words(allocator, words, scratch, self.row_bits, key_bits)
+    }
+}
+
+/// Merges pairs of the runs `words` starts with at `runs` until one is
+/// left. Returns whether the result is in `scratch` rather than `words`.
+fn merge_runs(words: &mut [u64], scratch: &mut [u64], order: &mut ExistingOrder) -> bool {
+    let (mut source, mut dest) = (words, scratch);
     let mut in_scratch = false;
     let ExistingOrder { runs, runs_len, .. } = order;
     while *runs_len > 2 {
@@ -168,40 +207,39 @@ fn merge_runs(
     in_scratch
 }
 
-/// Sorts each run of tokens with equal keys on the varying bytes from
-/// `from` on, 8 at a time, with the same sort as the first 8.
+/// Sorts each run of words with equal keys on the varying bytes from
+/// `from` on, as many at a time as a word holds, with the same sort.
 fn sort_ties(
     allocator: &dyn Allocator,
-    tokens: &mut [KeyedIndex],
+    words: &mut [u64],
     rows: Rows,
     varying: &[u32],
     from: usize,
-    spare: &mut [KeyedIndex],
+    packing: Words,
+    spare: &mut [u64],
 ) -> Result<(), AllocError> {
-    let next = at!(varying, from..(from + MAX_KEY_BYTES).min(varying.len()));
+    let next = at!(varying, from..(from + packing.key_bytes).min(varying.len()));
     let mut i = 0;
-    while i < tokens.len() {
+    while i < words.len() {
         let mut j = i + 1;
-        while j < tokens.len() && at!(tokens, j).key == at!(tokens, i).key {
+        while j < words.len() && packing.key(*at!(words, j)) == packing.key(*at!(words, i)) {
             j += 1;
         }
         if j - i > 1 {
-            let tied = at_mut!(tokens, i..j);
-            for t in tied.iter_mut() {
-                t.key = pack_key(rows.get(t.index), next);
+            let tied = at_mut!(words, i..j);
+            for word in tied.iter_mut() {
+                let r = packing.row(*word);
+                *word = packing.word(rows.get(r), next, r);
             }
             let spare = at_mut!(spare, i..j);
             if tied.len() < INSERTION_SORT_TIES {
                 insertion_sort(tied);
-            } else {
-                #[expect(clippy::cast_possible_truncation, reason = "at most 64 bits")]
-                let key_bits = next.len() as u32 * 8;
-                if stable_sort_keyed_indices(allocator, tied, spare, key_bits)? {
-                    tied.copy_from_slice(spare);
-                }
+            } else if packing.sort(allocator, tied, spare, next.len())? {
+                tied.copy_from_slice(spare);
             }
-            if varying.len() > from + MAX_KEY_BYTES {
-                sort_ties(allocator, tied, rows, varying, from + MAX_KEY_BYTES, spare)?;
+            if varying.len() > from + packing.key_bytes {
+                let from = from + packing.key_bytes;
+                sort_ties(allocator, tied, rows, varying, from, packing, spare)?;
             }
         }
         i = j;
@@ -209,16 +247,16 @@ fn sort_ties(
     Ok(())
 }
 
-/// Stably sorts `indices` by the rows of `stride` bytes in `row_layout`,
-/// the `i`th index's row the `i`th. Frees the rows once sorting no longer
-/// needs them, before the memory the rest of the sort takes.
+/// Stably sorts `order`, the numbers of the rows of `stride` bytes in
+/// `row_layout` in the order they're laid out. Frees the rows once sorting
+/// no longer needs them, before the memory the rest of the sort takes.
 pub(crate) fn sort_row_layout(
     allocator: &dyn Allocator,
     row_layout: &mut SlowVec<u8>,
     stride: u32,
-    indices: &mut [u32],
+    order: &mut [u32],
 ) -> Result<(), AllocError> {
-    let Ok(count) = u32::try_from(indices.len()) else { failed!() };
+    let Ok(count) = u32::try_from(order.len()) else { failed!() };
     if count <= 1 {
         return Ok(());
     }
@@ -226,46 +264,43 @@ pub(crate) fn sort_row_layout(
     check!(row_layout.len() >= count as usize * rows.stride);
     // 1. Reuse the order the rows are already in, where it helps: keep where
     // runs start, to merge them, if there are few.
-    let mut order = find_existing_order(rows);
-    if order.sorted {
+    let mut existing = find_existing_order(rows);
+    if existing.sorted {
         return Ok(());
     }
-    if order.strictly_descending {
+    if existing.strictly_descending {
         // No two rows are equal, so reversing keeps ties in order.
-        indices.reverse();
+        order.reverse();
         return Ok(());
     }
-    // 2. Pack the first 8 varying bytes into keys, so sorting them doesn't
-    // read rows through their offsets again and again.
+    // 2. Pack the varying bytes a word holds above each row's number, so
+    // sorting them doesn't read rows through their offsets again and again,
+    // and the words of rows with equal bytes are in order.
     let varying = find_varying_bytes(allocator, rows)?;
-    let first = at!(varying, ..varying.len().min(MAX_KEY_BYTES));
-    let mut tokens = SlowVec::<KeyedIndex>::zeroed(allocator, indices.len())?;
-    for (r, (token, &value)) in (0..count).zip(tokens.iter_mut().zip(indices.iter())) {
-        *token = KeyedIndex { key: pack_key(rows.get(r), first), index: r, value };
-    }
-    if varying.len() <= MAX_KEY_BYTES {
-        // Every byte that orders the rows is in their keys.
+    let packing = Words::of(count);
+    let first = at!(varying, ..varying.len().min(packing.key_bytes));
+    let words = (0..count).map(|r| packing.word(rows.get(r), first, r));
+    let mut words = SlowVec::fixed_from(allocator, words)?;
+    if varying.len() <= packing.key_bytes {
+        // Every byte that orders the rows is in their words.
         row_layout.free();
     }
-    let mut spare = SlowVec::<KeyedIndex>::zeroed(allocator, indices.len())?;
-    // 3. Merge the runs, or sort, keeping ties in input order.
-    let in_spare = if order.runs_len > 0 {
-        merge_runs(&mut tokens, &mut spare, &mut order)
+    let mut spare = SlowVec::<u64>::zeroed(allocator, order.len())?;
+    // 3. Merge the runs, or sort.
+    let in_spare = if existing.runs_len > 0 {
+        merge_runs(&mut words, &mut spare, &mut existing)
     } else {
-        #[expect(clippy::cast_possible_truncation, reason = "at most 64 bits")]
-        let key_bits = first.len() as u32 * 8;
-        stable_sort_keyed_indices(allocator, &mut tokens, &mut spare, key_bits)?
+        packing.sort(allocator, &mut words, &mut spare, first.len())?
     };
-    let (sorted, free) =
-        if in_spare { (&mut spare, &mut tokens) } else { (&mut tokens, &mut spare) };
-    // 4. If the keys left out varying bytes, equal keys may still be
-    // different rows: sort each tied group on the bytes after the first 8.
-    if varying.len() > MAX_KEY_BYTES {
+    let (sorted, free) = if in_spare { (&mut spare, &mut words) } else { (&mut words, &mut spare) };
+    // 4. If the words left out varying bytes, equal keys may still be
+    // different rows: sort each tied group on the bytes after them.
+    if varying.len() > packing.key_bytes {
         let rows = Rows { data: row_layout, stride: stride as usize, count };
-        sort_ties(allocator, sorted, rows, &varying, MAX_KEY_BYTES, free)?;
+        sort_ties(allocator, sorted, rows, &varying, packing.key_bytes, packing, free)?;
     }
-    for (index, token) in indices.iter_mut().zip(sorted.iter()) {
-        *index = token.value;
+    for (row, &word) in order.iter_mut().zip(sorted.iter()) {
+        *row = packing.row(word);
     }
     Ok(())
 }
@@ -296,15 +331,13 @@ mod tests {
     fn expect_sorted(rows: &[u8], stride: usize) {
         let count = u32::try_from(rows.len() / stride).unwrap();
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
-        // The indices are the rows' own, shifted, to see values carried.
-        let mut indices: Vec<u32> = (0..count).map(|i| i + 100).collect();
+        let mut indices: Vec<u32> = (0..count).collect();
         let mut row_layout = SlowVec::new(&Heap, 1 << 20).unwrap();
         row_layout.extend_from_slice(rows).unwrap();
         let stride = u32::try_from(stride).unwrap();
         sort_row_layout(&Heap, &mut row_layout, stride, &mut indices).unwrap();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));
-        let expected: Vec<u32> = expected.iter().map(|i| i + 100).collect();
         assert_eq!(indices, expected, "{count} rows of {stride} bytes");
     }
 
