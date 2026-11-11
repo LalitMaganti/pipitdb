@@ -30,7 +30,7 @@ pub(crate) struct SortedRows {
     /// By key, its column if it's a string key, whose ranks among the rows'
     /// strings are laid out only once all are in.
     strings: SlowVec<Option<u32>>,
-    /// Each row's keys, one row after another.
+    /// Each row's keys, one row after another, until they're sorted.
     keys: SlowVec<u8>,
     /// The rows themselves.
     rows: RowStore,
@@ -91,6 +91,8 @@ impl SortedRows {
         }
         let stride = self.check_keys(context.allocator(), batch, keys)?.stride() as usize;
         let at = self.keys.len();
+        // Rows can't be added once their keys are sorted.
+        check!(at == self.rows.len() as usize * stride);
         self.keys.extend_zeroed(count as usize * stride)?;
         let rows = at_mut!(self.keys, at..);
         match (laid_out, &self.layout) {
@@ -193,8 +195,9 @@ impl SortedRows {
             RowLayout::write(layout.slot(k), self.rows.len(), get, &mut self.keys);
         }
         if layout.stride() > 0 {
-            sort_row_layout(allocator, &self.keys, layout.stride(), &mut self.order)?;
+            sort_row_layout(allocator, &mut self.keys, layout.stride(), &mut self.order)?;
         }
+        self.keys.free();
         Ok(())
     }
 
