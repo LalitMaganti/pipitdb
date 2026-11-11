@@ -2,7 +2,7 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
-use crate::column::DataType;
+use crate::column::{DataType, Forms};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering, SortKey};
@@ -103,6 +103,12 @@ impl<'c> Op<'c> for AggregateOp {
         }
         lowering.declare_sorted(sorted);
         Ok(())
+    }
+
+    /// Its keys in dictionaries too: a string key's entries are each
+    /// interned once, rather than each row's. Only strings come in them.
+    fn accepts(&self, column: ColumnId) -> Forms {
+        if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
     }
 
     /// False for every column: what comes out is one row per group, and any

@@ -5,7 +5,7 @@
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType};
+use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::murmur_hash::mix;
@@ -57,6 +57,18 @@ pub(crate) struct GroupTable {
     /// Bit `k` set if key `k` is a string, stored as its id, which is 0 if
     /// null: as in Perfetto, a null string is a key, not a null one.
     string_keys: u64,
+    /// For each key, the last dictionary it came in, if it's a string key.
+    dictionaries: SlowVec<Option<Interned>>,
+}
+
+/// A string key's dictionary, and the ids of its entries: kept while
+/// batches share it, as a chunk's do, so each entry is interned once.
+struct Interned {
+    /// A column of the dictionary, kept so its values aren't freed, and
+    /// their address reused, while the ids are.
+    dictionary: ColumnView,
+    /// Each entry's id, or 0 until a row with it is found.
+    ids: SlowVec<u32>,
 }
 
 impl GroupTable {
@@ -81,6 +93,7 @@ impl GroupTable {
             stride,
             keys,
             string_keys,
+            dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
         })
     }
 
@@ -101,8 +114,8 @@ impl GroupTable {
 
     /// Writes the group of each row `select` keeps of `columns`, all if it's
     /// empty, to `groups`, with `columns` as the key. New keys get new
-    /// groups. Each column is flat: a string for a string key, else an
-    /// `Int64`.
+    /// groups. Each column is flat, or a dictionary for a string key, of
+    /// strings for a string key, else of `Int64`s.
     pub(crate) fn find_or_create(
         &mut self,
         context: &mut Context,
@@ -118,7 +131,8 @@ impl GroupTable {
         let mut nulls: Option<Buffer> = None;
         for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
             if self.string_keys >> k & 1 != 0 {
-                load_string_ids(context, column, select, count, copy)?;
+                let interned = at_mut!(self.dictionaries, k);
+                load_string_ids(context, interned, column, select, count, copy)?;
             } else {
                 load_key_words(context, column, select, count, k, copy, &mut nulls)?;
             }
@@ -303,28 +317,58 @@ impl GroupTable {
     }
 }
 
-/// Loads `count` rows that `select` keeps of string key column `column`, all
-/// if it's empty, to `copy` as the ids the run's string pool has for them.
+/// Loads `count` rows that `select` keeps of string key column `column`, flat
+/// or a dictionary, all if `select` is empty, to `copy` as the ids the run's
+/// string pool has for them. A dictionary's entries are each interned once,
+/// when a row with it is first found, and their ids kept in `interned` while
+/// batches share the dictionary.
 fn load_string_ids(
     context: &mut Context,
+    interned: &mut Option<Interned>,
     column: &ColumnView,
     select: &[u16],
     count: usize,
     copy: &mut Option<Buffer>,
 ) -> Result<(), Error> {
     check!(column.data_type() == DataType::String);
-    let (strings, validity) = (column.values().strings(), column.validity());
+    let values = column.values();
+    let strings = values.strings();
     let mut ids = context.values_buffer(count * 8)?;
     let allocator = context.allocator();
     let pool = context.string_pool()?;
-    let string = |i: usize| {
-        let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-        validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
-    };
-    let out = ids.as_mut_slice::<i64>();
-    pool.intern_strings(allocator, count, string, |i, id| {
-        *at_mut!(out, i) = i64::from(id.raw_id());
-    })?;
+    let row_of = |i: usize| if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+    let out = ids.as_mut_slice::<i64>().iter_mut().enumerate();
+    match column.form() {
+        Form::Flat => {
+            let validity = column.validity();
+            let string = |i: usize| {
+                let row = row_of(i);
+                validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
+            };
+            let ids = ids.as_mut_slice::<i64>();
+            pool.intern_strings(allocator, count, string, |i, id| {
+                *at_mut!(ids, i) = i64::from(id.raw_id());
+            })?;
+        }
+        Form::Dictionary(indices) => {
+            if !interned.as_ref().is_some_and(|interned| interned.dictionary.shares_values(column))
+            {
+                let ids = SlowVec::zeroed(allocator, values.len() as usize)?;
+                *interned = Some(Interned { dictionary: column.clone(), ids });
+            }
+            let Some(Interned { ids: entries, .. }) = interned else { failed!() };
+            for (i, id) in out {
+                let entry = *at!(indices, row_of(i));
+                let known = at_mut!(entries, entry as usize);
+                if *known == 0 && !values.is_null(entry) {
+                    let string = Some(strings.get(entry as usize));
+                    *known = pool.intern_string(allocator, string)?.raw_id();
+                }
+                *id = i64::from(*known);
+            }
+        }
+        Form::Constant => failed!(),
+    }
     *copy = Some(ids);
     Ok(())
 }
