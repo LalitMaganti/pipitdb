@@ -37,9 +37,12 @@ pub(crate) struct RowStore {
     /// How many batches are held.
     batches: u32,
     /// How many columns each batch held has.
-    width: usize,
-    /// Where each row held is: its batch, shifted up `ROW_BITS`, and its row
-    /// in it.
+    width: u32,
+    /// How many rows, from the first, are in batches held whole: each full
+    /// but maybe the last, and keeping every row. A row's place is its number.
+    dense: u32,
+    /// Where each row held after the `dense` ones is: its batch, shifted up
+    /// `ROW_BITS`, and its row in it.
     places: SlowVec<u32>,
     /// By column, the rows being packed, until there are a batch's worth or a
     /// batch is shared after them.
@@ -57,6 +60,7 @@ impl RowStore {
             held: SlowVec::new(allocator, 1 << 31)?,
             batches: 0,
             width: 0,
+            dense: 0,
             places: SlowVec::new(allocator, 1 << 31)?,
             packing: SlowVec::new(allocator, 1 << 6)?,
             packed: 0,
@@ -65,9 +69,10 @@ impl RowStore {
     }
 
     /// How many rows are held.
+    #[inline(never)]
     pub(crate) fn len(&self) -> u32 {
         #[expect(clippy::cast_possible_truncation, reason = "at most 2^31")]
-        let len = self.places.len() as u32 + self.packed;
+        let len = self.dense + self.places.len() as u32 + self.packed;
         len
     }
 
@@ -113,15 +118,20 @@ impl RowStore {
         if held as usize == BATCHES_MAX {
             return Err(Error::OutOfMemory);
         }
-        self.width = batch.column_count() as usize;
+        self.width = batch.column_count();
         for c in 0..batch.column_count() {
             let column = batch.column(c);
             self.held.push(GatherSource::of(column))?;
             self.nullable |= u64::from(column.has_nulls()) << c.min(63);
         }
         let kept = batch.selection().kept();
-        for i in 0..batch.selection().len() {
-            self.places.push(held << ROW_BITS | kept.row(i))?;
+        let whole = self.dense.is_multiple_of(BATCH_ROWS_MAX) && matches!(kept, Kept::Prefix);
+        if whole && self.places.is_empty() {
+            self.dense += batch.selection().len();
+        } else {
+            for i in 0..batch.selection().len() {
+                self.places.push(held << ROW_BITS | kept.row(i))?;
+            }
         }
         self.batches += 1;
         Ok(())
@@ -147,7 +157,7 @@ impl RowStore {
     /// if not null. Rows packed must be flushed first.
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
         check!(self.packed == 0);
-        let (held, row) = self.find(row);
+        let (held, row) = self.find(self.place(row));
         let values = at!(held, column as usize).view().values();
         (!values.is_null(row)).then(|| values.strings().get(row as usize))
     }
@@ -168,41 +178,47 @@ impl RowStore {
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
-        let place = |row: u32| *at!(self.places, row as usize);
-        let (held, start) = self.find(first);
+        // Found once for every column.
+        let mut places = [0_u32; BATCH_ROWS_MAX as usize];
+        for (found, &row) in places.iter_mut().zip(rows) {
+            *found = self.place(row);
+        }
+        let places = at!(places, ..count as usize);
+        let first_place = *at!(places, 0);
+        let (held, start) = self.find(first_place);
         // Rows from `start` on in one batch, not running past its last.
         let run = start + count <= 1 << ROW_BITS
             && (0..count)
-                .zip(rows)
-                .all(|(r, &row)| row == first + r && place(row) == place(first) + r);
+                .zip(rows.iter().zip(places))
+                .all(|(r, (&row, &place))| row == first + r && place == first_place + r);
         if run {
             for held in held {
                 let Ok(()) = out.push_column(held.view().slice(start, count)) else { failed!() };
             }
             return Ok(count);
         }
-        // Found once for every column.
-        let mut places = [0_u32; BATCH_ROWS_MAX as usize];
-        for (found, &row) in places.iter_mut().zip(rows) {
-            *found = place(row);
-        }
-        let places = at!(places, ..count as usize);
         // So every place, of a batch held, has its sources: `gather` relies on it.
-        check!(self.held.len() == self.batches as usize * self.width);
-        for c in 0..self.width {
+        let width = self.width as usize;
+        check!(self.held.len() == self.batches as usize * width);
+        for c in 0..width {
             let nullable = self.nullable >> c.min(63) & 1 != 0;
             let data_type = at!(held, c).view().data_type();
-            let column = gather(context, data_type, (&self.held, self.width, c), places, nullable)?;
+            let column = gather(context, data_type, (&self.held, width, c), places, nullable)?;
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
     }
 
-    /// The columns of the batch held row `row` is in, and its row there.
-    fn find(&self, row: u32) -> (&[GatherSource], u32) {
-        let place = *at!(self.places, row as usize);
-        let first = (place >> ROW_BITS) as usize * self.width;
-        (at!(self.held, first..first + self.width), place & ROW_MASK)
+    /// Where row `row` is: its batch, shifted up `ROW_BITS`, and its row in it.
+    fn place(&self, row: u32) -> u32 {
+        if row < self.dense { row } else { *at!(self.places, (row - self.dense) as usize) }
+    }
+
+    /// The columns of the batch held at `place`, and its row there.
+    fn find(&self, place: u32) -> (&[GatherSource], u32) {
+        let width = self.width as usize;
+        let first = (place >> ROW_BITS) as usize * width;
+        (at!(self.held, first..first + width), place & ROW_MASK)
     }
 }
 
