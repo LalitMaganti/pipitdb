@@ -11,7 +11,7 @@ use crate::error::Error;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
-use crate::string_pool::Id;
+use crate::string_pool::{Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -59,7 +59,16 @@ pub(crate) struct GroupTable {
     string_keys: u64,
     /// For each key, the last dictionary it came in, if it's a string key.
     dictionaries: SlowVec<Option<Interned>>,
+    /// With a single key, a string, the group of each string by its number
+    /// in the run's pool, `NONE` until it has one, so a row's group is found
+    /// without hashing again.
+    number_groups: SlowVec<u32>,
+    /// With a single key, a string, the null string's group, once it has one.
+    null_group: u32,
 }
+
+/// No number, or no group.
+const NONE: u32 = u32::MAX;
 
 /// A string key's dictionary, and the ids of its entries: kept while
 /// batches share it, as a chunk's do, so each entry is interned once.
@@ -67,8 +76,9 @@ struct Interned {
     /// A column of the dictionary, kept so its values aren't freed, and
     /// their address reused, while the ids are.
     dictionary: ColumnView,
-    /// Each entry's id, or 0 until a row with it is found.
-    ids: SlowVec<u32>,
+    /// Each entry's id, and its number above, or 0 until a row with it is
+    /// found.
+    ids: SlowVec<u64>,
 }
 
 impl GroupTable {
@@ -94,6 +104,8 @@ impl GroupTable {
             keys,
             string_keys,
             dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
+            number_groups: SlowVec::new(allocator, 1 << 31)?,
+            null_group: NONE,
         })
     }
 
@@ -125,6 +137,14 @@ impl GroupTable {
     ) -> Result<(), Error> {
         check!(columns.len() == self.keys);
         let count = groups.len();
+        if (self.keys, self.string_keys) == (1, 1) {
+            let (mut ids, mut numbers) = (None, context.indices_buffer(count * 4)?);
+            let (interned, column) = (at_mut!(self.dictionaries, 0), at!(columns, 0));
+            let out = Some(numbers.as_mut_slice());
+            load_string_ids(context, interned, column, select, count, &mut ids, out)?;
+            let Some(ids) = ids else { failed!() };
+            return self.find_numbered(ids.as_slice(), numbers.as_slice(), groups);
+        }
         // Each key as a word a row, 0 where null, and a word a row of which
         // keys are null, unless none are.
         let mut copies = [const { None }; KEYS_MAX];
@@ -132,7 +152,7 @@ impl GroupTable {
         for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
             if self.string_keys >> k & 1 != 0 {
                 let interned = at_mut!(self.dictionaries, k);
-                load_string_ids(context, interned, column, select, count, copy)?;
+                load_string_ids(context, interned, column, select, count, copy, None)?;
             } else {
                 load_key_words(context, column, select, count, k, copy, &mut nulls)?;
             }
@@ -192,6 +212,43 @@ impl GroupTable {
         Ok(())
     }
 
+    /// As `find_or_create`, for a single key, a string, given each row's id
+    /// and number in the run's pool: a string's group is found by its
+    /// number, without hashing it again.
+    #[inline(never)]
+    fn find_numbered(
+        &mut self,
+        ids: &[i64],
+        numbers: &[u32],
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
+        for ((&id, &number), group) in ids.iter().zip(numbers).zip(groups.iter_mut()) {
+            // Other tables share the pool, so numbers can be skipped.
+            while number != NO_NUMBER && number as usize >= self.number_groups.len() {
+                self.number_groups.push(NONE)?;
+            }
+            let known = match number {
+                NO_NUMBER => self.null_group,
+                _ => *at!(self.number_groups, number as usize),
+            };
+            *group = if known == NONE { self.add_numbered(number, id)? } else { known };
+        }
+        Ok(())
+    }
+
+    /// Adds a group for the string with id `id` and number `number`, and
+    /// returns its number.
+    #[cold]
+    #[inline(never)]
+    fn add_numbered(&mut self, number: u32, id: i64) -> Result<u32, Error> {
+        let group = self.push(&[0, id])?;
+        match number {
+            NO_NUMBER => self.null_group = group,
+            _ => *at_mut!(self.number_groups, number as usize) = group,
+        }
+        Ok(group)
+    }
+
     /// As `find_or_create`, for a single key with no nulls: compares the key
     /// values directly.
     #[inline(never)]
@@ -245,6 +302,14 @@ impl GroupTable {
 
     /// As `add_row`, given the group's null word and keys together in `key`.
     fn add(&mut self, at: usize, hash: u64, key: &[i64]) -> Result<u32, Error> {
+        let group = self.push(key)?;
+        *at_mut!(self.slots, at) = salt(hash) | (u64::from(group) + 1);
+        Ok(group)
+    }
+
+    /// Appends a group of `key`, its null word and keys, and returns its
+    /// number.
+    fn push(&mut self, key: &[i64]) -> Result<u32, Error> {
         let group = self.len();
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
@@ -253,9 +318,7 @@ impl GroupTable {
         self.records.extend_zeroed(self.stride)?;
         at_mut!(self.records, start..start + key.len()).copy_from_slice(key);
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-        let group = group as u32;
-        *at_mut!(self.slots, at) = salt(hash) | (u64::from(group) + 1);
-        Ok(group)
+        Ok(group as u32)
     }
 
     /// Doubles the slots until at most two thirds are used by `groups`
@@ -319,7 +382,8 @@ impl GroupTable {
 
 /// Loads `count` rows that `select` keeps of string key column `column`, flat
 /// or a dictionary, all if `select` is empty, to `copy` as the ids the run's
-/// string pool has for them. A dictionary's entries are each interned once,
+/// string pool has for them, and their numbers to `numbers` if given, `NO_NUMBER`
+/// for null. A dictionary's entries are each interned once,
 /// when a row with it is first found, and their ids kept in `interned` while
 /// batches share the dictionary.
 fn load_string_ids(
@@ -329,6 +393,7 @@ fn load_string_ids(
     select: &[u16],
     count: usize,
     copy: &mut Option<Buffer>,
+    mut numbers: Option<&mut [u32]>,
 ) -> Result<(), Error> {
     check!(column.data_type() == DataType::String);
     let values = column.values();
@@ -346,8 +411,11 @@ fn load_string_ids(
                 validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
             };
             let ids = ids.as_mut_slice::<i64>();
-            pool.intern_strings(allocator, count, string, |i, id| {
+            pool.intern_strings(allocator, count, string, |i, id, number| {
                 *at_mut!(ids, i) = i64::from(id.raw_id());
+                if let Some(numbers) = numbers.as_deref_mut() {
+                    *at_mut!(numbers, i) = number;
+                }
             })?;
         }
         Form::Dictionary(indices) => {
@@ -360,11 +428,21 @@ fn load_string_ids(
             for (i, id) in out {
                 let entry = *at!(indices, row_of(i));
                 let known = at_mut!(entries, entry as usize);
-                if *known == 0 && !values.is_null(entry) {
-                    let string = Some(strings.get(entry as usize));
-                    *known = pool.intern_string(allocator, string)?.raw_id();
+                if *known == 0 {
+                    *known = if values.is_null(entry) {
+                        u64::from(NO_NUMBER) << 32
+                    } else {
+                        let (found, number) =
+                            pool.intern_numbered(allocator, strings.get(entry as usize))?;
+                        u64::from(found.raw_id()) | u64::from(number) << 32
+                    };
                 }
-                *id = i64::from(*known);
+                #[expect(clippy::cast_possible_truncation, reason = "the low half")]
+                let found = *known as u32;
+                *id = i64::from(found);
+                if let Some(numbers) = numbers.as_deref_mut() {
+                    *at_mut!(numbers, i) = (*known >> 32) as u32;
+                }
             }
         }
         Form::Constant => failed!(),

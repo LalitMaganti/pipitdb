@@ -590,6 +590,31 @@ mod tests {
     }
 
     #[test]
+    fn tables_sharing_a_pool_number_their_own_groups() {
+        let mut context = Context::new(&Heap);
+        let mut tables = [(); 2].map(|()| GroupTable::new(&Heap, 1, 1, 0).unwrap());
+        let column = |texts: &[Option<&str>]| {
+            strings(&texts.iter().map(|text| text.map(String::from)).collect::<Vec<_>>())
+        };
+        let mut groups = [0; 5];
+        let first = column(&[Some("a"), Some("b"), Some("c")]);
+        tables[0].find_or_create(&mut context, &[&first], &[], &mut groups[..3]).unwrap();
+        assert_eq!(groups[..3], [0, 1, 2]);
+        // The pool numbered "a" and "c" for the first table, and numbers "d"
+        // after them.
+        let second = column(&[Some("c"), None, Some("a"), Some("c"), Some("d")]);
+        tables[1].find_or_create(&mut context, &[&second], &[], &mut groups).unwrap();
+        assert_eq!(groups, [0, 1, 2, 0, 3]);
+        let keys = tables[1].write_keys(&mut context, 0, 0..4).unwrap();
+        let key =
+            |row: u32| (!keys.is_null(row)).then(|| keys.values().strings().get(row as usize));
+        assert_eq!(
+            (0..4).map(key).collect::<Vec<_>>(),
+            [Some(&b"c"[..]), None, Some(b"a"), Some(b"d")]
+        );
+    }
+
+    #[test]
     fn aggregates_all_rows_without_keys() {
         let rows = Rows { batches: Vec::new(), dropped: Vec::new() };
         // With no rows, `COUNT` is 0 and the rest are null.

@@ -34,6 +34,9 @@ const METADATA_BYTES: usize = 5;
 /// them, as a core's L2.
 const CACHED_SLOTS: usize = 1 << 15;
 
+/// The number of the null string, which has none.
+pub const NO_NUMBER: u32 = u32::MAX;
+
 /// How many strings a batch is interned in at a time: each step's loads
 /// are started for all of them before the next step waits for any.
 const CHUNK_ROWS: usize = 512;
@@ -111,7 +114,7 @@ impl Id {
 pub struct StringPool {
     /// Where the strings are.
     store: Store,
-    /// The id of each string, found by its hash and then its bytes.
+    /// Each string's id and number, found by its hash and then its bytes.
     string_index: FlatHashMap<Interned, ()>,
 }
 
@@ -127,11 +130,14 @@ struct Store {
     large_strings: SlowVec<Buffer>,
 }
 
-/// A string's hash, which the index takes as already hashed, and its id.
+/// A string's hash, which the index takes as already hashed, its id, and
+/// its number: strings are numbered from 0 in the order first interned. The
+/// number fits in what would be padding.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Interned {
     hash: u64,
     id: Id,
+    number: u32,
 }
 
 impl Key for Interned {
@@ -164,11 +170,22 @@ impl StringPool {
         str: Option<&[u8]>,
     ) -> Result<Id, AllocError> {
         let Some(str) = str else { return Ok(Id::NULL) };
+        Ok(self.intern_numbered(allocator, str)?.0)
+    }
+
+    /// As `intern_string`, also returning the string's number: strings are
+    /// numbered from 0 in the order first interned.
+    #[inline]
+    pub fn intern_numbered(
+        &mut self,
+        allocator: &dyn Allocator,
+        str: &[u8],
+    ) -> Result<(Id, u32), AllocError> {
         self.intern_hashed(allocator, str, murmur_hash::bytes(str))
     }
 
-    /// Interns `count` strings, `string(i)` for each, giving each one's id to
-    /// `out(i, id)`: as `intern_string` for each, but a batch at a time, so
+    /// Interns `count` strings, `string(i)` for each, giving each one's id
+    /// and number to `out(i, id, number)`, the number `NO_NUMBER` for null: as `intern_string` for each, but a batch at a time, so
     /// the memory each needs is loaded for all of them at once rather than
     /// waited for one by one.
     pub fn intern_strings<'s>(
@@ -176,13 +193,17 @@ impl StringPool {
         allocator: &dyn Allocator,
         count: usize,
         string: impl Fn(usize) -> Option<&'s [u8]>,
-        mut out: impl FnMut(usize, Id),
+        mut out: impl FnMut(usize, Id, u32),
     ) -> Result<(), AllocError> {
         check!(count <= BATCH_ROWS_MAX as usize);
         // While the index fits in cache, there's no wait to hide.
         if self.string_index.capacity() <= CACHED_SLOTS {
             for i in 0..count {
-                out(i, self.intern_string(allocator, string(i))?);
+                let (id, number) = match string(i) {
+                    Some(str) => self.intern_numbered(allocator, str)?,
+                    None => (Id::NULL, NO_NUMBER),
+                };
+                out(i, id, number);
             }
             return Ok(());
         }
@@ -201,11 +222,11 @@ impl StringPool {
         first: usize,
         rows: usize,
         string: &impl Fn(usize) -> Option<&'s [u8]>,
-        out: &mut impl FnMut(usize, Id),
+        out: &mut impl FnMut(usize, Id, u32),
     ) -> Result<(), AllocError> {
         let mut strs: [Option<&[u8]>; CHUNK_ROWS] = [None; CHUNK_ROWS];
         let mut hashes = [0_u64; CHUNK_ROWS];
-        let mut found = [Id::NULL; CHUNK_ROWS];
+        let mut found = [(Id::NULL, NO_NUMBER); CHUNK_ROWS];
         let strs = at_mut!(strs, ..rows);
         for (i, (str, hash)) in strs.iter_mut().zip(&mut hashes).enumerate() {
             *str = string(first + i);
@@ -217,41 +238,43 @@ impl StringPool {
         for ((str, &hash), found) in strs.iter().zip(&hashes).zip(&mut found) {
             if str.is_some() {
                 let held = self.string_index.find_key_by(hash, |held| held.hash == hash);
-                *found = held.map_or(Id::NULL, |held| held.id);
-                self.store.prefetch(*found);
+                *found = held.map_or((Id::NULL, NO_NUMBER), |held| (held.id, held.number));
+                self.store.prefetch(found.0);
             }
         }
         for (i, ((str, &hash), &found)) in strs.iter().zip(&hashes).zip(&found).enumerate() {
-            let id = match *str {
-                None => Id::NULL,
-                Some(str) if !found.is_null() && self.store.equals(found, str) => found,
+            let (id, number) = match *str {
+                None => (Id::NULL, NO_NUMBER),
+                Some(str) if !found.0.is_null() && self.store.equals(found.0, str) => found,
                 Some(str) => self.intern_hashed(allocator, str, hash)?,
             };
-            out(first + i, id);
+            out(first + i, id, number);
         }
         Ok(())
     }
 
-    /// As `intern_string`, for `str`, hashed as `hash`.
+    /// As `intern_numbered`, for `str`, hashed as `hash`.
     #[inline]
     fn intern_hashed(
         &mut self,
         allocator: &dyn Allocator,
         str: &[u8],
         hash: u64,
-    ) -> Result<Id, AllocError> {
+    ) -> Result<(Id, u32), AllocError> {
         // Inserts the null id just to see if the string is already in, and
         // if it isn't, overwrites it with the string's. Strings with the
         // same hash are told apart by their bytes, unlike in Perfetto.
         let store = &self.store;
         let equal = |held: &Interned| held.hash == hash && store.equals(held.id, str);
-        let key = Interned { hash, id: Id::NULL };
+        #[expect(clippy::cast_possible_truncation, reason = "ids are 32 bits too")]
+        let number = self.string_index.len() as u32;
+        let key = Interned { hash, id: Id::NULL, number };
         let ((held, ()), inserted) =
             self.string_index.insert_by(allocator, hash, equal, key, ())?;
         if inserted {
             held.id = self.store.insert_string(allocator, str)?;
         }
-        Ok(held.id)
+        Ok((held.id, held.number))
     }
 
     /// The string whose id is `id`, or `None` for the null string's.
@@ -416,7 +439,7 @@ mod tests {
                 })
                 .collect();
             let string = |i: usize| strings[i].as_deref();
-            pool.intern_strings(&Heap, strings.len(), string, |i, id| ids[i] = id).unwrap();
+            pool.intern_strings(&Heap, strings.len(), string, |i, id, _| ids[i] = id).unwrap();
             for (i, &id) in ids.iter().enumerate() {
                 assert_eq!(pool.get(id), string(i));
                 let expected = one_at_a_time.intern_string(&Heap, string(i)).unwrap();
