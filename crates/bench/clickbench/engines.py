@@ -12,7 +12,8 @@ the engine's default.
 Pivot is a server, so its times include sending the rows to this process,
 which in-process engines never pay. pivot-cold clears Pivot's caches of
 compressed and decompressed pages before each timed run, as its own
-benchmark's cold runs do; the OS page cache stays warm for every engine.
+benchmark's cold runs do, so it reads the files as every other engine does:
+only cold runs are compared. The OS page cache stays warm for every engine.
 
 Needs `pip install duckdb chdb datafusion polars psycopg[binary]`, and Pivot
 from `curl https://pivotlake.io | sh`, in $PIVOT_HOME or ~/.pivot.
@@ -36,7 +37,7 @@ import tempfile
 import time
 
 HERE = pathlib.Path(__file__).parent
-ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot", "pivot-cold"]
+ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot-cold"]
 
 
 def queries():
@@ -119,7 +120,7 @@ def connect(engine, threads, directory):
         import polars
         ctx = polars.SQLContext(hits=polars.scan_parquet(files))
         return (lambda sql: ctx.execute(sql).collect()), polars.__version__
-    if engine in ("pivot", "pivot-cold"):
+    if engine == "pivot-cold":
         return connect_pivot(threads, directory)
     raise ValueError(engine)
 
