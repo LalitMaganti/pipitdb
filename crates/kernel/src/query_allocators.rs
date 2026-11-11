@@ -112,6 +112,11 @@ unsafe impl Allocator for FixedAllocator<'_> {
         self.free.set(Some(ptr));
         self.live.set(self.live.get() - 1);
     }
+
+    unsafe fn discard(&self, ptr: NonNull<u8>, len: usize) {
+        // SAFETY: a block is within a chunk taken from the allocator under it.
+        unsafe { self.allocator.discard(ptr, len) };
+    }
 }
 
 impl Drop for FixedAllocator<'_> {

@@ -60,13 +60,19 @@ impl<T> SlowVec<T> {
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<SlowVec<T>, AllocError> {
         let mut vec = SlowVec::fixed(allocator, values.len())?;
-        // An iterator can claim a wrong length, so it can't overrun.
-        for value in values.take(vec.raw.capacity as usize) {
-            // SAFETY: `len` is below the capacity.
-            unsafe { vec.slot(vec.raw.len).write(value) };
-            vec.raw.len += 1;
-        }
+        vec.extend_within(values);
         Ok(vec)
+    }
+
+    /// Adds `values` at the end, as many as there's room for without
+    /// growing: an iterator can claim a wrong length, so it can't overrun.
+    #[inline]
+    pub fn extend_within(&mut self, values: impl Iterator<Item = T>) {
+        for value in values.take(self.raw.capacity as usize - self.raw.len) {
+            // SAFETY: `len` is below the capacity.
+            unsafe { self.slot(self.raw.len).write(value) };
+            self.raw.len += 1;
+        }
     }
 
     /// `len` zeros, in a `SlowVec` that never grows. Zeroed by the

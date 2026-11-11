@@ -174,6 +174,17 @@ impl Buffer {
     pub(crate) fn as_non_null(&self) -> NonNull<u8> {
         self.data
     }
+
+    /// Lets go of the buffer, and if it was the only reference, tells its
+    /// allocator its bytes won't be read again, so their pages can go back
+    /// to the system now rather than when they're next written.
+    pub(crate) fn discard(self) {
+        if self.is_unique() {
+            let header = self.header();
+            // SAFETY: the bytes are in the allocation, which isn't freed yet.
+            unsafe { header.allocator.as_ref().discard(self.data, header.size_bytes) };
+        }
+    }
 }
 
 /// The header of the bytes at `data`.
