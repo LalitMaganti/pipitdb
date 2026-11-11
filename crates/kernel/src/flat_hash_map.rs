@@ -190,7 +190,7 @@ use group::Group;
 
 /// Asks for the cache line at `at` to be loaded, where the target can.
 #[inline]
-fn prefetch<T>(at: *const T) {
+pub(crate) fn prefetch<T>(at: *const T) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: a prefetch never faults, wherever it points.
     unsafe {
@@ -376,6 +376,22 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     pub fn find_by(&self, hash: u64, equal: impl Fn(&K) -> bool) -> Option<&V> {
         let at = self.find_slot::<false>(hash, equal).ok()?;
         Some(&self.slot(at).1)
+    }
+
+    /// Starts loading where the probe for `hash` begins, so a lookup of it
+    /// soon after finds that in cache.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let at = h1(hash) & (self.capacity() - 1);
+        prefetch(self.base.ctrl().as_ptr().wrapping_add(at));
+        prefetch(self.base.slot::<(K, V)>(at));
+    }
+
+    /// As `find_by`, the key found.
+    #[inline]
+    pub fn find_key_by(&self, hash: u64, equal: impl Fn(&K) -> bool) -> Option<&K> {
+        let at = self.find_slot::<false>(hash, equal).ok()?;
+        Some(&self.slot(at).0)
     }
 
     /// Adds `key` with `value`, unless it has it. Returns its value, and
