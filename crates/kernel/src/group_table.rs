@@ -317,12 +317,14 @@ fn load_string_ids(
     let mut ids = context.values_buffer(count * 8)?;
     let allocator = context.allocator();
     let pool = context.string_pool()?;
-    for (i, id) in ids.as_mut_slice::<i64>().iter_mut().enumerate() {
+    let string = |i: usize| {
         let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-        let string =
-            validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row));
-        *id = i64::from(pool.intern_string(allocator, string)?.raw_id());
-    }
+        validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
+    };
+    let out = ids.as_mut_slice::<i64>();
+    pool.intern_strings(allocator, count, string, |i, id| {
+        *at_mut!(out, i) = i64::from(id.raw_id());
+    })?;
     *copy = Some(ids);
     Ok(())
 }
