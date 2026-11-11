@@ -6,6 +6,7 @@ use core::ptr::NonNull;
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
+use crate::row_batch::BATCH_ROWS_MAX;
 
 /// A set of the forms a column may come in: what a plan lets a producer
 /// make a column in, and what a consumer takes it in. Every producer can
@@ -124,84 +125,86 @@ struct Header {
     bounds: Cell<Bounds>,
 }
 
-/// Where a flat view's values are, flat enough to read in a loop, as
-/// Perfetto's `GatherSource`: row `row` is the word and the bit at
-/// `start + row`. Valid for as long as the view's buffers are.
-#[derive(Clone, Copy)]
+/// A flat view, with where its values are, flat enough to read in a loop
+/// as Perfetto's `GatherSource`: row `row` is the word at `row` and the bit
+/// at `row`.
+///
+/// It keeps the view, so the buffers its pointers are into stay alive, and
+/// they aren't written once shared. Their bytes don't move with it. Each
+/// is a cache line, so finding one is a shift and reading one a line.
+#[repr(align(64))]
 pub(crate) struct GatherSource {
-    /// The values, a word each: an integer, a float's bits, or a string's
+    /// The view.
+    view: ColumnView,
+    /// Its values, a word each: an integer, a float's bits, or a string's
     /// view.
-    data: *const i64,
-    /// Which values aren't null, or null if none are.
-    validity: *const u8,
-    /// What a string column's views are into, or null for other columns.
-    bytes: *const u8,
-    /// Where the view's rows start among the values.
-    start: u32,
+    words: NonNull<[i64; BATCH_ROWS_MAX as usize]>,
+    /// Which values aren't null, if any are.
+    validity: Option<NonNull<[u8; BATCH_ROWS_MAX as usize / 8]>>,
+    /// What a string column's views are into, or none.
+    bytes: NonNull<[u8]>,
 }
 
 impl GatherSource {
+    /// `view`'s, which must `fit`.
     pub(crate) fn of(view: &ColumnView) -> GatherSource {
-        view.check_flat();
+        check!(GatherSource::fits(view));
         let header = view.header();
+        let start = (header.value_start + view.start) as usize;
+        let at = |buffer: &Buffer, at: usize| buffer.as_ptr::<u8>().wrapping_add(at).cast_mut();
+        let validity = header.validity.as_ref().map(|bits| at(bits, start / 8));
+        let bytes = header.bytes.as_ref().map_or(&[][..], Buffer::as_slice::<u8>);
+        let Some(words) = NonNull::new(at(&header.values, start * 8)) else { failed!() };
         GatherSource {
-            data: header.values.as_ptr(),
-            validity: header.validity.as_ref().map_or(core::ptr::null(), Buffer::as_ptr),
-            bytes: header.bytes.as_ref().map_or(core::ptr::null(), Buffer::as_ptr),
-            start: header.value_start + view.start,
+            view: view.clone(),
+            words: words.cast(),
+            validity: validity.and_then(NonNull::new).map(NonNull::cast),
+            bytes: NonNull::from(bytes),
         }
     }
 
-    /// The word of row `row`.
-    ///
-    /// # Safety
-    ///
-    /// `row` must be a row of the view, whose buffers must be alive.
-    #[inline]
-    pub(crate) unsafe fn word(self, row: u32) -> i64 {
-        // SAFETY: the caller's.
-        unsafe { *self.data.add((self.start + row) as usize) }
+    /// Whether `view` has a batch's worth of words and of bits from its
+    /// first, its first bit the first of a byte.
+    #[inline(never)]
+    pub(crate) fn fits(view: &ColumnView) -> bool {
+        let header = view.header();
+        let start = (header.value_start + view.start) as usize;
+        let rows = BATCH_ROWS_MAX as usize;
+        header.values.size_bytes() >= (start + rows) * 8
+            && header.validity.as_ref().is_none_or(|bits| {
+                start.is_multiple_of(8) && bits.size_bytes() >= (start + rows) / 8
+            })
     }
 
-    /// Whether row `row` isn't null.
-    ///
-    /// # Safety
-    ///
-    /// As `word`.
-    #[inline]
-    pub(crate) unsafe fn is_valid(self, row: u32) -> bool {
-        if self.validity.is_null() {
-            return true;
-        }
-        let bit = (self.start + row) as usize;
-        // SAFETY: the caller's, and `ColumnView::new` checked the bitmap
-        // covers every row.
-        unsafe { *self.validity.add(bit / 8) >> (bit % 8) & 1 != 0 }
+    pub(crate) fn view(&self) -> &ColumnView {
+        &self.view
     }
 
-    /// The start and length of the string of row `row`.
-    ///
-    /// # Safety
-    ///
-    /// As `word`, and the view must be a string column's.
+    /// The word of row `row`, a row of a batch.
     #[inline]
-    pub(crate) unsafe fn string_view(self, row: u32) -> [u32; 2] {
-        let at = (self.start + row) as usize;
-        // SAFETY: the caller's: a word is a string's start and length.
-        unsafe { *self.data.cast::<[u32; 2]>().add(at) }
+    pub(crate) fn word(&self, row: u32) -> i64 {
+        // SAFETY: made from the view's words, which it keeps alive.
+        let words = unsafe { self.words.as_ref() };
+        *at!(words, row as usize % BATCH_ROWS_MAX as usize)
+    }
+
+    /// Whether row `row`, a row of a batch, isn't null.
+    #[inline]
+    pub(crate) fn is_valid(&self, row: u32) -> bool {
+        let row = row as usize % BATCH_ROWS_MAX as usize;
+        self.validity.is_none_or(|bits| {
+            // SAFETY: made from the view's validity, which it keeps alive.
+            let bits = unsafe { bits.as_ref() };
+            *at!(bits, row / 8) >> (row % 8) & 1 != 0
+        })
     }
 
     /// The `len` bytes from `start` of a string column's bytes.
-    ///
-    /// # Safety
-    ///
-    /// `start` and `len` must be a `string_view` of the view, whose buffers
-    /// must be alive for `'a`.
     #[inline]
-    pub(crate) unsafe fn string<'a>(self, start: u32, len: u32) -> &'a [u8] {
-        // SAFETY: the caller's: `ColumnView::strings` checked views are
-        // within its bytes.
-        unsafe { core::slice::from_raw_parts(self.bytes.add(start as usize), len as usize) }
+    pub(crate) fn string(&self, start: u32, len: u32) -> &[u8] {
+        // SAFETY: made from the view's bytes, which it keeps alive.
+        let bytes = unsafe { self.bytes.as_ref() };
+        at!(bytes, start as usize..(start + len) as usize)
     }
 }
 

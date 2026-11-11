@@ -33,7 +33,7 @@ const BATCHES_MAX: usize = 1 << (32 - ROW_BITS);
 /// whole buffers alive.
 pub(crate) struct RowStore {
     /// Each batch held, by its columns.
-    held: SlowVec<Held>,
+    held: SlowVec<GatherSource>,
     /// How many batches are held.
     batches: u32,
     /// How many columns each batch held has.
@@ -113,12 +113,10 @@ impl RowStore {
         if held as usize == BATCHES_MAX {
             return Err(Error::OutOfMemory);
         }
-        let width = batch.column_count() as usize;
-        check!(held == 0 || width == self.width);
-        self.width = width;
+        self.width = batch.column_count() as usize;
         for c in 0..batch.column_count() {
             let column = batch.column(c);
-            self.held.push(Held { source: GatherSource::of(column), column: column.clone() })?;
+            self.held.push(GatherSource::of(column))?;
             self.nullable |= u64::from(column.has_nulls()) << c.min(63);
         }
         let kept = batch.selection().kept();
@@ -150,7 +148,7 @@ impl RowStore {
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
         check!(self.packed == 0);
         let (held, row) = self.find(row);
-        let values = at!(held, column as usize).column.values();
+        let values = at!(held, column as usize).view().values();
         (!values.is_null(row)).then(|| values.strings().get(row as usize))
     }
 
@@ -179,7 +177,7 @@ impl RowStore {
                 .all(|(r, &row)| row == first + r && place(row) == place(first) + r);
         if run {
             for held in held {
-                let Ok(()) = out.push_column(held.column.slice(start, count)) else { failed!() };
+                let Ok(()) = out.push_column(held.view().slice(start, count)) else { failed!() };
             }
             return Ok(count);
         }
@@ -191,7 +189,7 @@ impl RowStore {
         let places = at!(places, ..count as usize);
         for c in 0..self.width {
             let nullable = self.nullable >> c.min(63) & 1 != 0;
-            let data_type = at!(held, c).column.data_type();
+            let data_type = at!(held, c).view().data_type();
             let column = gather(context, data_type, (&self.held, self.width, c), places, nullable)?;
             let Ok(()) = out.push_column(column) else { failed!() };
         }
@@ -199,27 +197,21 @@ impl RowStore {
     }
 
     /// The columns of the batch held row `row` is in, and its row there.
-    fn find(&self, row: u32) -> (&[Held], u32) {
+    fn find(&self, row: u32) -> (&[GatherSource], u32) {
         let place = *at!(self.places, row as usize);
         let first = (place >> ROW_BITS) as usize * self.width;
         (at!(self.held, first..first + self.width), place & ROW_MASK)
     }
 }
 
-/// A column of a batch held.
-struct Held {
-    /// Where its values are: what gathering reads.
-    source: GatherSource,
-    /// The column, which keeps its buffers alive.
-    column: ColumnView,
-}
-
 /// Whether `batch` is held by sharing its buffers rather than packed: if it
 /// keeps at least half a batch's worth of rows, or its columns all borrow
-/// what they view.
+/// what they view, and each column's buffer has a batch's worth of words
+/// from its first, as gathering reads.
 fn shares(batch: &RowBatch) -> bool {
-    batch.selection().len() * 2 >= BATCH_ROWS_MAX
-        || (0..batch.column_count()).all(|c| batch.is_borrowed(c))
+    let columns = 0..batch.column_count();
+    (batch.selection().len() * 2 >= BATCH_ROWS_MAX || columns.clone().all(|c| batch.is_borrowed(c)))
+        && columns.into_iter().all(|c| GatherSource::fits(batch.column(c)))
 }
 
 /// A column being packed: its values, up to a batch's, and nulls.
@@ -305,17 +297,14 @@ fn view(start: usize, len: usize) -> Result<[u32; 2], Error> {
 fn gather(
     context: &mut Context,
     data_type: DataType,
-    (held, width, column): (&[Held], usize, usize),
+    (held, width, column): (&[GatherSource], usize, usize),
     places: &[u32],
     nullable: bool,
 ) -> Result<ColumnView, Error> {
     let rows = places.len();
-    let found = |place: u32| {
-        let at = (place >> ROW_BITS) as usize * width + column;
-        // SAFETY: `hold` made `place` from a batch held, each of whose
-        // `width` columns it held, and `column` is one of them.
-        (unsafe { held.get_unchecked(at) }.source, place & ROW_MASK)
-    };
+    // This column of every batch held is every `width`th from here.
+    let held = at!(held, column..);
+    let found = |place: u32| (at!(held, (place >> ROW_BITS) as usize * width), place & ROW_MASK);
     let mut values = context.values_buffer(rows * 8)?;
     let mut validity = None;
     if nullable {
@@ -325,38 +314,29 @@ fn gather(
         let mut nulls = false;
         for (r, &place) in places.iter().enumerate() {
             let (source, row) = found(place);
-            // SAFETY: `place` was made from a row of the batch held, and the
-            // store keeps that batch's buffers alive.
-            let valid = unsafe { source.is_valid(row) };
+            let valid = source.is_valid(row);
             *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
             nulls |= !valid;
         }
         validity = nulls.then_some(buffer);
     }
+    // A string's word is its view.
+    for (out, &place) in values.as_mut_slice::<i64>().iter_mut().zip(places) {
+        let (source, row) = found(place);
+        *out = source.word(row);
+    }
     if !data_type.has_bytes() {
-        for (out, &place) in values.as_mut_slice::<i64>().iter_mut().zip(places) {
-            let (source, row) = found(place);
-            // SAFETY: as for `is_valid`.
-            *out = unsafe { source.word(row) };
-        }
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
     let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
-    let mut total = 0;
-    for (out, &place) in views.iter_mut().zip(places) {
-        let (source, row) = found(place);
-        // SAFETY: as for `is_valid`, and the column holds strings.
-        *out = unsafe { source.string_view(row) };
-        total += out[1] as usize;
-    }
+    let total = views.iter().map(|&[_, len]| len as usize).sum();
     let mut bytes = context.bytes_buffer(total)?;
     let out = bytes.as_mut_slice::<u8>();
     let mut start = 0;
     for (out_view, &place) in views.iter_mut().zip(places) {
         let (source, _) = found(place);
         let [from, len] = *out_view;
-        // SAFETY: as for `string_view`, of which this is the result.
-        let string = unsafe { source.string(from, len) };
+        let string = source.string(from, len);
         at_mut!(out, start..start + string.len()).copy_from_slice(string);
         *out_view = view(start, string.len())?;
         start += string.len();
