@@ -165,6 +165,11 @@ impl RowStore {
         self.nullable >> column.min(63) & 1 != 0
     }
 
+    /// Whether column `column` is in output order.
+    pub(crate) fn is_scattered(&self, column: u32) -> bool {
+        column < 63 && self.scattered >> column & 1 != 0
+    }
+
     /// Which column dropped column `column` is, if it is.
     fn dropped(&self, column: usize) -> Option<usize> {
         (column < 63 && self.dropped >> column & 1 != 0)
@@ -315,7 +320,7 @@ impl RowStore {
         context: &mut Context,
         words: &mut [u64],
         row_of: impl Fn(u64) -> u32,
-        decode: Option<impl FnMut(usize, u64) -> i64>,
+        (by_word, mut decode): (bool, Option<impl FnMut(usize, u64) -> i64>),
     ) -> Result<(), Error> {
         self.flush(context)?;
         let (width, rows) = (self.width as usize, words.len());
@@ -328,33 +333,32 @@ impl RowStore {
                 copy |= 1 << c;
             }
         }
-        let decoded = if decode.is_some() { self.dropped } else { 0 };
+        let dropped = if decode.is_some() { self.dropped } else { 0 };
+        // Decoded by word before the rest, or by row with the rest.
+        let (decoded, by_row) = if by_word { (dropped, 0) } else { (0, dropped) };
         let columns = |mask: u64| (0..63).filter(move |c| mask >> c & 1 != 0);
         // Every row is then held in order, a full batch at a time.
         let dense = self.dense as usize == rows && self.len() as usize == rows;
         if !dense
             || !SCATTER_ROWS.contains(&rows)
             || ((copy | self.dropped).count_ones() as usize) < SCATTER_COLUMNS_MIN
-            || decoded & self.nullable != 0
+            || dropped & self.nullable != 0
         {
             return Ok(());
         }
         // 0. Columns decoded from the words, in order already: a bit for
         // each of the columns copied.
-        let moved = copy | decoded;
+        let moved = copy | dropped;
         let mut copies = Copies::new(allocator, moved.count_ones() as usize, rows)?;
         let mut in_order = 0_u64;
-        if let Some(mut decode) = decode {
+        if let Some(decode) = decode.as_mut() {
             for (k, c) in columns(moved).enumerate().filter(|&(_, c)| decoded >> c & 1 != 0) {
                 in_order |= 1 << k;
                 copies.decode(context, k, |at| decode(c, *at!(words, at)))?;
             }
         }
         // 1. Where each row goes, in its own word.
-        for at in 0..rows {
-            let word = at_mut!(words, row_of(*at!(words, at)) as usize);
-            *word = *word & !(POSITION_MASK << POSITION_SHIFT) | (at as u64) << POSITION_SHIFT;
-        }
+        mark_positions(words, row_of);
         // 2. Each held batch's rows to the next slots of their regions, then
         // its values are let go of. A region's slots fill from its start, so
         // an output batch's buffer is taken when its first slot is: by then
@@ -381,7 +385,13 @@ impl RowStore {
                 let word = at_mut!(words, *slot);
                 *word = *word & !(u64::MAX << OFFSET_SHIFT) | offset << OFFSET_SHIFT;
             }
-            for (k, c) in columns(moved).enumerate().filter(|&(_, c)| copy >> c & 1 != 0) {
+            for (k, c) in columns(moved).enumerate().filter(|&(_, c)| decoded >> c & 1 == 0) {
+                if let (Some(decode), true) = (decode.as_mut(), by_row >> c & 1 != 0) {
+                    for (row, &slot) in (first as u64..).zip(at!(slots, ..count)) {
+                        copies.write(k, slot, decode(c, row));
+                    }
+                    continue;
+                }
                 let source = at!(self.held, b * width + c);
                 for (row, &slot) in (0..).zip(at!(slots, ..count)) {
                     copies.write(k, slot, source.word(row));
@@ -406,6 +416,15 @@ impl RowStore {
         let width = self.width as usize;
         let first = (place >> ROW_BITS) as usize * width;
         (at!(self.held, first..first + width), place & ROW_MASK)
+    }
+}
+
+/// Writes where in `words`' order each row is into its own word, above
+/// its row's number.
+fn mark_positions(words: &mut [u64], row_of: impl Fn(u64) -> u32) {
+    for at in 0..words.len() {
+        let word = at_mut!(words, row_of(*at!(words, at)) as usize);
+        *word = *word & !(POSITION_MASK << POSITION_SHIFT) | (at as u64) << POSITION_SHIFT;
     }
 }
 
@@ -850,7 +869,7 @@ mod tests {
         sorted.sort_unstable();
         assert!(sorted.iter().copied().eq(0..n));
         let mut words: Vec<u64> = rows.iter().map(|&row| u64::from(row) | 0xdead << 30).collect();
-        let no_decode = None::<fn(usize, u64) -> i64>;
+        let no_decode = (false, None::<fn(usize, u64) -> i64>);
         store
             .scatter(&mut context, &mut words, |word| (word & 0xff_ffff) as u32, no_decode)
             .unwrap();

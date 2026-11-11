@@ -9,6 +9,7 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
@@ -30,9 +31,9 @@ pub(crate) struct SortedRows {
     /// By key, its column if it's a string key, whose ranks among the rows'
     /// strings are laid out only once all are in.
     strings: SlowVec<Option<u32>>,
-    /// Each row's keys, one row after another, until they're sorted and
-    /// nothing is decoded from them.
-    keys: SlowVec<u8>,
+    /// Each row's keys, until they're sorted and nothing is decoded from
+    /// them, once the first batch says how long they are.
+    keys: Option<RowBlocks>,
     /// The rows themselves, but for the columns `decoded`.
     rows: RowStore,
     /// The key columns not held, as their keys hold their values: each
@@ -49,7 +50,7 @@ impl SortedRows {
             layout: None,
             types: SlowVec::new(allocator, 1 << 6)?,
             strings: SlowVec::new(allocator, 1 << 6)?,
-            keys: SlowVec::new(allocator, 1 << 31)?,
+            keys: None,
             rows: RowStore::new(allocator)?,
             decoded: SlowVec::new(allocator, 1 << 6)?,
             order: Sorted::Held { reverse: false, count: 0 },
@@ -107,15 +108,24 @@ impl SortedRows {
                 }
             }
         }
-        let at = self.keys.len();
-        // Rows can't be added once their keys are sorted.
-        check!(at == self.rows.len() as usize * stride);
-        self.keys.extend_zeroed(count as usize * stride)?;
-        let rows = at_mut!(self.keys, at..);
-        match (laid_out, &self.layout) {
-            (Some(laid_out), _) => rows.copy_from_slice(at!(laid_out, ..rows.len())),
-            (None, Some(layout)) => lay_out_keys(layout, batch, keys, rows),
-            (None, None) => failed!(),
+        if stride > 0 {
+            if self.keys.is_none() {
+                self.keys = Some(RowBlocks::new(context, stride)?);
+            }
+            let (Some(rows), Some(layout)) = (&mut self.keys, &self.layout) else { failed!() };
+            // Rows can't be added once their keys are sorted.
+            let first = rows.len();
+            check!(first == self.rows.len());
+            rows.extend(context, count, |row, bytes| {
+                let from = row - first;
+                match laid_out {
+                    Some(laid_out) => {
+                        let at = from as usize * stride;
+                        bytes.copy_from_slice(at!(laid_out, at..at + bytes.len()));
+                    }
+                    None => lay_out_keys_from(layout, batch, keys, from, bytes),
+                }
+            })?;
         }
         self.rows.append(context, batch)
     }
@@ -176,8 +186,8 @@ impl SortedRows {
 
     /// The keys of the held row `row`, laid out.
     pub(crate) fn keys_of(&self, row: u32) -> &[u8] {
-        let stride = self.layout().stride() as usize;
-        at!(self.keys, row as usize * stride..(row as usize + 1) * stride)
+        let Some(keys) = &self.keys else { failed!() };
+        keys.get(row)
     }
 
     /// How many rows the order has.
@@ -197,20 +207,25 @@ impl SortedRows {
         let allocator = context.allocator();
         self.order = Sorted::Held { reverse: false, count: self.rows.len() };
         self.order_len = self.rows.len();
-        let Some(layout) = &self.layout else { return Ok(()) };
+        let (Some(layout), Some(keys)) = (&self.layout, &mut self.keys) else { return Ok(()) };
         self.rows.flush(context)?;
+        let stride = layout.stride() as usize;
         for (k, column) in self.strings.iter().enumerate() {
             let Some(column) = *column else { continue };
             let ranks = rank_strings(allocator, &self.rows, column)?;
-            let get = |row: u32| self.rows.string(column, row).map(|_| *at!(ranks, row as usize));
-            RowLayout::write(layout.slot(k), self.rows.len(), get, &mut self.keys);
+            keys.for_each_block_mut(|first, bytes| {
+                let get = |i: u32| {
+                    let row = first + i;
+                    self.rows.string(column, row).map(|_| *at!(ranks, row as usize))
+                };
+                #[expect(clippy::cast_possible_truncation, reason = "a block's rows")]
+                let count = (bytes.len() / stride) as u32;
+                RowLayout::write(layout.slot(k), count, get, bytes);
+            });
         }
-        if layout.stride() > 0 {
-            self.order =
-                sort_row_layout(allocator, &mut self.keys, layout.stride(), self.order_len)?;
-        }
+        self.order = sort_row_layout(allocator, keys)?;
         if self.decoded.is_empty() {
-            self.keys.free();
+            keys.free();
         }
         Ok(())
     }
@@ -239,7 +254,7 @@ impl SortedRows {
             let Some(&(_, k)) = decoded.iter().find(|&&(c, _)| c == column) else { failed!() };
             let Some(layout) = &self.layout else { failed!() };
             let (slot, data_type) = (layout.slot(k), *at!(types, k));
-            let (stride, float) = (layout.stride() as usize, data_type == DataType::Float64);
+            let float = data_type == DataType::Float64;
             let in_words = order.slot_in_words(slot, float);
             let range = start as usize..end as usize;
             let mut values = context.values_buffer(rows.len() * 8)?;
@@ -248,11 +263,12 @@ impl SortedRows {
             {
                 return Ok(ColumnView::new(context, data_type, values, None)?);
             }
+            let Some(keys) = keys else { failed!() };
             if in_words.is_none() && nullable >> column & 1 == 0 {
                 let value_at = usize::from(slot.offset) + usize::from(slot.nullable);
                 for (out, &row) in values.as_mut_slice::<i64>().iter_mut().zip(rows) {
-                    let at = row as usize * stride + value_at;
-                    *out = row_layout::decode_value(slot, at!(keys, at..at + 8), float);
+                    let value = at!(keys.get(row), value_at..value_at + 8);
+                    *out = row_layout::decode_value(slot, value, float);
                 }
                 return Ok(ColumnView::new(context, data_type, values, None)?);
             }
@@ -271,8 +287,7 @@ impl SortedRows {
                 }
             } else {
                 for (r, &row) in (0..).zip(rows) {
-                    let at = row as usize * stride;
-                    put(r, row_layout::decode(slot, at!(keys, at..at + stride), float));
+                    put(r, row_layout::decode(slot, keys.get(row), float));
                 }
             }
             Ok(ColumnView::new(context, data_type, values, nulls.then_some(validity))?)
@@ -290,25 +305,45 @@ impl SortedRows {
         let packing = *packing;
         let words = at_mut!(words, ..self.order_len as usize);
         // Decoded columns are decoded from the words before scatter uses
-        // their bits, if their keys are only there.
+        // their bits, if their keys are only there, or else from the keys,
+        // each block let go of as soon as scatter is past its rows.
         let mut decode = None;
-        if let (Some(fixed), Some(layout), false) = (fixed, &self.layout, self.decoded.is_empty()) {
+        if let (Some(layout), false) = (&self.layout, self.decoded.is_empty()) {
             let mut slots = SlowVec::fixed(context.allocator(), self.decoded.len())?;
             for &(column, k) in self.decoded.iter() {
-                let float = *at!(self.types, k) == DataType::Float64;
-                slots.push((
-                    column,
-                    SlotInWords::new(packing, varying, fixed, layout.slot(k), float),
-                ))?;
+                let (slot, float) = (layout.slot(k), *at!(self.types, k) == DataType::Float64);
+                let in_words =
+                    fixed.as_ref().map(|f| SlotInWords::new(packing, varying, f, slot, float));
+                slots.push((column, slot, float, in_words))?;
             }
-            decode = Some(move |column: usize, word: u64| {
-                let Some((_, slot)) = slots.iter().find(|(c, _)| *c as usize == column) else {
+            let keys = &mut self.keys;
+            decode = Some(move |column: usize, word_or_row: u64| {
+                let Some((_, slot, float, in_words)) =
+                    slots.iter().find(|(c, ..)| *c as usize == column)
+                else {
                     failed!()
                 };
-                slot.decode(word).unwrap_or(0)
+                if let Some(in_words) = in_words {
+                    return in_words.decode(word_or_row).unwrap_or(0);
+                }
+                let Some(keys) = keys.as_mut() else { failed!() };
+                #[expect(clippy::cast_possible_truncation, reason = "a row held")]
+                let row = word_or_row as u32;
+                if row.is_multiple_of(BATCH_ROWS_MAX) {
+                    keys.let_go_below(row);
+                }
+                let at = usize::from(slot.offset) + usize::from(slot.nullable);
+                row_layout::decode_value(*slot, at!(keys.get(row), at..at + 8), *float)
             });
         }
-        self.rows.scatter(context, words, |word| packing.row(word), decode)
+        let by_word = fixed.is_some();
+        self.rows.scatter(context, words, |word| packing.row(word), (by_word, decode))?;
+        if self.decoded.iter().all(|&(column, _)| self.rows.is_scattered(column))
+            && let Some(keys) = &mut self.keys
+        {
+            keys.free();
+        }
+        Ok(())
     }
 }
 
@@ -341,9 +376,22 @@ pub(crate) fn lay_out_keys(
     keys: &[SortKey],
     rows: &mut [u8],
 ) {
-    let count = batch.selection().len();
+    lay_out_keys_from(layout, batch, keys, 0, rows);
+}
+
+/// As `lay_out_keys`, the rows from the `from`th the batch keeps, as many
+/// as `rows` holds.
+fn lay_out_keys_from(
+    layout: &RowLayout,
+    batch: &RowBatch,
+    keys: &[SortKey],
+    from: u32,
+    rows: &mut [u8],
+) {
+    #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+    let count = (rows.len() / layout.stride().max(1) as usize) as u32;
     let kept = batch.selection().kept();
-    let row = |i: u32| kept.row(i);
+    let row = |i: u32| kept.row(from + i);
     for (k, key) in keys.iter().enumerate() {
         let column = batch.column(key.column);
         let slot = layout.slot(k);
