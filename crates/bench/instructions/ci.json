@@ -13,9 +13,9 @@
   "clickbench.g_region": 98926370,
   "clickbench.g_user": 123824505,
   "clickbench.g_window": 225140840,
-  "clickbench.q10": 40920137,
-  "clickbench.q12": 69741842,
-  "clickbench.q14": 92837421,
+  "clickbench.q10": 41153890,
+  "clickbench.q12": 70923887,
+  "clickbench.q14": 94175162,
   "clickbench.q15": 106837239,
   "clickbench.q24t": 145756810,
   "clickbench.q25": 97101656,
@@ -40,8 +40,8 @@
   "scan.table": 194578,
   "small.point": 33879,
   "small_planned.order": 481078,
-  "small_planned.point": 4194,
+  "small_planned.point": 4307,
   "string_pool_get.distinct": 270688,
-  "string_pool_intern.distinct": 2281599,
-  "string_pool_intern.repeats": 1522423
+  "string_pool_intern.distinct": 2237853,
+  "string_pool_intern.repeats": 1532630
 }
