@@ -42,6 +42,6 @@
   "small_planned.order": 481078,
   "small_planned.point": 4194,
   "string_pool_get.distinct": 270688,
-  "string_pool_intern.distinct": 2352003,
-  "string_pool_intern.repeats": 1094988
+  "string_pool_intern.distinct": 2281600,
+  "string_pool_intern.repeats": 1562024
 }
