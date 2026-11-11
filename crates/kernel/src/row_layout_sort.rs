@@ -9,6 +9,7 @@ use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::radix_sort::{Scratch, merge, sort_words};
+use crate::row_blocks::RowBlocks;
 use crate::row_layout::Slot;
 use crate::slow_vec::SlowVec;
 
@@ -17,18 +18,17 @@ use crate::slow_vec::SlowVec;
 const MAX_MERGED_RUNS: usize = 32;
 const ROWS_PER_MERGED_RUN: usize = 256;
 
-/// Rows of `stride` bytes each, one after another.
+/// Rows of `stride` bytes each.
 #[derive(Clone, Copy)]
 struct Rows<'a> {
-    data: &'a [u8],
+    blocks: &'a RowBlocks,
     stride: usize,
     count: u32,
 }
 
 impl<'a> Rows<'a> {
     fn get(self, row: u32) -> &'a [u8] {
-        let at = row as usize * self.stride;
-        at!(self.data, at..at + self.stride)
+        self.blocks.get(row)
     }
 }
 
@@ -380,17 +380,14 @@ impl SlotInWords {
     }
 }
 
-/// Stably sorts the `count` rows of `stride` bytes in `row_layout`. Frees
-/// the rows once sorting no longer needs them, before the memory the rest
-/// of the sort takes.
+/// Stably sorts the rows laid out in `row_layout`. Frees them once sorting
+/// no longer needs them, before the memory the rest of the sort takes.
 pub(crate) fn sort_row_layout(
     allocator: &dyn Allocator,
-    row_layout: &mut SlowVec<u8>,
-    stride: u32,
-    count: u32,
+    row_layout: &mut RowBlocks,
 ) -> Result<Sorted, AllocError> {
-    let rows = Rows { data: row_layout, stride: stride as usize, count };
-    check!(row_layout.len() >= count as usize * rows.stride);
+    let count = row_layout.len();
+    let rows = Rows { blocks: row_layout, stride: row_layout.stride(), count };
     // 1. Reuse the order the rows are already in, where it helps: keep where
     // runs start, to merge them, if there are few.
     let mut existing = find_existing_order(rows);
@@ -426,7 +423,7 @@ pub(crate) fn sort_row_layout(
     // 4. If the words left out varying bytes, equal keys may still be
     // different rows: sort each tied group on the bytes after them.
     if varying.len() > packing.key_bytes {
-        let rows = Rows { data: row_layout, stride: stride as usize, count };
+        let rows = Rows { blocks: row_layout, stride: row_layout.stride(), count };
         sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, &mut scratch);
     }
     Ok(Sorted::Words { words, packing, varying, fixed })
@@ -438,6 +435,7 @@ mod tests {
 
     use super::*;
     use crate::allocator::Heap;
+    use crate::context::Context;
 
     /// `count` rows of `stride` bytes, of a few values so many tie, with
     /// `fixed` bytes the same in every row.
@@ -458,10 +456,15 @@ mod tests {
     fn expect_sorted(rows: &[u8], stride: usize) {
         let count = u32::try_from(rows.len() / stride).unwrap();
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
-        let mut row_layout = SlowVec::new(&Heap, 1 << 20).unwrap();
-        row_layout.extend_from_slice(rows).unwrap();
-        let stride = u32::try_from(stride).unwrap();
-        let sorted = sort_row_layout(&Heap, &mut row_layout, stride, count).unwrap();
+        let mut context = Context::new(&Heap);
+        let mut row_layout = RowBlocks::new(&context, stride).unwrap();
+        row_layout
+            .extend(&mut context, count, |first, bytes| {
+                let at = first as usize * stride;
+                bytes.copy_from_slice(&rows[at..at + bytes.len()]);
+            })
+            .unwrap();
+        let sorted = sort_row_layout(&Heap, &mut row_layout).unwrap();
         let indices: Vec<u32> = (0..count).map(|i| sorted.row(i)).collect();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));

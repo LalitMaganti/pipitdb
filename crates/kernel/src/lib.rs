@@ -34,6 +34,7 @@ pub mod predicate;
 pub mod query_allocators;
 mod radix_sort;
 pub mod row_batch;
+mod row_blocks;
 mod row_layout;
 mod row_layout_sort;
 mod row_store;
