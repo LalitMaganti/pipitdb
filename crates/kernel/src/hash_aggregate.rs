@@ -9,7 +9,7 @@ use crate::aggregate_function::{
 };
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, Forms};
+use crate::column::{ColumnView, DataType, Forms};
 use crate::context::Context;
 use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
@@ -144,8 +144,9 @@ fn first_values(
     Ok((values, firsts, kept))
 }
 
-/// A batch whose columns this reads are flat: they're in whatever form the
-/// first op to read them takes, so those that aren't are made flat.
+/// A batch whose columns this reads are flat, but for string keys'
+/// dictionaries: they're in whatever form the first op to read them takes,
+/// so those that aren't are made flat.
 struct Flat<'b, 'r> {
     /// The batch, whose columns that are flat are read as they are.
     batch: &'b RowBatch<'r>,
@@ -162,9 +163,14 @@ impl<'b, 'r> Flat<'b, 'r> {
         let mut copies = [const { None }; BATCH_COLUMNS_MAX as usize];
         for position in read {
             let column = batch.column(position);
-            if !column.is_in(Forms::FLAT) && at!(copies, position as usize).is_none() {
+            let forms = if column.data_type() == DataType::String {
+                Forms::FLAT | Forms::DICTIONARY
+            } else {
+                Forms::FLAT
+            };
+            if !column.is_in(forms) && at!(copies, position as usize).is_none() {
                 let mut copy = column.clone();
-                copy.make_in(context, Forms::FLAT)?;
+                copy.make_in(context, forms)?;
                 *at_mut!(copies, position as usize) = Some(copy);
             }
         }
@@ -405,8 +411,9 @@ mod tests {
         ColumnView::strings(&mut Context::new(&Heap), views, stored, validity).unwrap()
     }
 
-    /// `Rows`, with its key `k` as a string column, of each key's digits.
-    struct StringKeys(Rows);
+    /// `Rows`, with its key `k` as a string column, of each key's digits:
+    /// flat, or, if there are dictionaries, as indices into its batch's.
+    struct StringKeys(Rows, Vec<ColumnView>);
 
     impl Source for StringKeys {
         type State = usize;
@@ -429,7 +436,22 @@ mod tests {
             let texts: Vec<_> = (0..keys.row_count())
                 .map(|row| (!keys.is_null(row)).then(|| digits(row)))
                 .collect();
-            batch.set_column(0, strings(&texts));
+            let Some(entries) = self.1.get(*i - 1) else {
+                batch.set_column(0, strings(&texts));
+                return Ok(true);
+            };
+            let found = |text: &Option<String>, e: u32| match text {
+                None => entries.is_null(e),
+                Some(text) => {
+                    !entries.is_null(e)
+                        && entries.values().strings().get(e as usize) == text.as_bytes()
+                }
+            };
+            let mut indices = Buffer::allocate(&Heap, texts.len() * 4).unwrap();
+            for (index, text) in indices.as_mut_slice::<u32>().iter_mut().zip(&texts) {
+                *index = (0..entries.row_count()).find(|&e| found(text, e)).unwrap();
+            }
+            batch.set_column(0, ColumnView::dictionary(context, entries, indices).unwrap());
             Ok(true)
         }
     }
@@ -542,19 +564,28 @@ mod tests {
                 alloc::vec![(Some(1), Some(1)), (Some(12), Some(2)), (None, Some(1))],
                 alloc::vec![(Some(12), Some(4)), (None, None), (Some(-3), Some(1))],
                 Vec::new(),
+                alloc::vec![(Some(12), Some(7)), (Some(-3), Some(2)), (None, Some(5))],
             ],
             dropped: alloc::vec![1],
         };
-        for keys in [&[0][..], &[0, 1], &[1, 0]] {
-            let mut by_strings = spec(keys);
-            by_strings.string_keys = 1 << keys.iter().position(|&key| key == 0).unwrap();
+        // The first three batches share a dictionary, and the last has its
+        // own, with entries in another order.
+        let first = strings(&[Some("1".into()), Some("12".into()), None, Some("-3".into())]);
+        let last = strings(&[Some("-3".into()), None, Some("12".into()), Some("x".into())]);
+        let dictionaries = [Vec::new(), alloc::vec![first.clone(), first.clone(), first, last]];
+        for (keys, groups) in [(&[0][..], 4), (&[0, 1], 6), (&[1, 0], 6)] {
             let expected = run(rows(), spec(keys)).unwrap();
-            assert_eq!(expected.len(), 4);
-            assert_eq!(run(StringKeys(rows()), by_strings).unwrap(), expected);
+            assert_eq!(expected.len(), groups);
+            for dictionaries in &dictionaries {
+                let rows = StringKeys(rows(), dictionaries.clone());
+                let mut by_strings = spec(keys);
+                by_strings.string_keys = 1 << keys.iter().position(|&key| key == 0).unwrap();
+                assert_eq!(run(rows, by_strings).unwrap(), expected);
+            }
         }
         let mut by_strings = spec(&[0]);
         by_strings.string_keys = 1;
-        let none = StringKeys(Rows { batches: Vec::new(), dropped: Vec::new() });
+        let none = StringKeys(Rows { batches: Vec::new(), dropped: Vec::new() }, Vec::new());
         assert!(run(none, by_strings).unwrap().is_empty());
     }
 
