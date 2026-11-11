@@ -187,6 +187,8 @@ impl RowStore {
             *found = place(row);
         }
         let places = at!(places, ..count as usize);
+        // So every place, of a batch held, has its sources: `gather` relies on it.
+        check!(self.held.len() == self.batches as usize * self.width);
         for c in 0..self.width {
             let nullable = self.nullable >> c.min(63) & 1 != 0;
             let data_type = at!(held, c).view().data_type();
@@ -304,7 +306,11 @@ fn gather(
     let rows = places.len();
     // This column of every batch held is every `width`th from here.
     let held = at!(held, column..);
-    let found = |place: u32| (at!(held, (place >> ROW_BITS) as usize * width), place & ROW_MASK);
+    let found = |place: u32| {
+        let at = (place >> ROW_BITS) as usize * width;
+        // SAFETY: a place is of a batch held, each with `width` sources.
+        (unsafe { held.get_unchecked(at) }, place & ROW_MASK)
+    };
     let mut values = context.values_buffer(rows * 8)?;
     let mut validity = None;
     if nullable {
