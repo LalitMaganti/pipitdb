@@ -6,6 +6,7 @@ use core::ptr::NonNull;
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
+use crate::row_batch::BATCH_ROWS_MAX;
 
 /// A set of the forms a column may come in: what a plan lets a producer
 /// make a column in, and what a consumer takes it in. Every producer can
@@ -122,6 +123,89 @@ struct Header {
     value_start: u32,
     len: u32,
     bounds: Cell<Bounds>,
+}
+
+/// A flat view, with where its values are, flat enough to read in a loop
+/// as Perfetto's `GatherSource`: row `row` is the word at `row` and the bit
+/// at `row`.
+///
+/// It keeps the view, so the buffers its pointers are into stay alive, and
+/// they aren't written once shared. Their bytes don't move with it. Each
+/// is a cache line, so finding one is a shift and reading one a line.
+#[repr(align(64))]
+pub(crate) struct GatherSource {
+    /// The view.
+    view: ColumnView,
+    /// Its values, a word each: an integer, a float's bits, or a string's
+    /// view.
+    words: NonNull<[i64; BATCH_ROWS_MAX as usize]>,
+    /// Which values aren't null, if any are.
+    validity: Option<NonNull<[u8; BATCH_ROWS_MAX as usize / 8]>>,
+    /// What a string column's views are into, or none.
+    bytes: NonNull<[u8]>,
+}
+
+impl GatherSource {
+    /// `view`'s, which must `fit`.
+    pub(crate) fn of(view: &ColumnView) -> GatherSource {
+        check!(GatherSource::fits(view));
+        let header = view.header();
+        let start = (header.value_start + view.start) as usize;
+        let at = |buffer: &Buffer, at: usize| buffer.as_ptr::<u8>().wrapping_add(at).cast_mut();
+        let validity = header.validity.as_ref().map(|bits| at(bits, start / 8));
+        let bytes = header.bytes.as_ref().map_or(&[][..], Buffer::as_slice::<u8>);
+        let Some(words) = NonNull::new(at(&header.values, start * 8)) else { failed!() };
+        GatherSource {
+            view: view.clone(),
+            words: words.cast(),
+            validity: validity.and_then(NonNull::new).map(NonNull::cast),
+            bytes: NonNull::from(bytes),
+        }
+    }
+
+    /// Whether `view` has a batch's worth of words and of bits from its
+    /// first, its first bit the first of a byte.
+    #[inline(never)]
+    pub(crate) fn fits(view: &ColumnView) -> bool {
+        let header = view.header();
+        let start = (header.value_start + view.start) as usize;
+        let rows = BATCH_ROWS_MAX as usize;
+        header.values.size_bytes() >= (start + rows) * 8
+            && header.validity.as_ref().is_none_or(|bits| {
+                start.is_multiple_of(8) && bits.size_bytes() >= (start + rows) / 8
+            })
+    }
+
+    pub(crate) fn view(&self) -> &ColumnView {
+        &self.view
+    }
+
+    /// The word of row `row`, a row of a batch.
+    #[inline]
+    pub(crate) fn word(&self, row: u32) -> i64 {
+        // SAFETY: made from the view's words, which it keeps alive.
+        let words = unsafe { self.words.as_ref() };
+        *at!(words, row as usize % BATCH_ROWS_MAX as usize)
+    }
+
+    /// Whether row `row`, a row of a batch, isn't null.
+    #[inline]
+    pub(crate) fn is_valid(&self, row: u32) -> bool {
+        let row = row as usize % BATCH_ROWS_MAX as usize;
+        self.validity.is_none_or(|bits| {
+            // SAFETY: made from the view's validity, which it keeps alive.
+            let bits = unsafe { bits.as_ref() };
+            *at!(bits, row / 8) >> (row % 8) & 1 != 0
+        })
+    }
+
+    /// The `len` bytes from `start` of a string column's bytes.
+    #[inline]
+    pub(crate) fn string(&self, start: u32, len: u32) -> &[u8] {
+        // SAFETY: made from the view's bytes, which it keeps alive.
+        let bytes = unsafe { self.bytes.as_ref() };
+        at!(bytes, start as usize..(start + len) as usize)
+    }
 }
 
 /// Each is its bit in `Forms`.

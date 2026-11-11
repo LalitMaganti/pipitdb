@@ -3,7 +3,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Form};
+use crate::column::{ColumnView, DataType, Form, GatherSource};
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
@@ -14,6 +14,9 @@ use core::ops::Range;
 /// The bits of a row's place that say which row of its batch it is.
 const ROW_BITS: u32 = 11;
 const _: () = assert!(BATCH_ROWS_MAX <= 1 << ROW_BITS);
+
+/// Keeps the bits of a row's place that say which row of its batch it is.
+const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
 
 /// The most batches a store holds, as a place is 32 bits: with full
 /// batches, about 4 billion rows.
@@ -30,7 +33,11 @@ const BATCHES_MAX: usize = 1 << (32 - ROW_BITS);
 /// whole buffers alive.
 pub(crate) struct RowStore {
     /// Each batch held, by its columns.
-    batches: SlowVec<SlowVec<ColumnView>>,
+    held: SlowVec<GatherSource>,
+    /// How many batches are held.
+    batches: u32,
+    /// How many columns each batch held has.
+    width: usize,
     /// Where each row held is: its batch, shifted up `ROW_BITS`, and its row
     /// in it.
     places: SlowVec<u32>,
@@ -39,15 +46,21 @@ pub(crate) struct RowStore {
     packing: SlowVec<Packing>,
     /// How many rows are being packed.
     packed: u32,
+    /// By column, a bit for whether any batch held has nulls in it; the
+    /// last bit is for every column from there on.
+    nullable: u64,
 }
 
 impl RowStore {
     pub(crate) fn new(allocator: &dyn Allocator) -> Result<RowStore, AllocError> {
         Ok(RowStore {
-            batches: SlowVec::new(allocator, BATCHES_MAX)?,
+            held: SlowVec::new(allocator, 1 << 31)?,
+            batches: 0,
+            width: 0,
             places: SlowVec::new(allocator, 1 << 31)?,
             packing: SlowVec::new(allocator, 1 << 6)?,
             packed: 0,
+            nullable: 0,
         })
     }
 
@@ -71,7 +84,7 @@ impl RowStore {
         if shares(batch) {
             // Rows packed before come first.
             self.flush(context)?;
-            return self.hold(context, batch);
+            return self.hold(batch);
         }
         let columns = (0..batch.column_count()).map(|c| batch.column(c));
         let kept = batch.selection().kept();
@@ -95,20 +108,22 @@ impl RowStore {
     }
 
     /// Holds `batch` as it is, sharing its buffers.
-    fn hold(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
-        let mut columns = SlowVec::fixed(context.allocator(), batch.column_count() as usize)?;
-        for c in 0..batch.column_count() {
-            columns.push(batch.column(c).clone())?;
-        }
-        let Ok(held) = u32::try_from(self.batches.len()) else { failed!() };
-        if self.batches.len() == BATCHES_MAX {
+    fn hold(&mut self, batch: &RowBatch) -> Result<(), Error> {
+        let held = self.batches;
+        if held as usize == BATCHES_MAX {
             return Err(Error::OutOfMemory);
         }
-        self.batches.push(columns)?;
+        self.width = batch.column_count() as usize;
+        for c in 0..batch.column_count() {
+            let column = batch.column(c);
+            self.held.push(GatherSource::of(column))?;
+            self.nullable |= u64::from(column.has_nulls()) << c.min(63);
+        }
         let kept = batch.selection().kept();
         for i in 0..batch.selection().len() {
             self.places.push(held << ROW_BITS | kept.row(i))?;
         }
+        self.batches += 1;
         Ok(())
     }
 
@@ -125,7 +140,7 @@ impl RowStore {
         }
         while self.packing.pop().is_some() {}
         self.packed = 0;
-        self.hold(context, &batch)
+        self.hold(&batch)
     }
 
     /// The string of the held row `row` in column `column`, a string column,
@@ -133,7 +148,7 @@ impl RowStore {
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
         check!(self.packed == 0);
         let (held, row) = self.find(row);
-        let values = at!(held, column as usize).values();
+        let values = at!(held, column as usize).view().values();
         (!values.is_null(row)).then(|| values.strings().get(row as usize))
     }
 
@@ -161,36 +176,44 @@ impl RowStore {
                 .zip(rows)
                 .all(|(r, &row)| row == first + r && place(row) == place(first) + r);
         if run {
-            for column in held.iter() {
-                let Ok(()) = out.push_column(column.slice(start, count)) else { failed!() };
+            for held in held {
+                let Ok(()) = out.push_column(held.view().slice(start, count)) else { failed!() };
             }
             return Ok(count);
         }
-        for c in 0..held.len() {
-            let data_type = at!(held, c).data_type();
-            let source = |r: usize| {
-                let (held, row) = self.find(*at!(rows, r));
-                (at!(held, c), row)
-            };
-            let column = gather(context, data_type, count, source)?;
+        // Found once for every column.
+        let mut places = [0_u32; BATCH_ROWS_MAX as usize];
+        for (found, &row) in places.iter_mut().zip(rows) {
+            *found = place(row);
+        }
+        let places = at!(places, ..count as usize);
+        // So every place, of a batch held, has its sources: `gather` relies on it.
+        check!(self.held.len() == self.batches as usize * self.width);
+        for c in 0..self.width {
+            let nullable = self.nullable >> c.min(63) & 1 != 0;
+            let data_type = at!(held, c).view().data_type();
+            let column = gather(context, data_type, (&self.held, self.width, c), places, nullable)?;
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
     }
 
     /// The columns of the batch held row `row` is in, and its row there.
-    fn find(&self, row: u32) -> (&SlowVec<ColumnView>, u32) {
+    fn find(&self, row: u32) -> (&[GatherSource], u32) {
         let place = *at!(self.places, row as usize);
-        (at!(self.batches, (place >> ROW_BITS) as usize), place & ((1 << ROW_BITS) - 1))
+        let first = (place >> ROW_BITS) as usize * self.width;
+        (at!(self.held, first..first + self.width), place & ROW_MASK)
     }
 }
 
 /// Whether `batch` is held by sharing its buffers rather than packed: if it
 /// keeps at least half a batch's worth of rows, or its columns all borrow
-/// what they view.
+/// what they view, and each column's buffer has a batch's worth of words
+/// from its first, as gathering reads.
 fn shares(batch: &RowBatch) -> bool {
-    batch.selection().len() * 2 >= BATCH_ROWS_MAX
-        || (0..batch.column_count()).all(|c| batch.is_borrowed(c))
+    let columns = 0..batch.column_count();
+    (batch.selection().len() * 2 >= BATCH_ROWS_MAX || columns.clone().all(|c| batch.is_borrowed(c)))
+        && columns.into_iter().all(|c| GatherSource::fits(batch.column(c)))
 }
 
 /// A column being packed: its values, up to a batch's, and nulls.
@@ -270,45 +293,56 @@ fn view(start: usize, len: usize) -> Result<[u32; 2], Error> {
     Ok([start, len])
 }
 
-/// A flat column of `count` rows of `data_type`, row `r` row `source(r).1`
-/// of the flat column `source(r).0`.
-fn gather<'c>(
+/// A flat column of `data_type` holding, for each of `places`, that row of
+/// its batch's column in `held`: the store's columns, how many each batch
+/// has, and which column. `nullable` is whether any has nulls.
+fn gather(
     context: &mut Context,
     data_type: DataType,
-    count: u32,
-    source: impl Fn(usize) -> (&'c ColumnView, u32),
+    (held, width, column): (&[GatherSource], usize, usize),
+    places: &[u32],
+    nullable: bool,
 ) -> Result<ColumnView, Error> {
-    let rows = count as usize;
+    let rows = places.len();
+    // This column of every batch held is every `width`th from here.
+    let held = at!(held, column..);
+    let found = |place: u32| {
+        let at = (place >> ROW_BITS) as usize * width;
+        // SAFETY: a place is of a batch held, each with `width` sources.
+        (unsafe { held.get_unchecked(at) }, place & ROW_MASK)
+    };
     let mut values = context.values_buffer(rows * 8)?;
-    let mut validity = context.small_buffer(rows.div_ceil(8))?;
-    let bits = validity.as_mut_slice::<u8>();
-    bits.fill(0);
-    let (mut nulls, mut total) = (false, 0);
-    let strings = data_type.has_bytes();
-    // Each row's validity, and its word or its string's length.
-    for (r, out) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
-        let (column, row) = source(r);
-        let values = column.values();
-        let valid = !values.is_null(row);
-        *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
-        nulls |= !valid;
-        if strings {
-            total += values.strings().get(row as usize).len();
-        } else {
-            *out = *at!(values.words(), row as usize);
+    let mut validity = None;
+    if nullable {
+        let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+        let bits = buffer.as_mut_slice::<u8>();
+        bits.fill(0);
+        let mut nulls = false;
+        for (r, &place) in places.iter().enumerate() {
+            let (source, row) = found(place);
+            let valid = source.is_valid(row);
+            *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
+            nulls |= !valid;
         }
+        validity = nulls.then_some(buffer);
     }
-    let validity = nulls.then_some(validity);
-    if !strings {
+    // A string's word is its view.
+    for (out, &place) in values.as_mut_slice::<i64>().iter_mut().zip(places) {
+        let (source, row) = found(place);
+        *out = source.word(row);
+    }
+    if !data_type.has_bytes() {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
+    let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
+    let total = views.iter().map(|&[_, len]| len as usize).sum();
     let mut bytes = context.bytes_buffer(total)?;
     let out = bytes.as_mut_slice::<u8>();
     let mut start = 0;
-    let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
-    for (r, out_view) in views.iter_mut().enumerate() {
-        let (column, row) = source(r);
-        let string = column.values().strings().get(row as usize);
+    for (out_view, &place) in views.iter_mut().zip(places) {
+        let (source, _) = found(place);
+        let [from, len] = *out_view;
+        let string = source.string(from, len);
         at_mut!(out, start..start + string.len()).copy_from_slice(string);
         *out_view = view(start, string.len())?;
         start += string.len();
@@ -373,6 +407,32 @@ mod tests {
             .collect()
     }
 
+    /// A full batch of the two columns `batch` makes, with no nulls.
+    fn batch_without_nulls(context: &mut Context, base: i64) -> RowBatch<'static> {
+        let rows = BATCH_ROWS_MAX as usize;
+        let mut ints = context.values_buffer(rows * 8).unwrap();
+        let mut views = context.values_buffer(rows * 8).unwrap();
+        let mut text = String::new();
+        for row in 0..rows {
+            let value = base + i64::try_from(row).unwrap();
+            ints.as_mut_slice::<i64>()[row] = value;
+            let string = format!("v{value}");
+            let start = u32::try_from(text.len()).unwrap();
+            views.as_mut_slice::<u32>()[2 * row..2 * row + 2]
+                .copy_from_slice(&[start, u32::try_from(string.len()).unwrap()]);
+            text.push_str(&string);
+        }
+        let mut bytes = context.bytes_buffer(text.len()).unwrap();
+        bytes.as_mut_slice::<u8>().copy_from_slice(text.as_bytes());
+        let ints = ColumnView::new(context, DataType::Int64, ints, None).unwrap();
+        let strings = ColumnView::strings(context, views, bytes, None).unwrap();
+        let mut batch = RowBatch::new();
+        batch.reset(BATCH_ROWS_MAX);
+        batch.push_column(ints).ok().unwrap();
+        batch.push_column(strings).ok().unwrap();
+        batch
+    }
+
     /// Which of a batch's rows to keep.
     type Keep = fn(u16) -> bool;
 
@@ -421,5 +481,24 @@ mod tests {
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn gathers_across_batches_with_and_without_nulls() {
+        let mut context = Context::new(&Heap);
+        let mut store = RowStore::new(&Heap).unwrap();
+        let with = batch(&mut context, 0, |_| true);
+        store.append(&mut context, &with).unwrap();
+        let without = batch_without_nulls(&mut context, 10_000);
+        store.append(&mut context, &without).unwrap();
+
+        let last = BATCH_ROWS_MAX * 2 - 1;
+        let rows = [last, 3, BATCH_ROWS_MAX, 0];
+        let mut out = RowBatch::new();
+        store.gather(&mut context, &mut out, &rows).unwrap();
+        let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
+        let null = (None, b"v0".to_vec());
+        let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
+        assert_eq!(read(&out), [int(newest), null, int(10_000), int(0)]);
     }
 }
