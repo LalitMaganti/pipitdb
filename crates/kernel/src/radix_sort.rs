@@ -1,154 +1,194 @@
-//! Sorting words by keys in their high bits, as Perfetto's `core/util/sort.h`
-//! sorts `KeyedIndex`es: by an LSD radix sort where that's estimated to be
-//! cheaper, and by comparing them otherwise.
+//! Sorting rows' words in place, most significant digit first, partitioning
+//! whole blocks at a time, and sorting strings by their bytes.
 
 use crate::allocator::{AllocError, Allocator};
 use crate::slow_vec::SlowVec;
 
-/// How a key is split into digits for a radix sort.
-#[derive(Clone, Copy)]
-struct RadixDigits {
-    passes: u32,
-    bits: u32,
+/// How many bits one partition splits on.
+const DIGIT_BITS: u32 = 8;
+
+/// How many buckets one partition splits into.
+const BUCKETS: usize = 1 << DIGIT_BITS;
+
+/// How many words a block holds, the unit partitioning moves.
+const BLOCK: usize = 128;
+
+/// Up to this many words are sorted by insertion.
+const INSERTION_MAX: usize = 24;
+
+/// Up to this many words are sorted by copying them to their buckets, which
+/// costs far less per call than partitioning in place.
+const SMALL: usize = 4096;
+
+/// What sorting words works in, one after another: by bucket, a block
+/// being filled then any block that had nowhere to go, which `sort_small`
+/// also copies through; the block being carried to its bucket; and by block
+/// of the input, whether it's been moved. Partitioning is done before
+/// the buckets are sorted, so one is enough for every level.
+pub(crate) struct Scratch(SlowVec<u64>);
+
+impl Scratch {
+    /// For sorting up to `count` words.
+    pub(crate) fn new(allocator: &dyn Allocator, count: usize) -> Result<Scratch, AllocError> {
+        let len =
+            if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
+        Ok(Scratch(SlowVec::zeroed(allocator, len)?))
+    }
 }
 
-/// Splits a key of `key_bits` bits into digits of at most 16 bits, all the
-/// same width. Each pass scatters every element, which costs several times
-/// clearing and summing one count, so the split minimizes
-/// `passes * (4 * size + counts)`: the fewest passes for many elements, and
-/// narrower digits, with more passes, for few.
-fn radix_digits(key_bits: u32, size: usize) -> RadixDigits {
-    let fewest = key_bits.div_ceil(16);
-    if fewest == 0 {
-        return RadixDigits { passes: 0, bits: 0 };
-    }
-    let mut best = RadixDigits { passes: 0, bits: 0 };
-    let mut best_cost = u64::MAX;
-    for passes in fewest..=fewest + 2 {
-        let bits = key_bits.div_ceil(passes);
-        let cost = u64::from(passes) * (4 * size as u64 + (1 << bits));
-        if cost < best_cost {
-            (best, best_cost) = (RadixDigits { passes, bits }, cost);
-        }
-    }
-    best
+/// The bits to split `words`, which all differ, on: the highest that differ.
+fn top_digit(words: &[u64]) -> u32 {
+    let first = *at!(words, 0);
+    let differ = words.iter().fold(0, |differ, &word| differ | (word ^ first));
+    differ.ilog2().saturating_sub(DIGIT_BITS - 1)
 }
 
-/// The number of counts `radix_sort` needs for `size` keys of `key_bits`
-/// bits.
-fn radix_sort_counts_size(key_bits: u32, size: usize) -> usize {
-    let digits = radix_digits(key_bits, size);
-    (digits.passes as usize) << digits.bits
-}
-
-/// Sorts `words` by key with a stable radix sort, least significant digit
-/// first. Each pass is a stable counting sort on one digit into the other
-/// buffer, and the two then swap roles. The counts of every digit are taken
-/// in one read, and a pass is skipped when every word has the same digit.
-/// Returns whether the sorted words are in `scratch`, at least as long,
-/// rather than `words`.
-fn radix_sort(
-    words: &mut [u64],
-    scratch: &mut [u64],
-    counts: &mut [u32],
-    low: u32,
-    key_bits: u32,
-) -> bool {
-    let n = words.len();
-    if n <= 1 || key_bits == 0 {
-        return false;
+/// Sorts up to `SMALL` `words`, which all differ, through `spare`.
+fn sort_small(words: &mut [u64], spare: &mut [u64]) {
+    if words.len() <= INSERTION_MAX {
+        insertion_sort(words);
+        return;
     }
-    let digits = radix_digits(key_bits, n);
-    let buckets = 1_usize << digits.bits;
-    let mask = buckets as u64 - 1;
-    let counts = at_mut!(counts, ..digits.passes as usize * buckets);
-    counts.fill(0);
+    let shift = top_digit(words);
+    #[expect(clippy::cast_possible_truncation, reason = "masked to a digit")]
+    let digit = |word: u64| (word >> shift) as usize & (BUCKETS - 1);
+    let mut start = [0_u32; BUCKETS + 1];
     for &word in words.iter() {
-        for p in 0..digits.passes {
-            #[expect(clippy::cast_possible_truncation, reason = "under 2^16")]
-            let digit = ((word >> (low + p * digits.bits)) & mask) as usize;
-            *at_mut!(counts, p as usize * buckets + digit) += 1;
+        *at_mut!(start, digit(word) + 1) += 1;
+    }
+    for b in 0..BUCKETS {
+        *at_mut!(start, b + 1) += *at!(start, b);
+    }
+    let copy = at_mut!(spare, ..words.len());
+    copy.copy_from_slice(words);
+    let mut next = start;
+    for &word in copy.iter() {
+        let at = at_mut!(next, digit(word));
+        *at_mut!(words, *at as usize) = word;
+        *at += 1;
+    }
+    for b in 0..BUCKETS {
+        let bucket = at_mut!(words, *at!(start, b) as usize..*at!(start, b + 1) as usize);
+        if bucket.len() > 1 {
+            sort_small(bucket, spare);
         }
     }
-    let (mut source, mut dest) = (words, at_mut!(scratch, ..n));
-    let mut in_scratch = false;
-    for (p, count) in counts.chunks_exact_mut(buckets).enumerate() {
-        #[expect(clippy::cast_possible_truncation, reason = "at most 4 passes")]
-        let shift = low + p as u32 * digits.bits;
-        #[expect(clippy::cast_possible_truncation, reason = "under 2^16")]
-        let digit = |word: u64| ((word >> shift) & mask) as usize;
-        // Every word has the same digit: this pass can't move any.
-        if *at!(count, digit(*at!(source, 0))) as usize == n {
+}
+
+fn insertion_sort(words: &mut [u64]) {
+    for i in 1..words.len() {
+        let word = *at!(words, i);
+        let mut j = i;
+        while j > 0 && word < *at!(words, j - 1) {
+            *at_mut!(words, j) = *at!(words, j - 1);
+            j -= 1;
+        }
+        *at_mut!(words, j) = word;
+    }
+}
+
+/// Puts `words` into blocks of one bucket each, written back over the words
+/// already read, and returns how many words are left in each bucket's
+/// buffer, how many each bucket has, and how many blocks were written.
+fn fill_blocks(
+    words: &mut [u64],
+    digit: impl Fn(u64) -> usize,
+    buffers: &mut [u64],
+) -> ([usize; BUCKETS], [usize; BUCKETS], usize) {
+    let (mut filled, mut total, mut written) = ([0_usize; BUCKETS], [0_usize; BUCKETS], 0);
+    for i in 0..words.len() {
+        let word = *at!(words, i);
+        let bucket = digit(word);
+        *at_mut!(buffers, bucket * 2 * BLOCK + *at!(filled, bucket)) = word;
+        *at_mut!(filled, bucket) += 1;
+        *at_mut!(total, bucket) += 1;
+        if *at!(filled, bucket) == BLOCK {
+            let block = at!(buffers, bucket * 2 * BLOCK..bucket * 2 * BLOCK + BLOCK);
+            at_mut!(words, written..written + BLOCK).copy_from_slice(block);
+            written += BLOCK;
+            *at_mut!(filled, bucket) = 0;
+        }
+    }
+    (filled, total, written / BLOCK)
+}
+
+/// Splits `words` in place by the digit at `shift`, and returns where each
+/// bucket starts, then their end. Whole blocks are moved to the blocks
+/// inside their bucket, and what's left fills each bucket's ends.
+fn partition(words: &mut [u64], shift: u32, scratch: &mut [u64]) -> [usize; BUCKETS + 1] {
+    #[expect(clippy::cast_possible_truncation, reason = "masked to a digit")]
+    let digit = |word: u64| (word >> shift) as usize & (BUCKETS - 1);
+    let n = words.len();
+    let (buffers, rest) = scratch.split_at_mut(BUCKETS * 2 * BLOCK);
+    let (carried, moved) = rest.split_at_mut(BLOCK);
+    let (filled, total, full) = fill_blocks(words, digit, buffers);
+    // A bucket's slots are the blocks inside it: from `next`, the next to
+    // fill, to `end`.
+    let mut start = [0_usize; BUCKETS + 1];
+    let (mut next, mut end) = ([0_usize; BUCKETS], [0_usize; BUCKETS]);
+    for b in 0..BUCKETS {
+        *at_mut!(start, b + 1) = *at!(start, b) + *at!(total, b);
+        *at_mut!(next, b) = at!(start, b).div_ceil(BLOCK);
+        *at_mut!(end, b) = (*at!(next, b)).max(*at!(start, b + 1) / BLOCK);
+    }
+    at_mut!(moved, ..n / BLOCK + 2).fill(0);
+    for g in 0..full {
+        if *at!(moved, g) != 0 {
             continue;
         }
-        let mut total = 0;
-        for c in count.iter_mut() {
-            (*c, total) = (total, total + *c);
+        carried.copy_from_slice(at!(words, g * BLOCK..(g + 1) * BLOCK));
+        *at_mut!(moved, g) = 1;
+        loop {
+            let b = digit(*at!(carried, 0));
+            if *at!(next, b) == *at!(end, b) {
+                // At most one block of a bucket's has no slot inside it.
+                let at = b * 2 * BLOCK + *at!(filled, b);
+                at_mut!(buffers, at..at + BLOCK).copy_from_slice(carried);
+                break;
+            }
+            let target = *at!(next, b);
+            *at_mut!(next, b) += 1;
+            let range = target * BLOCK..(target + 1) * BLOCK;
+            let free = target >= full || *at!(moved, target) != 0;
+            *at_mut!(moved, target) = 1;
+            if free {
+                at_mut!(words, range).copy_from_slice(carried);
+                break;
+            }
+            at_mut!(words, range).swap_with_slice(carried);
         }
-        for &word in source.iter() {
-            let at = at_mut!(count, digit(word));
-            *at_mut!(dest, *at as usize) = word;
-            *at += 1;
-        }
-        core::mem::swap(&mut source, &mut dest);
-        in_scratch = !in_scratch;
     }
-    in_scratch
+    // Each bucket's words before and after its slots are the ones left in
+    // its buffer.
+    for b in 0..BUCKETS {
+        let (low, high) = (*at!(start, b), *at!(start, b + 1));
+        let from = (low.div_ceil(BLOCK) * BLOCK).min(high);
+        let to = (*at!(end, b) * BLOCK).min(high);
+        let left = at!(buffers, b * 2 * BLOCK..);
+        at_mut!(words, low..from).copy_from_slice(at!(left, ..from - low));
+        at_mut!(words, to..high).copy_from_slice(at!(left, from - low..from - low + high - to));
+    }
+    start
 }
 
-/// Whether radix sorting `size` keys of `key_bits` bits is estimated to cost
-/// less than comparing them. Each pass of `radix_sort` reads and writes
-/// every element, and clears and sums its counts.
-fn radix_sort_is_cheaper(size: usize, key_bits: u32) -> bool {
-    let digits = radix_digits(key_bits, size);
-    let radix = u64::from(digits.passes) * (3 * size as u64 + (1 << digits.bits));
-    let log2_size = u64::from(usize::BITS - size.leading_zeros());
-    radix < 2 * size as u64 * log2_size
-}
-
-/// Sorts `words` whose keys are their `key_bits` bits from `low`: any bits
-/// above must be the same in every word, and words with equal keys must be
-/// in order already, which they stay in. By a radix sort when that's
-/// estimated to be cheaper, as for many words, and by comparing them
-/// otherwise. Returns whether the sorted words are in `scratch`, at least as
-/// long, rather than `words`.
-pub(crate) fn sort_words(
-    allocator: &dyn Allocator,
-    words: &mut [u64],
-    scratch: &mut [u64],
-    low: u32,
-    key_bits: u32,
-) -> Result<bool, AllocError> {
-    let size = words.len();
-    if !radix_sort_is_cheaper(size, key_bits) {
-        return Ok(sort_by_comparing(words, scratch));
+/// Sorts `words`, which must all differ, in `scratch`, made for at least as
+/// many: each level partitions on the highest bits that differ among them,
+/// so a level always makes progress and few words are ever left to
+/// insertion sort.
+pub(crate) fn sort_words(words: &mut [u64], scratch: &mut Scratch) {
+    if words.len() <= SMALL {
+        sort_small(words, &mut scratch.0);
+        return;
     }
-    let mut counts = SlowVec::zeroed(allocator, radix_sort_counts_size(key_bits, size))?;
-    Ok(radix_sort(words, scratch, &mut counts, low, key_bits))
-}
-
-/// How many words an insertion sort sorts before runs are merged.
-const RUN: usize = 16;
-
-/// Sorts `words`: runs of `RUN` by insertion, then merged, back and forth
-/// with `scratch`. Returns whether the sorted words are in `scratch`.
-fn sort_by_comparing(words: &mut [u64], scratch: &mut [u64]) -> bool {
-    let n = words.len();
-    for run in words.chunks_mut(RUN) {
-        insertion_sort(run);
-    }
-    let (mut source, mut dest) = (words, at_mut!(scratch, ..n));
-    let mut in_scratch = false;
-    let mut width = RUN;
-    while width < n {
-        for start in (0..n).step_by(2 * width) {
-            merge(source, dest, start, (start + width).min(n), (start + 2 * width).min(n));
+    let start = partition(words, top_digit(words), &mut scratch.0);
+    let mut rest = words;
+    for b in 0..BUCKETS {
+        let (bucket, tail) = rest.split_at_mut(*at!(start, b + 1) - *at!(start, b));
+        rest = tail;
+        if bucket.len() > 1 {
+            sort_words(bucket, scratch);
         }
-        core::mem::swap(&mut source, &mut dest);
-        in_scratch = !in_scratch;
-        width *= 2;
     }
-    in_scratch
 }
 
 /// Merges the sorted `source[start..mid]` and `source[mid..end]` into
@@ -159,18 +199,6 @@ pub(crate) fn merge(source: &[u64], dest: &mut [u64], start: usize, mid: usize, 
         let left = b == end || (a < mid && at!(source, a) <= at!(source, b));
         *out = if left { *at!(source, a) } else { *at!(source, b) };
         if left { a += 1 } else { b += 1 }
-    }
-}
-
-pub(crate) fn insertion_sort(words: &mut [u64]) {
-    for i in 1..words.len() {
-        let word = *at!(words, i);
-        let mut j = i;
-        while j > 0 && word < *at!(words, j - 1) {
-            *at_mut!(words, j) = *at!(words, j - 1);
-            j -= 1;
-        }
-        *at_mut!(words, j) = word;
     }
 }
 
@@ -251,46 +279,26 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
 
-    /// `count` words of keys of `key_bits` bits, many of them tied, above
-    /// their index's 20 bits.
-    fn words(count: u32, key_bits: u32) -> Vec<u64> {
-        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
-        let mask = (1 << key_bits) - 1;
-        (0..count)
-            .map(|index| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                // A few values, spread across every digit.
-                let key = (seed % 50).wrapping_mul(0x9e37_79b9_7f4a_7c15) & mask;
-                key << 20 | u64::from(index)
-            })
-            .collect()
-    }
-
-    fn sorted(mut words: Vec<u64>, sort: impl Fn(&mut [u64], &mut [u64]) -> bool) -> Vec<u64> {
-        let mut scratch = alloc::vec![0; words.len()];
-        if sort(&mut words, &mut scratch) { scratch } else { words }
-    }
-
     #[test]
-    #[cfg_attr(miri, ignore = "slow under Miri, and there's no unsafe code to check")]
-    fn sorts_stably_by_radix_and_by_comparing() {
-        for (count, key_bits) in
-            [(3000, 44), (3000, 20), (300, 9), (17, 44), (3, 8), (1, 8), (0, 8)]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
+    fn sorts_words_of_any_spread() {
+        for (count, mask) in
+            [(100_000_u64, u64::MAX), (50_000, 0xFF << 24), (9000, 0), (10, u64::MAX)]
         {
-            let words = words(count, key_bits);
+            let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+            let mut words: Vec<u64> = (0..count)
+                .map(|row| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    (seed & mask) << 24 >> 24 & !0xFF_FFFF | row
+                })
+                .collect();
             let mut expected = words.clone();
             expected.sort_unstable();
-            let counts = radix_sort_counts_size(key_bits, words.len());
-            let radix = sorted(words.clone(), |w, s| {
-                radix_sort(w, s, &mut alloc::vec![0; counts], 20, key_bits)
-            });
-            assert_eq!(radix, expected, "radix, {count} of {key_bits} bits");
-            let compared = sorted(words.clone(), sort_by_comparing);
-            assert_eq!(compared, expected, "comparing, {count} of {key_bits} bits");
-            let either = sorted(words, |w, s| sort_words(&Heap, w, s, 20, key_bits).unwrap());
-            assert_eq!(either, expected, "either, {count} of {key_bits} bits");
+            let mut scratch = Scratch::new(&Heap, words.len()).unwrap();
+            sort_words(&mut words, &mut scratch);
+            assert_eq!(words, expected);
         }
     }
 
@@ -316,15 +324,5 @@ mod tests {
         let mut expected: Vec<&Vec<u8>> = strings.iter().collect();
         expected.sort();
         assert_eq!(sorted, expected);
-    }
-
-    #[test]
-    fn radix_sorts_many_keys_and_compares_few() {
-        assert!(radix_sort_is_cheaper(30_000, 64));
-        assert!(!radix_sort_is_cheaper(300, 64));
-        let digits = radix_digits(64, 1 << 20);
-        assert_eq!((digits.passes, digits.bits), (4, 16));
-        let digits = radix_digits(20, 100);
-        assert_eq!((digits.passes, digits.bits), (3, 7));
     }
 }

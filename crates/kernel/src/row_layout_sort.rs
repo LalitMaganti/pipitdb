@@ -8,16 +8,13 @@
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
-use crate::radix_sort::{insertion_sort, merge, sort_words};
+use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::slow_vec::SlowVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
 /// rather than sorted.
 const MAX_MERGED_RUNS: usize = 32;
 const ROWS_PER_MERGED_RUN: usize = 256;
-
-/// Below this size, a group of tied rows is sorted by insertion.
-const INSERTION_SORT_TIES: usize = 16;
 
 /// Rows of `stride` bytes each, one after another.
 #[derive(Clone, Copy)]
@@ -160,20 +157,6 @@ impl Words {
         let row = (word & ((1 << self.row_bits) - 1)) as u32;
         row
     }
-
-    /// Sorts `words`, those with equal keys in order already, on their keys
-    /// of `key_bytes` bytes. Returns whether they're in `scratch` instead.
-    fn sort(
-        self,
-        allocator: &dyn Allocator,
-        words: &mut [u64],
-        scratch: &mut [u64],
-        key_bytes: usize,
-    ) -> Result<bool, AllocError> {
-        #[expect(clippy::cast_possible_truncation, reason = "at most 64 bits")]
-        let key_bits = key_bytes as u32 * 8;
-        sort_words(allocator, words, scratch, self.row_bits, key_bits)
-    }
 }
 
 /// Merges pairs of the runs `words` starts with at `runs` until one is
@@ -210,14 +193,13 @@ fn merge_runs(words: &mut [u64], scratch: &mut [u64], order: &mut ExistingOrder)
 /// Sorts each run of words with equal keys on the varying bytes from
 /// `from` on, as many at a time as a word holds, with the same sort.
 fn sort_ties(
-    allocator: &dyn Allocator,
     words: &mut [u64],
     rows: Rows,
     varying: &[u32],
     from: usize,
     packing: Words,
-    spare: &mut [u64],
-) -> Result<(), AllocError> {
+    scratch: &mut Scratch,
+) {
     let next = at!(varying, from..(from + packing.key_bytes).min(varying.len()));
     let mut i = 0;
     while i < words.len() {
@@ -231,20 +213,14 @@ fn sort_ties(
                 let r = packing.row(*word);
                 *word = packing.word(rows.get(r), next, r);
             }
-            let spare = at_mut!(spare, i..j);
-            if tied.len() < INSERTION_SORT_TIES {
-                insertion_sort(tied);
-            } else if packing.sort(allocator, tied, spare, next.len())? {
-                tied.copy_from_slice(spare);
-            }
+            sort_words(tied, scratch);
             if varying.len() > from + packing.key_bytes {
                 let from = from + packing.key_bytes;
-                sort_ties(allocator, tied, rows, varying, from, packing, spare)?;
+                sort_ties(tied, rows, varying, from, packing, scratch);
             }
         }
         i = j;
     }
-    Ok(())
 }
 
 /// Stably sorts `order`, the numbers of the rows of `stride` bytes in
@@ -285,21 +261,23 @@ pub(crate) fn sort_row_layout(
         // Every byte that orders the rows is in their words.
         row_layout.free();
     }
-    let mut spare = SlowVec::<u64>::zeroed(allocator, order.len())?;
+    let mut scratch = Scratch::new(allocator, order.len())?;
     // 3. Merge the runs, or sort.
-    let in_spare = if existing.runs_len > 0 {
-        merge_runs(&mut words, &mut spare, &mut existing)
+    if existing.runs_len > 0 {
+        let mut other = SlowVec::<u64>::zeroed(allocator, order.len())?;
+        if merge_runs(&mut words, &mut other, &mut existing) {
+            words.copy_from_slice(&other);
+        }
     } else {
-        packing.sort(allocator, &mut words, &mut spare, first.len())?
-    };
-    let (sorted, free) = if in_spare { (&mut spare, &mut words) } else { (&mut words, &mut spare) };
+        sort_words(&mut words, &mut scratch);
+    }
     // 4. If the words left out varying bytes, equal keys may still be
     // different rows: sort each tied group on the bytes after them.
     if varying.len() > packing.key_bytes {
         let rows = Rows { data: row_layout, stride: stride as usize, count };
-        sort_ties(allocator, sorted, rows, &varying, packing.key_bytes, packing, free)?;
+        sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, &mut scratch);
     }
-    for (row, &word) in order.iter_mut().zip(sorted.iter()) {
+    for (row, &word) in order.iter_mut().zip(words.iter()) {
         *row = packing.row(word);
     }
     Ok(())
