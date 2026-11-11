@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{self, RowLayout, Word};
-use crate::row_layout_sort::sort_row_layout;
+use crate::row_layout_sort::{Sorted, sort_row_layout};
 use crate::row_store::RowStore;
 use crate::slow_vec::SlowVec;
 
@@ -34,8 +34,9 @@ pub(crate) struct SortedRows {
     keys: SlowVec<u8>,
     /// The rows themselves.
     rows: RowStore,
-    /// The row numbers in output order.
-    order: SlowVec<u32>,
+    /// The rows in output order: the first `order_len`.
+    order: Sorted,
+    order_len: u32,
 }
 
 impl SortedRows {
@@ -46,7 +47,8 @@ impl SortedRows {
             strings: SlowVec::new(allocator, 1 << 6)?,
             keys: SlowVec::new(allocator, 1 << 31)?,
             rows: RowStore::new(allocator)?,
-            order: SlowVec::new(allocator, 1 << 31)?,
+            order: Sorted::Held { reverse: false, count: 0 },
+            order_len: 0,
         })
     }
 
@@ -165,16 +167,12 @@ impl SortedRows {
 
     /// How many rows the order has.
     pub(crate) fn order_len(&self) -> u32 {
-        #[expect(clippy::cast_possible_truncation, reason = "at most 2^31")]
-        let len = self.order.len() as u32;
-        len
+        self.order_len
     }
 
     /// Keeps only the first `count` rows of the order.
     pub(crate) fn truncate_order(&mut self, count: u32) {
-        while self.order.len() > count as usize {
-            self.order.pop();
-        }
+        self.order_len = self.order_len.min(count);
     }
 
     /// Resets the order to the order rows came in, then sorts it stably by
@@ -182,10 +180,8 @@ impl SortedRows {
     /// Strings sort by their bytes.
     pub(crate) fn sort(&mut self, context: &mut Context) -> Result<(), Error> {
         let allocator = context.allocator();
-        while self.order.pop().is_some() {}
-        for row in 0..self.rows.len() {
-            self.order.push(row)?;
-        }
+        self.order = Sorted::Held { reverse: false, count: self.rows.len() };
+        self.order_len = self.rows.len();
         let Some(layout) = &self.layout else { return Ok(()) };
         self.rows.flush(context)?;
         for (k, column) in self.strings.iter().enumerate() {
@@ -195,7 +191,8 @@ impl SortedRows {
             RowLayout::write(layout.slot(k), self.rows.len(), get, &mut self.keys);
         }
         if layout.stride() > 0 {
-            sort_row_layout(allocator, &mut self.keys, layout.stride(), &mut self.order)?;
+            self.order =
+                sort_row_layout(allocator, &mut self.keys, layout.stride(), self.order_len)?;
         }
         self.keys.free();
         Ok(())
@@ -209,9 +206,12 @@ impl SortedRows {
         out: &mut RowBatch,
         at: u32,
     ) -> Result<u32, Error> {
-        let end = self.order.len().min(at as usize + BATCH_ROWS_MAX as usize);
-        let rows = at!(self.order, (at as usize).min(end)..end);
-        self.rows.gather(context, out, rows)
+        let end = self.order_len.min(at.saturating_add(BATCH_ROWS_MAX));
+        let mut rows = [0; BATCH_ROWS_MAX as usize];
+        for (row, i) in rows.iter_mut().zip(at.min(end)..end) {
+            *row = self.order.row(i);
+        }
+        self.rows.gather(context, out, at!(rows, ..(end - at.min(end)) as usize))
     }
 }
 
