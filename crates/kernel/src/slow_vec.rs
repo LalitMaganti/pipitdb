@@ -152,6 +152,18 @@ impl<T> SlowVec<T> {
         Ok(())
     }
 
+    /// Empties it and frees its memory, so it holds no more than one made by
+    /// `new`.
+    pub fn free(&mut self)
+    where
+        T: Primitive,
+    {
+        // SAFETY: the values need no dropping, and aren't used again.
+        unsafe { self.raw.free(size_of::<T>()) };
+        self.raw.values = NonNull::<Aligned>::dangling().cast();
+        (self.raw.len, self.raw.capacity) = (0, 0);
+    }
+
     /// Removes the last value, if any.
     pub fn pop(&mut self) -> Option<T> {
         self.raw.len = self.raw.len.checked_sub(1)?;
@@ -468,6 +480,18 @@ mod tests {
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
         let _ = SlowVec::<u64>::new(&Heap, 100);
+    }
+
+    #[test]
+    fn frees_and_grows_again() {
+        let live = Rc::new(Cell::new(0));
+        let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
+        let mut values = SlowVec::new(&allocator, 16).unwrap();
+        assert!(values.extend_from_slice(&[1_u64, 2, 3]).is_ok());
+        values.free();
+        assert!(values.is_empty() && live.get() == 0);
+        assert!(values.push(4).is_ok());
+        assert_eq!(*values, [4]);
     }
 
     #[test]

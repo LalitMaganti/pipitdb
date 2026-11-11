@@ -210,10 +210,11 @@ fn sort_ties(
 }
 
 /// Stably sorts `indices` by the rows of `stride` bytes in `row_layout`,
-/// the `i`th index's row the `i`th.
+/// the `i`th index's row the `i`th. Frees the rows once sorting no longer
+/// needs them, before the memory the rest of the sort takes.
 pub(crate) fn sort_row_layout(
     allocator: &dyn Allocator,
-    row_layout: &[u8],
+    row_layout: &mut SlowVec<u8>,
     stride: u32,
     indices: &mut [u32],
 ) -> Result<(), AllocError> {
@@ -242,6 +243,10 @@ pub(crate) fn sort_row_layout(
     for (r, (token, &value)) in (0..count).zip(tokens.iter_mut().zip(indices.iter())) {
         *token = KeyedIndex { key: pack_key(rows.get(r), first), index: r, value };
     }
+    if varying.len() <= MAX_KEY_BYTES {
+        // Every byte that orders the rows is in their keys.
+        row_layout.free();
+    }
     let mut spare = SlowVec::<KeyedIndex>::zeroed(allocator, indices.len())?;
     // 3. Merge the runs, or sort, keeping ties in input order.
     let in_spare = if order.runs_len > 0 {
@@ -256,6 +261,7 @@ pub(crate) fn sort_row_layout(
     // 4. If the keys left out varying bytes, equal keys may still be
     // different rows: sort each tied group on the bytes after the first 8.
     if varying.len() > MAX_KEY_BYTES {
+        let rows = Rows { data: row_layout, stride: stride as usize, count };
         sort_ties(allocator, sorted, rows, &varying, MAX_KEY_BYTES, free)?;
     }
     for (index, token) in indices.iter_mut().zip(sorted.iter()) {
@@ -292,7 +298,10 @@ mod tests {
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
         // The indices are the rows' own, shifted, to see values carried.
         let mut indices: Vec<u32> = (0..count).map(|i| i + 100).collect();
-        sort_row_layout(&Heap, rows, u32::try_from(stride).unwrap(), &mut indices).unwrap();
+        let mut row_layout = SlowVec::new(&Heap, 1 << 20).unwrap();
+        row_layout.extend_from_slice(rows).unwrap();
+        let stride = u32::try_from(stride).unwrap();
+        sort_row_layout(&Heap, &mut row_layout, stride, &mut indices).unwrap();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));
         let expected: Vec<u32> = expected.iter().map(|i| i + 100).collect();
