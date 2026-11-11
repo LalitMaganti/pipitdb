@@ -329,7 +329,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
         let column = compiler.find_column(key)?;
-        if at!(compiler.plan.columns, column.id as usize).data_type != DataType::Int64 {
+        let data_type = at!(compiler.plan.columns, column.id as usize).data_type;
+        if !matches!(data_type, DataType::Int64 | DataType::String) {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
         keys.push(column.id)?;

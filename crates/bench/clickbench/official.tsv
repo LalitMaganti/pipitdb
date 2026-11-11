@@ -8,13 +8,13 @@
 7	FROM hits |> WHERE AdvEngineID != 0 |> AGGREGATE count(*) AS c GROUP BY AdvEngineID |> ORDER BY c DESC	SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC
 8	FROM hits |> AGGREGATE count(DISTINCT UserID) AS u GROUP BY RegionID |> ORDER BY u DESC |> LIMIT 10	SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC LIMIT 10
 9	FROM hits |> AGGREGATE sum(AdvEngineID), count(*) AS c, avg(ResolutionWidth), count(DISTINCT UserID) GROUP BY RegionID |> ORDER BY c DESC |> LIMIT 10	SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10
-10		SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10
-11		SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10
-12		SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
-13		SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10
-14		SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10
+10	FROM hits |> WHERE MobilePhoneModel != '' |> AGGREGATE count(DISTINCT UserID) AS u GROUP BY MobilePhoneModel |> ORDER BY u DESC |> LIMIT 10	SELECT MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhoneModel ORDER BY u DESC LIMIT 10
+11	FROM hits |> WHERE MobilePhoneModel != '' |> AGGREGATE count(DISTINCT UserID) AS u GROUP BY MobilePhone, MobilePhoneModel |> ORDER BY u DESC |> LIMIT 10	SELECT MobilePhone, MobilePhoneModel, COUNT(DISTINCT UserID) AS u FROM hits WHERE MobilePhoneModel <> '' GROUP BY MobilePhone, MobilePhoneModel ORDER BY u DESC LIMIT 10
+12	FROM hits |> WHERE SearchPhrase != '' |> AGGREGATE count(*) AS c GROUP BY SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+13	FROM hits |> WHERE SearchPhrase != '' |> AGGREGATE count(DISTINCT UserID) AS u GROUP BY SearchPhrase |> ORDER BY u DESC |> LIMIT 10	SELECT SearchPhrase, COUNT(DISTINCT UserID) AS u FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY u DESC LIMIT 10
+14	FROM hits |> WHERE SearchPhrase != '' |> AGGREGATE count(*) AS c GROUP BY SearchEngineID, SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT SearchEngineID, SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, SearchPhrase ORDER BY c DESC LIMIT 10
 15	FROM hits |> AGGREGATE count(*) AS c GROUP BY UserID |> ORDER BY c DESC |> LIMIT 10	SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC LIMIT 10
-16		SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
+16	FROM hits |> AGGREGATE count(*) AS c GROUP BY UserID, SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
 17		SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, SearchPhrase LIMIT 10
 18		SELECT UserID, extract(minute FROM toDateTime(EventTime)) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
 19	FROM hits |> WHERE UserID = 435090932899640449 |> SELECT UserID	SELECT UserID FROM hits WHERE UserID = 435090932899640449
@@ -31,7 +31,7 @@
 30		SELECT SearchEngineID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY SearchEngineID, ClientIP ORDER BY c DESC LIMIT 10
 31		SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits WHERE SearchPhrase <> '' GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10
 32		SELECT WatchID, ClientIP, COUNT(*) AS c, SUM(IsRefresh), AVG(ResolutionWidth) FROM hits GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT 10
-33		SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10
+33	FROM hits |> AGGREGATE count(*) AS c GROUP BY URL |> ORDER BY c DESC |> LIMIT 10	SELECT URL, COUNT(*) AS c FROM hits GROUP BY URL ORDER BY c DESC LIMIT 10
 34		SELECT 1, URL, COUNT(*) AS c FROM hits GROUP BY 1, URL ORDER BY c DESC LIMIT 10
 35		SELECT ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3, COUNT(*) AS c FROM hits GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 ORDER BY c DESC LIMIT 10
 36		SELECT URL, COUNT(*) AS PageViews FROM hits WHERE CounterID = 62 AND EventDate >= '2013-07-01' AND EventDate <= '2013-07-31' AND DontCountHits = 0 AND IsRefresh = 0 AND URL <> '' GROUP BY URL ORDER BY PageViews DESC LIMIT 10

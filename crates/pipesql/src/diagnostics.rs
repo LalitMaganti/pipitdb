@@ -154,8 +154,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             ("only columns can be sorted by yet".into(), "not a column".into())
         }
         what if what == Unsupported::GroupKey as u16 => (
-            "only integer columns can be grouped by yet".into(),
-            "not an integer column".into(),
+            "only integer and string columns can be grouped by yet".into(),
+            "not an integer or string column".into(),
         ),
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }

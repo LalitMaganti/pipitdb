@@ -3,6 +3,7 @@
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
 use crate::column::DataType;
+use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering, SortKey};
 use crate::optimize::{Needed, Pruned};
@@ -51,7 +52,7 @@ pub struct Aggregate {
 /// groups were first seen. With no keys, all rows are one group, and there's
 /// a row even if there are none.
 pub struct AggregateOp {
-    /// The `Int64` columns rows are grouped by.
+    /// The `Int64` and string columns rows are grouped by.
     pub keys: SlowVec<ColumnId>,
     /// What each group's rows make, from `Int64` columns.
     pub aggregates: SlowVec<Aggregate>,
@@ -66,14 +67,15 @@ impl<'c> Op<'c> for AggregateOp {
         check!(node.children.len() == 1);
         lowering.lower(*at!(node.children, 0))?;
         let allocator = lowering.allocator();
-        let inputs = self.aggregates.iter().filter_map(|aggregate| aggregate.input);
-        check!(
-            self.keys
-                .iter()
-                .copied()
-                .chain(inputs)
-                .all(|id| lowering.query_type(id) == DataType::Int64)
-        );
+        let mut inputs = self.aggregates.iter().filter_map(|aggregate| aggregate.input);
+        check!(inputs.all(|id| lowering.query_type(id) == DataType::Int64));
+        check!(self.keys.len() <= KEYS_MAX);
+        let mut string_keys = 0;
+        for (k, &key) in self.keys.iter().enumerate() {
+            let data_type = lowering.query_type(key);
+            check!(matches!(data_type, DataType::Int64 | DataType::String));
+            string_keys |= u64::from(data_type == DataType::String) << k;
+        }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
         let key_columns = SlowVec::fixed_from(allocator, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
@@ -88,7 +90,8 @@ impl<'c> Op<'c> for AggregateOp {
         let known = lowering.query_sorted_by(&self.keys);
         let sorted = at_mut!(sorted, ..known.len().min(8));
         sorted.copy_from_slice(at!(known, ..sorted.len()));
-        let operator = hash_aggregate(allocator, HashAggregateSpec { key_columns, aggregates })?;
+        let spec = HashAggregateSpec { key_columns, string_keys, aggregates };
+        let operator = hash_aggregate(allocator, spec)?;
         lowering.add_breaker(Step::Operator(operator))?;
         // The output has a row for each group, with a new layout.
         lowering.declare_new_batches();
@@ -139,6 +142,10 @@ pub struct HashAggregateSpec {
     /// Where the keys are in batches. With none, all rows are one group,
     /// output even if there are no rows.
     pub key_columns: SlowVec<u32>,
+    /// Bit `k` set if key `k` is a string, rather than an `Int64`. Perfetto
+    /// learns this from the first batch, but a group-by here serves a batch
+    /// with its keys' types even if none came.
+    pub string_keys: u64,
     /// Each aggregate.
     pub aggregates: SlowVec<AggregateCall>,
 }
