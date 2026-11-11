@@ -102,8 +102,8 @@ impl Id {
 pub struct StringPool {
     /// Where the strings are.
     store: Store,
-    /// The id of each string, by its hash.
-    string_index: FlatHashMap<StringHash, Id>,
+    /// The id of each string, found by its hash and then its bytes.
+    string_index: FlatHashMap<Interned, ()>,
 }
 
 /// Where a pool's strings are, apart from its index, so a string can be
@@ -118,14 +118,17 @@ struct Store {
     large_strings: SlowVec<Buffer>,
 }
 
-/// A string's hash, which the index takes as already hashed.
+/// A string's hash, which the index takes as already hashed, and its id.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct StringHash(u64);
+struct Interned {
+    hash: u64,
+    id: Id,
+}
 
-impl Key for StringHash {
+impl Key for Interned {
     #[inline]
     fn hash(&self) -> u64 {
-        self.0
+        self.hash
     }
 }
 
@@ -144,8 +147,7 @@ impl StringPool {
     }
 
     /// Interns `str` and returns its id: the same each time it's interned.
-    /// Strings are told apart by their hash alone. After an error, the pool
-    /// mustn't be used again.
+    /// After an error, the pool mustn't be used again.
     #[inline]
     pub fn intern_string(
         &mut self,
@@ -154,34 +156,24 @@ impl StringPool {
     ) -> Result<Id, AllocError> {
         let Some(str) = str else { return Ok(Id::NULL) };
         // Inserts the null id just to see if the string is already in, and
-        // if it isn't, overwrites it with the string's.
-        let hash = StringHash(murmur_hash::bytes(str));
-        let (id, inserted) = self.string_index.insert(allocator, hash, Id::NULL)?;
+        // if it isn't, overwrites it with the string's. Strings with the
+        // same hash are told apart by their bytes, unlike in Perfetto.
+        let hash = murmur_hash::bytes(str);
+        let store = &self.store;
+        let equal = |held: &Interned| held.hash == hash && store.get(held.id) == Some(str);
+        let key = Interned { hash, id: Id::NULL };
+        let ((held, ()), inserted) =
+            self.string_index.insert_by(allocator, hash, equal, key, ())?;
         if inserted {
-            *id = self.store.insert_string(allocator, str)?;
-            return Ok(*id);
+            held.id = self.store.insert_string(allocator, str)?;
         }
-        let id = *id;
-        if cfg!(debug_assertions) {
-            check!(self.get(id) == Some(str));
-        }
-        Ok(id)
+        Ok(held.id)
     }
 
     /// The string whose id is `id`, or `None` for the null string's.
     #[inline]
     pub fn get(&self, id: Id) -> Option<&[u8]> {
-        if id.is_null() {
-            return None;
-        }
-        if id.is_large_string() {
-            return Some(self.store.get_large_string(id));
-        }
-        let block = at!(self.store.blocks, id.block_index() as usize).as_slice::<u8>();
-        let offset = id.block_offset() as usize;
-        let Some(size) = at!(block, offset..).first_chunk::<4>() else { failed!() };
-        let start = offset + 4;
-        Some(at!(block, start..start + u32::from_ne_bytes(*size) as usize))
+        self.store.get(id)
     }
 
     /// How many strings it has, besides the null string.
@@ -191,6 +183,21 @@ impl StringPool {
 }
 
 impl Store {
+    #[inline]
+    fn get(&self, id: Id) -> Option<&[u8]> {
+        if id.is_null() {
+            return None;
+        }
+        if id.is_large_string() {
+            return Some(self.get_large_string(id));
+        }
+        let block = at!(self.blocks, id.block_index() as usize).as_slice::<u8>();
+        let offset = id.block_offset() as usize;
+        let Some(size) = at!(block, offset..).first_chunk::<4>() else { failed!() };
+        let start = offset + 4;
+        Some(at!(block, start..start + u32::from_ne_bytes(*size) as usize))
+    }
+
     #[inline(never)]
     fn add_block(&mut self, allocator: &dyn Allocator) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
