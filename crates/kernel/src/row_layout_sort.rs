@@ -128,7 +128,7 @@ fn pack_key(row: &[u8], varying: &[u32]) -> u64 {
 
 /// How a row's bytes and number are packed into a word.
 #[derive(Clone, Copy)]
-struct Words {
+pub(crate) struct Words {
     /// The low bits, which hold the row's number.
     row_bits: u32,
     /// How many of its varying bytes a word holds above them.
@@ -223,31 +223,43 @@ fn sort_ties(
     }
 }
 
-/// Stably sorts `order`, the numbers of the rows of `stride` bytes in
-/// `row_layout` in the order they're laid out. Frees the rows once sorting
-/// no longer needs them, before the memory the rest of the sort takes.
+/// Rows in order.
+pub(crate) enum Sorted {
+    /// The `count` rows in the order they're held, or reversed.
+    Held { reverse: bool, count: u32 },
+    /// Each row's word, in order.
+    Words { words: SlowVec<u64>, packing: Words },
+}
+
+impl Sorted {
+    /// The row `i`th in order.
+    pub(crate) fn row(&self, i: u32) -> u32 {
+        match self {
+            Sorted::Held { reverse: false, .. } => i,
+            Sorted::Held { reverse: true, count } => count - 1 - i,
+            Sorted::Words { words, packing } => packing.row(*at!(words, i as usize)),
+        }
+    }
+}
+
+/// Stably sorts the `count` rows of `stride` bytes in `row_layout`. Frees
+/// the rows once sorting no longer needs them, before the memory the rest
+/// of the sort takes.
 pub(crate) fn sort_row_layout(
     allocator: &dyn Allocator,
     row_layout: &mut SlowVec<u8>,
     stride: u32,
-    order: &mut [u32],
-) -> Result<(), AllocError> {
-    let Ok(count) = u32::try_from(order.len()) else { failed!() };
-    if count <= 1 {
-        return Ok(());
-    }
+    count: u32,
+) -> Result<Sorted, AllocError> {
     let rows = Rows { data: row_layout, stride: stride as usize, count };
     check!(row_layout.len() >= count as usize * rows.stride);
     // 1. Reuse the order the rows are already in, where it helps: keep where
     // runs start, to merge them, if there are few.
     let mut existing = find_existing_order(rows);
-    if existing.sorted {
-        return Ok(());
-    }
-    if existing.strictly_descending {
-        // No two rows are equal, so reversing keeps ties in order.
-        order.reverse();
-        return Ok(());
+    if count <= 1 || existing.sorted || existing.strictly_descending {
+        // No two rows are equal when strictly descending, so reversing keeps
+        // ties in order.
+        return Ok(Sorted::Held { reverse: existing.strictly_descending, count });
     }
     // 2. Pack the varying bytes a word holds above each row's number, so
     // sorting them doesn't read rows through their offsets again and again,
@@ -261,10 +273,10 @@ pub(crate) fn sort_row_layout(
         // Every byte that orders the rows is in their words.
         row_layout.free();
     }
-    let mut scratch = Scratch::new(allocator, order.len())?;
+    let mut scratch = Scratch::new(allocator, count as usize)?;
     // 3. Merge the runs, or sort.
     if existing.runs_len > 0 {
-        let mut other = SlowVec::<u64>::zeroed(allocator, order.len())?;
+        let mut other = SlowVec::<u64>::zeroed(allocator, count as usize)?;
         if merge_runs(&mut words, &mut other, &mut existing) {
             words.copy_from_slice(&other);
         }
@@ -277,10 +289,7 @@ pub(crate) fn sort_row_layout(
         let rows = Rows { data: row_layout, stride: stride as usize, count };
         sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, &mut scratch);
     }
-    for (row, &word) in order.iter_mut().zip(words.iter()) {
-        *row = packing.row(word);
-    }
-    Ok(())
+    Ok(Sorted::Words { words, packing })
 }
 
 #[cfg(test)]
@@ -309,11 +318,11 @@ mod tests {
     fn expect_sorted(rows: &[u8], stride: usize) {
         let count = u32::try_from(rows.len() / stride).unwrap();
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
-        let mut indices: Vec<u32> = (0..count).collect();
         let mut row_layout = SlowVec::new(&Heap, 1 << 20).unwrap();
         row_layout.extend_from_slice(rows).unwrap();
         let stride = u32::try_from(stride).unwrap();
-        sort_row_layout(&Heap, &mut row_layout, stride, &mut indices).unwrap();
+        let sorted = sort_row_layout(&Heap, &mut row_layout, stride, count).unwrap();
+        let indices: Vec<u32> = (0..count).map(|i| sorted.row(i)).collect();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));
         assert_eq!(indices, expected, "{count} rows of {stride} bytes");
