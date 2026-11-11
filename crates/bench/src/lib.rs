@@ -19,6 +19,7 @@ use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
+use pipit_kernel::string_pool::{Id, StringPool};
 use pipit_operators::table::Table;
 use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
@@ -327,6 +328,28 @@ pub fn hash_map(len: i64) -> FlatHashMap<i64, ()> {
 /// How many of the numbers below `count` `map` has.
 pub fn find_keys(map: &FlatHashMap<i64, ()>, count: i64) -> u64 {
     (0..count).map(|key| u64::from(map.find(key).is_some())).sum()
+}
+
+/// `count` strings of 8 digits, one after another, `distinct` of them
+/// different, repeating out of order.
+pub fn strings(count: usize, distinct: usize) -> Vec<u8> {
+    (0..count).flat_map(|i| format!("{:08}", (i * 7919) % distinct).into_bytes()).collect()
+}
+
+/// `strings`' strings interned in a new pool, and their ids.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn intern_strings(strings: &[u8]) -> (StringPool, Vec<Id>) {
+    let mut pool = StringPool::new(&Heap).expect("allocates");
+    let ids = strings
+        .chunks(8)
+        .map(|string| pool.intern_string(&Heap, Some(string)).expect("allocates"))
+        .collect();
+    (pool, ids)
+}
+
+/// The total length of the strings `ids` are in `pool`.
+pub fn get_strings(pool: &StringPool, ids: &[Id]) -> usize {
+    ids.iter().map(|&id| pool.get(id).map_or(0, <[u8]>::len)).sum()
 }
 
 /// The phone models `string_column` holds.

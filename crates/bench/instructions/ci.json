@@ -37,5 +37,8 @@
   "scan.table": 194578,
   "small.point": 33879,
   "small_planned.order": 481078,
-  "small_planned.point": 4194
+  "small_planned.point": 4194,
+  "string_pool_get.distinct": 270688,
+  "string_pool_intern.distinct": 2281599,
+  "string_pool_intern.repeats": 1522423
 }

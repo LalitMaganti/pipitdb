@@ -106,9 +106,25 @@ fn flat_hash_map(map: pipit_kernel::flat_hash_map::FlatHashMap<i64, ()>) -> u64 
     black_box(pipitdb_bench::find_keys(black_box(&map), 4000))
 }
 
+#[library_benchmark]
+#[bench::repeats(pipitdb_bench::strings(10_000, 100))]
+#[bench::distinct(pipitdb_bench::strings(10_000, 10_000))]
+fn string_pool_intern(strings: Vec<u8>) -> usize {
+    black_box(pipitdb_bench::intern_strings(black_box(&strings)).1.len())
+}
+
+#[library_benchmark]
+#[bench::distinct(pipitdb_bench::intern_strings(&pipitdb_bench::strings(10_000, 10_000)))]
+fn string_pool_get(
+    (pool, ids): (pipit_kernel::string_pool::StringPool, Vec<pipit_kernel::string_pool::Id>),
+) -> usize {
+    black_box(pipitdb_bench::get_strings(black_box(&pool), black_box(&ids)))
+}
+
 library_benchmark_group!(
     name = pipeline_group,
-    benchmarks = [pipeline, scan, filter, predicate, flat_hash_map]
+    benchmarks =
+        [pipeline, scan, filter, predicate, flat_hash_map, string_pool_intern, string_pool_get]
 );
 
 /// The table `hits`, over ClickBench's first file.
