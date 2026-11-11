@@ -398,6 +398,30 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
         Ok((unsafe { &mut (*slot).1 }, added))
     }
 
+    /// As `insert`, for a key found by `equal` among those hashed as `hash`,
+    /// as `find_by` finds it: adds `key`, hashed as `hash`, and `value` if
+    /// there's none. Returns the key and value, and whether they were added.
+    #[inline]
+    pub fn insert_by(
+        &mut self,
+        allocator: &dyn Allocator,
+        hash: u64,
+        equal: impl Fn(&K) -> bool,
+        key: K,
+        value: V,
+    ) -> Result<(&mut (K, V), bool), AllocError> {
+        check!(key.hash() == hash);
+        let (at, added) = self.find_or_prepare_insert_by(allocator, hash, equal)?;
+        let slot = self.base.slot::<(K, V)>(at);
+        if added {
+            // SAFETY: a slot of this map, claimed for `key`.
+            unsafe { slot.write((key, value)) };
+        }
+        // SAFETY: the slot holds a key and value, and the map is borrowed
+        // mutably for as long as they are.
+        Ok((unsafe { &mut *slot }, added))
+    }
+
     /// Removes `key`, returning whether it had it.
     #[inline(never)]
     pub fn erase(&mut self, key: K) -> bool {
@@ -472,8 +496,19 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
         allocator: &dyn Allocator,
         key: K,
     ) -> Result<(usize, bool), AllocError> {
-        let hash = key.hash();
-        let mut at = match self.find_slot::<true>(hash, |&held| held == key) {
+        self.find_or_prepare_insert_by(allocator, key.hash(), |&held| held == key)
+    }
+
+    /// As `find_or_prepare_insert`, for the key hashed as `hash` that `equal`
+    /// is true for.
+    #[inline]
+    fn find_or_prepare_insert_by(
+        &mut self,
+        allocator: &dyn Allocator,
+        hash: u64,
+        equal: impl Fn(&K) -> bool,
+    ) -> Result<(usize, bool), AllocError> {
+        let mut at = match self.find_slot::<true>(hash, equal) {
             Ok(at) => return Ok((at, false)),
             Err(at) => at,
         };
@@ -522,6 +557,29 @@ mod tests {
 
     use super::*;
     use crate::allocator::{Heap, LimitAllocator};
+
+    /// A key whose hash is its top half, so keys can share one.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Halves(u64);
+
+    impl Key for Halves {
+        fn hash(&self) -> u64 {
+            self.0 >> 32
+        }
+    }
+
+    #[test]
+    fn inserts_keys_that_share_a_hash_by_what_equal_says() {
+        let mut map = FlatHashMap::<Halves, u32>::new(&Heap, 1).unwrap();
+        for (i, key) in (0_u32..).zip([7 << 32 | 1, 7 << 32 | 2, 7 << 32 | 1, 9 << 32]) {
+            let (key, hash) = (Halves(key), key >> 32);
+            let ((_, value), added) =
+                map.insert_by(&Heap, hash, |held| *held == key, key, i).unwrap();
+            assert_eq!((*value, added), if i == 2 { (0, false) } else { (i, true) });
+        }
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.find_by(7, |held| held.0 == 7 << 32 | 2), Some(&1));
+    }
 
     #[test]
     fn finds_what_it_holds_as_it_grows() {
