@@ -330,7 +330,7 @@ impl SortedRows {
                 #[expect(clippy::cast_possible_truncation, reason = "a row held")]
                 let row = word_or_row as u32;
                 if row.is_multiple_of(BATCH_ROWS_MAX) {
-                    keys.let_go_below(row);
+                    keys.let_go_below(row, false);
                 }
                 let at = usize::from(slot.offset) + usize::from(slot.nullable);
                 row_layout::decode_value(*slot, at!(keys.get(row), at..at + 8), *float)

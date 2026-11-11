@@ -9,6 +9,7 @@ use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::radix_sort::{Scratch, merge, sort_words};
+use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::Slot;
 use crate::slow_vec::SlowVec;
@@ -402,12 +403,22 @@ pub(crate) fn sort_row_layout(
     let varying = find_varying_bytes(allocator, rows)?;
     let packing = Words::of(count);
     let first = at!(varying, ..varying.len().min(packing.key_bytes));
-    let words = (0..count).map(|r| packing.word(rows.get(r), first, r));
-    let mut words = SlowVec::fixed_from(allocator, words)?;
+    // If every byte that orders the rows is in their words, the rows aren't
+    // read again: each block is let go of once its words are written.
+    let in_words = varying.len() <= packing.key_bytes;
     let mut fixed = None;
-    if varying.len() <= packing.key_bytes {
-        // Every byte that orders the rows is in their words.
+    if in_words {
         fixed = Some(SlowVec::fixed_from(allocator, rows.get(0).iter().copied())?);
+    }
+    let mut words = SlowVec::fixed(allocator, count as usize)?;
+    for from in (0..count).step_by(BATCH_ROWS_MAX as usize) {
+        let to = count.min(from + BATCH_ROWS_MAX);
+        words.extend_within((from..to).map(|r| packing.word(row_layout.get(r), first, r)));
+        if in_words {
+            row_layout.let_go_below(to, true);
+        }
+    }
+    if in_words {
         row_layout.free();
     }
     let mut scratch = Scratch::new(allocator, count as usize)?;

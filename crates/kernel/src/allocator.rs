@@ -30,6 +30,15 @@ pub unsafe trait Allocator {
     /// `ptr` and `layout` must come from a matching call to `allocate` or
     /// `allocate_zeroed`.
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout);
+
+    /// Says the `len` bytes at `ptr` won't be read before they're written
+    /// again, so the whole pages among them can go back to the system.
+    ///
+    /// # Safety
+    ///
+    /// They must be within an allocation from this allocator, not yet
+    /// deallocated.
+    unsafe fn discard(&self, _ptr: NonNull<u8>, _len: usize) {}
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +125,11 @@ unsafe impl Allocator for LimitAllocator<'_> {
         // SAFETY: forwarded from the caller.
         unsafe { self.allocator.deallocate(ptr, layout) };
         self.used.set(self.used.get() - layout.size());
+    }
+
+    unsafe fn discard(&self, ptr: NonNull<u8>, len: usize) {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.allocator.discard(ptr, len) };
     }
 }
 

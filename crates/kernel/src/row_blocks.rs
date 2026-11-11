@@ -100,11 +100,15 @@ impl RowBlocks {
         }
     }
 
-    /// Lets go of the blocks whose rows are all below `row`.
-    pub(crate) fn let_go_below(&mut self, row: u32) {
+    /// Lets go of the blocks whose rows are all below `row`, and if
+    /// `discard`, of their pages too, as they won't be reused soon.
+    pub(crate) fn let_go_below(&mut self, row: u32, discard: bool) {
         let (block, _) = self.locate(row.min(self.len));
         for block in at_mut!(self.blocks, self.kept.min(block)..block) {
-            *block = None;
+            match block.take() {
+                Some(block) if discard => block.discard(),
+                _ => {}
+            }
         }
         self.kept = self.kept.max(block);
     }
@@ -112,7 +116,9 @@ impl RowBlocks {
     /// Lets go of every block.
     pub(crate) fn free(&mut self) {
         for block in self.blocks.iter_mut() {
-            *block = None;
+            if let Some(block) = block.take() {
+                block.discard();
+            }
         }
         self.kept = self.blocks.len();
     }
