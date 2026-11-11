@@ -9,6 +9,7 @@ use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::radix_sort::{Scratch, merge, sort_words};
+use crate::row_layout::Slot;
 use crate::slow_vec::SlowVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
@@ -227,8 +228,10 @@ fn sort_ties(
 pub(crate) enum Sorted {
     /// The `count` rows in the order they're held, or reversed.
     Held { reverse: bool, count: u32 },
-    /// Each row's word, in order.
-    Words { words: SlowVec<u64>, packing: Words },
+    /// Each row's word, in order. If they hold every byte that varies, at
+    /// `varying`, `fixed` is the bytes of the first row, as every other byte
+    /// is in every row.
+    Words { words: SlowVec<u64>, packing: Words, varying: SlowVec<u32>, fixed: Option<SlowVec<u8>> },
 }
 
 impl Sorted {
@@ -237,8 +240,143 @@ impl Sorted {
         match self {
             Sorted::Held { reverse: false, .. } => i,
             Sorted::Held { reverse: true, count } => count - 1 - i,
-            Sorted::Words { words, packing } => packing.row(*at!(words, i as usize)),
+            Sorted::Words { words, packing, .. } => packing.row(*at!(words, i as usize)),
         }
+    }
+
+    /// The words, and how to read `slot`, of 8-byte values of floats if
+    /// `float`, from them, if they hold every key.
+    pub(crate) fn slot_in_words(&self, slot: Slot, float: bool) -> Option<(&[u64], SlotInWords)> {
+        let Sorted::Words { words, packing, varying, fixed: Some(fixed) } = self else {
+            return None;
+        };
+        Some((words, SlotInWords::new(*packing, varying, fixed, slot, float)))
+    }
+}
+
+/// How to read a slot of 8-byte values from the words of rows whose every
+/// key they hold: its bytes are `fixed`'s, but for those the word's key
+/// holds.
+pub(crate) struct SlotInWords {
+    packing: Words,
+    slot: Slot,
+    float: bool,
+    /// The value's bytes, big-endian, where the key doesn't hold them, and
+    /// its flag's.
+    value: u64,
+    flag: u8,
+    /// Where the flag is in the key, and its bits there: none if it doesn't
+    /// vary.
+    flag_shift: u32,
+    flag_mask: u8,
+    /// Each run of the value's bytes the key holds: where it is in the key,
+    /// where in the value, and its bits.
+    runs: [(u32, u32, u64); 8],
+    len: usize,
+}
+
+impl SlotInWords {
+    pub(crate) fn new(
+        packing: Words,
+        varying: &[u32],
+        fixed: &[u8],
+        slot: Slot,
+        float: bool,
+    ) -> SlotInWords {
+        let flag_at = usize::from(slot.offset);
+        let start = flag_at + usize::from(slot.nullable);
+        let mut bytes = [0; 8];
+        bytes.copy_from_slice(at!(fixed, start..start + 8));
+        let (mut value, flag) =
+            (u64::from_be_bytes(bytes), if slot.nullable { *at!(fixed, flag_at) } else { 0 });
+        let runs = [(0, 0, 0); 8];
+        let (flag_shift, flag_mask) = (0, 0);
+        let mut in_words = SlotInWords {
+            packing,
+            slot,
+            float,
+            value: 0,
+            flag,
+            flag_shift,
+            flag_mask,
+            runs,
+            len: 0,
+        };
+        #[expect(clippy::cast_possible_truncation, reason = "at most 8 bytes")]
+        let count = varying.len() as u32;
+        for (v, &b) in (0_u32..).zip(varying) {
+            let (b, from) = (b as usize, (count - 1 - v) * 8);
+            if slot.nullable && b == flag_at {
+                (in_words.flag_shift, in_words.flag_mask) = (from, 0xff);
+            }
+            if !(start..start + 8).contains(&b) {
+                continue;
+            }
+            #[expect(clippy::cast_possible_truncation, reason = "within a value")]
+            let to = (7 - (b - start) as u32) * 8;
+            value &= !(0xff << to);
+            // A byte after the last of a run, in both, extends it.
+            let last = in_words.len.checked_sub(1).map(|r| at_mut!(in_words.runs, r));
+            match last {
+                Some((run_from, run_to, mask)) if *run_from == from + 8 && *run_to == to + 8 => {
+                    (*run_from, *run_to, *mask) = (from, to, *mask << 8 | 0xff);
+                }
+                _ => {
+                    *at_mut!(in_words.runs, in_words.len) = (from, to, 0xff);
+                    in_words.len += 1;
+                }
+            }
+        }
+        in_words.value = value;
+        in_words
+    }
+
+    /// Writes the value of each of `words`' rows into `out`, if none is null
+    /// and their bytes are one run in the key, returning whether it did.
+    pub(crate) fn decode_all(&self, words: &[u64], out: &mut [i64]) -> bool {
+        let invert = if self.slot.descending { u64::MAX } else { 0 };
+        #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
+        let present = !self.slot.nullable || self.flag ^ invert as u8 != 0;
+        if self.flag_mask != 0 || !present || self.len != 1 {
+            return false;
+        }
+        let ((from, to, mask), float) = (*at!(self.runs, 0), self.float);
+        for (out, &word) in out.iter_mut().zip(words) {
+            let value = self.value | (self.packing.key(word) >> from & mask) << to;
+            let bits = (value ^ invert).cast_signed() ^ i64::MIN;
+            let flip = if float { ((bits >> 63).cast_unsigned() >> 1).cast_signed() } else { 0 };
+            *out = bits ^ flip;
+        }
+        true
+    }
+
+    /// The value `word`'s row has in the slot, an integer or a float's
+    /// bits; `None` if none.
+    #[inline]
+    pub(crate) fn decode(&self, word: u64) -> Option<i64> {
+        let key = self.packing.key(word);
+        let mut value = self.value;
+        if self.len == 1 {
+            let (from, to, mask) = *at!(self.runs, 0);
+            value |= (key >> from & mask) << to;
+        } else {
+            for &(from, to, mask) in at!(self.runs, ..self.len) {
+                value |= (key >> from & mask) << to;
+            }
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "a byte")]
+        let flag = self.flag & !self.flag_mask | (key >> self.flag_shift) as u8 & self.flag_mask;
+        let invert = if self.slot.descending { u64::MAX } else { 0 };
+        #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
+        if self.slot.nullable && flag ^ invert as u8 == 0 {
+            return None;
+        }
+        let bits = (value ^ invert).cast_signed() ^ i64::MIN;
+        if !self.float {
+            return Some(bits);
+        }
+        // A negative float's bits but its sign were flipped by `Word::encode`.
+        Some(bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed())
     }
 }
 
@@ -269,8 +407,10 @@ pub(crate) fn sort_row_layout(
     let first = at!(varying, ..varying.len().min(packing.key_bytes));
     let words = (0..count).map(|r| packing.word(rows.get(r), first, r));
     let mut words = SlowVec::fixed_from(allocator, words)?;
+    let mut fixed = None;
     if varying.len() <= packing.key_bytes {
         // Every byte that orders the rows is in their words.
+        fixed = Some(SlowVec::fixed_from(allocator, rows.get(0).iter().copied())?);
         row_layout.free();
     }
     let mut scratch = Scratch::new(allocator, count as usize)?;
@@ -289,7 +429,7 @@ pub(crate) fn sort_row_layout(
         let rows = Rows { data: row_layout, stride: stride as usize, count };
         sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, &mut scratch);
     }
-    Ok(Sorted::Words { words, packing })
+    Ok(Sorted::Words { words, packing, varying, fixed })
 }
 
 #[cfg(test)]

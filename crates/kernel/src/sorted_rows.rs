@@ -4,13 +4,13 @@
 //! and rows are copied out once, in that order.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::DataType;
+use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{self, RowLayout, Word};
-use crate::row_layout_sort::{Sorted, sort_row_layout};
+use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
 use crate::slow_vec::SlowVec;
 
@@ -30,10 +30,14 @@ pub(crate) struct SortedRows {
     /// By key, its column if it's a string key, whose ranks among the rows'
     /// strings are laid out only once all are in.
     strings: SlowVec<Option<u32>>,
-    /// Each row's keys, one row after another, until they're sorted.
+    /// Each row's keys, one row after another, until they're sorted and
+    /// nothing is decoded from them.
     keys: SlowVec<u8>,
-    /// The rows themselves.
+    /// The rows themselves, but for the columns `decoded`.
     rows: RowStore,
+    /// The key columns not held, as their keys hold their values: each
+    /// one's number and its key's.
+    decoded: SlowVec<(u32, usize)>,
     /// The rows in output order: the first `order_len`.
     order: Sorted,
     order_len: u32,
@@ -47,6 +51,7 @@ impl SortedRows {
             strings: SlowVec::new(allocator, 1 << 6)?,
             keys: SlowVec::new(allocator, 1 << 31)?,
             rows: RowStore::new(allocator)?,
+            decoded: SlowVec::new(allocator, 1 << 6)?,
             order: Sorted::Held { reverse: false, count: 0 },
             order_len: 0,
         })
@@ -92,6 +97,16 @@ impl SortedRows {
             return Ok(());
         }
         let stride = self.check_keys(context.allocator(), batch, keys)?.stride() as usize;
+        if self.rows.len() == 0 {
+            for (k, key) in keys.iter().enumerate() {
+                let data_type = *at!(self.types, k);
+                let decoded = self.decoded.iter().any(|&(c, _)| c == key.column);
+                if !data_type.has_bytes() && !decoded && key.column < 63 {
+                    self.rows.drop_column(context, key.column, data_type)?;
+                    self.decoded.push((key.column, k))?;
+                }
+            }
+        }
         let at = self.keys.len();
         // Rows can't be added once their keys are sorted.
         check!(at == self.rows.len() as usize * stride);
@@ -194,7 +209,9 @@ impl SortedRows {
             self.order =
                 sort_row_layout(allocator, &mut self.keys, layout.stride(), self.order_len)?;
         }
-        self.keys.free();
+        if self.decoded.is_empty() {
+            self.keys.free();
+        }
         Ok(())
     }
 
@@ -207,21 +224,91 @@ impl SortedRows {
         at: u32,
     ) -> Result<u32, Error> {
         let end = self.order_len.min(at.saturating_add(BATCH_ROWS_MAX));
+        let start = at.min(end);
         let mut rows = [0; BATCH_ROWS_MAX as usize];
-        for (row, i) in rows.iter_mut().zip(at.min(end)..end) {
+        for (row, i) in rows.iter_mut().zip(start..end) {
             *row = self.order.row(i);
         }
-        self.rows.gather(context, out, at!(rows, ..(end - at.min(end)) as usize), at)
+        let rows = at!(rows, ..(end - start) as usize);
+        let (order, keys, decoded, types) = (&self.order, &self.keys, &self.decoded, &self.types);
+        let mut nullable = 0_u64;
+        for &(column, _) in decoded.iter() {
+            nullable |= u64::from(self.rows.has_nulls(column)) << column;
+        }
+        let given = |context: &mut Context, column: u32| {
+            let Some(&(_, k)) = decoded.iter().find(|&&(c, _)| c == column) else { failed!() };
+            let Some(layout) = &self.layout else { failed!() };
+            let (slot, data_type) = (layout.slot(k), *at!(types, k));
+            let (stride, float) = (layout.stride() as usize, data_type == DataType::Float64);
+            let in_words = order.slot_in_words(slot, float);
+            let range = start as usize..end as usize;
+            let mut values = context.values_buffer(rows.len() * 8)?;
+            if let Some((words, in_words)) = &in_words
+                && in_words.decode_all(at!(words, range.clone()), values.as_mut_slice::<i64>())
+            {
+                return Ok(ColumnView::new(context, data_type, values, None)?);
+            }
+            if in_words.is_none() && nullable >> column & 1 == 0 {
+                let value_at = usize::from(slot.offset) + usize::from(slot.nullable);
+                for (out, &row) in values.as_mut_slice::<i64>().iter_mut().zip(rows) {
+                    let at = row as usize * stride + value_at;
+                    *out = row_layout::decode_value(slot, at!(keys, at..at + 8), float);
+                }
+                return Ok(ColumnView::new(context, data_type, values, None)?);
+            }
+            let mut validity = context.small_buffer(rows.len().div_ceil(8))?;
+            let (out, bits) = (values.as_mut_slice::<i64>(), validity.as_mut_slice::<u8>());
+            bits.fill(0);
+            let mut nulls = false;
+            let mut put = |r: usize, value: Option<i64>| {
+                *at_mut!(out, r) = value.unwrap_or(0);
+                *at_mut!(bits, r / 8) |= u8::from(value.is_some()) << (r % 8);
+                nulls |= value.is_none();
+            };
+            if let Some((words, in_words)) = &in_words {
+                for (r, &word) in (0..).zip(at!(words, range)) {
+                    put(r, in_words.decode(word));
+                }
+            } else {
+                for (r, &row) in (0..).zip(rows) {
+                    let at = row as usize * stride;
+                    put(r, row_layout::decode(slot, at!(keys, at..at + stride), float));
+                }
+            }
+            Ok(ColumnView::new(context, data_type, values, nulls.then_some(validity))?)
+        };
+        self.rows.gather(context, out, rows, at, given)
     }
 
     /// Copies the columns `RowStore::scatter` can into the order, once
     /// sorted, so gathering them only views them. Rows still in the order
     /// they're held are viewed where they are anyway.
     pub(crate) fn scatter(&mut self, context: &mut Context) -> Result<(), Error> {
-        let Sorted::Words { words, packing } = &mut self.order else { return Ok(()) };
+        let Sorted::Words { words, packing, varying, fixed } = &mut self.order else {
+            return Ok(());
+        };
         let packing = *packing;
         let words = at_mut!(words, ..self.order_len as usize);
-        self.rows.scatter(context, words, |word| packing.row(word))
+        // Decoded columns are decoded from the words before scatter uses
+        // their bits, if their keys are only there.
+        let mut decode = None;
+        if let (Some(fixed), Some(layout), false) = (fixed, &self.layout, self.decoded.is_empty()) {
+            let mut slots = SlowVec::fixed(context.allocator(), self.decoded.len())?;
+            for &(column, k) in self.decoded.iter() {
+                let float = *at!(self.types, k) == DataType::Float64;
+                slots.push((
+                    column,
+                    SlotInWords::new(packing, varying, fixed, layout.slot(k), float),
+                ))?;
+            }
+            decode = Some(move |column: usize, word: u64| {
+                let Some((_, slot)) = slots.iter().find(|(c, _)| *c as usize == column) else {
+                    failed!()
+                };
+                slot.decode(word).unwrap_or(0)
+            });
+        }
+        self.rows.scatter(context, words, |word| packing.row(word), decode)
     }
 }
 

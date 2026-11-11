@@ -100,6 +100,35 @@ impl RowLayout {
     }
 }
 
+/// The word `write` laid out in `slot` of `row`, an integer or, if `float`,
+/// a float's bits; `None` if it has none.
+pub(crate) fn decode(slot: Slot, row: &[u8], float: bool) -> Option<i64> {
+    let invert = if slot.descending { u64::MAX } else { 0 };
+    let mut at = usize::from(slot.offset);
+    if slot.nullable {
+        #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
+        let present = *at!(row, at) ^ invert as u8 != 0;
+        if !present {
+            return None;
+        }
+        at += 1;
+    }
+    Some(decode_value(slot, at!(row, at..at + 8), float))
+}
+
+/// The word `write` laid out in `slot` of a row from its value's `bytes`,
+/// after any flag.
+#[inline]
+pub(crate) fn decode_value(slot: Slot, bytes: &[u8], float: bool) -> i64 {
+    let invert = if slot.descending { u64::MAX } else { 0 };
+    let mut be = [0; 8];
+    be.copy_from_slice(bytes);
+    let bits = (u64::from_be_bytes(be) ^ invert).cast_signed() ^ i64::MIN;
+    // A negative float's bits but its sign were flipped by `Word::encode`.
+    let flip = if float { ((bits >> 63).cast_unsigned() >> 1).cast_signed() } else { 0 };
+    bits ^ flip
+}
+
 fn value_size(data_type: Type) -> u32 {
     match data_type {
         Type::Uint32 => 4,
@@ -201,5 +230,27 @@ mod tests {
         assert_eq!(layout.slot(2).offset, 17);
         assert_eq!(layout.stride(), 26);
         assert_eq!(layout.slot(1).stride, 26);
+    }
+
+    #[test]
+    fn decodes_what_it_lays_out() {
+        let values = [Some(-3.5_f64), None, Some(0.0), Some(f64::MAX), Some(-0.0)];
+        for (descending, float) in [(false, true), (true, true), (false, false), (true, false)] {
+            let data_type = if float { Type::Float64 } else { Type::Int64 };
+            let column = Column { data_type, nullable: true, descending };
+            let layout = RowLayout::new(&Heap, &[column]).unwrap();
+            let stride = layout.stride() as usize;
+            #[expect(clippy::cast_possible_truncation, reason = "whole numbers, or floats' bits")]
+            let bits = |i: u32| {
+                values[i as usize]
+                    .map(|v: f64| if float { v.to_bits().cast_signed() } else { v as i64 })
+            };
+            let get = |i: u32| bits(i).map(|bits| Word { bits, float });
+            let mut rows = alloc::vec![0; stride * values.len()];
+            RowLayout::write(layout.slot(0), 5, get, &mut rows);
+            for (i, row) in (0..).zip(rows.chunks(stride)) {
+                assert_eq!(decode(layout.slot(0), row, float), bits(i), "{i}");
+            }
+        }
     }
 }
