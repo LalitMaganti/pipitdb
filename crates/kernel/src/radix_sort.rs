@@ -1,23 +1,9 @@
-//! Sorting `KeyedIndex`es by their keys, as Perfetto's `core/util/sort.h`
-//! does: by an LSD radix sort where that's estimated to be cheaper, and by
-//! comparing them otherwise.
+//! Sorting words by keys in their high bits, as Perfetto's `core/util/sort.h`
+//! sorts `KeyedIndex`es: by an LSD radix sort where that's estimated to be
+//! cheaper, and by comparing them otherwise.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::buffer::Primitive;
 use crate::slow_vec::SlowVec;
-
-/// What's sorted: a key, the index which breaks ties, and a value carried
-/// along.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-#[repr(C)]
-pub(crate) struct KeyedIndex {
-    pub(crate) key: u64,
-    pub(crate) index: u32,
-    pub(crate) value: u32,
-}
-
-// SAFETY: any bits are a valid `KeyedIndex`, which has no padding.
-unsafe impl Primitive for KeyedIndex {}
 
 /// How a key is split into digits for a radix sort.
 #[derive(Clone, Copy)]
@@ -55,20 +41,20 @@ fn radix_sort_counts_size(key_bits: u32, size: usize) -> usize {
     (digits.passes as usize) << digits.bits
 }
 
-/// Sorts `elements` by key with a stable radix sort, least significant digit
-/// first. Only the low `key_bits` bits of the keys are sorted on: any above
-/// them must be the same in every key. Each pass is a stable counting sort
-/// on one digit into the other buffer, and the two then swap roles. The
-/// counts of every digit are taken in one read, and a pass is skipped when
-/// every element has the same digit. Returns whether the sorted elements are
-/// in `scratch`, at least as long, rather than `elements`.
+/// Sorts `words` by key with a stable radix sort, least significant digit
+/// first. Each pass is a stable counting sort on one digit into the other
+/// buffer, and the two then swap roles. The counts of every digit are taken
+/// in one read, and a pass is skipped when every word has the same digit.
+/// Returns whether the sorted words are in `scratch`, at least as long,
+/// rather than `words`.
 fn radix_sort(
-    elements: &mut [KeyedIndex],
-    scratch: &mut [KeyedIndex],
+    words: &mut [u64],
+    scratch: &mut [u64],
     counts: &mut [u32],
+    low: u32,
     key_bits: u32,
 ) -> bool {
-    let n = elements.len();
+    let n = words.len();
     if n <= 1 || key_bits == 0 {
         return false;
     }
@@ -77,31 +63,31 @@ fn radix_sort(
     let mask = buckets as u64 - 1;
     let counts = at_mut!(counts, ..digits.passes as usize * buckets);
     counts.fill(0);
-    for element in elements.iter() {
+    for &word in words.iter() {
         for p in 0..digits.passes {
             #[expect(clippy::cast_possible_truncation, reason = "under 2^16")]
-            let digit = ((element.key >> (p * digits.bits)) & mask) as usize;
+            let digit = ((word >> (low + p * digits.bits)) & mask) as usize;
             *at_mut!(counts, p as usize * buckets + digit) += 1;
         }
     }
-    let (mut source, mut dest) = (elements, at_mut!(scratch, ..n));
+    let (mut source, mut dest) = (words, at_mut!(scratch, ..n));
     let mut in_scratch = false;
     for (p, count) in counts.chunks_exact_mut(buckets).enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "at most 4 passes")]
-        let shift = p as u32 * digits.bits;
+        let shift = low + p as u32 * digits.bits;
         #[expect(clippy::cast_possible_truncation, reason = "under 2^16")]
-        let digit = |element: &KeyedIndex| ((element.key >> shift) & mask) as usize;
-        // Every element has the same digit: this pass can't move any.
-        if *at!(count, digit(at!(source, 0))) as usize == n {
+        let digit = |word: u64| ((word >> shift) & mask) as usize;
+        // Every word has the same digit: this pass can't move any.
+        if *at!(count, digit(*at!(source, 0))) as usize == n {
             continue;
         }
         let mut total = 0;
         for c in count.iter_mut() {
             (*c, total) = (total, total + *c);
         }
-        for element in source.iter() {
-            let at = at_mut!(count, digit(element));
-            *at_mut!(dest, *at as usize) = *element;
+        for &word in source.iter() {
+            let at = at_mut!(count, digit(word));
+            *at_mut!(dest, *at as usize) = word;
             *at += 1;
         }
         core::mem::swap(&mut source, &mut dest);
@@ -120,37 +106,38 @@ fn radix_sort_is_cheaper(size: usize, key_bits: u32) -> bool {
     radix < 2 * size as u64 * log2_size
 }
 
-/// Stably sorts `elements` by key, ties by index, where only the low
-/// `key_bits` bits of the keys may differ: by a radix sort when that's
-/// estimated to be cheaper, as for many elements, and by comparing them
-/// otherwise. Returns whether the sorted elements are in `scratch`, at least
-/// as long, rather than `elements`.
-pub(crate) fn stable_sort_keyed_indices(
+/// Sorts `words` whose keys are their `key_bits` bits from `low`: any bits
+/// above must be the same in every word, and words with equal keys must be
+/// in order already, which they stay in. By a radix sort when that's
+/// estimated to be cheaper, as for many words, and by comparing them
+/// otherwise. Returns whether the sorted words are in `scratch`, at least as
+/// long, rather than `words`.
+pub(crate) fn sort_words(
     allocator: &dyn Allocator,
-    elements: &mut [KeyedIndex],
-    scratch: &mut [KeyedIndex],
+    words: &mut [u64],
+    scratch: &mut [u64],
+    low: u32,
     key_bits: u32,
 ) -> Result<bool, AllocError> {
-    let size = elements.len();
+    let size = words.len();
     if !radix_sort_is_cheaper(size, key_bits) {
-        return Ok(sort_keyed_indices(elements, scratch));
+        return Ok(sort_by_comparing(words, scratch));
     }
     let mut counts = SlowVec::zeroed(allocator, radix_sort_counts_size(key_bits, size))?;
-    Ok(radix_sort(elements, scratch, &mut counts, key_bits))
+    Ok(radix_sort(words, scratch, &mut counts, low, key_bits))
 }
 
-/// How many elements an insertion sort sorts before runs are merged.
+/// How many words an insertion sort sorts before runs are merged.
 const RUN: usize = 16;
 
-/// Sorts `elements` by key, then index: runs of `RUN` by insertion, then
-/// merged, back and forth with `scratch`. Returns whether the sorted
-/// elements are in `scratch`.
-fn sort_keyed_indices(elements: &mut [KeyedIndex], scratch: &mut [KeyedIndex]) -> bool {
-    let n = elements.len();
-    for run in elements.chunks_mut(RUN) {
+/// Sorts `words`: runs of `RUN` by insertion, then merged, back and forth
+/// with `scratch`. Returns whether the sorted words are in `scratch`.
+fn sort_by_comparing(words: &mut [u64], scratch: &mut [u64]) -> bool {
+    let n = words.len();
+    for run in words.chunks_mut(RUN) {
         insertion_sort(run);
     }
-    let (mut source, mut dest) = (elements, at_mut!(scratch, ..n));
+    let (mut source, mut dest) = (words, at_mut!(scratch, ..n));
     let mut in_scratch = false;
     let mut width = RUN;
     while width < n {
@@ -164,37 +151,26 @@ fn sort_keyed_indices(elements: &mut [KeyedIndex], scratch: &mut [KeyedIndex]) -
     in_scratch
 }
 
-/// Merges `source[start..mid]` and `source[mid..end]`, each sorted by key,
-/// then index, into `dest[start..end]`.
-pub(crate) fn merge(
-    source: &[KeyedIndex],
-    dest: &mut [KeyedIndex],
-    start: usize,
-    mid: usize,
-    end: usize,
-) {
+/// Merges the sorted `source[start..mid]` and `source[mid..end]` into
+/// `dest[start..end]`.
+pub(crate) fn merge(source: &[u64], dest: &mut [u64], start: usize, mid: usize, end: usize) {
     let (mut a, mut b) = (start, mid);
     for out in at_mut!(dest, start..end) {
-        let left = b == end || (a < mid && !less(at!(source, b), at!(source, a)));
+        let left = b == end || (a < mid && at!(source, a) <= at!(source, b));
         *out = if left { *at!(source, a) } else { *at!(source, b) };
         if left { a += 1 } else { b += 1 }
     }
 }
 
-fn less(a: &KeyedIndex, b: &KeyedIndex) -> bool {
-    (a.key, a.index) < (b.key, b.index)
-}
-
-/// Sorts `elements` by key, then index, in place.
-pub(crate) fn insertion_sort(elements: &mut [KeyedIndex]) {
-    for i in 1..elements.len() {
-        let t = *at!(elements, i);
+pub(crate) fn insertion_sort(words: &mut [u64]) {
+    for i in 1..words.len() {
+        let word = *at!(words, i);
         let mut j = i;
-        while j > 0 && less(&t, at!(elements, j - 1)) {
-            *at_mut!(elements, j) = *at!(elements, j - 1);
+        while j > 0 && word < *at!(words, j - 1) {
+            *at_mut!(words, j) = *at!(words, j - 1);
             j -= 1;
         }
-        *at_mut!(elements, j) = t;
+        *at_mut!(words, j) = word;
     }
 }
 
@@ -275,10 +251,11 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
 
-    /// `count` elements whose keys are of `key_bits` bits, many of them tied.
-    fn elements(count: u32, key_bits: u32) -> Vec<KeyedIndex> {
+    /// `count` words of keys of `key_bits` bits, many of them tied, above
+    /// their index's 20 bits.
+    fn words(count: u32, key_bits: u32) -> Vec<u64> {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
-        let mask = if key_bits == 64 { u64::MAX } else { (1 << key_bits) - 1 };
+        let mask = (1 << key_bits) - 1;
         (0..count)
             .map(|index| {
                 seed ^= seed << 13;
@@ -286,37 +263,33 @@ mod tests {
                 seed ^= seed << 17;
                 // A few values, spread across every digit.
                 let key = (seed % 50).wrapping_mul(0x9e37_79b9_7f4a_7c15) & mask;
-                KeyedIndex { key, index, value: index * 3 }
+                key << 20 | u64::from(index)
             })
             .collect()
     }
 
-    fn sorted(
-        mut elements: Vec<KeyedIndex>,
-        sort: impl Fn(&mut [KeyedIndex], &mut [KeyedIndex]) -> bool,
-    ) -> Vec<KeyedIndex> {
-        let mut scratch = alloc::vec![KeyedIndex::default(); elements.len()];
-        if sort(&mut elements, &mut scratch) { scratch } else { elements }
+    fn sorted(mut words: Vec<u64>, sort: impl Fn(&mut [u64], &mut [u64]) -> bool) -> Vec<u64> {
+        let mut scratch = alloc::vec![0; words.len()];
+        if sort(&mut words, &mut scratch) { scratch } else { words }
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri, and there's no unsafe code to check")]
     fn sorts_stably_by_radix_and_by_comparing() {
         for (count, key_bits) in
-            [(3000, 64), (3000, 20), (300, 9), (17, 64), (3, 8), (1, 8), (0, 8)]
+            [(3000, 44), (3000, 20), (300, 9), (17, 44), (3, 8), (1, 8), (0, 8)]
         {
-            let elements = elements(count, key_bits);
-            let mut expected = elements.clone();
-            expected.sort_by_key(|e| (e.key, e.index));
-            let counts = radix_sort_counts_size(key_bits, elements.len());
-            let radix = sorted(elements.clone(), |e, s| {
-                radix_sort(e, s, &mut alloc::vec![0; counts], key_bits)
+            let words = words(count, key_bits);
+            let mut expected = words.clone();
+            expected.sort_unstable();
+            let counts = radix_sort_counts_size(key_bits, words.len());
+            let radix = sorted(words.clone(), |w, s| {
+                radix_sort(w, s, &mut alloc::vec![0; counts], 20, key_bits)
             });
             assert_eq!(radix, expected, "radix, {count} of {key_bits} bits");
-            let compared = sorted(elements.clone(), sort_keyed_indices);
+            let compared = sorted(words.clone(), sort_by_comparing);
             assert_eq!(compared, expected, "comparing, {count} of {key_bits} bits");
-            let either =
-                sorted(elements, |e, s| stable_sort_keyed_indices(&Heap, e, s, key_bits).unwrap());
+            let either = sorted(words, |w, s| sort_words(&Heap, w, s, 20, key_bits).unwrap());
             assert_eq!(either, expected, "either, {count} of {key_bits} bits");
         }
     }
