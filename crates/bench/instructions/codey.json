@@ -13,9 +13,9 @@
   "clickbench.g_region": 96453343,
   "clickbench.g_user": 126809332,
   "clickbench.g_window": 225898316,
-  "clickbench.q10": 41387513,
-  "clickbench.q12": 70517223,
-  "clickbench.q14": 92244066,
+  "clickbench.q10": 41446834,
+  "clickbench.q12": 70681827,
+  "clickbench.q14": 92556434,
   "filter.greater": 732706,
   "filter.greater_nulls": 1068557,
   "lexer.long_text": 102843,
@@ -36,6 +36,6 @@
   "small.point": 34035,
   "small_planned.point": 4137,
   "string_pool_get.distinct": 270688,
-  "string_pool_intern.distinct": 2281600,
-  "string_pool_intern.repeats": 1562024
+  "string_pool_intern.distinct": 2281599,
+  "string_pool_intern.repeats": 1522423
 }

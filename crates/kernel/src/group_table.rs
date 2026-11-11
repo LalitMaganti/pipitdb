@@ -341,12 +341,14 @@ fn load_string_ids(
     match column.form() {
         Form::Flat => {
             let validity = column.validity();
-            for (i, id) in out {
+            let string = |i: usize| {
                 let row = row_of(i);
-                let valid = validity.is_none_or(|validity| is_valid(validity, row));
-                let string = valid.then(|| strings.get(row));
-                *id = i64::from(pool.intern_string(allocator, string)?.raw_id());
-            }
+                validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
+            };
+            let ids = ids.as_mut_slice::<i64>();
+            pool.intern_strings(allocator, count, string, |i, id| {
+                *at_mut!(ids, i) = i64::from(id.raw_id());
+            })?;
         }
         Form::Dictionary(indices) => {
             if !interned.as_ref().is_some_and(|interned| interned.dictionary.shares_values(column))

@@ -3,8 +3,9 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
-use crate::flat_hash_map::{FlatHashMap, Key};
+use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
+use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
 
 /// How many bits of an id say which block its string is in.
@@ -28,6 +29,14 @@ const LARGE_STRING_BYTES_MIN: usize = BLOCK_BYTES / 4;
 /// The bytes a string in a block takes besides its own: its size, and a nul
 /// after it.
 const METADATA_BYTES: usize = 5;
+
+/// The most slots an index has while it's taken to fit in cache: 512 KB of
+/// them, as a core's L2.
+const CACHED_SLOTS: usize = 1 << 15;
+
+/// How many strings a batch is interned in at a time: each step's loads
+/// are started for all of them before the next step waits for any.
+const CHUNK_ROWS: usize = 512;
 
 /// How many slots the index starts with.
 const INDEX_CAPACITY: usize = 4096;
@@ -155,12 +164,87 @@ impl StringPool {
         str: Option<&[u8]>,
     ) -> Result<Id, AllocError> {
         let Some(str) = str else { return Ok(Id::NULL) };
+        self.intern_hashed(allocator, str, murmur_hash::bytes(str))
+    }
+
+    /// Interns `count` strings, `string(i)` for each, giving each one's id to
+    /// `out(i, id)`: as `intern_string` for each, but a batch at a time, so
+    /// the memory each needs is loaded for all of them at once rather than
+    /// waited for one by one.
+    pub fn intern_strings<'s>(
+        &mut self,
+        allocator: &dyn Allocator,
+        count: usize,
+        string: impl Fn(usize) -> Option<&'s [u8]>,
+        mut out: impl FnMut(usize, Id),
+    ) -> Result<(), AllocError> {
+        check!(count <= BATCH_ROWS_MAX as usize);
+        // While the index fits in cache, there's no wait to hide.
+        if self.string_index.capacity() <= CACHED_SLOTS {
+            for i in 0..count {
+                out(i, self.intern_string(allocator, string(i))?);
+            }
+            return Ok(());
+        }
+        for first in (0..count).step_by(CHUNK_ROWS) {
+            let rows = CHUNK_ROWS.min(count - first);
+            self.intern_chunk(allocator, first, rows, &string, &mut out)?;
+        }
+        Ok(())
+    }
+
+    /// As `intern_strings`, for the `rows` strings from `first`: their
+    /// slots are loaded, then the strings they hold, then they're compared.
+    fn intern_chunk<'s>(
+        &mut self,
+        allocator: &dyn Allocator,
+        first: usize,
+        rows: usize,
+        string: &impl Fn(usize) -> Option<&'s [u8]>,
+        out: &mut impl FnMut(usize, Id),
+    ) -> Result<(), AllocError> {
+        let mut strs: [Option<&[u8]>; CHUNK_ROWS] = [None; CHUNK_ROWS];
+        let mut hashes = [0_u64; CHUNK_ROWS];
+        let mut found = [Id::NULL; CHUNK_ROWS];
+        let strs = at_mut!(strs, ..rows);
+        for (i, (str, hash)) in strs.iter_mut().zip(&mut hashes).enumerate() {
+            *str = string(first + i);
+            if let Some(str) = str {
+                *hash = murmur_hash::bytes(str);
+                self.string_index.prefetch(*hash);
+            }
+        }
+        for ((str, &hash), found) in strs.iter().zip(&hashes).zip(&mut found) {
+            if str.is_some() {
+                let held = self.string_index.find_key_by(hash, |held| held.hash == hash);
+                *found = held.map_or(Id::NULL, |held| held.id);
+                self.store.prefetch(*found);
+            }
+        }
+        for (i, ((str, &hash), &found)) in strs.iter().zip(&hashes).zip(&found).enumerate() {
+            let id = match *str {
+                None => Id::NULL,
+                Some(str) if !found.is_null() && self.store.equals(found, str) => found,
+                Some(str) => self.intern_hashed(allocator, str, hash)?,
+            };
+            out(first + i, id);
+        }
+        Ok(())
+    }
+
+    /// As `intern_string`, for `str`, hashed as `hash`.
+    #[inline]
+    fn intern_hashed(
+        &mut self,
+        allocator: &dyn Allocator,
+        str: &[u8],
+        hash: u64,
+    ) -> Result<Id, AllocError> {
         // Inserts the null id just to see if the string is already in, and
         // if it isn't, overwrites it with the string's. Strings with the
         // same hash are told apart by their bytes, unlike in Perfetto.
-        let hash = murmur_hash::bytes(str);
         let store = &self.store;
-        let equal = |held: &Interned| held.hash == hash && store.get(held.id) == Some(str);
+        let equal = |held: &Interned| held.hash == hash && store.equals(held.id, str);
         let key = Interned { hash, id: Id::NULL };
         let ((held, ()), inserted) =
             self.string_index.insert_by(allocator, hash, equal, key, ())?;
@@ -183,6 +267,31 @@ impl StringPool {
 }
 
 impl Store {
+    /// Whether the string whose id is `id`, not the null string's, is `str`.
+    #[inline]
+    fn equals(&self, id: Id, str: &[u8]) -> bool {
+        if id.is_large_string() {
+            return self.get_large_string(id) == str;
+        }
+        let block = at!(self.blocks, id.block_index() as usize).as_slice::<u8>();
+        let offset = id.block_offset() as usize;
+        let Some(size) = at!(block, offset..).first_chunk::<4>() else { failed!() };
+        let start = offset + 4;
+        u32::from_ne_bytes(*size) as usize == str.len()
+            && block.get(start..start + str.len()) == Some(str)
+    }
+
+    /// Starts loading the string whose id is `id`, unless it's null or large.
+    #[inline]
+    fn prefetch(&self, id: Id) {
+        if !id.is_null()
+            && !id.is_large_string()
+            && let Some(block) = self.blocks.get(id.block_index() as usize)
+        {
+            prefetch(block.as_slice::<u8>().as_ptr().wrapping_add(id.block_offset() as usize));
+        }
+    }
+
     #[inline]
     fn get(&self, id: Id) -> Option<&[u8]> {
         if id.is_null() {
@@ -291,6 +400,31 @@ mod tests {
             assert_eq!(pool.get(id), Some(str.as_bytes()));
             assert_eq!(pool.intern_string(&Heap, Some(str.as_bytes())).unwrap(), id);
         }
+    }
+
+    #[test]
+    fn interns_a_batch_as_one_at_a_time() {
+        // Small enough to intern a row at a time, then past `CACHED_SLOTS`,
+        // when a batch is looked up at once.
+        let mut pool = StringPool::new(&Heap).unwrap();
+        let mut one_at_a_time = StringPool::new(&Heap).unwrap();
+        let mut ids = alloc::vec![Id::NULL; BATCH_ROWS_MAX as usize];
+        for batch in 0..40_u32 {
+            let strings: Vec<Option<Vec<u8>>> = (0..BATCH_ROWS_MAX)
+                .map(|i| {
+                    (i % 9 != 4).then(|| format!("{}", (batch * 1000 + i) % 30_000).into_bytes())
+                })
+                .collect();
+            let string = |i: usize| strings[i].as_deref();
+            pool.intern_strings(&Heap, strings.len(), string, |i, id| ids[i] = id).unwrap();
+            for (i, &id) in ids.iter().enumerate() {
+                assert_eq!(pool.get(id), string(i));
+                let expected = one_at_a_time.intern_string(&Heap, string(i)).unwrap();
+                assert_eq!(pool.get(id), one_at_a_time.get(expected));
+            }
+        }
+        assert!(pool.string_index.capacity() > CACHED_SLOTS);
+        assert_eq!(pool.size(), one_at_a_time.size());
     }
 
     #[test]
