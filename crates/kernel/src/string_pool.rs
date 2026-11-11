@@ -144,7 +144,8 @@ impl StringPool {
     }
 
     /// Interns `str` and returns its id: the same each time it's interned.
-    /// Strings are told apart by their hash alone.
+    /// Strings are told apart by their hash alone. After an error, the pool
+    /// mustn't be used again.
     #[inline]
     pub fn intern_string(
         &mut self,
@@ -157,13 +158,7 @@ impl StringPool {
         let hash = StringHash(murmur_hash::bytes(str));
         let (id, inserted) = self.string_index.insert(allocator, hash, Id::NULL)?;
         if inserted {
-            match self.store.insert_string(allocator, str) {
-                Ok(new) => *id = new,
-                Err(error) => {
-                    self.string_index.erase(hash);
-                    return Err(error);
-                }
-            }
+            *id = self.store.insert_string(allocator, str)?;
             return Ok(*id);
         }
         let id = *id;
@@ -196,6 +191,7 @@ impl StringPool {
 }
 
 impl Store {
+    #[inline(never)]
     fn add_block(&mut self, allocator: &dyn Allocator) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
@@ -229,6 +225,7 @@ impl Store {
 
     /// Writes `str` at the end of the last block, which has room for it, and
     /// returns where it starts.
+    #[inline(never)]
     fn insert_in_current_block(&mut self, str: &[u8]) -> u32 {
         let start = self.block_end;
         let Some(block) = self.blocks.last_mut() else { failed!() };
