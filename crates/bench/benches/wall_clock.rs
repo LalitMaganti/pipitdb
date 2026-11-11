@@ -149,6 +149,21 @@ fn perfetto_filter(c: &mut Criterion) {
     group.finish();
 }
 
+/// Interning 100,000 strings, and getting them back.
+fn string_pool(c: &mut Criterion) {
+    let mut group = c.benchmark_group("string_pool");
+    group.throughput(Throughput::Elements(100_000));
+    for (name, distinct) in [("intern_repeats", 1000), ("intern_distinct", 100_000)] {
+        let strings = pipitdb_bench::strings(100_000, distinct);
+        group.bench_function(name, |b| {
+            b.iter(|| pipitdb_bench::intern_strings(black_box(&strings)));
+        });
+    }
+    let (pool, ids) = pipitdb_bench::intern_strings(&pipitdb_bench::strings(100_000, 100_000));
+    group.bench_function("get", |b| b.iter(|| pipitdb_bench::get_strings(&pool, black_box(&ids))));
+    group.finish();
+}
+
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -156,6 +171,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter
+    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter, string_pool
 }
 criterion_main!(benches);
