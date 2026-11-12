@@ -259,7 +259,8 @@ impl GroupTable {
     /// values directly.
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
-        if self.slots.len() > CACHED_SLOTS {
+        // `prefetch` does nothing on other targets, so they don't look ahead.
+        if cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS {
             self.find_values_in::<true>(keys, groups)
         } else {
             self.find_values_in::<false>(keys, groups)
