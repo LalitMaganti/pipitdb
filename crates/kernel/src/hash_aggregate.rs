@@ -119,6 +119,9 @@ impl Key for GroupValue {
     }
 }
 
+/// How many rows ahead `first_values` fetches a row's slot.
+const SLOT_AHEAD: usize = 16;
+
 /// The values of `input`'s rows that aren't null and that their group, in
 /// `groups`, all 0 if `None`, hadn't had before, adding them to `set`; and
 /// each one's group, and how many there are.
@@ -128,26 +131,9 @@ fn first_values(
     input: &AggregateInput,
     groups: Option<&[u32]>,
 ) -> Result<(Buffer, Buffer, usize), Error> {
-    // `prefetch` does nothing on other targets, so they don't look ahead.
-    if cfg!(target_arch = "x86_64") && set.capacity() > CACHED_SLOTS {
-        first_values_in::<true>(context, set, input, groups)
-    } else {
-        first_values_in::<false>(context, set, input, groups)
-    }
-}
-
-/// How many rows ahead `first_values_in` fetches a row's slot.
-const SLOT_AHEAD: usize = 16;
-
-/// As `first_values`. A set too big for the cache misses it a row, so if
-/// `AHEAD`, each row's slot is fetched ahead.
-#[inline(never)]
-fn first_values_in<const AHEAD: bool>(
-    context: &mut Context,
-    set: &mut FlatHashMap<GroupValue, ()>,
-    input: &AggregateInput,
-    groups: Option<&[u32]>,
-) -> Result<(Buffer, Buffer, usize), Error> {
+    // A set too big for the cache misses it a row, so each row's slot is
+    // fetched ahead. `prefetch` does nothing on other targets, so they don't.
+    let ahead = cfg!(target_arch = "x86_64") && set.capacity() > CACHED_SLOTS;
     let mut values = context.values_buffer(input.rows * 8)?;
     let mut firsts = context.indices_buffer(input.rows * 4)?;
     let (kept_values, kept_groups) = (values.as_mut_slice::<i64>(), firsts.as_mut_slice::<u32>());
@@ -155,8 +141,8 @@ fn first_values_in<const AHEAD: bool>(
     let group_of = |row: usize| groups.map_or(0, |groups| *at!(groups, row));
     let mut kept = 0;
     for (row, &value) in all.iter().enumerate() {
-        if AHEAD && let Some(&ahead) = all.get(row + SLOT_AHEAD) {
-            set.prefetch(GroupValue { group: group_of(row + SLOT_AHEAD), value: ahead }.hash());
+        if ahead && let Some(&next) = all.get(row + SLOT_AHEAD) {
+            set.prefetch(GroupValue { group: group_of(row + SLOT_AHEAD), value: next }.hash());
         }
         let group = group_of(row);
         if input.is_valid(row)
