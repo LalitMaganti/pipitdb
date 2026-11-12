@@ -126,7 +126,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     fn apply(&mut self, step: &InputStep) -> Result<(), LowerError> {
-        let InputStep::Sort { keys, keep } = step;
+        let InputStep::Sort { keys, keep, .. } = step;
         let keys = keys.iter().map(|key| crate::sort::SortKey {
             column: self.query_position(key.column),
             descending: key.descending,
@@ -143,7 +143,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
     /// outputs only those.
     pub fn query_sort_keep(&self) -> Option<u32> {
         let sort = self.rows().open_sort?;
-        let InputStep::Sort { keep, .. } = step(self.planned, sort.at);
+        let InputStep::Sort { keep, .. } = step(self.planned, sort);
         *keep
     }
 

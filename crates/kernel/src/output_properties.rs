@@ -87,15 +87,6 @@ impl Arrangements {
     }
 }
 
-/// The most recent sort, while nothing has read its order, and what was
-/// known before it: it can still be undone.
-#[derive(Clone, Copy)]
-pub struct OpenSort {
-    /// Where its step is.
-    pub at: SortAt,
-    arrangements: Arrangements,
-}
-
 /// A sort step: the node and input it's planned for, and which of that
 /// input's steps it is.
 #[derive(Clone, Copy)]
@@ -115,8 +106,9 @@ pub struct OutputProperties {
     column_count: u32,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
-    /// Set while a sort can still be undone.
-    pub open_sort: Option<OpenSort>,
+    /// The most recent sort, while nothing has read its order: it can still
+    /// be undone.
+    pub open_sort: Option<SortAt>,
 }
 
 impl OutputProperties {
@@ -214,8 +206,9 @@ pub struct InputNeeds<'a> {
 /// A step run on an input before the node reads it, to meet its needs.
 pub enum InputStep {
     /// Sorts the rows by `keys`, and outputs only the first `keep` of them,
-    /// if given.
-    Sort { keys: SlowVec<SortKey>, keep: Option<u32> },
+    /// if given. `unsorted` is what was known of the rows before it, to undo
+    /// it.
+    Sort { keys: SlowVec<SortKey>, keep: Option<u32>, unsorted: Arrangements },
 }
 
 /// One input of a node, once planned.
@@ -353,10 +346,9 @@ fn meet(
     {
         return Ok(());
     }
-    let sort =
-        OpenSort { at: SortAt { step: out.steps.len(), ..at }, arrangements: rows.arrangements };
+    let sort = SortAt { step: out.steps.len(), ..at };
     let keys = SlowVec::fixed_from(allocator, sorted_by.iter().copied())?;
-    out.steps.push(InputStep::Sort { keys, keep: None })?;
+    out.steps.push(InputStep::Sort { keys, keep: None, unsorted: rows.arrangements })?;
     rows.arrangements = Arrangements::NONE;
     rows.arrangements.push(&[], sorted_by);
     rows.open_sort = Some(sort);
@@ -367,11 +359,11 @@ fn meet(
 /// it.
 fn drop_open_sort(planned: &mut Planned, rows: &mut OutputProperties) -> bool {
     let Some(sort) = rows.open_sort.take() else { return false };
-    let Some(node) = at_mut!(planned, sort.at.node as usize) else { failed!() };
+    let Some(node) = at_mut!(planned, sort.node as usize) else { failed!() };
     // Nothing is planned after a sort before its order is read, so it's last.
-    let steps = &mut at_mut!(node.inputs, sort.at.input as usize).steps;
-    check!(sort.at.step + 1 == steps.len());
-    steps.pop();
-    rows.arrangements = sort.arrangements;
+    let steps = &mut at_mut!(node.inputs, sort.input as usize).steps;
+    check!(sort.step + 1 == steps.len());
+    let Some(InputStep::Sort { unsorted, .. }) = steps.pop() else { failed!() };
+    rows.arrangements = unsorted;
     true
 }
