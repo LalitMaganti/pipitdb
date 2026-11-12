@@ -265,12 +265,12 @@ impl GroupTable {
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
             if ahead {
-                if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
-                    let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
+                if let Some(&next) = keys.get(i + SLOT_AHEAD) {
+                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
                     prefetch(self.slots.as_ptr().wrapping_add(at));
                 }
-                if let Some(&ahead) = keys.get(i + RECORD_AHEAD) {
-                    let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
+                if let Some(&next) = keys.get(i + RECORD_AHEAD) {
+                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
                     let slot = *at!(self.slots, at);
                     #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
                     let group = (slot & !salt(slot)) as usize;
