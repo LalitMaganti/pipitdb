@@ -8,6 +8,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
 use crate::error::Error;
+use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
@@ -30,6 +31,11 @@ const GROUP_BITS: u32 = 27;
 /// The slot that `hash` starts probing from, out of `slots`, a power of two.
 /// It's picked by the hash's top bits, which a slot stores, so growing the
 /// table doesn't need to hash any key again.
+/// How many rows ahead `find_values` fetches a row's slot, and its group's
+/// record.
+const SLOT_AHEAD: usize = 16;
+const RECORD_AHEAD: usize = 8;
+
 #[inline]
 fn slot_of(hash: u64, slots: usize) -> usize {
     #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
@@ -254,7 +260,22 @@ impl GroupTable {
     #[inline(never)]
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
-        for (&key, group) in keys.iter().zip(groups) {
+        for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
+            // A big table misses the cache twice a row, for its slot and then
+            // its group's record, so both are fetched ahead.
+            if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
+                prefetch(
+                    self.slots
+                        .as_ptr()
+                        .wrapping_add(slot_of(mix(ahead.cast_unsigned()), self.slots.len())),
+                );
+            }
+            if let Some(&ahead) = keys.get(i + RECORD_AHEAD) {
+                let slot = *at!(self.slots, slot_of(mix(ahead.cast_unsigned()), self.slots.len()));
+                #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+                let group = (slot & !salt(slot)) as usize;
+                prefetch(self.records.as_ptr().wrapping_add(group.wrapping_sub(1) * self.stride));
+            }
             let hash = mix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
