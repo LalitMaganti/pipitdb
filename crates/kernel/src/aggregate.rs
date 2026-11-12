@@ -76,7 +76,7 @@ impl<'c> Op<'c> for AggregateOp {
             }
         }
         check!(self.keys.len() <= KEYS_MAX);
-        let mut out = OutputProperties::new(c.allocator())?;
+        let mut out = OutputProperties::NONE;
         for &key in self.keys.iter() {
             out.push_column(key)?;
         }
