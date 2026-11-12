@@ -147,14 +147,11 @@ impl<'c> Op<'c> for AggregateOp {
         for aggregate in self.aggregates.iter() {
             // A summary's bounds are the least and greatest values. With no
             // rows, there are none, and MIN and MAX are null: scanned.
-            let value = match (aggregate.function, aggregate.input) {
-                (Function::CountStar, _) => child.summary(None).map(|s| s.rows),
-                (Function::Min, Some(input)) => {
-                    child.summary(Some(input)).and_then(|s| s.bounds).map(|b| b.min)
-                }
-                (Function::Max, Some(input)) => {
-                    child.summary(Some(input)).and_then(|s| s.bounds).map(|b| b.max)
-                }
+            let Some(summary) = child.summary(aggregate.input) else { return Ok(false) };
+            let value = match aggregate.function {
+                Function::CountStar => Some(summary.rows),
+                Function::Min => summary.bounds.map(|b| b.min),
+                Function::Max => summary.bounds.map(|b| b.max),
                 _ => None,
             };
             let Some(value) = value else { return Ok(false) };
