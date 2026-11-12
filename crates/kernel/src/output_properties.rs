@@ -43,7 +43,7 @@ impl Arrangement {
 const ARRANGEMENT_KEYS_MAX: usize = 8;
 
 /// The most arrangements rows are known to have at once.
-const ARRANGEMENTS_MAX: usize = 1 << 4;
+const ARRANGEMENTS_MAX: usize = 1 << 2;
 
 /// Every layout known to hold, the first `len` of these.
 #[derive(Clone, Copy)]
@@ -108,9 +108,11 @@ pub struct SortAt {
 /// What is known about the batches a node outputs: their columns, and how
 /// the rows are arranged. Planning reads this to decide which steps an input
 /// needs.
+#[derive(Clone, Copy)]
 pub struct OutputProperties {
-    /// The columns of a batch, in order.
-    columns: SlowVec<ColumnId>,
+    /// The columns of a batch, in order: the first `column_count` of these.
+    columns: [ColumnId; BATCH_COLUMNS_MAX as usize],
+    column_count: u32,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
     /// Set while a sort can still be undone.
@@ -119,33 +121,29 @@ pub struct OutputProperties {
 
 impl OutputProperties {
     /// No columns, and nothing known.
-    pub fn new(allocator: &dyn Allocator) -> Result<OutputProperties, AllocError> {
-        Ok(OutputProperties {
-            columns: SlowVec::new(allocator, BATCH_COLUMNS_MAX as usize)?,
-            arrangements: Arrangements::NONE,
-            open_sort: None,
-        })
-    }
-
-    pub fn copy(&self, allocator: &dyn Allocator) -> Result<OutputProperties, AllocError> {
-        let mut columns = SlowVec::new(allocator, BATCH_COLUMNS_MAX as usize)?;
-        columns.extend_from_slice(&self.columns)?;
-        Ok(OutputProperties { columns, ..*self })
-    }
+    pub const NONE: OutputProperties = OutputProperties {
+        columns: [0; BATCH_COLUMNS_MAX as usize],
+        column_count: 0,
+        arrangements: Arrangements::NONE,
+        open_sort: None,
+    };
 
     /// Adds `column` at the next position in batches, which fail to hold
     /// more than `BATCH_COLUMNS_MAX`.
     pub fn push_column(&mut self, column: ColumnId) -> Result<(), LowerError> {
-        if self.columns.len() == BATCH_COLUMNS_MAX as usize {
+        let Some(slot) = self.columns.get_mut(self.column_count as usize) else {
             return Err(LowerError::TooManyColumns);
-        }
-        Ok(self.columns.push(column)?)
+        };
+        *slot = column;
+        self.column_count += 1;
+        Ok(())
     }
 
     /// The position of `column` in a batch, if it has one.
     pub fn position_of(&self, column: ColumnId) -> Option<u32> {
+        let columns = at!(self.columns, ..self.column_count as usize);
         #[expect(clippy::cast_possible_truncation, reason = "at most `BATCH_COLUMNS_MAX`")]
-        self.columns.iter().position(|&id| id == column).map(|position| position as u32)
+        columns.iter().position(|&id| id == column).map(|position| position as u32)
     }
 
     /// Whether the rows are grouped by `keys`, and each group sorted by
@@ -324,13 +322,13 @@ fn plan_node_inputs(
     let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
     for (input, &child) in (0..).zip(node.children.iter()) {
         let Some(child) = at!(planned, child as usize) else { failed!() };
-        let rows = child.output.copy(allocator)?;
+        let rows = child.output;
         let mut out = PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows };
         let at = SortAt { node: id, input, step: 0 };
         meet(allocator, planned, at, &mut out, &node.op.needs(input))?;
         inputs.push(out)?;
     }
-    let output = OutputProperties::new(allocator)?;
+    let output = OutputProperties::NONE;
     *at_mut!(planned, id as usize) = Some(PlannedNode { inputs, output });
     let mut derive = DeriveContext { plan, allocator, planned, node: id };
     let output = node.op.derive(&mut derive)?;

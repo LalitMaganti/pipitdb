@@ -357,7 +357,7 @@ mod tests {
 
     impl<'c> Op<'c> for Knows<'_> {
         fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-            let mut out = c.input(0).copy(c.allocator())?;
+            let mut out = *c.input(0);
             if self.breaker {
                 out.arrangements = Arrangements::NONE;
             }
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn keeps_the_start_of_sorts_too_long_to_hold() {
-        let mut rows = OutputProperties::new(&Heap).unwrap();
+        let mut rows = OutputProperties::NONE;
         let key = |column| SortKey { column, descending: false };
         let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
         rows.arrangements.push(&[10], &sorted_by);
