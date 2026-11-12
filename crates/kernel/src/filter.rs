@@ -162,9 +162,8 @@ pub fn is_in(
         let valid = valid_rows(column);
         retain(selection, None, |row| valid(row) && listed(at(row)) == want);
     } else {
-        // Each row is compared with all of a list of fixed length, which
-        // compilers keep in registers and compare without a branch: 4 values,
-        // or 16, padded with copies of the first.
+        // Each row is compared with all of a list of fixed length at once:
+        // 4 values, or 16, padded with copies of the first.
         let mut list = [*at!(values, 0); IN_SCAN_MAX];
         at_mut!(list, ..values.len()).copy_from_slice(values);
         match list.first_chunk::<4>() {
@@ -186,11 +185,10 @@ fn scan<const N: usize>(
     list: [i64; N],
     want: bool,
 ) {
-    #[expect(clippy::needless_bitwise_bool, reason = "without a branch")]
     let listed = move |row| {
         // SAFETY: `is_in` checked every row is a row of `column`.
         let cell = unsafe { cell(cells, row) };
-        list.iter().fold(false, |found, &value| found | (value == cell)) == want
+        crate::listed::listed(&list, cell) == want
     };
     match column.validity() {
         None => retain(selection, None, listed),

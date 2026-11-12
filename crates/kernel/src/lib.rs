@@ -23,6 +23,7 @@ mod group_table;
 mod hash_aggregate;
 pub mod like;
 pub mod limit;
+mod listed;
 pub mod lower;
 mod murmur_hash;
 pub mod names;
