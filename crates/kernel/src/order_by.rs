@@ -2,49 +2,34 @@
 
 use crate::lower::{self, LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
+use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{Op, PlanNode};
 use crate::slow_vec::SlowVec;
-use crate::sort::{SortKey, sort};
-use crate::step::Step;
-use crate::top_k::top_k;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
-/// the first first: as they are, if they're known to be in that order
-/// already, and only as many as are read if a LIMIT reads only the first. It
-/// reads every column, so each is made flat before it's held.
+/// the first first. It needs its input sorted, which planning does only if
+/// it isn't known to be, and only for as many rows as a LIMIT just above
+/// reads. It reads every column, so each is made flat before it's held.
 pub struct OrderByOp {
     pub keys: SlowVec<lower::SortKey>,
 }
 
 impl<'c> Op<'c> for OrderByOp {
+    fn needs(&self, _: u32) -> InputNeeds<'_> {
+        InputNeeds { sorted_by: Some(&self.keys) }
+    }
+
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        Ok(c.input(0).copy(c.allocator())?)
+    }
+
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        let first_read = lowering.query_first_read();
-        lowering.lower(*at!(node.children, 0))?;
-        if lowering.query_arranged(&[], &self.keys) {
-            return Ok(());
-        }
-        let allocator = lowering.allocator();
-        let keys = self.keys.iter().map(|key| SortKey {
-            column: lowering.query_position(key.column),
-            descending: key.descending,
-        });
-        let keys = SlowVec::fixed_from(allocator, keys)?;
-        // Only the first rows are read, as with LIMIT: keep only those.
-        let step = match first_read {
-            Some(count) => {
-                lowering.declare_only_first_read();
-                top_k(allocator, keys, count)?
-            }
-            None => sort(allocator, keys)?,
-        };
-        lowering.add_breaker(Step::Operator(step))?;
-        lowering.declare_sorted(&self.keys);
-        Ok(())
+        lowering.lower_input(node, 0)
     }
 
     /// Makes no columns, and needs its keys.

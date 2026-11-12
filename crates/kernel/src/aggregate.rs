@@ -5,8 +5,9 @@
 use crate::column::{DataType, Forms};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
-use crate::lower::{LowerError, Lowering, SortKey};
+use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
+use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::Step;
@@ -59,22 +60,44 @@ pub struct AggregateOp {
 }
 
 impl<'c> Op<'c> for AggregateOp {
+    /// A row per group: its keys, then its aggregates. Groups are output in
+    /// the order first seen, so if the input is sorted by the keys, the
+    /// output is too. Its keys must be `Int64` or strings, and what its
+    /// aggregates read `Int64`.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        for id in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
+            if c.query_type(id) != DataType::Int64 {
+                return Err(LowerError::WrongType(id));
+            }
+        }
+        for &key in self.keys.iter() {
+            if !matches!(c.query_type(key), DataType::Int64 | DataType::String) {
+                return Err(LowerError::WrongType(key));
+            }
+        }
+        check!(self.keys.len() <= KEYS_MAX);
+        let mut out = OutputProperties::new(c.allocator())?;
+        for &key in self.keys.iter() {
+            out.push_column(key)?;
+        }
+        for aggregate in self.aggregates.iter() {
+            out.push_column(aggregate.binding.id)?;
+        }
+        out.arrangements.push(&[], c.input(0).sorted_by(&self.keys));
+        Ok(out)
+    }
+
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        lowering.lower(*at!(node.children, 0))?;
+        lowering.lower_input(node, 0)?;
         let allocator = lowering.allocator();
-        let mut inputs = self.aggregates.iter().filter_map(|aggregate| aggregate.input);
-        check!(inputs.all(|id| lowering.query_type(id) == DataType::Int64));
-        check!(self.keys.len() <= KEYS_MAX);
         let mut string_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
-            let data_type = lowering.query_type(key);
-            check!(matches!(data_type, DataType::Int64 | DataType::String));
-            string_keys |= u64::from(data_type == DataType::String) << k;
+            string_keys |= u64::from(lowering.query_type(key) == DataType::String) << k;
         }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
         let key_columns = SlowVec::fixed_from(allocator, keys)?;
@@ -84,25 +107,9 @@ impl<'c> Op<'c> for AggregateOp {
             column: aggregate.input.map_or(0, |id| lowering.query_position(id)),
         });
         let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
-        // Groups are output in the order first seen, so if the input is sorted
-        // by the keys, the output is too.
-        let mut sorted = [SortKey { column: 0, descending: false }; 8];
-        let known = lowering.query_sorted_by(&self.keys);
-        let sorted = at_mut!(sorted, ..known.len().min(8));
-        sorted.copy_from_slice(at!(known, ..sorted.len()));
         let spec = HashAggregateSpec { key_columns, string_keys, aggregates };
         let operator = hash_aggregate(allocator, spec)?;
-        lowering.add_breaker(Step::Operator(operator))?;
-        // The output has a row for each group, with a new layout.
-        lowering.declare_new_batches();
-        for &key in self.keys.iter() {
-            lowering.declare_column(key)?;
-        }
-        for aggregate in self.aggregates.iter() {
-            lowering.declare_column(aggregate.binding.id)?;
-        }
-        lowering.declare_sorted(sorted);
-        Ok(())
+        lowering.add_operator(Step::Operator(operator))
     }
 
     /// Its keys in dictionaries too: a string key's entries are each

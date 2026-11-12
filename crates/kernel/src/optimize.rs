@@ -266,6 +266,7 @@ mod tests {
     use crate::allocator::Heap;
     use crate::column::DataType;
     use crate::lower::{LowerError, Lowering};
+    use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{DynOp, LogicalPlan, Op, PlanNode};
 
     /// Makes column 0, and records the forms it's allowed in.
@@ -279,6 +280,10 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Maker<'_> {
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
             failed!()
         }
@@ -292,6 +297,10 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Reader {
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
             failed!()
         }

@@ -1,13 +1,18 @@
 //! `lower`: a `LogicalPlan` to a `PhysicalPlan`, a pipeline ready to run.
+//! Planning decides first, node by node, what each needs of its inputs and
+//! what it outputs; lowering then only adds the steps that does.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::allocator::Allocator;
 use crate::column::DataType;
 use crate::names::{Name, Names};
+use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes, step};
 use crate::pipeline::Pipeline;
-use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNodeId};
-use crate::row_batch::BATCH_COLUMNS_MAX;
+use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId};
 use crate::slow_vec::SlowVec;
+use crate::sort::sort;
 use crate::step::{DynSource, Step};
+use crate::top_k::top_k;
 
 /// Why a plan couldn't be lowered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -16,6 +21,8 @@ pub enum LowerError {
     OutOfMemory,
     /// A batch would need more than `BATCH_COLUMNS_MAX` columns.
     TooManyColumns,
+    /// An op reads a column of a type it doesn't take.
+    WrongType(ColumnId),
 }
 
 impl From<AllocError> for LowerError {
@@ -63,103 +70,102 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// A layout known to hold for a pipeline's rows: grouped by the columns of
-/// its first `grouped` keys, none meaning one group, and each group sorted
-/// by the `sorted` keys after them. Rows sorted by (a, b) are also grouped
-/// by a, and sorted by b within each group.
+/// Which rows the steps added so far output.
 #[derive(Clone, Copy)]
-struct Arrangement {
-    grouped: u8,
-    sorted: u8,
-    keys: [SortKey; ARRANGEMENT_KEYS_MAX],
+enum Rows {
+    /// A node's output.
+    Output(PlanNodeId),
+    /// One of a node's inputs, once its steps have run.
+    Input(PlanNodeId, u32),
 }
 
-impl Arrangement {
-    const NONE: Arrangement = Arrangement {
-        grouped: 0,
-        sorted: 0,
-        keys: [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX],
-    };
-
-    fn grouped_by(&self) -> impl Iterator<Item = ColumnId> + '_ {
-        at!(self.keys, ..usize::from(self.grouped)).iter().map(|key| key.column)
-    }
-
-    fn sorted_by(&self) -> &[SortKey] {
-        let start = usize::from(self.grouped);
-        at!(self.keys, start..start + usize::from(self.sorted))
-    }
-}
-
-/// The most keys an arrangement has: one with more isn't kept, as knowing
-/// less of the order is always safe.
-const ARRANGEMENT_KEYS_MAX: usize = 8;
-
-/// The most arrangements a pipeline's rows are known to have at once.
-const ARRANGEMENTS_MAX: usize = 1 << 4;
-
-/// A pipeline being built from a plan, which each operation adds to.
+/// A pipeline being built from a planned plan, which each operation adds
+/// to.
 pub struct Lowering<'p, 'c> {
     /// The plan being lowered.
     plan: &'p LogicalPlan<'c>,
+    /// What planning decided of each node.
+    planned: &'p Planned,
     /// What steps are made with.
     allocator: &'p dyn Allocator,
     /// The pipeline's source, once a node sets it.
     source: Option<DynSource<'c>>,
     /// The steps after it, in order.
     steps: SlowVec<Step<'c>>,
-    /// Each column's position in batches, or `u32::MAX` until defined.
-    positions: SlowVec<u32>,
-    /// How many columns batches have.
-    column_count: u32,
-    /// Every arrangement known to hold for the rows, the first `arranged` of
-    /// these, replaced when a step replaces them.
-    arrangements: [Arrangement; ARRANGEMENTS_MAX],
-    arranged: usize,
-    /// How many of its first rows are read of the node being lowered, if not
-    /// all, until it lowers its children; and whether it makes no more.
-    first_read: Option<u32>,
-    took_first_read: bool,
+    /// Which rows the steps so far output.
+    rows: Rows,
 }
 
 /// Its methods are named by what they do. Building ones add to the
-/// pipeline, `declare_` ones record what a step added makes, and `query_`
-/// ones only read what's known.
+/// pipeline, and `query_` ones only read what's known.
 impl<'p, 'c> Lowering<'p, 'c> {
     /// What to make steps with.
     pub fn allocator(&self) -> &'p dyn Allocator {
         self.allocator
     }
 
-    /// Lowers `node`, such as a child of the node being lowered.
-    pub fn lower(&mut self, node: PlanNodeId) -> Result<(), LowerError> {
-        self.lower_first(node, None).map(drop)
-    }
-
-    /// Lowers `node`, of whose rows only the first `count` are read, if
-    /// given, as by a LIMIT, which it may make use of. Returns whether it
-    /// makes no more rows than that.
-    pub fn lower_first(
-        &mut self,
-        node: PlanNodeId,
-        count: Option<u32>,
-    ) -> Result<bool, LowerError> {
-        let node = at!(self.plan.nodes, node as usize);
-        self.first_read = count;
+    fn lower_node(&mut self, id: PlanNodeId) -> Result<(), LowerError> {
+        let node = at!(self.plan.nodes, id as usize);
+        self.rows = Rows::Output(id);
         node.op.lower(node, self)?;
-        Ok(core::mem::take(&mut self.took_first_read))
+        self.rows = Rows::Output(id);
+        Ok(())
     }
 
-    /// How many of the first rows of the node being lowered are read, if not
-    /// all. Only known before it lowers its children.
-    pub fn query_first_read(&self) -> Option<u32> {
-        self.first_read
+    /// Lowers input `input` of `node`, the node being lowered, then the
+    /// steps planning chose to meet its needs.
+    pub fn lower_input(&mut self, node: &PlanNode<'c>, input: u32) -> Result<(), LowerError> {
+        let id = self.id_of(node);
+        self.lower_node(*at!(node.children, input as usize))?;
+        self.rows = Rows::Input(id, input);
+        let Some(planned) = at!(self.planned, id as usize) else { failed!() };
+        for step in at!(planned.inputs, input as usize).steps.iter() {
+            self.apply(step)?;
+        }
+        Ok(())
     }
 
-    /// Records that the node being lowered makes no more rows than
-    /// `query_first_read` said are read. Only once its children are lowered.
-    pub fn declare_only_first_read(&mut self) {
-        self.took_first_read = true;
+    fn apply(&mut self, step: &InputStep) -> Result<(), LowerError> {
+        let InputStep::Sort { keys, keep } = step;
+        let keys = keys.iter().map(|key| crate::sort::SortKey {
+            column: self.query_position(key.column),
+            descending: key.descending,
+        });
+        let keys = SlowVec::fixed_from(self.allocator, keys)?;
+        let operator = match *keep {
+            Some(count) => top_k(self.allocator, keys, count)?,
+            None => sort(self.allocator, keys)?,
+        };
+        self.add_operator(Step::Operator(operator))
+    }
+
+    /// How many of its first rows the open sort just below outputs, if it
+    /// outputs only those.
+    pub fn query_sort_keep(&self) -> Option<u32> {
+        let sort = self.rows().open_sort?;
+        let InputStep::Sort { keep, .. } = step(self.planned, sort.at);
+        *keep
+    }
+
+    fn id_of(&self, node: &PlanNode<'c>) -> PlanNodeId {
+        let Some(id) = self.plan.nodes.iter().position(|n| core::ptr::eq(n, node)) else {
+            failed!()
+        };
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let id = id as PlanNodeId;
+        id
+    }
+
+    fn rows(&self) -> &OutputProperties {
+        let (id, input) = match self.rows {
+            Rows::Output(id) => (id, None),
+            Rows::Input(id, input) => (id, Some(input)),
+        };
+        let Some(planned) = at!(self.planned, id as usize) else { failed!() };
+        match input {
+            None => &planned.output,
+            Some(input) => &at!(planned.inputs, input as usize).rows,
+        }
     }
 
     /// Makes `source` the pipeline's.
@@ -168,126 +174,9 @@ impl<'p, 'c> Lowering<'p, 'c> {
         self.source = Some(source);
     }
 
-    /// Adds `step`, which keeps the rows in the order they come in, so what's
-    /// known of their order still holds.
-    pub fn add_order_independent(&mut self, step: Step<'c>) -> Result<(), LowerError> {
+    /// Adds `step`.
+    pub fn add_operator(&mut self, step: Step<'c>) -> Result<(), LowerError> {
         Ok(self.steps.push(step)?)
-    }
-
-    /// Adds `step`, a breaker, whose rows replace those it reads: nothing is
-    /// known of their order but what's declared after.
-    pub fn add_breaker(&mut self, step: Step<'c>) -> Result<(), LowerError> {
-        self.arranged = 0;
-        Ok(self.steps.push(step)?)
-    }
-
-    /// Records that the source or a step makes `column`, at the next
-    /// position in batches, which fail to hold more than `BATCH_COLUMNS_MAX`.
-    pub fn declare_column(&mut self, column: ColumnId) -> Result<(), LowerError> {
-        if self.column_count == BATCH_COLUMNS_MAX {
-            return Err(LowerError::TooManyColumns);
-        }
-        *at_mut!(self.positions, column as usize) = self.column_count;
-        self.column_count += 1;
-        Ok(())
-    }
-
-    /// Records that rows are sorted by `keys`.
-    pub fn declare_sorted(&mut self, keys: &[SortKey]) {
-        self.declare_sorted_within_groups(&[], keys);
-    }
-
-    /// Records that rows are grouped by `keys`: rows with equal keys are next
-    /// to each other.
-    pub fn declare_grouped(&mut self, keys: &[ColumnId]) {
-        self.declare_sorted_within_groups(keys, &[]);
-    }
-
-    /// Records that rows are grouped by `keys`, and each group sorted by
-    /// `sorted_by`. What there isn't room for is forgotten, which is safe:
-    /// sort keys past the room left are dropped, as rows sorted by keys are
-    /// sorted by their start too.
-    pub fn declare_sorted_within_groups(&mut self, keys: &[ColumnId], sorted_by: &[SortKey]) {
-        let Some(room) = ARRANGEMENT_KEYS_MAX.checked_sub(keys.len()) else {
-            return;
-        };
-        let sorted_by = at!(sorted_by, ..sorted_by.len().min(room));
-        let (Ok(grouped), Ok(sorted)) = (u8::try_from(keys.len()), u8::try_from(sorted_by.len()))
-        else {
-            return;
-        };
-        let mut arrangement = Arrangement { grouped, sorted, ..Arrangement::NONE };
-        let grouped_by = keys.iter().map(|&column| SortKey { column, descending: false });
-        for (slot, key) in
-            arrangement.keys.iter_mut().zip(grouped_by.chain(sorted_by.iter().copied()))
-        {
-            *slot = key;
-        }
-        if let Some(slot) = self.arrangements.get_mut(self.arranged) {
-            *slot = arrangement;
-            self.arranged += 1;
-        }
-    }
-
-    /// The longest start of a known sort of all rows that sorts by `columns`
-    /// alone.
-    pub fn query_sorted_by(&self, columns: &[ColumnId]) -> &[SortKey] {
-        let mut longest: &[SortKey] = &[];
-        for arrangement in self.known().iter().filter(|a| a.grouped == 0) {
-            let keys = arrangement.sorted_by();
-            let len = keys.iter().take_while(|key| columns.contains(&key.column)).count();
-            if len > longest.len() {
-                longest = at!(keys, ..len);
-            }
-        }
-        longest
-    }
-
-    /// Whether rows are known to be grouped by `keys`, and each group sorted
-    /// by `sorted_by`. Sorting by some keys first also groups by them, and a
-    /// sort key on a grouped column is the same within a group, so means
-    /// nothing.
-    pub fn query_arranged(&self, keys: &[ColumnId], sorted_by: &[SortKey]) -> bool {
-        let wanted = || sorted_by.iter().filter(|key| !keys.contains(&key.column));
-        if keys.is_empty() && wanted().next().is_none() {
-            return true;
-        }
-        'arrangements: for arrangement in self.known() {
-            if !arrangement.grouped_by().all(|column| keys.contains(&column)) {
-                continue;
-            }
-            let grouped = |column| arrangement.grouped_by().any(|by| by == column);
-            let mut sorted = arrangement.sorted_by().iter().filter(|key| !grouped(key.column));
-            // Sort keys on the rest of `keys` group by them too.
-            let mut covered = usize::from(arrangement.grouped);
-            let mut next = sorted.next();
-            while next.is_some_and(|key| keys.contains(&key.column)) {
-                covered += 1;
-                next = sorted.next();
-            }
-            if covered != keys.len() {
-                continue;
-            }
-            for want in wanted() {
-                if next != Some(want) {
-                    continue 'arrangements;
-                }
-                next = sorted.next();
-            }
-            return true;
-        }
-        false
-    }
-
-    fn known(&self) -> &[Arrangement] {
-        at!(self.arrangements, ..self.arranged)
-    }
-
-    /// Records that the step added last makes new batches, holding only the
-    /// columns declared after this.
-    pub fn declare_new_batches(&mut self) {
-        self.positions.iter_mut().for_each(|position| *position = u32::MAX);
-        self.column_count = 0;
     }
 
     /// What `column` holds.
@@ -297,33 +186,27 @@ impl<'p, 'c> Lowering<'p, 'c> {
 
     /// Where `column` is in batches.
     pub fn query_position(&self, column: ColumnId) -> u32 {
-        let position = *at!(self.positions, column as usize);
-        check!(position != u32::MAX);
+        let Some(position) = self.rows().position_of(column) else { failed!() };
         position
     }
 }
 
-/// Builds the pipeline for `plan`, from its root, with memory from
+/// Plans `plan`, then builds its pipeline from its root, with memory from
 /// `allocator`.
 pub fn lower<'c>(
     allocator: &dyn Allocator,
     plan: &LogicalPlan<'c>,
 ) -> Result<PhysicalPlan<'c>, LowerError> {
-    let unset = core::iter::repeat_n(u32::MAX, plan.columns.len());
-    let positions = SlowVec::fixed_from(allocator, unset)?;
+    let planned = plan_nodes(allocator, plan)?;
     let mut lowering = Lowering {
         plan,
+        planned: &planned,
         allocator,
         source: None,
         steps: SlowVec::new(allocator, LOWERED_STEPS_MAX)?,
-        positions,
-        column_count: 0,
-        arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
-        arranged: 0,
-        first_read: None,
-        took_first_read: false,
+        rows: Rows::Output(plan.root),
     };
-    lowering.lower(plan.root)?;
+    lowering.lower_node(plan.root)?;
 
     let mut names = Names::new(allocator, PLAN_NAME_BYTES_MAX)?;
     let mut columns = SlowVec::fixed(allocator, plan.output.len())?;
@@ -350,6 +233,7 @@ mod tests {
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
     use crate::optimize::{Needed, choose_forms};
+    use crate::output_properties::{Arrangements, DeriveContext, OutputProperties};
     use crate::plan::{ColumnId, DynOp, FilterOp, Op, PlanNode, ScanColumn, ScanOp};
     use crate::predicate::{Leaf, Node, Predicate};
     use crate::query_allocators::QueryAllocators;
@@ -469,24 +353,32 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Knows<'_> {
-        fn lower(
-            &self,
-            node: &PlanNode<'c>,
-            lowering: &mut Lowering<'_, 'c>,
-        ) -> Result<(), LowerError> {
-            lowering.lower(*at!(node.children, 0))?;
+        fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            let mut out = c.input(0).copy(c.allocator())?;
             if self.breaker {
-                let operator = DynOperator::new(lowering.allocator(), Nothing)?;
-                lowering.add_breaker(Step::Operator(operator))?;
+                out.arrangements = Arrangements::NONE;
             }
             for &(keys, sorted_by) in self.asks {
                 let sorted_by: StdVec<SortKey> = sorted_by
                     .iter()
                     .map(|&(column, descending)| SortKey { column, descending })
                     .collect();
-                self.known.borrow_mut().push(lowering.query_arranged(keys, &sorted_by));
+                self.known.borrow_mut().push(out.is_arranged(keys, &sorted_by));
             }
-            *self.sorted_by_b.borrow_mut() = lowering.query_sorted_by(&[1]).len();
+            *self.sorted_by_b.borrow_mut() = out.sorted_by(&[1]).len();
+            Ok(out)
+        }
+
+        fn lower(
+            &self,
+            node: &PlanNode<'c>,
+            lowering: &mut Lowering<'_, 'c>,
+        ) -> Result<(), LowerError> {
+            lowering.lower_input(node, 0)?;
+            if self.breaker {
+                let operator = DynOperator::new(lowering.allocator(), Nothing)?;
+                lowering.add_operator(Step::Operator(operator))?;
+            }
             Ok(())
         }
     }
@@ -573,28 +465,16 @@ mod tests {
 
     #[test]
     fn keeps_the_start_of_sorts_too_long_to_hold() {
-        let plan = LogicalPlan::new(&Heap).unwrap();
-        let mut lowering = Lowering {
-            plan: &plan,
-            allocator: &Heap,
-            source: None,
-            steps: SlowVec::fixed(&Heap, 0).unwrap(),
-            positions: SlowVec::fixed(&Heap, 0).unwrap(),
-            column_count: 0,
-            arrangements: [Arrangement::NONE; ARRANGEMENTS_MAX],
-            arranged: 0,
-            first_read: None,
-            took_first_read: false,
-        };
+        let mut rows = OutputProperties::new(&Heap).unwrap();
         let key = |column| SortKey { column, descending: false };
         let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
-        lowering.declare_sorted_within_groups(&[10], &sorted_by);
-        assert!(lowering.query_arranged(&[10], &sorted_by[..7]));
-        assert!(!lowering.query_arranged(&[10], &sorted_by[..8]));
+        rows.arrangements.push(&[10], &sorted_by);
+        assert!(rows.is_arranged(&[10], &sorted_by[..7]));
+        assert!(!rows.is_arranged(&[10], &sorted_by[..8]));
         // Grouping by too many keys says nothing of grouping by fewer.
         let keys: StdVec<ColumnId> = (0..9).collect();
-        lowering.declare_grouped(&keys);
-        assert!(!lowering.query_arranged(&keys[..8], &[]));
+        rows.arrangements.push(&keys, &[]);
+        assert!(!rows.is_arranged(&keys[..8], &[]));
     }
 
     /// The steps of `Ab` scanned, its rows counted by `groups` of its
@@ -665,6 +545,30 @@ mod tests {
         assert_eq!(ordered(None, &[(0, false)], Some((10, 0))), "Scan | Limit");
         let grouped = ordered(Some(&[1]), &[(1, true)], Some((1, 0)));
         assert_eq!(grouped, "Scan | HashAggregate | TopK");
+    }
+
+    #[test]
+    fn drops_a_sort_a_later_sort_makes_pointless() {
+        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut ids = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b")] {
+            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            ids.push(binding);
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        for (column, descending) in [(1, false), (0, true)] {
+            let key = SortKey { column: ids[column].id, descending };
+            let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
+            let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap();
+            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
+            node = plan.add_node(order_by, children).unwrap();
+        }
+        assert!(plan.output.push(ids[0]).is_ok());
+        assert_eq!(lower(&Heap, &plan).unwrap().pipeline().describe(), "Scan | Sort");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -1109,6 +1013,10 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Reads {
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
             failed!()
         }

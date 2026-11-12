@@ -1,6 +1,7 @@
 //! `LogicalPlan`: what a query does, as Perfetto's: a tree of operations over
 //! columns named by id, independent of how batches lay them out. Frontends
-//! build one; `lower` turns it into a pipeline, asking each operation to
+//! build one; `lower` plans it, asking each operation what it needs of its
+//! inputs and what it outputs, then turns it into a pipeline, asking each to
 //! lower itself, so extensions can add operations.
 
 use core::marker::PhantomData;
@@ -14,6 +15,7 @@ use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering, SortKey};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
+use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate};
 use crate::scannable::DynScannable;
 use crate::slow_vec::SlowVec;
@@ -46,9 +48,18 @@ pub struct NamedColumn {
 /// An operation in a plan that reads what it borrows for `'c`, and knows how
 /// to lower itself.
 pub trait Op<'c> {
+    /// What this needs of the rows of input `input`. By default, nothing.
+    fn needs(&self, input: u32) -> InputNeeds<'_> {
+        let _ = input;
+        InputNeeds::default()
+    }
+
+    /// What is known of this node's output, given its inputs' needs are met.
+    fn derive(&self, derive: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError>;
+
     /// Adds what runs `node`, which holds this, to `lowering`: first its
-    /// children, through `Lowering::lower`, then its own source or steps,
-    /// defining the columns it makes.
+    /// inputs, through `Lowering::lower_input`, then the source or steps that
+    /// make what `derive` said. It decides nothing about row order.
     fn lower(&self, node: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>)
     -> Result<(), LowerError>;
 
@@ -168,6 +179,11 @@ pub struct DynOp<'c> {
 
 /// An op type's functions: one table for each type, which its ops share.
 struct OpFunctions<'c> {
+    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
+    derive: for<'p> unsafe fn(
+        NonNull<()>,
+        &mut DeriveContext<'p, 'c>,
+    ) -> Result<OutputProperties, LowerError>,
     lower: for<'l> unsafe fn(
         NonNull<()>,
         &PlanNode<'c>,
@@ -189,7 +205,11 @@ struct Functions<'c, T>(PhantomData<(&'c (), T)>);
 
 impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
     const TABLE: OpFunctions<'c> = OpFunctions {
+        // SAFETY: only called with this op, which outlives what it returns.
+        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: only called with this op.
+        derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
+        // SAFETY: as for `derive`.
         lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
         // SAFETY: as above, and the caller has the op mutably.
         prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
@@ -222,6 +242,19 @@ impl<'c> DynOp<'c> {
     pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
         let op = Box::new(allocator, op)?.erase();
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
+    }
+
+    pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.needs)(self, input) }
+    }
+
+    pub(crate) fn derive(
+        &self,
+        derive: &mut DeriveContext<'_, 'c>,
+    ) -> Result<OutputProperties, LowerError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.derive)(self.op.as_ptr(), derive) }
     }
 
     pub(crate) fn lower(
@@ -392,29 +425,34 @@ pub struct ScanColumn {
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
-    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+    /// Its columns, in order, and the order the scannable says its rows are
+    /// in, as far as the columns it sorts by are read: a sort by one
+    /// that isn't says nothing of the order by those after it.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        let mut out = OutputProperties::new(c.allocator())?;
         for column in self.columns.iter() {
-            lowering.declare_column(column.binding.id)?;
+            out.push_column(column.binding.id)?;
         }
-        let read = self.columns.iter().map(|column| (column.column, column.forms));
-        let conditions = self.conditions.as_deref().unwrap_or(&[]);
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read, conditions)?);
-        // As far as the columns it sorts by are read: a sort by one that
-        // isn't says nothing of the order by those after it.
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);
             read.map(|read| SortKey { column: read.binding.id, descending })
         };
-        let empty = SortKey { column: 0, descending: false };
-        let mut sorted = [empty; 8];
+        let mut sorted = [SortKey { column: 0, descending: false }; 8];
         let mut len = 0;
         for (slot, key) in sorted.iter_mut().zip(self.scannable.sorted_by().iter().map_while(read))
         {
             (*slot, len) = (key, len + 1);
         }
         if len > 0 {
-            lowering.declare_sorted(at!(sorted, ..len));
+            out.arrangements.push(&[], at!(sorted, ..len));
         }
+        Ok(out)
+    }
+
+    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+        let read = self.columns.iter().map(|column| (column.column, column.forms));
+        let conditions = self.conditions.as_deref().unwrap_or(&[]);
+        lowering.set_source(self.scannable.scan(lowering.allocator(), read, conditions)?);
         Ok(())
     }
 
@@ -483,19 +521,24 @@ pub struct MaterializeOp<'c> {
 }
 
 impl<'c> Op<'c> for MaterializeOp<'c> {
+    /// Its input's: it loads columns where they are.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        Ok(c.input(0).copy(c.allocator())?)
+    }
+
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        lowering.lower(*at!(node.children, 0))?;
+        lowering.lower_input(node, 0)?;
         let positions = self.columns.iter().map(|&(column, _)| lowering.query_position(column));
         let positions = SlowVec::fixed_from(lowering.allocator(), positions)?;
         let forms = self.columns.iter().map(|&(_, forms)| forms);
         let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
         let transform = self.scannable.materialize(lowering.allocator(), positions, forms)?;
-        lowering.add_order_independent(Step::Transform(transform))
+        lowering.add_operator(Step::Transform(transform))
     }
 
     /// Keeps loading the needed columns, if any.
@@ -516,19 +559,23 @@ pub struct FilterOp {
 }
 
 impl<'c> Op<'c> for FilterOp {
+    /// Its input's, less some rows.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        let mut out = c.input(0).copy(c.allocator())?;
+        out.drop_rows();
+        Ok(out)
+    }
+
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        lowering.lower(*at!(node.children, 0))?;
+        lowering.lower_input(node, 0)?;
         let allocator = lowering.allocator();
         let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
-        lowering.add_order_independent(Step::Transform(DynTransform::new(
-            allocator,
-            Filter { predicate },
-        )?))
+        lowering.add_operator(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
     }
 
     /// Its predicate's columns.
