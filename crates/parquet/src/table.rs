@@ -117,16 +117,12 @@ impl<'a> Rows<'a> {
             }
             self.left -= u64::from(rows);
             batch.reset(rows);
-            let (file, group) = (self.file, self.group);
+            // The cutoff's column is read flat, even if it could be lazy, to
+            // test its rows.
             let tested = match (cutoff, context.cutoff()) {
                 (Some((c, cutoff)), Some(value)) => {
-                    let reader = at_mut!(self.readers, c);
-                    let &(column, forms) = at!(columns, c);
-                    let is_lazy = forms.contains(Forms::LAZY);
-                    let handle =
-                        is_lazy.then(|| lazy(context, reader, (file, group, column), rows));
-                    let handle = handle.transpose()?;
-                    let values = reader.read(context, rows as usize, Forms::FLAT)?;
+                    let values =
+                        at_mut!(self.readers, c).read(context, rows as usize, Forms::FLAT)?;
                     // Nulls sort first ascending, so they're kept, which
                     // `compare` doesn't do.
                     if cutoff.descending || !values.has_nulls() {
@@ -139,7 +135,7 @@ impl<'a> Rows<'a> {
                             None,
                         );
                     }
-                    Some((c, handle.unwrap_or(values)))
+                    Some((c, values))
                 }
                 _ => None,
             };
@@ -160,11 +156,15 @@ impl<'a> Rows<'a> {
             {
                 let view = match &tested {
                     Some((c, view)) if *c == i => view.clone(),
-                    // Only counted, so no page body is read.
                     _ if forms.contains(Forms::LAZY) => {
-                        let view = lazy(context, reader, (file, group, column), rows)?;
+                        // Where its rows are, for `load`: only counted here, so
+                        // no page body is read.
+                        let (header, row) = reader.place();
+                        let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
+                        let handle =
+                            Handle { file: self.file, group: self.group, column, row, header };
                         reader.pass(rows as usize);
-                        view
+                        ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
                     }
                     _ => reader.read(context, rows as usize, forms)?,
                 };
@@ -175,20 +175,6 @@ impl<'a> Rows<'a> {
             return Ok(true);
         }
     }
-}
-
-/// A lazy column of the next `rows` rows of `column`, of file and row group
-/// `at`, saying where they are for `load`: `reader` is left where it is.
-fn lazy(
-    context: &mut Context,
-    reader: &ChunkReader<'_>,
-    (file, group, column): (u32, u32, u32),
-    rows: u32,
-) -> Result<ColumnView, Error> {
-    let (header, row) = reader.place();
-    let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
-    let handle = Handle { file, group, column, row, header };
-    Ok(ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?)
 }
 
 /// A scan of a `ParquetTable` that reads only `groups`, by file and row

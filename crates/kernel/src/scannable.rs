@@ -419,7 +419,10 @@ unsafe fn materialize_process(
     let scannable = unsafe { materialize.scannable.as_ref() };
     for (&position, &forms) in materialize.positions.iter().zip(materialize.forms.iter()) {
         let lazy = batch.column(position);
-        check!(lazy.is_lazy());
+        // A scannable may read a column it could have left lazy.
+        if !lazy.is_lazy() {
+            continue;
+        }
         let selection = batch.selection();
         // SAFETY: the function matches the scannable's type, and `loader`
         // holds its loader.
