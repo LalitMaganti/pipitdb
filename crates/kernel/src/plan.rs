@@ -425,8 +425,8 @@ pub struct ScanColumn {
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
-    /// Its columns, in order, and the order the scannable says its rows are
-    /// in, as far as the columns it sorts by are read: a sort by one
+    /// Its columns, in order, and each order the scannable says its rows
+    /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::new(c.allocator())?;
@@ -437,14 +437,15 @@ impl<'c> Op<'c> for ScanOp<'c> {
             let read = self.columns.iter().find(|read| read.column == column);
             read.map(|read| SortKey { column: read.binding.id, descending })
         };
-        let mut sorted = [SortKey { column: 0, descending: false }; 8];
-        let mut len = 0;
-        for (slot, key) in sorted.iter_mut().zip(self.scannable.sorted_by().iter().map_while(read))
-        {
-            (*slot, len) = (key, len + 1);
-        }
-        if len > 0 {
-            out.arrangements.push(&[], at!(sorted, ..len));
+        for order in self.scannable.sorted_by() {
+            let mut sorted = [SortKey { column: 0, descending: false }; 8];
+            let mut len = 0;
+            for (slot, key) in sorted.iter_mut().zip(order.iter().map_while(read)) {
+                (*slot, len) = (key, len + 1);
+            }
+            if len > 0 {
+                out.arrangements.push(&[], at!(sorted, ..len));
+            }
         }
         Ok(out)
     }

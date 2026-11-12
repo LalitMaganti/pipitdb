@@ -242,8 +242,12 @@ mod tests {
     use crate::selection::{Kept, Selection};
     use crate::step::{DynOperator, DynSource};
 
-    /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20.
-    struct Ab;
+    /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20,
+    /// declared sorted in the orders it holds.
+    struct Ab(&'static [&'static [(u32, bool)]]);
+
+    /// `Ab` sorted by `a` and then `b`.
+    const AB: Ab = Ab(&[&[(0, false), (1, false)]]);
 
     impl Scannable for Ab {
         type State<'s>
@@ -252,9 +256,8 @@ mod tests {
             Self: 's;
         type Loader = ();
 
-        // As its rows are: `a` is 1 and 2, `b` 10 and 20.
-        fn sorted_by(&self) -> &[(u32, bool)] {
-            &[(0, false), (1, false)]
+        fn sorted_by(&self) -> &[&[(u32, bool)]] {
+            self.0
         }
 
         fn column_count(&self) -> u32 {
@@ -312,7 +315,7 @@ mod tests {
 
     #[test]
     fn lowers_a_scan_with_its_output_in_order() {
-        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let table = DynScannable::new(&Heap, AB).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let a = plan.add_column("a", DataType::Int64).unwrap();
         let b = plan.add_column("b", DataType::Int64).unwrap();
@@ -416,8 +419,13 @@ mod tests {
     /// Which of `asks` hold of `Ab`'s rows, scanning its columns `read`, after
     /// a breaker if `breaker`; and how many keys `b` alone sorts by.
     fn knows(read: &[u32], breaker: bool, asks: &[Ask]) -> (StdVec<bool>, usize) {
+        knows_of(AB, read, breaker, asks)
+    }
+
+    /// As `knows`, of `table`.
+    fn knows_of(table: Ab, read: &[u32], breaker: bool, asks: &[Ask]) -> (StdVec<bool>, usize) {
         let (known, sorted_by_b) = (RefCell::new(StdVec::new()), RefCell::new(0));
-        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let table = DynScannable::new(&Heap, table).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let bindings = [
             plan.add_column("a", DataType::Int64).unwrap(),
@@ -461,6 +469,9 @@ mod tests {
         assert_eq!(knows(&[1], false, &asks[6..8]), ([false, false].to_vec(), 0));
         // A breaker's rows are new.
         assert_eq!(knows(&[0, 1], true, &asks[1..2]), ([false].to_vec(), 0));
+        // Declared sorted by `b` alone too, it's known to be in both orders.
+        let both = Ab(&[&[(0, false), (1, false)], &[(1, false)]]);
+        assert_eq!(knows_of(both, &[0, 1], false, &asks[5..8]), ([true, true, true].to_vec(), 1));
     }
 
     #[test]
@@ -485,7 +496,7 @@ mod tests {
         keys: &[(usize, bool)],
         limit: Option<(u64, u64)>,
     ) -> alloc::string::String {
-        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let table = DynScannable::new(&Heap, AB).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
@@ -549,7 +560,7 @@ mod tests {
 
     #[test]
     fn drops_a_sort_a_later_sort_makes_pointless() {
-        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let table = DynScannable::new(&Heap, AB).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut ids = StdVec::new();
@@ -573,7 +584,7 @@ mod tests {
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
     fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
-        let table = DynScannable::new(&Heap, Ab).unwrap();
+        let table = DynScannable::new(&Heap, AB).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
