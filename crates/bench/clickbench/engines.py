@@ -5,20 +5,22 @@ to results/MACHINE/ENGINE-THREADS.tsv, with the machine, version, date and
 load, so we know where pipitdb stands without running them again. Times
 from one machine only compare with times from the same one.
 
-Each engine runs in-process, best of RUNS after a warm-up, in ms. "1" is
-one thread, ClickHouse's parsing and download threads limited too; "N" is
-the engine's default.
+Each engine runs in-process and is timed as pipitdb is: each of RUNS runs
+is a fresh process that runs every query once, with no warm-up, and each
+query's best is kept, in ms. "1" is one thread, ClickHouse's parsing and
+download threads limited too; "N" is the engine's default.
 
 Pivot is a server, so its times include sending the rows to this process,
 which in-process engines never pay. pivot-cold clears Pivot's caches of
 compressed and decompressed pages before each timed run, as its own
-benchmark's cold runs do; the OS page cache stays warm for every engine.
+benchmark's cold runs do, so it reads the files as every other engine does:
+only cold runs are compared. The OS page cache stays warm for every engine.
 
 Needs `pip install duckdb chdb datafusion polars psycopg[binary]`, and Pivot
 from `curl https://pivotlake.io | sh`, in $PIVOT_HOME or ~/.pivot.
 
 Usage: crates/bench/clickbench/engines.py DIR --machine NAME
-       [--engines duckdb,...] [--threads 1,N] [--runs 2] [--quiet LOAD]
+       [--engines duckdb,...] [--threads 1,N] [--runs 3] [--quiet LOAD]
 DIR holds hits_*.parquet. --quiet waits until the machine's load average
 stays below LOAD before starting.
 """
@@ -36,7 +38,7 @@ import tempfile
 import time
 
 HERE = pathlib.Path(__file__).parent
-ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot", "pivot-cold"]
+ENGINES = ["duckdb", "clickhouse", "datafusion", "polars", "pivot-cold"]
 
 
 def queries():
@@ -119,7 +121,7 @@ def connect(engine, threads, directory):
         import polars
         ctx = polars.SQLContext(hits=polars.scan_parquet(files))
         return (lambda sql: ctx.execute(sql).collect()), polars.__version__
-    if engine in ("pivot", "pivot-cold"):
+    if engine == "pivot-cold":
         return connect_pivot(threads, directory)
     raise ValueError(engine)
 
@@ -178,34 +180,49 @@ def connect_pivot(threads, directory):
     return run, version.removeprefix("pivot ")
 
 
-def run_one(engine, threads, runs, directory, name):
-    """Times every query with one engine, in this process, and writes its file."""
+def run_once(engine, threads, directory):
+    """Runs every query once with one engine, in this process, printing the
+    engine's version, then each query's ms or "failed"."""
     run, version = connect(engine, threads, directory)
+    print(f"version\t{version}", flush=True)
+    for query, sql in queries():
+        try:
+            if engine == "pivot-cold":
+                run("SELECT drop_cache()")
+            start = time.perf_counter()
+            run(sql)
+            print(f"{query}\t{(time.perf_counter() - start) * 1000:.1f}", flush=True)
+        except Exception as error:
+            print(f"{query}\tfailed", flush=True)
+            print(f"{engine} {query}: {str(error)[:200]}", file=sys.stderr)
+
+
+def run_one(engine, threads, runs, directory, name):
+    """Times every query with one engine, best of `runs` fresh processes,
+    and writes its file."""
     before = load()
+    best, version = {}, ""
+    for _ in range(runs):
+        out = subprocess.run([sys.executable, __file__, directory, "--machine", name,
+                              "--once", f"{engine}:{threads}"],
+                             capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            query, value = line.split("\t")
+            if query == "version":
+                version = value
+            elif value != "failed":
+                best[query] = min(float(value), best.get(query, float("inf")))
     count = len(list(pathlib.Path(directory).glob("hits_*.parquet")))
     label = "1" if threads == 1 else "N"
     lines = [
         f"# {engine} {version}, {'one thread' if threads == 1 else 'default threads'},"
-        f" best of {runs} after a warm-up, ms",
+        f" best of {runs} fresh processes, no warm-up, ms",
         f"# {machine()}, {datetime.date.today()}, {count} files",
+        f"# load {before:.2f} before, {load():.2f} after",
     ]
-    rows = []
-    for query, sql in queries():
-        try:
-            run(sql)
-            best = float("inf")
-            for _ in range(runs):
-                if engine == "pivot-cold":
-                    run("SELECT drop_cache()")
-                start = time.perf_counter()
-                run(sql)
-                best = min(best, time.perf_counter() - start)
-            rows.append(f"{query}\t{best * 1000:.1f}")
-        except Exception as error:
-            rows.append(f"{query}\tfailed")
-            print(f"{engine}-{label} {query}: {str(error)[:200]}", file=sys.stderr)
-        print(f"{engine}-{label} {rows[-1]}", file=sys.stderr, flush=True)
-    lines.append(f"# load {before:.2f} before, {load():.2f} after")
+    rows = [f"{query}\t{best[query]:.1f}" if query in best else f"{query}\tfailed"
+            for query, _ in queries()]
+    print(f"{engine}-{label}: {sum(q in best for q, _ in queries())} queries", file=sys.stderr)
     (results(name) / f"{engine}-{label}.tsv").write_text("\n".join(lines + rows) + "\n")
 
 
@@ -214,11 +231,15 @@ def main():
     parser.add_argument("directory")
     parser.add_argument("--engines", default=",".join(ENGINES))
     parser.add_argument("--threads", default="1,N")
-    parser.add_argument("--runs", type=int, default=2)
+    parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--machine", required=True)
     parser.add_argument("--quiet", type=float)
     parser.add_argument("--one", help=argparse.SUPPRESS)
+    parser.add_argument("--once", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.once:
+        engine, threads = args.once.split(":")
+        return run_once(engine, int(threads), args.directory)
     if args.one:
         engine, threads = args.one.split(":")
         return run_one(engine, int(threads), args.runs, args.directory, args.machine)
