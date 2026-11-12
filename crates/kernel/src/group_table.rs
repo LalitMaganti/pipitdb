@@ -260,24 +260,11 @@ impl GroupTable {
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         // `prefetch` does nothing on other targets, so they don't look ahead.
-        if cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS {
-            self.find_values_in::<true>(keys, groups)
-        } else {
-            self.find_values_in::<false>(keys, groups)
-        }
-    }
-
-    /// As `find_values`. A table too big for the cache misses it twice a
-    /// row, for its slot and then its group's record, so if `AHEAD`, both
-    /// are fetched ahead.
-    #[inline(never)]
-    fn find_values_in<const AHEAD: bool>(
-        &mut self,
-        keys: &[i64],
-        groups: &mut [u32],
-    ) -> Result<(), Error> {
+        // A table too big for the cache misses it twice a row, for its slot
+        // and then its group's record, so both are fetched ahead.
+        let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
-            if AHEAD {
+            if ahead {
                 if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
                     let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
                     prefetch(self.slots.as_ptr().wrapping_add(at));
