@@ -523,6 +523,7 @@ mod tests {
             let aggregate = crate::aggregate::AggregateOp {
                 keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
                 aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),
+                answer: None,
             };
             let aggregate = DynOp::new(&Heap, aggregate).unwrap();
             let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
@@ -1160,6 +1161,7 @@ mod tests {
         let aggregate = AggregateOp {
             keys: SlowVec::fixed(&Heap, 0).unwrap(),
             aggregates: SlowVec::fixed_from(&Heap, aggregates.into_iter()).unwrap(),
+            answer: None,
         };
         let aggregate = DynOp::new(&Heap, aggregate).unwrap();
         plan.add_node(aggregate, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();

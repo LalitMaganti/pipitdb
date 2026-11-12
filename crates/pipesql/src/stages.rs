@@ -381,7 +381,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
-    let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates })?;
+    let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates, answer: None })?;
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(aggregate, children)?;
     compiler.scope = scope;
