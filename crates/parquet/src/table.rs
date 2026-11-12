@@ -3,7 +3,7 @@
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
-use pipit_kernel::condition::Condition;
+use pipit_kernel::condition::{Condition, Cutoff};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
@@ -133,6 +133,9 @@ struct Pruned<'a> {
     table: &'a ParquetTable<'a>,
     columns: SlowVec<(u32, Forms)>,
     groups: SlowVec<(usize, usize)>,
+    /// What a `TopK` above publishes a cutoff on, if anything: a row group
+    /// whose rows all sort after it is skipped as it's reached.
+    cutoff: Option<Cutoff>,
 }
 
 impl<'a> Source for Pruned<'a> {
@@ -152,8 +155,17 @@ impl<'a> Source for Pruned<'a> {
         loop {
             if !rows.started {
                 let Some(&(file, group)) = self.groups.get(*started) else { return Ok(false) };
-                rows.start(self.table, &self.columns, file, group)?;
                 *started += 1;
+                if let Some(cutoff) = self.cutoff {
+                    let footer = &at!(self.table.files, file).footer;
+                    let c = cutoff.column as usize;
+                    let chunk = footer.chunk(group, c);
+                    let bounds = bounds::of_chunk(*at!(footer.columns(), c), chunk);
+                    if !cutoff.may_keep(context, bounds, chunk.nulls) {
+                        continue;
+                    }
+                }
+                rows.start(self.table, &self.columns, file, group)?;
             }
             if rows.next(context, &self.columns, batch)? {
                 return Ok(true);
@@ -361,12 +373,14 @@ impl<'a> Scannable for ParquetTable<'a> {
         }
     }
 
-    /// Skips the row groups whose footer statistics rule out a condition.
+    /// Skips the row groups whose footer statistics rule out a condition,
+    /// and, as it reaches them, those that sort after the cutoff.
     fn scan_within<'s>(
         &'s self,
         allocator: &dyn Allocator,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
+        cutoff: Option<Cutoff>,
     ) -> Result<Option<DynSource<'s>>, AllocError> {
         let may_keep = |file: &File, group: usize| {
             conditions.iter().all(|condition| {
@@ -387,11 +401,11 @@ impl<'a> Scannable for ParquetTable<'a> {
                 }
             }
         }
-        if !skipped {
+        if !skipped && cutoff.is_none() {
             return Ok(None);
         }
         let columns = SlowVec::fixed_from(allocator, columns.iter().copied())?;
-        Ok(Some(DynSource::new(allocator, Pruned { table: self, columns, groups })?))
+        Ok(Some(DynSource::new(allocator, Pruned { table: self, columns, groups, cutoff })?))
     }
 }
 
@@ -567,7 +581,8 @@ mod tests {
         let ids = |min, max| {
             // Not exact: it only skips.
             let conditions = [Condition::new(0, &between(min, max))];
-            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions).unwrap();
+            let source =
+                table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
             let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
             let query = QueryAllocators::new(&Heap);
             let mut execution = pipeline.start(&query).unwrap();

@@ -23,7 +23,7 @@ impl<'c> Op<'c> for LimitOp {
         let mut out = c.input(0).copy(c.allocator())?;
         if let Some(sort) = out.open_sort {
             let read = self.count.saturating_add(self.offset);
-            c.limit_sort(sort.at, u32::try_from(read).unwrap_or(u32::MAX));
+            c.limit_sort(sort, u32::try_from(read).unwrap_or(u32::MAX));
         }
         out.drop_rows();
         Ok(out)

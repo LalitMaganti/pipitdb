@@ -13,7 +13,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::{ColumnView, DataType, Forms};
-use crate::condition::{CONDITIONS_MAX, Condition};
+use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
@@ -67,8 +67,9 @@ pub trait Scannable {
     ) -> Result<bool, Error>;
 
     /// A source of `columns`, read as `open` would, that may leave out rows
-    /// failing `conditions`, which the plan pushed down from filters: the
-    /// filters still test every row. It's of whatever type suits, such as
+    /// failing `conditions`, which the plan pushed down from filters, or
+    /// sorting after the `cutoff` a `TopK` above publishes: the filters and
+    /// the `TopK` still test every row. It's of whatever type suits, such as
     /// one that skips what statistics rule out, or `None` to read with
     /// `open`. Its lazy columns are loaded by this, as `open`'s are. By
     /// default, `None`.
@@ -77,8 +78,9 @@ pub trait Scannable {
         allocator: &dyn Allocator,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
+        cutoff: Option<Cutoff>,
     ) -> Result<Option<DynSource<'s>>, AllocError> {
-        let _ = (allocator, columns, conditions);
+        let _ = (allocator, columns, conditions, cutoff);
         Ok(None)
     }
 
@@ -133,6 +135,7 @@ type ScannableScanWithin<'a> = unsafe fn(
     &dyn Allocator,
     &[(u32, Forms)],
     &[Condition],
+    Option<Cutoff>,
 ) -> Result<Option<DynSource<'a>>, AllocError>;
 
 /// The orders a scannable's rows are in, lent for as long as it lives.
@@ -209,8 +212,8 @@ impl<'a> DynScannable<'a> {
             },
             // SAFETY: as above. The source borrows the scannable, for as
             // long as `scan` says.
-            scan_within: |scannable, allocator, columns, conditions| unsafe {
-                value_of::<T>(scannable).scan_within(allocator, columns, conditions)
+            scan_within: |scannable, allocator, columns, conditions, cutoff| unsafe {
+                value_of::<T>(scannable).scan_within(allocator, columns, conditions, cutoff)
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
@@ -269,12 +272,13 @@ impl<'a> DynScannable<'a> {
 
     /// A source of `columns` of this, in that order, each written in one of
     /// the forms with it, maybe skipping rows failing `conditions`, on those
-    /// columns.
+    /// columns, or sorting after `cutoff`'s.
     pub fn scan(
         &self,
         allocator: &dyn Allocator,
         columns: impl ExactSizeIterator<Item = (u32, Forms)>,
         conditions: &[Condition],
+        cutoff: Option<Cutoff>,
     ) -> Result<DynSource<'_>, AllocError> {
         let columns = SlowVec::fixed_from(allocator, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
@@ -288,11 +292,13 @@ impl<'a> DynScannable<'a> {
         check!(conditions.len() <= CONDITIONS_MAX);
         let read = |condition: &Condition| columns.iter().any(|&(c, _)| c == condition.column());
         check!(conditions.iter().all(read));
-        if !conditions.is_empty() {
+        check!(cutoff.is_none_or(|cutoff| columns.iter().any(|&(c, _)| c == cutoff.column)));
+        if !conditions.is_empty() || cutoff.is_some() {
             // SAFETY: the function matches the scannable's type, and the
             // source borrows `self`.
             let within = unsafe {
-                (self.scan_within)(self.scannable.as_ptr(), allocator, &columns, conditions)?
+                let scannable = self.scannable.as_ptr();
+                (self.scan_within)(scannable, allocator, &columns, conditions, cutoff)?
             };
             if let Some(source) = within {
                 return Ok(source);
@@ -518,7 +524,7 @@ mod tests {
         let scannable = DynScannable::new(&Heap, Columns).unwrap();
         let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
         let pipeline = Pipeline::new(
-            scannable.scan(&Heap, columns, &[]).unwrap(),
+            scannable.scan(&Heap, columns, &[], None).unwrap(),
             SlowVec::new(&Heap, 1).unwrap(),
         );
         let query = QueryAllocators::new(&Heap);
@@ -634,7 +640,7 @@ mod tests {
         let loads = RefCell::new(StdVec::new());
         let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
         let source =
-            scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[]).unwrap();
+            scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None).unwrap();
         let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
         let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
         let flat = SlowVec::fixed_from(&Heap, [Forms::FLAT].into_iter()).unwrap();

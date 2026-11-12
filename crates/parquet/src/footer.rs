@@ -80,6 +80,8 @@ pub struct Chunk {
     pub min: Option<i64>,
     /// The largest value, likewise.
     pub max: Option<i64>,
+    /// How many of its values are null, if recorded.
+    pub nulls: Option<u64>,
 }
 
 pub struct ParquetFile {
@@ -250,13 +252,14 @@ fn column_chunk(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
     let unsigned = |value: Value<'_>| u64::try_from(value.int()?).ok();
     let data = unsigned(meta[3])?;
     let start = unsigned(meta[4]).map_or(data, |dictionary| dictionary.min(data));
-    let (mut min, mut max) = (None, None);
+    let (mut min, mut max, mut nulls) = (None, None, None);
     if let Some(at) = meta[5].at() {
         // `Statistics`: the current max and min are fields 5 and 6, ordered
         // as the column's values are. 1 and 2 are older and always ordered
-        // as signed, so are only right for signed integers.
-        let mut stats = [Value::Missing; 4];
-        c.at(at).fields(&[5, 6, 1, 2], &mut stats)?;
+        // as signed, so are only right for signed integers. 3 counts nulls.
+        let mut stats = [Value::Missing; 5];
+        c.at(at).fields(&[5, 6, 1, 2, 3], &mut stats)?;
+        nulls = unsigned(stats[4]);
         let integer = |value: Value<'_>| integer(value.bytes()?, column);
         let signed = column.logical == Logical::Plain;
         max = integer(stats[0]).or_else(|| integer(stats[2]).filter(|_| signed));
@@ -269,6 +272,7 @@ fn column_chunk(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
         values: unsigned(meta[1]).unwrap_or(0),
         min,
         max,
+        nulls,
     })
 }
 

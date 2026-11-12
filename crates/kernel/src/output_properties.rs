@@ -94,6 +94,8 @@ pub struct OpenSort {
     /// Where its step is.
     pub at: SortAt,
     arrangements: Arrangements,
+    /// The scan the rows it sorts are of, as `OutputProperties::scan`.
+    scan: Option<PlanNodeId>,
 }
 
 /// A sort step: the node and input it's planned for, and which of that
@@ -115,6 +117,10 @@ pub struct OutputProperties {
     pub arrangements: Arrangements,
     /// Set while a sort can still be undone.
     pub open_sort: Option<OpenSort>,
+    /// The scan the rows are of, if each is one of its rows, kept or dropped
+    /// by its own values alone, as a filter does. Not copied: each op that
+    /// keeps it says so.
+    pub scan: Option<PlanNodeId>,
 }
 
 impl OutputProperties {
@@ -124,13 +130,14 @@ impl OutputProperties {
             columns: SlowVec::new(allocator, BATCH_COLUMNS_MAX as usize)?,
             arrangements: Arrangements::NONE,
             open_sort: None,
+            scan: None,
         })
     }
 
     pub fn copy(&self, allocator: &dyn Allocator) -> Result<OutputProperties, AllocError> {
         let mut columns = SlowVec::new(allocator, BATCH_COLUMNS_MAX as usize)?;
         columns.extend_from_slice(&self.columns)?;
-        Ok(OutputProperties { columns, ..*self })
+        Ok(OutputProperties { columns, scan: None, ..*self })
     }
 
     /// Adds `column` at the next position in batches, which fail to hold
@@ -216,8 +223,9 @@ pub struct InputNeeds<'a> {
 /// A step run on an input before the node reads it, to meet its needs.
 pub enum InputStep {
     /// Sorts the rows by `keys`, and outputs only the first `keep` of them,
-    /// if given.
-    Sort { keys: SlowVec<SortKey>, keep: Option<u32> },
+    /// if given; if `publish`, publishing a cutoff on the first key for a
+    /// scan below to skip by.
+    Sort { keys: SlowVec<SortKey>, keep: Option<u32>, publish: bool },
 }
 
 /// One input of a node, once planned.
@@ -231,6 +239,9 @@ pub struct PlannedInput {
 pub struct PlannedNode {
     pub inputs: SlowVec<PlannedInput>,
     pub output: OutputProperties,
+    /// For a scan: the column, and whether descending, a `TopK` above sorts
+    /// by first and publishes a cutoff on.
+    pub cutoff: Option<SortKey>,
 }
 
 /// By node, what's decided about it; `None` for nodes the plan doesn't
@@ -269,11 +280,21 @@ impl<'p> DeriveContext<'p, '_> {
         at!(self.plan.columns, column as usize).data_type
     }
 
-    /// Makes the sort at `at` output only its first `rows` rows, so it is
-    /// lowered as a `TopK`.
-    pub fn limit_sort(&mut self, at: SortAt, rows: u32) {
-        let InputStep::Sort { keep, .. } = step_mut(self.planned, at);
+    /// Makes the open sort `sort` output only its first `rows` rows, so it
+    /// is lowered as a `TopK`. If the rows it sorts are of a scan, and its
+    /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
+    /// scan to skip by.
+    pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
+        let InputStep::Sort { keys, keep, publish } = step_mut(self.planned, sort.at);
         *keep = Some(rows);
+        let first = *at!(keys, 0);
+        let Some(scan) = sort.scan else { return };
+        if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
+            return;
+        }
+        *publish = true;
+        let Some(scan) = at_mut!(self.planned, scan as usize) else { failed!() };
+        scan.cutoff = Some(first);
     }
 }
 
@@ -324,14 +345,15 @@ fn plan_node_inputs(
     let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
     for (input, &child) in (0..).zip(node.children.iter()) {
         let Some(child) = at!(planned, child as usize) else { failed!() };
-        let rows = child.output.copy(allocator)?;
+        let mut rows = child.output.copy(allocator)?;
+        rows.scan = child.output.scan;
         let mut out = PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows };
         let at = SortAt { node: id, input, step: 0 };
         meet(allocator, planned, at, &mut out, &node.op.needs(input))?;
         inputs.push(out)?;
     }
     let output = OutputProperties::new(allocator)?;
-    *at_mut!(planned, id as usize) = Some(PlannedNode { inputs, output });
+    *at_mut!(planned, id as usize) = Some(PlannedNode { inputs, output, cutoff: None });
     let mut derive = DeriveContext { plan, allocator, planned, node: id };
     let output = node.op.derive(&mut derive)?;
     let Some(node) = at_mut!(planned, id as usize) else { failed!() };
@@ -355,10 +377,10 @@ fn meet(
     {
         return Ok(());
     }
-    let sort =
-        OpenSort { at: SortAt { step: out.steps.len(), ..at }, arrangements: rows.arrangements };
+    let at = SortAt { step: out.steps.len(), ..at };
+    let sort = OpenSort { at, arrangements: rows.arrangements, scan: rows.scan.take() };
     let keys = SlowVec::fixed_from(allocator, sorted_by.iter().copied())?;
-    out.steps.push(InputStep::Sort { keys, keep: None })?;
+    out.steps.push(InputStep::Sort { keys, keep: None, publish: false })?;
     rows.arrangements = Arrangements::NONE;
     rows.arrangements.push(&[], sorted_by);
     rows.open_sort = Some(sort);

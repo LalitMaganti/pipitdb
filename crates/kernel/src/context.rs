@@ -22,6 +22,9 @@ pub struct Context<'a> {
     selections: Option<SlowVec<Selection>>,
     /// Made when first used: most runs intern no strings.
     string_pool: Option<StringPool>,
+    /// The first key of the last row a `TopK` keeps, once it has published
+    /// one, so its scan can skip rows that sort after it.
+    cutoff: Option<i64>,
 }
 
 impl<'a> Context<'a> {
@@ -29,7 +32,15 @@ impl<'a> Context<'a> {
     /// `allocator`, for steps run outside a pipeline, such as in tests.
     pub fn new(allocator: &'a dyn Allocator) -> Context<'a> {
         let (values, indices, small) = (allocator, allocator, allocator);
-        Context { allocator, values, indices, small, selections: None, string_pool: None }
+        Context {
+            allocator,
+            values,
+            indices,
+            small,
+            selections: None,
+            string_pool: None,
+            cutoff: None,
+        }
     }
 
     /// A query's context, which allocates from `query`'s allocators.
@@ -41,6 +52,7 @@ impl<'a> Context<'a> {
             small: &query.small,
             selections: None,
             string_pool: None,
+            cutoff: None,
         }
     }
 
@@ -97,6 +109,15 @@ impl<'a> Context<'a> {
     /// whatever the last step left in them.
     pub fn selections(&mut self) -> &mut [Selection] {
         self.selections.as_deref_mut().unwrap_or_default()
+    }
+
+    /// The cutoff a `TopK` published, if any.
+    pub fn cutoff(&self) -> Option<i64> {
+        self.cutoff
+    }
+
+    pub fn set_cutoff(&mut self, cutoff: Option<i64>) {
+        self.cutoff = cutoff;
     }
 
     /// The run's string pool, so the ids of strings interned anywhere in it
