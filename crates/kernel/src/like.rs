@@ -112,20 +112,63 @@ fn find(text: &[u8], segment: &[u8]) -> Option<usize> {
     None
 }
 
-/// Where `byte` first is in `text`. Blocks without it are skipped whole, in a
-/// loop the compiler vectorizes, as it can't one that stops at a match.
+/// Where `byte` first is in `text`. Blocks of 32 bytes without it are skipped
+/// whole.
 fn find_byte(text: &[u8], byte: u8) -> Option<usize> {
-    const BLOCK: usize = 32;
     let mut at = 0;
-    while let Some(block) = text.get(at..at + BLOCK) {
-        #[expect(clippy::needless_bitwise_bool, reason = "`||` would stop it vectorizing")]
-        let found = block.iter().fold(false, |found, &b| found | (b == byte));
-        if found {
+    while let Some(block) = text.get(at..at + 32).and_then(<[u8]>::first_chunk::<32>) {
+        if block::holds(block, byte) {
             break;
         }
-        at += BLOCK;
+        at += 32;
     }
     at!(text, at..).iter().position(|&b| b == byte).map(|found| at + found)
+}
+
+/// Whether a block of 32 bytes holds a byte, compared with every byte at once
+/// with each target's vector instructions. Left to itself, the compiler
+/// vectorizes the comparison or not depending on what it's inlined into.
+mod block {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline]
+    pub(super) fn holds(block: &[u8; 32], byte: u8) -> bool {
+        use core::arch::x86_64::{
+            __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_set1_epi8, _mm256_testz_si256,
+        };
+        // SAFETY: the build has AVX2, and the load reads `block`'s 32 bytes.
+        unsafe {
+            #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
+            let bytes = _mm256_loadu_si256(block.as_ptr().cast::<__m256i>());
+            let equal = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(byte.cast_signed()));
+            _mm256_testz_si256(equal, equal) == 0
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[inline]
+    pub(super) fn holds(block: &[u8; 32], byte: u8) -> bool {
+        use core::arch::aarch64::{vceqq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vorrq_u8};
+        // SAFETY: NEON is part of aarch64, and the loads read `block`'s 32
+        // bytes.
+        unsafe {
+            let byte = vdupq_n_u8(byte);
+            let half = |at: usize| vceqq_u8(vld1q_u8(block.as_ptr().add(at)), byte);
+            vmaxvq_u8(vorrq_u8(half(0), half(16))) != 0
+        }
+    }
+
+    /// Anywhere else: a fold the compiler can vectorize, as it can't a loop
+    /// that stops at a match. On wasm, explicit vectors made the build
+    /// bigger, with no benchmark there to show a gain.
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(target_arch = "aarch64", target_feature = "neon"),
+    )))]
+    #[inline]
+    #[expect(clippy::needless_bitwise_bool, reason = "`||` would stop it vectorizing")]
+    pub(super) fn holds(block: &[u8; 32], byte: u8) -> bool {
+        block.iter().fold(false, |found, &b| found | (b == byte))
+    }
 }
 
 #[cfg(test)]
