@@ -150,18 +150,66 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
     ) else {
         return Some(Err(Error::OutOfMemory));
     };
-    let c = Cursor::new(footer);
-    // `FileMetaData`: its schema, and its row groups.
-    let mut file = [Value::Missing; 2];
-    c.at(0).fields(&[2, 4], &mut file)?;
-    let mut schema = c.at(file[0].at()?);
-    let (_, len) = schema.list()?;
+    let mut c = Cursor::new(footer);
+    // `FileMetaData`: its schema, then its row groups, each read where it
+    // is, so no byte is passed over more than once. What comes after them
+    // isn't read at all.
+    let mut last = 0;
+    loop {
+        match c.field(&mut last)?? {
+            (2, _) => {
+                if let Err(error) = schema(&mut c, &mut names, &mut columns)? {
+                    return Some(Err(error));
+                }
+            }
+            (4, _) => break,
+            (_, kind) => c.skip(kind)?,
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    let (_, len) = c.list()?;
+    // `RowGroup`s: their column chunks, and rows.
+    for _ in 0..len {
+        let (mut last, mut rows) = (0, None);
+        while let Some((id, kind)) = c.field(&mut last)? {
+            match id {
+                1 => {
+                    if c.list()?.1 != columns.len() {
+                        return None;
+                    }
+                    for column in columns.iter() {
+                        if chunks.push(column_chunk(&mut c, *column)?).is_err() {
+                            return Some(Err(Error::Unsupported));
+                        }
+                    }
+                }
+                3 => rows = Some(c.int()?),
+                _ => c.skip(kind)?,
+            }
+        }
+        if group_rows.push(u64::try_from(rows?).ok()?).is_err() {
+            return Some(Err(Error::Unsupported));
+        }
+    }
+    Some(Ok(ParquetFile { names, columns, group_rows, chunks }))
+}
+
+/// Reads the schema at `c` into `names` and `columns`: `None` if it's
+/// damaged, and an error if it can't be read.
+fn schema(
+    c: &mut Cursor<'_>,
+    names: &mut Names,
+    columns: &mut SlowVec<Column>,
+) -> Option<Result<(), Error>> {
+    let (_, len) = c.list()?;
     // `SchemaElement`s: its type, repetition, name, children's count, and
     // converted and logical types. The first is the root; flat schemas have
     // columns only under it.
     let mut element = [Value::Missing; 6];
     for i in 0..len {
-        schema.fields(&[1, 3, 4, 5, 6, 10], &mut element)?;
+        c.fields(&[1, 3, 4, 5, 6, 10], &mut element)?;
         if i == 0 {
             continue;
         }
@@ -181,7 +229,7 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
             return Some(Err(Error::Unsupported));
         }
         let optional = element[1].int() == Some(1);
-        let logical = logical(&c, element[4], element[5])?;
+        let logical = logical(c, element[4], element[5])?;
         let Ok(name) = names.add(core::str::from_utf8(element[2].bytes()?).ok()?) else {
             return Some(Err(Error::OutOfMemory));
         };
@@ -189,27 +237,7 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
             return Some(Err(Error::Unsupported));
         }
     }
-    let mut groups = c.at(file[1].at()?);
-    let (_, len) = groups.list()?;
-    // `RowGroup`s: their column chunks, and rows.
-    let mut group = [Value::Missing; 2];
-    for _ in 0..len {
-        groups.fields(&[1, 3], &mut group)?;
-        let mut list = c.at(group[0].at()?);
-        if list.list()?.1 != columns.len() {
-            return None;
-        }
-        for column in columns.iter() {
-            if chunks.push(column_chunk(&mut list, *column)?).is_err() {
-                return Some(Err(Error::Unsupported));
-            }
-        }
-        let rows = u64::try_from(group[1].int()?).ok()?;
-        if group_rows.push(rows).is_err() {
-            return Some(Err(Error::Unsupported));
-        }
-    }
-    Some(Ok(ParquetFile { names, columns, group_rows, chunks }))
+    Some(Ok(()))
 }
 
 /// A column's `Logical` kind, from its converted type, and its logical type
@@ -241,12 +269,24 @@ fn logical(c: &Cursor<'_>, converted: Value<'_>, logical: Value<'_>) -> Option<L
 
 /// A `ColumnChunk`, at `c`, of `column`.
 fn column_chunk(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
-    let mut chunk = [Value::Missing];
-    c.fields(&[3], &mut chunk)?;
-    // `ColumnMetaData`: its codec, values, size, the offsets of its data and
-    // dictionary pages, and its statistics.
+    // Its `ColumnMetaData`, read where it is.
+    let (mut last, mut chunk) = (0, None);
+    while let Some((id, kind)) = c.field(&mut last)? {
+        if id == 3 {
+            chunk = Some(column_meta(c, column)?);
+        } else {
+            c.skip(kind)?;
+        }
+    }
+    chunk
+}
+
+/// A `ColumnMetaData`, at `c`, of `column`.
+fn column_meta(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
+    // Its codec, values, size, the offsets of its data and dictionary pages,
+    // and its statistics.
     let mut meta = [Value::Missing; 6];
-    c.at(chunk[0].at()?).fields(&[4, 5, 7, 9, 11, 12], &mut meta)?;
+    c.fields(&[4, 5, 7, 9, 11, 12], &mut meta)?;
     let unsigned = |value: Value<'_>| u64::try_from(value.int()?).ok();
     let data = unsigned(meta[3])?;
     let start = unsigned(meta[4]).map_or(data, |dictionary| dictionary.min(data));
