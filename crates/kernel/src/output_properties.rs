@@ -87,17 +87,6 @@ impl Arrangements {
     }
 }
 
-/// The most recent sort, while nothing has read its order, and what was
-/// known before it: it can still be undone.
-#[derive(Clone, Copy)]
-pub struct OpenSort {
-    /// Where its step is.
-    pub at: SortAt,
-    arrangements: Arrangements,
-    /// The scan the rows it sorts are of, as `OutputProperties::scan`.
-    scan: Option<PlanNodeId>,
-}
-
 /// A sort step: the node and input it's planned for, and which of that
 /// input's steps it is.
 #[derive(Clone, Copy)]
@@ -117,8 +106,9 @@ pub struct OutputProperties {
     column_count: u32,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
-    /// Set while a sort can still be undone.
-    pub open_sort: Option<OpenSort>,
+    /// The most recent sort, while nothing has read its order: it can still
+    /// be undone.
+    pub open_sort: Option<SortAt>,
     /// The scan the rows are of, if each is one of its rows, kept or dropped
     /// by its own values alone, as a filter does. An op that keeps rows by
     /// where they are, as LIMIT does, clears it.
@@ -222,8 +212,15 @@ pub struct InputNeeds<'a> {
 pub enum InputStep {
     /// Sorts the rows by `keys`, and outputs only the first `keep` of them,
     /// if given; if `publish`, publishing a cutoff on the first key for a
-    /// scan below to skip by.
-    Sort { keys: SlowVec<SortKey>, keep: Option<u32>, publish: bool },
+    /// scan below to skip by. `unsorted` and `scan` are what was known of
+    /// the rows before it, to undo it.
+    Sort {
+        keys: SlowVec<SortKey>,
+        keep: Option<u32>,
+        publish: bool,
+        unsorted: Arrangements,
+        scan: Option<PlanNodeId>,
+    },
 }
 
 /// One input of a node, once planned.
@@ -282,11 +279,11 @@ impl<'p> DeriveContext<'p, '_> {
     /// is lowered as a `TopK`. If the rows it sorts are of a scan, and its
     /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
     /// scan to skip by.
-    pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
-        let InputStep::Sort { keys, keep, publish } = step_mut(self.planned, sort.at);
+    pub fn limit_sort(&mut self, sort: SortAt, rows: u32) {
+        let InputStep::Sort { keys, keep, publish, scan, .. } = step_mut(self.planned, sort);
         *keep = Some(rows);
         let first = *at!(keys, 0);
-        let Some(scan) = sort.scan else { return };
+        let Some(scan) = *scan else { return };
         if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
             return;
         }
@@ -374,10 +371,10 @@ fn meet(
     {
         return Ok(());
     }
-    let at = SortAt { step: out.steps.len(), ..at };
-    let sort = OpenSort { at, arrangements: rows.arrangements, scan: rows.scan.take() };
+    let sort = SortAt { step: out.steps.len(), ..at };
     let keys = SlowVec::fixed_from(allocator, sorted_by.iter().copied())?;
-    out.steps.push(InputStep::Sort { keys, keep: None, publish: false })?;
+    let (unsorted, scan) = (rows.arrangements, rows.scan.take());
+    out.steps.push(InputStep::Sort { keys, keep: None, publish: false, unsorted, scan })?;
     rows.arrangements = Arrangements::NONE;
     rows.arrangements.push(&[], sorted_by);
     rows.open_sort = Some(sort);
@@ -388,11 +385,11 @@ fn meet(
 /// it.
 fn drop_open_sort(planned: &mut Planned, rows: &mut OutputProperties) -> bool {
     let Some(sort) = rows.open_sort.take() else { return false };
-    let Some(node) = at_mut!(planned, sort.at.node as usize) else { failed!() };
+    let Some(node) = at_mut!(planned, sort.node as usize) else { failed!() };
     // Nothing is planned after a sort before its order is read, so it's last.
-    let steps = &mut at_mut!(node.inputs, sort.at.input as usize).steps;
-    check!(sort.at.step + 1 == steps.len());
-    steps.pop();
-    rows.arrangements = sort.arrangements;
+    let steps = &mut at_mut!(node.inputs, sort.input as usize).steps;
+    check!(sort.step + 1 == steps.len());
+    let Some(InputStep::Sort { unsorted, scan, .. }) = steps.pop() else { failed!() };
+    (rows.arrangements, rows.scan) = (unsorted, scan);
     true
 }
