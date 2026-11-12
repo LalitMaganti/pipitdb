@@ -12,11 +12,10 @@ rust-version = "1.98"
 [profile.dev]
 panic = "abort"
 
-# Built as profiling is, so benchmarks count what development measures.
-# gungraun finds benchmark functions by their symbols.
+# Built as speed is, so benchmarks count what ships. gungraun finds
+# benchmark functions by their symbols.
 [profile.bench]
 opt-level = 3
-lto = "thin"
 strip = false
 debug = true
 
