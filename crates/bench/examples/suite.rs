@@ -1,6 +1,6 @@
 //! Runs the queries of a suite, such as ClickBench or TPC-H, that pipitdb can
 //! run over Parquet files, printing each row of each result and, to stderr,
-//! how long each took. `check_queries.py` compares the rows with DuckDB's.
+//! how long each took, from opening its tables to its results. `check_queries.py` compares the rows with DuckDB's.
 //!
 //! Usage: `cargo run --profile speed -p pipitdb-bench --example suite -- [QUERIES] FILE...`
 //!
@@ -114,18 +114,7 @@ fn main() -> Result<(), String> {
         .map(|(name, table)| (name.as_str(), table.iter().map(|f| f as &dyn ByteSource).collect()))
         .collect();
     let codecs = Counting::default();
-    let mut tables = Vec::new();
-    for (name, sources) in &sources {
-        // A table pipitdb can't read is left out, so only queries reading it fail.
-        match ParquetTable::open(&Heap, &codecs, sources) {
-            Ok(table) => {
-                let table = DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?;
-                tables.push(((*name).to_string(), table));
-            }
-            Err(error) => eprintln!("{name}: {error:?}"),
-        }
-    }
-    let tables = Tables(tables);
+    let mut first = true;
     for line in queries.lines() {
         let mut fields = line.split('\t');
         let (Some(number), Some(query)) = (fields.next(), fields.next()) else { continue };
@@ -139,14 +128,18 @@ fn main() -> Result<(), String> {
         }
         let repeat = std::env::var("REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
         for _ in 1..repeat {
-            run(&tables, query, &QueryAllocators::new(&Heap))?;
+            run(&open_tables(&codecs, &sources, false)?, query, &QueryAllocators::new(&Heap))?;
         }
         let limit = LimitAllocator::new(&Heap, usize::MAX);
         // Counts what the query holds at its peak, for the report.
         let allocators = QueryAllocators::new(&limit);
         codecs.pages.set(0);
         codecs.bytes.set(0);
+        // Each query opens its tables, reading their footers, as other
+        // engines' queries over Parquet files do.
         let start = Instant::now();
+        let tables = open_tables(&codecs, &sources, first)?;
+        first = false;
         match run(&tables, query, &allocators) {
             Ok(columns) => {
                 // Timed up to the results, as other engines' times are; turning
@@ -171,6 +164,27 @@ fn main() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Each table of `sources`, opened. A table pipitdb can't read is left out,
+/// so only queries reading it fail, and said why if `report`.
+fn open_tables<'a>(
+    codecs: &'a Counting,
+    sources: &'a [(&str, Vec<&dyn ByteSource>)],
+    report: bool,
+) -> Result<Tables<'a>, String> {
+    let mut tables = Vec::new();
+    for (name, sources) in sources {
+        match ParquetTable::open(&Heap, codecs, sources) {
+            Ok(table) => {
+                let table = DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?;
+                tables.push(((*name).to_string(), table));
+            }
+            Err(error) if report => eprintln!("{name}: {error:?}"),
+            Err(_) => {}
+        }
+    }
+    Ok(Tables(tables))
 }
 
 /// A column of a result: its kept rows' values, as other engines' results
