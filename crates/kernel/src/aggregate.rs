@@ -11,8 +11,9 @@ use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
+use crate::step::DynSource;
 use crate::step::Step;
-use crate::values::ValuesOp;
+use crate::values::Values;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
 /// `Int64` values, and makes an `Int64` but for `Avg`.
@@ -59,6 +60,9 @@ pub struct AggregateOp {
     pub keys: SlowVec<ColumnId>,
     /// What each group's rows make, from `Int64` columns.
     pub aggregates: SlowVec<Aggregate>,
+    /// Each aggregate's value, once known without reading any rows: then it
+    /// has no child, and outputs one row of them.
+    pub answer: Option<SlowVec<i64>>,
 }
 
 impl<'c> Op<'c> for AggregateOp {
@@ -85,7 +89,9 @@ impl<'c> Op<'c> for AggregateOp {
         for aggregate in self.aggregates.iter() {
             out.push_column(aggregate.binding.id)?;
         }
-        out.arrangements.push(&[], c.input(0).sorted_by(&self.keys));
+        if self.answer.is_none() {
+            out.arrangements.push(&[], c.input(0).sorted_by(&self.keys));
+        }
         Ok(out)
     }
 
@@ -94,9 +100,14 @@ impl<'c> Op<'c> for AggregateOp {
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
+        let allocator = lowering.allocator();
+        if let Some(answer) = &self.answer {
+            let values = SlowVec::fixed_from(allocator, answer.iter().copied())?;
+            lowering.set_source(DynSource::new(allocator, Values { values })?);
+            return Ok(());
+        }
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
-        let allocator = lowering.allocator();
         let mut string_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
             string_keys |= u64::from(lowering.query_type(key) == DataType::String) << k;
@@ -126,17 +137,11 @@ impl<'c> Op<'c> for AggregateOp {
         false
     }
 
-    /// Drops the aggregates nothing reads, keeping one if there are no keys:
-    /// a batch with no columns has no rows.
-    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: a row of what
-    /// `child` knows of its rows without reading them, if it knows enough.
-    fn answer(
-        &self,
-        allocator: &dyn Allocator,
-        child: &DynOp<'c>,
-    ) -> Result<Option<DynOp<'c>>, AllocError> {
+    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
+    /// knows of its rows without reading them, if it knows enough.
+    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
         if !self.keys.is_empty() {
-            return Ok(None);
+            return Ok(false);
         }
         let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
         for aggregate in self.aggregates.iter() {
@@ -152,12 +157,15 @@ impl<'c> Op<'c> for AggregateOp {
                 }
                 _ => None,
             };
-            let Some(value) = value else { return Ok(None) };
-            values.push((aggregate.binding.id, value))?;
+            let Some(value) = value else { return Ok(false) };
+            values.push(value)?;
         }
-        Ok(Some(DynOp::new(allocator, ValuesOp { values })?))
+        self.answer = Some(values);
+        Ok(true)
     }
 
+    /// Drops the aggregates nothing reads, keeping one if there are no keys:
+    /// a batch with no columns has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding.id));
         let keep_first = !any && self.keys.is_empty();
@@ -172,6 +180,9 @@ impl<'c> Op<'c> for AggregateOp {
     }
 
     fn reads(&self, reads: &mut Needed) {
+        if self.answer.is_some() {
+            return;
+        }
         for &key in self.keys.iter() {
             reads.need(key);
         }

@@ -155,16 +155,12 @@ pub trait Op<'c> {
         None
     }
 
-    /// An op making this one's rows from what `child`, its one child, says
-    /// of its own in `summary`, without reading them, if it can. By default,
-    /// none.
-    fn answer(
-        &self,
-        allocator: &dyn Allocator,
-        child: &DynOp<'c>,
-    ) -> Result<Option<DynOp<'c>>, AllocError> {
+    /// Whether this now makes its rows from what `child`, its one child,
+    /// says of its own in `summary`, without reading them. By default, it
+    /// can't.
+    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
         let _ = (allocator, child);
-        Ok(None)
+        Ok(false)
     }
 }
 
@@ -184,8 +180,7 @@ type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<
 type TakeCondition =
     unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
 
-type Answer<'c> =
-    unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<Option<DynOp<'c>>, AllocError>;
+type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -262,8 +257,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         },
         // SAFETY: as for `lower`.
         summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
-        // SAFETY: as for `lower`.
-        answer: |op, allocator, child| unsafe { value_of::<T>(op).answer(allocator, child) },
+        // SAFETY: as for `prune`.
+        answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
     };
 }
 
@@ -363,10 +358,10 @@ impl<'c> DynOp<'c> {
     }
 
     pub(crate) fn answer(
-        &self,
+        &mut self,
         allocator: &dyn Allocator,
         child: &DynOp<'c>,
-    ) -> Result<Option<DynOp<'c>>, AllocError> {
+    ) -> Result<bool, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.answer)(self.op.as_ptr(), allocator, child) }
     }

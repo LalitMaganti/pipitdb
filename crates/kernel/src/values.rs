@@ -1,45 +1,16 @@
-//! `ValuesOp`: one row of given values, such as an aggregate's, known
-//! without reading any rows.
+//! `Values`: a source of one row of given values, such as an aggregate's,
+//! known without reading any rows.
 
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
-use crate::lower::{LowerError, Lowering};
-use crate::optimize::Needed;
-use crate::output_properties::{DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Op, PlanNode};
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
-use crate::step::{DynSource, Source};
+use crate::step::Source;
 
 /// Outputs one row: each column's `Int64`.
-pub struct ValuesOp {
-    pub values: SlowVec<(ColumnId, i64)>,
-}
-
-impl<'c> Op<'c> for ValuesOp {
-    fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = OutputProperties::NONE;
-        for &(column, _) in self.values.iter() {
-            out.push_column(column)?;
-        }
-        Ok(out)
-    }
-
-    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
-        let allocator = lowering.allocator();
-        let values = SlowVec::fixed_from(allocator, self.values.iter().map(|&(_, value)| value))?;
-        lowering.set_source(DynSource::new(allocator, Values { values })?);
-        Ok(())
-    }
-
-    /// Reads none: it makes them.
-    fn reads(&self, _: &mut Needed) {}
-}
-
-/// The source of a `ValuesOp`'s row.
-struct Values {
-    values: SlowVec<i64>,
+pub struct Values {
+    pub values: SlowVec<i64>,
 }
 
 impl Source for Values {

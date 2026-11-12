@@ -88,21 +88,21 @@ pub fn prune_columns(
     Ok(())
 }
 
-/// Replaces each op that can make its rows from what its one child knows
-/// of its own without reading them, such as an aggregate's from a file's
-/// statistics, with the op that does. The child is then left unread.
+/// Has each op that can make its rows from what its one child knows of its
+/// own without reading them, such as an aggregate from a file's statistics,
+/// do so. The child is then left unread.
 pub fn answer_from_summaries(
     allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
     for id in 0..plan.nodes.len() {
-        let node = at!(plan.nodes, id);
+        // Children are added before their parents.
+        let (below, rest) = plan.nodes.split_at_mut(id);
+        let node = at_mut!(rest, 0);
         let &[child] = &node.children[..] else { continue };
-        let Some(op) = node.op.answer(allocator, &at!(plan.nodes, child as usize).op)? else {
-            continue;
-        };
-        let node = at_mut!(plan.nodes, id);
-        (node.op, node.children) = (op, SlowVec::fixed(allocator, 0)?);
+        if node.op.answer(allocator, &at!(below, child as usize).op)? {
+            node.children = SlowVec::fixed(allocator, 0)?;
+        }
     }
     Ok(())
 }
