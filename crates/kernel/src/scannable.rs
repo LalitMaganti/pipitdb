@@ -134,7 +134,7 @@ pub trait Scannable {
 /// none that aren't null.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Summary {
-    pub rows: u64,
+    pub rows: i64,
     pub bounds: Option<Bounds>,
 }
 

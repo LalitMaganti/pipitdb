@@ -433,7 +433,7 @@ impl<'a> Scannable for ParquetTable<'a> {
         let (mut rows, mut bounds) = (0, None::<Bounds>);
         for file in self.files.iter() {
             for group in 0..file.footer.row_groups() {
-                rows += file.footer.group_rows(group);
+                rows += i64::try_from(file.footer.group_rows(group)).ok()?;
                 let Some(c) = column else { continue };
                 let chunk = file.footer.chunk(group, c as usize);
                 if !chunk.exact || chunk.min.is_none() || chunk.max.is_none() {

@@ -140,15 +140,15 @@ impl<'c> Op<'c> for AggregateOp {
         }
         let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
         for aggregate in self.aggregates.iter() {
+            // A summary's bounds are the least and greatest values. With no
+            // rows, there are none, and MIN and MAX are null: scanned.
             let value = match (aggregate.function, aggregate.input) {
-                (Function::CountStar, _) => {
-                    child.summary(None).and_then(|s| i64::try_from(s.rows).ok()).map(Some)
-                }
+                (Function::CountStar, _) => child.summary(None).map(|s| s.rows),
                 (Function::Min, Some(input)) => {
-                    child.summary(Some(input)).map(|s| s.bounds.map(|b| b.min))
+                    child.summary(Some(input)).and_then(|s| s.bounds).map(|b| b.min)
                 }
                 (Function::Max, Some(input)) => {
-                    child.summary(Some(input)).map(|s| s.bounds.map(|b| b.max))
+                    child.summary(Some(input)).and_then(|s| s.bounds).map(|b| b.max)
                 }
                 _ => None,
             };

@@ -12,9 +12,9 @@ use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, Source};
 
-/// Outputs one row: each column's `Int64`, or null.
+/// Outputs one row: each column's `Int64`.
 pub struct ValuesOp {
-    pub values: SlowVec<(ColumnId, Option<i64>)>,
+    pub values: SlowVec<(ColumnId, i64)>,
 }
 
 impl<'c> Op<'c> for ValuesOp {
@@ -39,7 +39,7 @@ impl<'c> Op<'c> for ValuesOp {
 
 /// The source of a `ValuesOp`'s row.
 struct Values {
-    values: SlowVec<Option<i64>>,
+    values: SlowVec<i64>,
 }
 
 impl Source for Values {
@@ -62,20 +62,9 @@ impl Source for Values {
         batch.reset(1);
         for &value in self.values.iter() {
             let mut values = context.values_buffer(8)?;
-            *at_mut!(values.as_mut_slice::<i64>(), 0) = value.unwrap_or(0);
-            // A null's validity bit is unset.
-            let validity = if value.is_some() {
-                None
-            } else {
-                let mut validity = context.small_buffer(1)?;
-                *at_mut!(validity.as_mut_slice::<u8>(), 0) = 0;
-                Some(validity)
-            };
-            let Ok(()) =
-                batch.push_column(ColumnView::new(context, DataType::Int64, values, validity)?)
-            else {
-                failed!();
-            };
+            *at_mut!(values.as_mut_slice::<i64>(), 0) = value;
+            let column = ColumnView::new(context, DataType::Int64, values, None)?;
+            let Ok(()) = batch.push_column(column) else { failed!() };
         }
         Ok(true)
     }
