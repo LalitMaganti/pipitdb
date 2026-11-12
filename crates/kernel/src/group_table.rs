@@ -257,54 +257,53 @@ impl GroupTable {
 
     /// As `find_or_create`, for a single key with no nulls: compares the key
     /// values directly.
-    #[inline(never)]
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         if self.slots.len() > CACHED_SLOTS {
-            return self.find_values_ahead(keys, groups);
+            self.find_values_in::<true>(keys, groups)
+        } else {
+            self.find_values_in::<false>(keys, groups)
         }
-        for (&key, group) in keys.iter().zip(groups) {
-            *group = self.find_value(key)?;
-        }
-        Ok(())
     }
 
-    /// As `find_values`, for a table too big for the cache, which misses it
-    /// twice a row, for its slot and then its group's record: both are
-    /// fetched ahead.
+    /// As `find_values`. A table too big for the cache misses it twice a
+    /// row, for its slot and then its group's record, so if `AHEAD`, both
+    /// are fetched ahead.
     #[inline(never)]
-    fn find_values_ahead(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
+    fn find_values_in<const AHEAD: bool>(
+        &mut self,
+        keys: &[i64],
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
         for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
-            if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
-                let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
-                prefetch(self.slots.as_ptr().wrapping_add(at));
+            if AHEAD {
+                if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
+                    let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
+                    prefetch(self.slots.as_ptr().wrapping_add(at));
+                }
+                if let Some(&ahead) = keys.get(i + RECORD_AHEAD) {
+                    let at = slot_of(mix(ahead.cast_unsigned()), self.slots.len());
+                    let slot = *at!(self.slots, at);
+                    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+                    let group = (slot & !salt(slot)) as usize;
+                    let record = group.wrapping_sub(1) * self.stride;
+                    prefetch(self.records.as_ptr().wrapping_add(record));
+                }
             }
-            if let Some(&ahead) = keys.get(i + RECORD_AHEAD) {
-                let slot = *at!(self.slots, slot_of(mix(ahead.cast_unsigned()), self.slots.len()));
-                #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-                let group = (slot & !salt(slot)) as usize;
-                prefetch(self.records.as_ptr().wrapping_add(group.wrapping_sub(1) * self.stride));
-            }
-            *group = self.find_value(key)?;
+            let hash = mix(key.cast_unsigned());
+            let (records, stride) = (self.records.as_ptr(), self.stride);
+            // A stored group is its null bits, zero here, then its key.
+            // SAFETY: a group in a slot has a record, of at least two words.
+            let equal = |group: usize| unsafe {
+                let stored = records.add(group * stride);
+                *stored == 0 && *stored.add(1) == key
+            };
+            *group = match probe(&self.slots, hash, equal) {
+                Ok(group) => group,
+                Err(at) => self.add(at, hash, &[0, key])?,
+            };
         }
         Ok(())
-    }
-
-    /// The group of `key`, a single key with no nulls, added if it's new.
-    #[inline]
-    fn find_value(&mut self, key: i64) -> Result<u32, Error> {
-        let hash = mix(key.cast_unsigned());
-        let (records, stride) = (self.records.as_ptr(), self.stride);
-        // A stored group is its null bits, zero here, then its key.
-        // SAFETY: a group in a slot has a record, of at least two words.
-        let equal = |group: usize| unsafe {
-            let stored = records.add(group * stride);
-            *stored == 0 && *stored.add(1) == key
-        };
-        match probe(&self.slots, hash, equal) {
-            Ok(group) => Ok(group),
-            Err(at) => self.add(at, hash, &[0, key]),
-        }
     }
 
     /// Adds a group for row `row` of `keys`, with null word `null`, hashed as
