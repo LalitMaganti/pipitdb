@@ -12,7 +12,7 @@ use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
-use crate::string_pool::{Id, NO_NUMBER};
+use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -260,17 +260,18 @@ impl GroupTable {
     #[inline(never)]
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
+        // A table too big for the cache misses it twice a row, for its slot
+        // and then its group's record, so both are fetched ahead.
+        let big = self.slots.len() > CACHED_SLOTS;
         for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
-            // A big table misses the cache twice a row, for its slot and then
-            // its group's record, so both are fetched ahead.
-            if let Some(&ahead) = keys.get(i + SLOT_AHEAD) {
+            if let Some(&ahead) = keys.get(i + SLOT_AHEAD).filter(|_| big) {
                 prefetch(
                     self.slots
                         .as_ptr()
                         .wrapping_add(slot_of(mix(ahead.cast_unsigned()), self.slots.len())),
                 );
             }
-            if let Some(&ahead) = keys.get(i + RECORD_AHEAD) {
+            if let Some(&ahead) = keys.get(i + RECORD_AHEAD).filter(|_| big) {
                 let slot = *at!(self.slots, slot_of(mix(ahead.cast_unsigned()), self.slots.len()));
                 #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
                 let group = (slot & !salt(slot)) as usize;
