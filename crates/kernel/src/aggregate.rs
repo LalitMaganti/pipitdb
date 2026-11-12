@@ -2,15 +2,17 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
+use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
+use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::Step;
+use crate::values::ValuesOp;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
 /// `Int64` values, and makes an `Int64` but for `Avg`.
@@ -126,6 +128,36 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// Drops the aggregates nothing reads, keeping one if there are no keys:
     /// a batch with no columns has no rows.
+    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: a row of what
+    /// `child` knows of its rows without reading them, if it knows enough.
+    fn answer(
+        &self,
+        allocator: &dyn Allocator,
+        child: &DynOp<'c>,
+    ) -> Result<Option<DynOp<'c>>, AllocError> {
+        if !self.keys.is_empty() {
+            return Ok(None);
+        }
+        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
+        for aggregate in self.aggregates.iter() {
+            let value = match (aggregate.function, aggregate.input) {
+                (Function::CountStar, _) => {
+                    child.summary(None).and_then(|s| i64::try_from(s.rows).ok()).map(Some)
+                }
+                (Function::Min, Some(input)) => {
+                    child.summary(Some(input)).map(|s| s.bounds.map(|b| b.min))
+                }
+                (Function::Max, Some(input)) => {
+                    child.summary(Some(input)).map(|s| s.bounds.map(|b| b.max))
+                }
+                _ => None,
+            };
+            let Some(value) = value else { return Ok(None) };
+            values.push((aggregate.binding.id, value))?;
+        }
+        Ok(Some(DynOp::new(allocator, ValuesOp { values })?))
+    }
+
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding.id));
         let keep_first = !any && self.keys.is_empty();

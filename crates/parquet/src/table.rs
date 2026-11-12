@@ -2,7 +2,7 @@
 
 use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::condition::{Condition, Cutoff};
 use pipit_kernel::context::Context;
 use pipit_kernel::filter::{
@@ -11,7 +11,7 @@ use pipit_kernel::filter::{
     Value,
 };
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::scannable::Scannable;
+use pipit_kernel::scannable::{Scannable, Summary};
 use pipit_kernel::selection::{Kept, Selection};
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{DynSource, Source};
@@ -427,6 +427,28 @@ impl<'a> Scannable for ParquetTable<'a> {
         }
     }
 
+    /// From the footers: the rows' count, and a column's least and greatest
+    /// values, if every row group's statistics hold them exactly.
+    fn summary(&self, column: Option<u32>) -> Option<Summary> {
+        let (mut rows, mut bounds) = (0, None::<Bounds>);
+        for file in self.files.iter() {
+            for group in 0..file.footer.row_groups() {
+                rows += file.footer.group_rows(group);
+                let Some(c) = column else { continue };
+                let chunk = file.footer.chunk(group, c as usize);
+                if !chunk.exact || chunk.min.is_none() || chunk.max.is_none() {
+                    return None;
+                }
+                let next = bounds::of_chunk(*at!(file.footer.columns(), c as usize), chunk)?;
+                bounds = Some(bounds.map_or(next, |b| Bounds {
+                    min: b.min.min(next.min),
+                    max: b.max.max(next.max),
+                }));
+            }
+        }
+        Some(Summary { rows, bounds })
+    }
+
     /// Skips the row groups whose footer statistics rule out a condition,
     /// and, as it reaches them, those that sort after the cutoff.
     fn scan_within<'s>(
@@ -703,6 +725,18 @@ mod tests {
         };
         assert_eq!(first(false), ([0, 0, 1].into(), 10000));
         assert_eq!(first(true), ([0, 0, 1].into(), 4096 + 3));
+    }
+
+    #[test]
+    fn summarizes_from_statistics() {
+        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let summary =
+            |column| table.summary(column).map(|s| (s.rows, s.bounds.map(|b| (b.min, b.max))));
+        assert_eq!(summary(None), Some((10000, None)));
+        // `id` is 0 to 4999 in each file.
+        assert_eq!(summary(Some(0)), Some((10000, Some((0, 4999)))));
+        // `name` is a string, with no bounds.
+        assert_eq!(summary(Some(2)), None);
     }
 
     #[test]

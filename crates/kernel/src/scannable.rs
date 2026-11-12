@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
-use crate::column::{ColumnView, DataType, Forms};
+use crate::column::{Bounds, ColumnView, DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
@@ -84,6 +84,14 @@ pub trait Scannable {
         Ok(None)
     }
 
+    /// How many rows it has, and with `column`, the least and greatest of
+    /// that column's values, if they're known exactly without reading them,
+    /// as from a file's statistics. By default, `None`.
+    fn summary(&self, column: Option<u32>) -> Option<Summary> {
+        let _ = column;
+        None
+    }
+
     /// The forms `column` can be written in. By default, flat only.
     fn forms(&self, column: u32) -> Forms {
         let _ = column;
@@ -119,6 +127,15 @@ pub trait Scannable {
         let _ = (context, loader, lazy, selection, forms);
         failed!()
     }
+}
+
+/// What's known of a scannable's rows without reading them: how many there
+/// are, and the least and greatest of a column's values, `None` if it has
+/// none that aren't null.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Summary {
+    pub rows: u64,
+    pub bounds: Option<Bounds>,
 }
 
 /// The tables a frontend can read, provided by the embedder.
@@ -166,6 +183,7 @@ pub struct DynScannable<'a> {
     next: ScannableNext,
     scan_within: ScannableScanWithin<'a>,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
+    summary: unsafe fn(NonNull<()>, Option<u32>) -> Option<Summary>,
     sorted_by: ScannableSortedBy,
     loader_layout: Layout,
     new_loader: NewState,
@@ -218,6 +236,8 @@ impl<'a> DynScannable<'a> {
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
             // SAFETY: as above.
+            summary: |scannable, column| unsafe { value_of::<T>(scannable).summary(column) },
+            // SAFETY: as above.
             sorted_by: |scannable| {
                 // SAFETY: as above. The orders live as long as the scannable,
                 // which is all `DynScannable::sorted_by` lends them for.
@@ -259,6 +279,11 @@ impl<'a> DynScannable<'a> {
     }
 
     /// The forms `column` can be written in.
+    pub fn summary(&self, column: Option<u32>) -> Option<Summary> {
+        // SAFETY: as above.
+        unsafe { (self.summary)(self.scannable.as_ptr(), column) }
+    }
+
     pub fn forms(&self, column: u32) -> Forms {
         // SAFETY: as above.
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }

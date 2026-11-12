@@ -12,6 +12,7 @@ use crate::slow_vec::SlowVec;
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
+    answer_from_summaries(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -83,6 +84,25 @@ pub fn prune_columns(
         for (slot, &child) in at!(plan.nodes, id as usize).children.iter().enumerate() {
             pending.push((child, Some((id, slot))))?;
         }
+    }
+    Ok(())
+}
+
+/// Replaces each op that can make its rows from what its one child knows
+/// of its own without reading them, such as an aggregate's from a file's
+/// statistics, with the op that does. The child is then left unread.
+pub fn answer_from_summaries(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    for id in 0..plan.nodes.len() {
+        let node = at!(plan.nodes, id);
+        let &[child] = &node.children[..] else { continue };
+        let Some(op) = node.op.answer(allocator, &at!(plan.nodes, child as usize).op)? else {
+            continue;
+        };
+        let node = at_mut!(plan.nodes, id);
+        (node.op, node.children) = (op, SlowVec::fixed(allocator, 0)?);
     }
     Ok(())
 }
