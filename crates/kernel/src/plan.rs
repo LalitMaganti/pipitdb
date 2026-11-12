@@ -429,7 +429,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = OutputProperties::new(c.allocator())?;
+        let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
             out.push_column(column.binding.id)?;
         }
@@ -536,9 +536,7 @@ pub struct MaterializeOp<'c> {
 impl<'c> Op<'c> for MaterializeOp<'c> {
     /// Its input's: it loads columns where they are.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = c.input(0).copy(c.allocator())?;
-        out.scan = c.input(0).scan;
-        Ok(out)
+        Ok(*c.input(0))
     }
 
     fn lower(
@@ -576,9 +574,8 @@ pub struct FilterOp {
 impl<'c> Op<'c> for FilterOp {
     /// Its input's, less some rows.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = c.input(0).copy(c.allocator())?;
+        let mut out = *c.input(0);
         out.drop_rows();
-        out.scan = c.input(0).scan;
         Ok(out)
     }
 

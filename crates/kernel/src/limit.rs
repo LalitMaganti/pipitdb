@@ -20,12 +20,13 @@ impl<'c> Op<'c> for LimitOp {
     /// Its input's, less some rows. The sort just before, if any, only needs
     /// to output the rows read here.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = c.input(0).copy(c.allocator())?;
+        let mut out = *c.input(0);
         if let Some(sort) = out.open_sort {
             let read = self.count.saturating_add(self.offset);
             c.limit_sort(sort, u32::try_from(read).unwrap_or(u32::MAX));
         }
         out.drop_rows();
+        out.scan = None;
         Ok(out)
     }
 
