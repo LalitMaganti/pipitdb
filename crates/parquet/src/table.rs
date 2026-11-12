@@ -5,6 +5,11 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::condition::{Condition, Cutoff};
 use pipit_kernel::context::Context;
+use pipit_kernel::filter::{
+    self,
+    Comparison::{GreaterEqual, LessEqual},
+    Value,
+};
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::Scannable;
 use pipit_kernel::selection::{Kept, Selection};
@@ -85,46 +90,105 @@ impl<'a> Rows<'a> {
     }
 
     /// Resets `batch` and fills it with the next rows of the row group
-    /// started, or stops and returns false when none are left.
+    /// started, or stops and returns false when none are left. With a
+    /// `cutoff`, on the column at that index of `columns`, once a `TopK` has
+    /// published one it keeps only the rows that could come before it, and
+    /// skips batches with none, without reading the other columns' pages.
     fn next(
         &mut self,
         context: &mut Context,
         columns: &[(u32, Forms)],
+        cutoff: Option<(usize, Cutoff)>,
         batch: &mut RowBatch,
     ) -> Result<bool, Error> {
-        // A batch stays within each column's page, so pages are read whole.
-        let mut rows = u32::try_from(self.left).unwrap_or(u32::MAX).min(BATCH_ROWS_MAX);
-        for reader in self.readers.iter_mut() {
-            rows = rows.min(u32::try_from(reader.page_left(context)?).unwrap_or(u32::MAX));
-        }
-        if rows == 0 {
-            if self.left > 0 {
-                return Err(Error::Corrupt);
+        loop {
+            // A batch stays within each column's page, so pages are read whole.
+            let mut rows = u32::try_from(self.left).unwrap_or(u32::MAX).min(BATCH_ROWS_MAX);
+            for reader in self.readers.iter_mut() {
+                rows = rows.min(u32::try_from(reader.page_left(context)?).unwrap_or(u32::MAX));
             }
-            self.readers.retain(|_| false);
-            self.started = false;
-            return Ok(false);
-        }
-        batch.reset(rows);
-        for (reader, &(column, forms)) in self.readers.iter_mut().zip(columns) {
-            let view = if forms.contains(Forms::LAZY) {
-                // Where its rows are, for `load`: only counted here, so no
-                // page body is read.
-                let (header, row) = reader.place();
-                let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
-                let handle = Handle { file: self.file, group: self.group, column, row, header };
-                reader.pass(rows as usize);
-                ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
-            } else {
-                reader.read(context, rows as usize, forms)?
+            if rows == 0 {
+                if self.left > 0 {
+                    return Err(Error::Corrupt);
+                }
+                self.readers.retain(|_| false);
+                self.started = false;
+                return Ok(false);
+            }
+            self.left -= u64::from(rows);
+            batch.reset(rows);
+            let (file, group) = (self.file, self.group);
+            let tested = match (cutoff, context.cutoff()) {
+                (Some((c, cutoff)), Some(value)) => {
+                    let reader = at_mut!(self.readers, c);
+                    let &(column, forms) = at!(columns, c);
+                    let is_lazy = forms.contains(Forms::LAZY);
+                    let handle =
+                        is_lazy.then(|| lazy(context, reader, (file, group, column), rows));
+                    let handle = handle.transpose()?;
+                    let values = reader.read(context, rows as usize, Forms::FLAT)?;
+                    // Nulls sort first ascending, so they're kept, which
+                    // `compare` doesn't do.
+                    if cutoff.descending || !values.has_nulls() {
+                        let by = if cutoff.descending { GreaterEqual } else { LessEqual };
+                        filter::compare(
+                            &values,
+                            by,
+                            Value::Int64(value),
+                            batch.selection_mut(),
+                            None,
+                        );
+                    }
+                    Some((c, handle.unwrap_or(values)))
+                }
+                _ => None,
             };
-            let Ok(()) = batch.push_column(view) else {
-                pipit_kernel::failed!();
-            };
+            if batch.selection().is_empty() {
+                for (i, (reader, &(_, forms))) in self.readers.iter_mut().zip(columns).enumerate() {
+                    if tested.as_ref().is_some_and(|&(c, _)| c == i) {
+                        continue;
+                    }
+                    if forms.contains(Forms::LAZY) {
+                        reader.pass(rows as usize);
+                    } else {
+                        reader.skip(context, rows as usize)?;
+                    }
+                }
+                continue;
+            }
+            for (i, (reader, &(column, forms))) in self.readers.iter_mut().zip(columns).enumerate()
+            {
+                let view = match &tested {
+                    Some((c, view)) if *c == i => view.clone(),
+                    // Only counted, so no page body is read.
+                    _ if forms.contains(Forms::LAZY) => {
+                        let view = lazy(context, reader, (file, group, column), rows)?;
+                        reader.pass(rows as usize);
+                        view
+                    }
+                    _ => reader.read(context, rows as usize, forms)?,
+                };
+                let Ok(()) = batch.push_column(view) else {
+                    pipit_kernel::failed!();
+                };
+            }
+            return Ok(true);
         }
-        self.left -= u64::from(rows);
-        Ok(true)
     }
+}
+
+/// A lazy column of the next `rows` rows of `column`, of file and row group
+/// `at`, saying where they are for `load`: `reader` is left where it is.
+fn lazy(
+    context: &mut Context,
+    reader: &ChunkReader<'_>,
+    (file, group, column): (u32, u32, u32),
+    rows: u32,
+) -> Result<ColumnView, Error> {
+    let (header, row) = reader.place();
+    let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
+    let handle = Handle { file, group, column, row, header };
+    Ok(ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?)
 }
 
 /// A scan of a `ParquetTable` that reads only `groups`, by file and row
@@ -167,7 +231,11 @@ impl<'a> Source for Pruned<'a> {
                 }
                 rows.start(self.table, &self.columns, file, group)?;
             }
-            if rows.next(context, &self.columns, batch)? {
+            let cutoff = self.cutoff.and_then(|cutoff| {
+                let c = self.columns.iter().position(|&(column, _)| column == cutoff.column)?;
+                Some((c, cutoff))
+            });
+            if rows.next(context, &self.columns, cutoff, batch)? {
                 return Ok(true);
             }
         }
@@ -367,7 +435,7 @@ impl<'a> Scannable for ParquetTable<'a> {
                 state.rows.start(self, state.columns, state.file, state.group)?;
                 state.group += 1;
             }
-            if state.rows.next(context, state.columns, batch)? {
+            if state.rows.next(context, state.columns, None, batch)? {
                 return Ok(true);
             }
         }
@@ -597,6 +665,58 @@ mod tests {
         assert_eq!(ids(3000, 3000), [&middle[..], &middle[..]].concat());
         assert_eq!(ids(5000, i64::MAX), []);
         assert_eq!(ids(0, 4999).len(), 10000);
+    }
+
+    /// Counts the rows each batch keeps into its cell.
+    struct Rows<'c>(&'c core::cell::Cell<u32>);
+
+    impl pipit_kernel::step::Transform for Rows<'_> {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
+            self.0.set(self.0.get() + batch.selection().len());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn keeps_only_rows_before_a_top_k_cutoff() {
+        // The first 3 by `id` of two files whose row groups each hold `id`s 0
+        // to 2047, 2048 to 4095 and 4096 to 4999, and how many rows the scan
+        // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
+        // the third is skipped, and of the second file only 0, 1 and 2 kept.
+        let first = |publish: bool| {
+            use pipit_kernel::step::{DynTransform, Step};
+            let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+            let table = DynScannable::new(&Heap, table).unwrap();
+            let cutoff = publish.then_some(Cutoff { column: 0, descending: false });
+            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
+            let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
+            let keys = SlowVec::fixed_from(&Heap, keys.into_iter()).unwrap();
+            let kept = core::cell::Cell::new(0);
+            let steps = [
+                Step::Transform(DynTransform::new(&Heap, Rows(&kept)).unwrap()),
+                Step::Operator(pipit_kernel::top_k::top_k(&Heap, keys, 3, publish).unwrap()),
+            ];
+            let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).unwrap();
+            let pipeline = Pipeline::new(source, steps);
+            let query = QueryAllocators::new(&Heap);
+            let mut execution = pipeline.start(&query).unwrap();
+            let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
+            while execution.next(&mut batch).unwrap() {
+                let (selection, column) = (batch.selection(), batch.column(0));
+                let rows = (0..selection.len()).map(|i| selection.kept().row(i) as usize);
+                ids.extend(rows.map(|row| column.int64s()[row]));
+            }
+            drop(execution);
+            (ids, kept.get())
+        };
+        assert_eq!(first(false), ([0, 0, 1].into(), 10000));
+        assert_eq!(first(true), ([0, 0, 1].into(), 4096 + 3));
     }
 
     #[test]
