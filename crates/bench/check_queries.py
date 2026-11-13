@@ -65,7 +65,7 @@ def table(path):
 def main():
     suite, files = sys.argv[1], sys.argv[2:]
     queries = QUERIES[suite]
-    run = ["cargo", "run", "-q", "--profile", "speed", "-p", "pipitdb-bench", "--example", "suite", "--"]
+    run = ["cargo", "run", "-q", "--profile", "profiling", "-p", "pipitdb-bench", "--example", "suite", "--"]
     ours = subprocess.run(run + [str(queries)] + files, capture_output=True, text=True, check=True)
     # Each query that ran reports its time; one that failed, its error.
     errors = {}
