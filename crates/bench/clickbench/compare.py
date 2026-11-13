@@ -3,8 +3,8 @@
 so a change in the machine's load hits both, and prints each query's best
 time for each and the change.
 
-Build each with `cargo build --profile speed -p pipitdb-bench --example
-suite` and copy target/speed/examples/suite aside.
+Build each with `cargo build --profile profiling -p pipitdb-bench --example
+suite` and copy target/profiling/examples/suite aside.
 
 Usage: crates/bench/clickbench/compare.py BEFORE AFTER [--rounds N] FILE...
 """
