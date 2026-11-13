@@ -296,12 +296,7 @@ impl Store {
         if id.is_large_string() {
             return self.get_large_string(id) == str;
         }
-        let block = at!(self.blocks, id.block_index() as usize).as_slice::<u8>();
-        let offset = id.block_offset() as usize;
-        let Some(size) = at!(block, offset..).first_chunk::<4>() else { failed!() };
-        let start = offset + 4;
-        u32::from_ne_bytes(*size) as usize == str.len()
-            && block.get(start..start + str.len()) == Some(str)
+        self.block_string(id) == str
     }
 
     /// Starts loading the string whose id is `id`, unless it's null or large.
@@ -323,11 +318,20 @@ impl Store {
         if id.is_large_string() {
             return Some(self.get_large_string(id));
         }
+        Some(self.block_string(id))
+    }
+
+    /// The string whose id is `id`, one in a block. Its size is checked to
+    /// be in the block with one comparison, `offset + 4 <= len`.
+    #[inline]
+    fn block_string(&self, id: Id) -> &[u8] {
         let block = at!(self.blocks, id.block_index() as usize).as_slice::<u8>();
         let offset = id.block_offset() as usize;
-        let Some(size) = at!(block, offset..).first_chunk::<4>() else { failed!() };
         let start = offset + 4;
-        Some(at!(block, start..start + u32::from_ne_bytes(*size) as usize))
+        let Some(size) = block.get(offset..start).and_then(<[u8]>::first_chunk::<4>) else {
+            failed!()
+        };
+        at!(block, start..start + u32::from_ne_bytes(*size) as usize)
     }
 
     #[inline(never)]
