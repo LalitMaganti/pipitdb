@@ -38,7 +38,7 @@
   "predicate.or": 4624225,
   "query.typical": 831553,
   "scan.table": 178467,
-  "small.point": 37576,
+  "small.point": 36221,
   "small_planned.order": 478606,
   "small_planned.point": 4249,
   "string_pool_get.distinct": 240671,

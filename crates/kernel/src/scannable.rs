@@ -88,9 +88,10 @@ pub trait Scannable {
         Forms::FLAT
     }
 
-    /// The columns its rows are known to be sorted by, in order, each with
-    /// whether it descends, as a scan of it reads them. By default, none.
-    fn sorted_by(&self) -> &[(u32, bool)] {
+    /// The orders its rows are known to be in, as a scan of it reads them:
+    /// each the columns they're sorted by, in order, each with whether it
+    /// descends. By default, none.
+    fn sorted_by(&self) -> &[&[(u32, bool)]] {
         &[]
     }
 
@@ -134,6 +135,9 @@ type ScannableScanWithin<'a> = unsafe fn(
     &[Condition],
 ) -> Result<Option<DynSource<'a>>, AllocError>;
 
+/// The orders a scannable's rows are in, lent for as long as it lives.
+type ScannableSortedBy = unsafe fn(NonNull<()>) -> *const [&'static [(u32, bool)]];
+
 type ScannableNext =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, ErasedBatch) -> Result<bool, Error>;
 
@@ -159,7 +163,7 @@ pub struct DynScannable<'a> {
     next: ScannableNext,
     scan_within: ScannableScanWithin<'a>,
     forms: unsafe fn(NonNull<()>, u32) -> Forms,
-    sorted_by: unsafe fn(NonNull<()>) -> *const [(u32, bool)],
+    sorted_by: ScannableSortedBy,
     loader_layout: Layout,
     new_loader: NewState,
     drop_loader: unsafe fn(NonNull<u8>),
@@ -211,7 +215,14 @@ impl<'a> DynScannable<'a> {
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
             // SAFETY: as above.
-            sorted_by: |scannable| unsafe { value_of::<T>(scannable).sorted_by() },
+            sorted_by: |scannable| {
+                // SAFETY: as above. The orders live as long as the scannable,
+                // which is all `DynScannable::sorted_by` lends them for.
+                let orders: &[&[(u32, bool)]] = unsafe { value_of::<T>(scannable).sorted_by() };
+                #[expect(clippy::unnecessary_cast, reason = "it erases the orders' lifetime")]
+                let orders = core::ptr::from_ref(orders) as *const [&'static [(u32, bool)]];
+                orders
+            },
             loader_layout: Layout::new::<T::Loader>(),
             // SAFETY: as above.
             new_loader: |scannable, context, loader| unsafe {
@@ -250,8 +261,8 @@ impl<'a> DynScannable<'a> {
         unsafe { (self.forms)(self.scannable.as_ptr(), column) }
     }
 
-    /// The columns its rows are known to be sorted by, in order.
-    pub fn sorted_by(&self) -> &[(u32, bool)] {
+    /// The orders its rows are known to be in.
+    pub fn sorted_by(&self) -> &[&[(u32, bool)]] {
         // SAFETY: as above, and the keys live as long as the scannable.
         unsafe { &*(self.sorted_by)(self.scannable.as_ptr()) }
     }
