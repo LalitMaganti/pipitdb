@@ -1,8 +1,8 @@
 //! `LogicalPlan`: what a query does, as Perfetto's: a tree of operations over
 //! columns named by id, independent of how batches lay them out. Frontends
-//! build one; `lower` plans it, asking each operation what it needs of its
-//! inputs and what it outputs, then turns it into a pipeline, asking each to
-//! lower itself, so extensions can add operations.
+//! build one; `plan_nodes` plans it, asking each operation what it needs of
+//! its inputs and what it outputs, then `lower` turns it into a pipeline,
+//! asking each to lower itself, so extensions can add operations.
 
 use core::marker::PhantomData;
 use core::ptr::NonNull;
@@ -49,9 +49,9 @@ pub struct NamedColumn {
 /// to lower itself.
 pub trait Op<'c> {
     /// What this needs of the rows of input `input`. By default, nothing.
-    fn needs(&self, input: u32) -> InputNeeds<'_> {
+    fn needs(&self, allocator: &dyn Allocator, input: u32) -> Result<InputNeeds<'_>, AllocError> {
         let _ = input;
-        InputNeeds::default()
+        InputNeeds::none(allocator)
     }
 
     /// What is known of this node's output, given its inputs' needs are met.
@@ -179,7 +179,8 @@ pub struct DynOp<'c> {
 
 /// An op type's functions: one table for each type, which its ops share.
 struct OpFunctions<'c> {
-    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
+    needs:
+        for<'n> unsafe fn(&'n DynOp<'c>, &dyn Allocator, u32) -> Result<InputNeeds<'n>, AllocError>,
     derive: for<'p> unsafe fn(
         NonNull<()>,
         &mut DeriveContext<'p, 'c>,
@@ -206,7 +207,9 @@ struct Functions<'c, T>(PhantomData<(&'c (), T)>);
 impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
     const TABLE: OpFunctions<'c> = OpFunctions {
         // SAFETY: only called with this op, which outlives what it returns.
-        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
+        needs: |op, allocator, input| unsafe {
+            value_of::<T>(op.op.as_ptr()).needs(allocator, input)
+        },
         // SAFETY: only called with this op.
         derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
         // SAFETY: as for `derive`.
@@ -244,9 +247,13 @@ impl<'c> DynOp<'c> {
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
     }
 
-    pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
+    pub(crate) fn needs(
+        &self,
+        allocator: &dyn Allocator,
+        input: u32,
+    ) -> Result<InputNeeds<'_>, AllocError> {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.needs)(self, input) }
+        unsafe { (self.functions.needs)(self, allocator, input) }
     }
 
     pub(crate) fn derive(
@@ -428,10 +435,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Its columns, in order, and the order the scannable says its rows are
     /// in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
-    fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(column.binding.id)?;
+            out.push_column(c.column_of(column.binding.id))?;
         }
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);

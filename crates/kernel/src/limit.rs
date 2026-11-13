@@ -22,8 +22,8 @@ impl<'c> Op<'c> for LimitOp {
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = *c.input(0);
         if let Some(sort) = out.open_sort {
-            let read = self.count.saturating_add(self.offset);
-            c.limit_sort(sort, u32::try_from(read).unwrap_or(u32::MAX));
+            let read = u64::from(clamp(self.count)) + u64::from(clamp(self.offset));
+            c.limit_sort(sort, clamp(read));
         }
         out.drop_rows();
         Ok(out)
@@ -37,8 +37,7 @@ impl<'c> Op<'c> for LimitOp {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
         // A sort which outputs only the rows read here leaves nothing to drop.
-        let kept = lowering.query_sort_keep().map(u64::from);
-        if self.offset == 0 && kept == Some(self.count) {
+        if self.offset == 0 && lowering.query_sort_keep() == Some(clamp(self.count)) {
             return Ok(());
         }
         let limit = Limit { count: self.count, offset: self.offset };
@@ -51,6 +50,11 @@ impl<'c> Op<'c> for LimitOp {
     }
 
     fn reads(&self, _: &mut Needed) {}
+}
+
+/// Batches count rows in `u32`, so more than that many is as good as all.
+fn clamp(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 /// Drops the first `offset` rows, then keeps up to `count` rows, in order, by

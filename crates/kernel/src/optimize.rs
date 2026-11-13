@@ -84,20 +84,17 @@ pub fn prune_columns(
             pending.push((child, Some((id, slot))))?;
         }
     }
-    remove_unreachable_nodes(allocator, plan)
+    remove_unreachable_nodes(plan);
+    Ok(())
 }
 
 /// Removes the nodes pruning left unread, so nothing after it can reach
 /// them. Inputs come before what reads them, which removing nodes keeps
 /// true.
-fn remove_unreachable_nodes(
-    allocator: &dyn Allocator,
-    plan: &mut LogicalPlan<'_>,
-) -> Result<(), AllocError> {
-    let count = plan.nodes.len();
-    let mut reachable = SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))?;
+fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
+    let mut reachable = [false; PLAN_NODES_MAX];
     *at_mut!(reachable, plan.root as usize) = true;
-    for id in (0..count).rev() {
+    for id in (0..plan.nodes.len()).rev() {
         if *at!(reachable, id) {
             for &child in at!(plan.nodes, id).children.iter() {
                 check!((child as usize) < id);
@@ -105,13 +102,13 @@ fn remove_unreachable_nodes(
             }
         }
     }
-    let mut new_ids = SlowVec::fixed_from(allocator, core::iter::repeat_n(0, count))?;
+    let mut new_ids = [0; PLAN_NODES_MAX];
     let mut kept: PlanNodeId = 0;
-    for id in 0..count {
+    for (id, node) in plan.nodes.iter_mut().enumerate() {
         if !*at!(reachable, id) {
             continue;
         }
-        for child in at_mut!(plan.nodes, id).children.iter_mut() {
+        for child in node.children.iter_mut() {
             *child = *at!(new_ids, *child as usize);
         }
         *at_mut!(new_ids, id) = kept;
@@ -123,7 +120,6 @@ fn remove_unreachable_nodes(
         *at!(reachable, id - 1)
     });
     plan.root = *at!(new_ids, plan.root as usize);
-    Ok(())
 }
 
 /// Each node's parent, and which of its children it is; `None` for the

@@ -9,6 +9,7 @@ use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
+use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
@@ -183,7 +184,8 @@ pub fn run(pipeline: &Pipeline) -> u64 {
 pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
     let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
     optimize(&Heap, &mut plan).ok()?;
-    lower(&Heap, &plan).ok()
+    let planned = plan_nodes(&Heap, &plan).ok()?;
+    lower(&Heap, &plan, &planned).ok()
 }
 
 /// Plans and runs `query` over `catalog`, as an embedder would each query,
