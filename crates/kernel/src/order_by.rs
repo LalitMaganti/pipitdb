@@ -1,6 +1,5 @@
 //! `OrderByOp`: its child's rows sorted by keys, as `ORDER BY` does.
 
-use crate::allocator::{AllocError, Allocator};
 use crate::lower::{self, LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
@@ -16,10 +15,9 @@ pub struct OrderByOp {
 }
 
 impl<'c> Op<'c> for OrderByOp {
-    fn needs(&self, allocator: &dyn Allocator, _: u32) -> Result<InputNeeds<'_>, AllocError> {
-        let mut needs = InputNeeds::none(allocator)?;
-        needs.arranged = Some(Arranged { grouped_by: &[], sorted_by: &self.keys });
-        Ok(needs)
+    fn needs(&self, _: u32) -> InputNeeds<'_> {
+        let arranged = Some(Arranged { grouped_by: &[], sorted_by: &self.keys });
+        InputNeeds { arranged, ..InputNeeds::NONE }
     }
 
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {

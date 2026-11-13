@@ -2,13 +2,12 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
-use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties, Type};
+use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::Step;
@@ -62,13 +61,12 @@ pub struct AggregateOp {
 
 impl<'c> Op<'c> for AggregateOp {
     /// What its aggregates read must be `Int64`.
-    fn needs(&self, allocator: &dyn Allocator, _: u32) -> Result<InputNeeds<'_>, AllocError> {
-        let mut needs = InputNeeds::none(allocator)?;
-        needs.types_then = SlowVec::fixed(allocator, self.aggregates.len())?;
+    fn needs(&self, _: u32) -> InputNeeds<'_> {
+        let mut needs = InputNeeds::NONE;
         for column in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
-            needs.types_then.push(Type { column, data_type: DataType::Int64 })?;
+            needs.types_then.push(column, DataType::Int64);
         }
-        Ok(needs)
+        needs
     }
 
     /// A row per group: its keys, then its aggregates. Groups are output in

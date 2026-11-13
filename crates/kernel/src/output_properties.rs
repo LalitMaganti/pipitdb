@@ -40,7 +40,7 @@ impl Arrangement {
 
 /// The most keys an arrangement has: one with more isn't kept, as knowing
 /// less of the order is always safe.
-const ARRANGEMENT_KEYS_MAX: usize = 8;
+pub(crate) const ARRANGEMENT_KEYS_MAX: usize = 8;
 
 /// The most arrangements rows are known to have at once.
 const ARRANGEMENTS_MAX: usize = 1 << 4;
@@ -94,13 +94,19 @@ pub struct Column {
     pub data_type: DataType,
 }
 
-/// The most recent sort, while nothing has read its order, and what was
-/// known before it: it can still be undone.
+/// The most recent sort, while nothing has read its order: it can still be
+/// undone. What was known before it is kept in its step.
 #[derive(Clone, Copy)]
 pub struct OpenSort {
-    node: PlanNodeId,
-    input: u32,
-    step: usize,
+    pub node: PlanNodeId,
+    pub input: u32,
+    pub step: usize,
+}
+
+/// Whether `a` holds the same columns as `b`, as often each.
+fn is_permutation(a: &[ColumnId], b: &[ColumnId]) -> bool {
+    let count = |list: &[ColumnId], column| list.iter().filter(|&&c| c == column).count();
+    a.len() == b.len() && b.iter().all(|&column| count(a, column) == count(b, column))
 }
 
 /// What is known about the batches a node outputs: their columns and types,
@@ -110,6 +116,7 @@ pub struct OpenSort {
 pub struct OutputProperties {
     /// The columns of a batch, in order: the first `column_count` of these.
     columns: [Column; BATCH_COLUMNS_MAX as usize],
+    /// How many of `columns` there are.
     column_count: u32,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
@@ -152,6 +159,7 @@ impl OutputProperties {
         let Some(position) = self.position_of(column) else { failed!() };
         at!(self.columns, position as usize).data_type
     }
+
     /// Whether the rows are grouped by `keys`, and each group sorted by
     /// `sorted_by`. Sorting by some keys first also groups by them, and a
     /// sort key on a grouped column is the same within a group, so means
@@ -168,13 +176,17 @@ impl OutputProperties {
             let grouped = |column| arrangement.grouped_by().any(|by| by == column);
             let mut sorted = arrangement.sorted_by().iter().filter(|key| !grouped(key.column));
             // Sort keys on the rest of `keys` group by them too.
-            let mut covered = usize::from(arrangement.grouped);
+            let mut missing = [0; ARRANGEMENT_KEYS_MAX];
+            let mut len = 0;
+            for column in arrangement.grouped_by() {
+                (*at_mut!(missing, len), len) = (column, len + 1);
+            }
             let mut next = sorted.next();
-            while next.is_some_and(|key| keys.contains(&key.column)) {
-                covered += 1;
+            while let Some(key) = next.filter(|key| keys.contains(&key.column)) {
+                (*at_mut!(missing, len), len) = (key.column, len + 1);
                 next = sorted.next();
             }
-            if covered != keys.len() {
+            if !is_permutation(at!(missing, ..len), keys) {
                 continue;
             }
             for want in wanted() {
@@ -223,35 +235,61 @@ pub struct Arranged<'a> {
     pub sorted_by: &'a [SortKey],
 }
 
+/// Columns to hold types: the first `len` of these. Each is a column of the
+/// input, needed as one type, so there are at most as many as a batch has
+/// columns.
+#[derive(Clone, Copy)]
+pub struct Types {
+    list: [Type; BATCH_COLUMNS_MAX as usize],
+    len: usize,
+}
+
+impl Types {
+    pub const NONE: Types = Types {
+        list: [Type { column: 0, data_type: DataType::Int64 }; BATCH_COLUMNS_MAX as usize],
+        len: 0,
+    };
+
+    /// Adds that `column` must hold `data_type`, unless that's known.
+    pub fn push(&mut self, column: ColumnId, data_type: DataType) {
+        let need = Type { column, data_type };
+        if self.known().iter().any(|known| known.column == column && known.data_type == data_type) {
+            return;
+        }
+        *at_mut!(self.list, self.len) = need;
+        self.len += 1;
+    }
+
+    fn known(&self) -> &[Type] {
+        at!(self.list, ..self.len)
+    }
+}
+
 /// What a node needs of the rows of one of its inputs. All of it is
 /// optional, and it is met in the order of these fields.
+#[derive(Clone, Copy)]
 pub struct InputNeeds<'a> {
-    pub types_first: SlowVec<Type>,
     pub arranged: Option<Arranged<'a>>,
-    pub types_then: SlowVec<Type>,
+    pub types_then: Types,
 }
 
 impl InputNeeds<'_> {
     /// Nothing.
-    pub fn none(allocator: &dyn Allocator) -> Result<InputNeeds<'static>, AllocError> {
-        Ok(InputNeeds {
-            types_first: SlowVec::fixed(allocator, 0)?,
-            arranged: None,
-            types_then: SlowVec::fixed(allocator, 0)?,
-        })
-    }
+    pub const NONE: InputNeeds<'static> = InputNeeds { arranged: None, types_then: Types::NONE };
 }
 
 /// What it takes for an input to meet a node's needs, each step run in order
 /// before the node reads the input.
 pub enum InputStep {
     /// Sorts the rows by `keys`. Only the first `keep` rows in order are
-    /// read, if given.
+    /// read, if given. `unsorted` is what was known of the rows before it,
+    /// to undo it.
     Sort { keys: SlowVec<SortKey>, keep: Option<u32>, unsorted: Arrangements },
 }
 
 /// One input of a node, once planned.
 pub struct PlannedInput {
+    /// What runs on the input, in order, before the node reads it.
     pub steps: SlowVec<InputStep>,
     /// What is known of the rows after `steps`.
     pub rows: OutputProperties,
@@ -266,22 +304,17 @@ pub struct PlannedNode {
 /// By node, what's decided about it.
 pub type Planned = SlowVec<PlannedNode>;
 
-/// The most steps planned for one input.
-const INPUT_STEPS_MAX: usize = 1 << 2;
+/// The most steps planned for one input: only a sort, so far.
+const INPUT_STEPS_MAX: usize = 1;
 
 /// What an op derives its output from.
 pub struct DeriveContext<'p, 'c> {
     plan: &'p LogicalPlan<'c>,
-    allocator: &'p dyn Allocator,
     planned: &'p mut Planned,
     self_: PlanNodeId,
 }
 
-impl<'p> DeriveContext<'p, '_> {
-    pub fn allocator(&self) -> &'p dyn Allocator {
-        self.allocator
-    }
-
+impl DeriveContext<'_, '_> {
     /// What is known of input `i` once its needs are met.
     pub fn input(&self, i: u32) -> &OutputProperties {
         &at!(at!(self.planned, self.self_ as usize).inputs, i as usize).rows
@@ -308,42 +341,20 @@ impl<'p> DeriveContext<'p, '_> {
     }
 }
 
-/// The step that `sort` is.
-pub fn sort_step(planned: &Planned, sort: OpenSort) -> &InputStep {
-    at!(at!(at!(planned, sort.node as usize).inputs, sort.input as usize).steps, sort.step)
-}
-
 /// Works out how one input of a node meets the node's needs.
 struct InputPlanner<'p> {
     allocator: &'p dyn Allocator,
-    planned: &'p mut Planned,
     node: PlanNodeId,
     input: u32,
-    out: PlannedInput,
+    out: &'p mut PlannedInput,
 }
 
-impl<'p> InputPlanner<'p> {
-    fn new(
-        allocator: &'p dyn Allocator,
-        planned: &'p mut Planned,
-        node: PlanNodeId,
-        input: u32,
-        rows: &OutputProperties,
-    ) -> Result<InputPlanner<'p>, AllocError> {
-        let out = PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows: *rows };
-        Ok(InputPlanner { allocator, planned, node, input, out })
-    }
-
-    fn meet(&mut self, needs: &InputNeeds) -> Result<(), LowerError> {
-        self.types(&needs.types_first)?;
+impl InputPlanner<'_> {
+    fn meet(&mut self, planned: &mut Planned, needs: &InputNeeds) -> Result<(), LowerError> {
         if let Some(arranged) = needs.arranged {
-            self.arrange(arranged.grouped_by, arranged.sorted_by)?;
+            self.arrange(planned, arranged.grouped_by, arranged.sorted_by)?;
         }
-        self.types(&needs.types_then)
-    }
-
-    fn take(self) -> PlannedInput {
-        self.out
+        self.types(needs.types_then.known())
     }
 
     fn types(&self, types: &[Type]) -> Result<(), LowerError> {
@@ -360,9 +371,14 @@ impl<'p> InputPlanner<'p> {
         Ok(())
     }
 
-    fn arrange(&mut self, keys: &[ColumnId], sorted_by: &[SortKey]) -> Result<(), AllocError> {
+    fn arrange(
+        &mut self,
+        planned: &mut Planned,
+        keys: &[ColumnId],
+        sorted_by: &[SortKey],
+    ) -> Result<(), AllocError> {
         if self.out.rows.is_arranged(keys, sorted_by)
-            || (self.drop_open_sort() && self.out.rows.is_arranged(keys, sorted_by))
+            || (self.drop_open_sort(planned) && self.out.rows.is_arranged(keys, sorted_by))
         {
             return Ok(());
         }
@@ -371,12 +387,13 @@ impl<'p> InputPlanner<'p> {
         self.sort(sorted_by)
     }
 
-    fn drop_open_sort(&mut self) -> bool {
+    fn drop_open_sort(&mut self, planned: &mut Planned) -> bool {
         let rows = &mut self.out.rows;
         let Some(sort) = rows.open_sort.take() else { return false };
-        let steps =
-            &mut at_mut!(at_mut!(self.planned, sort.node as usize).inputs, sort.input as usize)
-                .steps;
+        // What was planned between the sort and here still says it's open, as
+        // in Perfetto: only a LIMIT reads that, and it drops the open sort.
+        let node = at_mut!(planned, sort.node as usize);
+        let steps = &mut at_mut!(node.inputs, sort.input as usize).steps;
         // Only sorts are planned so far, and nothing after a sort before its
         // order is read, so it's the last step.
         check!(sort.step + 1 == steps.len());
@@ -425,16 +442,57 @@ fn plan_node_inputs(
 ) -> Result<(), LowerError> {
     let node = at!(plan.nodes, id as usize);
     let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
-    for (i, &child) in (0..).zip(node.children.iter()) {
+    for &child in node.children.iter() {
         check!(child < id);
         let rows = at!(planned, child as usize).output;
-        let mut input = InputPlanner::new(allocator, planned, id, i, &rows)?;
-        input.meet(&node.op.needs(allocator, i)?)?;
-        inputs.push(input.take())?;
+        inputs.push(PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows })?;
+    }
+    for (i, out) in (0..).zip(inputs.iter_mut()) {
+        let mut input = InputPlanner { allocator, node: id, input: i, out };
+        input.meet(planned, &node.op.needs(i))?;
     }
     planned.push(PlannedNode { inputs, output: OutputProperties::NONE })?;
-    let mut derive = DeriveContext { plan, allocator, planned, self_: id };
+    let mut derive = DeriveContext { plan, planned, self_: id };
     let output = node.op.derive(&mut derive)?;
     at_mut!(planned, id as usize).output = output;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+
+    #[test]
+    fn keeps_the_start_of_sorts_too_long_to_hold() {
+        let mut rows = OutputProperties::NONE;
+        let key = |column| SortKey { column, descending: false };
+        let sorted_by: Vec<SortKey> = (0..10).map(key).collect();
+        rows.arrangements.push(&[10], &sorted_by);
+        assert!(rows.is_arranged(&[10], &sorted_by[..7]));
+        assert!(!rows.is_arranged(&[10], &sorted_by[..8]));
+        // Grouping by too many keys says nothing of grouping by fewer.
+        let keys: Vec<ColumnId> = (0..9).collect();
+        rows.arrangements.push(&keys, &[]);
+        assert!(!rows.is_arranged(&keys[..8], &[]));
+    }
+
+    #[test]
+    fn groups_only_by_the_keys_asked_for() {
+        let mut rows = OutputProperties::NONE;
+        let key = |column| SortKey { column, descending: false };
+        // Two keys on one column group by it once, not by two columns.
+        rows.arrangements.push(&[], &[key(0), key(0)]);
+        assert!(!rows.is_arranged(&[0, 1], &[]));
+    }
+
+    #[test]
+    fn needs_each_type_of_a_column_once() {
+        let mut types = Types::NONE;
+        for _ in 0..2 * BATCH_COLUMNS_MAX {
+            types.push(0, DataType::Int64);
+        }
+        assert_eq!(types.known().len(), 1);
+    }
 }

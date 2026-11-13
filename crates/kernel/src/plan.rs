@@ -15,7 +15,7 @@ use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering, SortKey};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
+use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate};
 use crate::scannable::DynScannable;
 use crate::slow_vec::SlowVec;
@@ -49,9 +49,9 @@ pub struct NamedColumn {
 /// to lower itself.
 pub trait Op<'c> {
     /// What this needs of the rows of input `input`. By default, nothing.
-    fn needs(&self, allocator: &dyn Allocator, input: u32) -> Result<InputNeeds<'_>, AllocError> {
+    fn needs(&self, input: u32) -> InputNeeds<'_> {
         let _ = input;
-        InputNeeds::none(allocator)
+        InputNeeds::NONE
     }
 
     /// What is known of this node's output, given its inputs' needs are met.
@@ -179,8 +179,8 @@ pub struct DynOp<'c> {
 
 /// An op type's functions: one table for each type, which its ops share.
 struct OpFunctions<'c> {
-    needs:
-        for<'n> unsafe fn(&'n DynOp<'c>, &dyn Allocator, u32) -> Result<InputNeeds<'n>, AllocError>,
+    // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
+    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
         NonNull<()>,
         &mut DeriveContext<'p, 'c>,
@@ -207,9 +207,7 @@ struct Functions<'c, T>(PhantomData<(&'c (), T)>);
 impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
     const TABLE: OpFunctions<'c> = OpFunctions {
         // SAFETY: only called with this op, which outlives what it returns.
-        needs: |op, allocator, input| unsafe {
-            value_of::<T>(op.op.as_ptr()).needs(allocator, input)
-        },
+        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: only called with this op.
         derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
         // SAFETY: as for `derive`.
@@ -247,13 +245,9 @@ impl<'c> DynOp<'c> {
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
     }
 
-    pub(crate) fn needs(
-        &self,
-        allocator: &dyn Allocator,
-        input: u32,
-    ) -> Result<InputNeeds<'_>, AllocError> {
+    pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.needs)(self, allocator, input) }
+        unsafe { (self.functions.needs)(self, input) }
     }
 
     pub(crate) fn derive(
@@ -402,12 +396,24 @@ impl<'c> LogicalPlan<'c> {
         self.root = id;
         Ok(id)
     }
+
+    /// The id of `node`, one of this plan's nodes.
+    pub fn id_of(&self, node: &PlanNode<'c>) -> PlanNodeId {
+        let offset = core::ptr::from_ref(node).addr() - self.nodes.as_ptr().addr();
+        let id = offset / size_of::<PlanNode<'c>>();
+        check!(id < self.nodes.len());
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let id = id as PlanNodeId;
+        id
+    }
 }
 
 /// Reads the rows of a scannable, binding the columns in `columns`, maybe
 /// skipping some failing `conditions`.
 pub struct ScanOp<'c> {
+    /// What it reads.
     scannable: &'c DynScannable<'c>,
+    /// The scannable's columns it reads, and what each is bound to.
     columns: SlowVec<ScanColumn>,
     /// Conditions the plan pushed down from filters above, if any, which the
     /// scannable may use to skip: the filters still test every row.
@@ -444,7 +450,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
             let read = self.columns.iter().find(|read| read.column == column);
             read.map(|read| SortKey { column: read.binding.id, descending })
         };
-        let mut sorted = [SortKey { column: 0, descending: false }; 8];
+        let mut sorted = [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX];
         let mut len = 0;
         for (slot, key) in sorted.iter_mut().zip(self.scannable.sorted_by().iter().map_while(read))
         {
