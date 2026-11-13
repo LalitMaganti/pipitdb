@@ -84,6 +84,45 @@ pub fn prune_columns(
             pending.push((child, Some((id, slot))))?;
         }
     }
+    remove_unreachable_nodes(allocator, plan)
+}
+
+/// Removes the nodes pruning left unread, so nothing after it can reach
+/// them. Inputs come before what reads them, which removing nodes keeps
+/// true.
+fn remove_unreachable_nodes(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    let count = plan.nodes.len();
+    let mut reachable = SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))?;
+    *at_mut!(reachable, plan.root as usize) = true;
+    for id in (0..count).rev() {
+        if *at!(reachable, id) {
+            for &child in at!(plan.nodes, id).children.iter() {
+                check!((child as usize) < id);
+                *at_mut!(reachable, child as usize) = true;
+            }
+        }
+    }
+    let mut new_ids = SlowVec::fixed_from(allocator, core::iter::repeat_n(0, count))?;
+    let mut kept: PlanNodeId = 0;
+    for id in 0..count {
+        if !*at!(reachable, id) {
+            continue;
+        }
+        for child in at_mut!(plan.nodes, id).children.iter_mut() {
+            *child = *at!(new_ids, *child as usize);
+        }
+        *at_mut!(new_ids, id) = kept;
+        kept += 1;
+    }
+    let mut id = 0;
+    plan.nodes.retain(|_| {
+        id += 1;
+        *at!(reachable, id - 1)
+    });
+    plan.root = *at!(new_ids, plan.root as usize);
     Ok(())
 }
 
@@ -230,7 +269,8 @@ pub fn choose_forms(
     }
     // One op loads the columns one node made lazy that are loaded at one
     // place.
-    for (i, &(maker, load, ..)) in lazy.iter().enumerate() {
+    for i in 0..lazy.len() {
+        let (maker, load, ..) = *at!(lazy, i);
         let same = |&&(m, l, ..): &&(usize, Load, ColumnId, Forms)| (m, l) == (maker, load);
         if at!(lazy, ..i).iter().any(|entry| same(&entry)) {
             continue;
@@ -245,16 +285,46 @@ pub fn choose_forms(
             Load::AtRoot | Load::Never => plan.root,
         };
         let children = SlowVec::fixed_from(allocator, core::iter::once(below))?;
+        // Just before what reads it, so inputs still come before their readers.
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
-        let id = plan.nodes.len() as PlanNodeId;
-        plan.nodes.push(PlanNode { op, children })?;
+        let id = match load {
+            Load::Below(parent, _) => parent,
+            Load::AtRoot | Load::Never => plan.nodes.len() as PlanNodeId,
+        };
+        insert_node(plan, id, PlanNode { op, children })?;
+        for (maker, load, ..) in lazy.iter_mut() {
+            *maker += usize::from(*maker >= id as usize);
+            if let Load::Below(parent, _) = load {
+                *parent += PlanNodeId::from(*parent >= id);
+            }
+        }
         match load {
             Load::Below(parent, slot) => {
-                *at_mut!(at_mut!(plan.nodes, parent as usize).children, slot) = id;
+                *at_mut!(at_mut!(plan.nodes, parent as usize + 1).children, slot) = id;
             }
             Load::AtRoot | Load::Never => plan.root = id,
         }
     }
+    Ok(())
+}
+
+/// Adds `node` to `plan` as node `id`, moving the nodes from `id` on up one.
+fn insert_node<'c>(
+    plan: &mut LogicalPlan<'c>,
+    id: PlanNodeId,
+    node: PlanNode<'c>,
+) -> Result<(), AllocError> {
+    plan.nodes.push(node)?;
+    at_mut!(plan.nodes, id as usize..).rotate_right(1);
+    let moved = |node: PlanNodeId| if node >= id { node + 1 } else { node };
+    for (at, node) in plan.nodes.iter_mut().enumerate() {
+        if at != id as usize {
+            for child in node.children.iter_mut() {
+                *child = moved(*child);
+            }
+        }
+    }
+    plan.root = moved(plan.root);
     Ok(())
 }
 
