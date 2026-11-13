@@ -12,9 +12,12 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::lower::lower;
+use pipit_kernel::optimize::optimize;
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
+use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
@@ -23,7 +26,7 @@ static REGISTRY: Registry =
     Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION]);
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::RowBatch;
-use pipit_kernel::scannable::Scannable;
+use pipit_kernel::scannable::{Catalog, DynScannable, Scannable};
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::spill::{Block, LogId, SpillStore, read_column, write_column};
 
@@ -217,6 +220,53 @@ pub unsafe extern "C" fn parquet_rows(data: *const u8, len: usize) -> usize {
         rows += batch.row_count() as usize;
     }
     rows
+}
+
+/// The Parquet table a query reads as `hits`.
+struct Hits<'a>(DynScannable<'a>);
+
+impl Catalog for Hits<'_> {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        (name == "hits").then_some(&self.0)
+    }
+}
+
+/// How many rows `query`, of `query_len` bytes, outputs over the Parquet file
+/// in `len` bytes from `data` as `hits`, or `u32::MAX` if it fails.
+///
+/// # Safety
+///
+/// `data` must be valid for `len` bytes, and `query` for `query_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn query_rows(
+    data: *const u8,
+    len: usize,
+    query: *const u8,
+    query_len: usize,
+) -> u32 {
+    // SAFETY: guaranteed by the caller.
+    let (bytes, query): (&[u8], &[u8]) = unsafe {
+        (core::slice::from_raw_parts(data, len), core::slice::from_raw_parts(query, query_len))
+    };
+    let Ok(table) = ParquetTable::open(&Heap, &Uncompressed, &[&bytes]) else { return u32::MAX };
+    let Ok(table) = DynScannable::new(&Heap, table) else { return u32::MAX };
+    let hits = Hits(table);
+    let Ok(mut plan) = compile(&Heap, &REGISTRY, &hits, query) else { return u32::MAX };
+    if optimize(&Heap, &mut plan).is_err() {
+        return u32::MAX;
+    }
+    let Ok(physical) = lower(&Heap, &plan) else { return u32::MAX };
+    let allocators = QueryAllocators::new(&Heap);
+    let Ok(mut execution) = physical.pipeline().start(&allocators) else { return u32::MAX };
+    let mut batch = RowBatch::new();
+    let mut rows = 0;
+    loop {
+        match execution.next(&mut batch) {
+            Ok(true) => rows += batch.selection().len(),
+            Ok(false) => return rows,
+            Err(_) => return u32::MAX,
+        }
+    }
 }
 
 /// Pushes `0..count` to a `SlowVec`, and returns the last.
