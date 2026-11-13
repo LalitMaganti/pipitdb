@@ -32,7 +32,7 @@ const METADATA_BYTES: usize = 5;
 
 /// The most slots an index has while it's taken to fit in cache: 512 KB of
 /// them, as a core's L2.
-const CACHED_SLOTS: usize = 1 << 15;
+pub(crate) const CACHED_SLOTS: usize = 1 << 15;
 
 /// The number of the null string, which has none.
 pub const NO_NUMBER: u32 = u32::MAX;

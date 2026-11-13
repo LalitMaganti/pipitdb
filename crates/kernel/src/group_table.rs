@@ -8,10 +8,11 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
 use crate::error::Error;
+use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
-use crate::string_pool::{Id, NO_NUMBER};
+use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -30,6 +31,11 @@ const GROUP_BITS: u32 = 27;
 /// The slot that `hash` starts probing from, out of `slots`, a power of two.
 /// It's picked by the hash's top bits, which a slot stores, so growing the
 /// table doesn't need to hash any key again.
+/// How many rows ahead `find_values` fetches a row's slot, and its group's
+/// record.
+const SLOT_AHEAD: usize = 16;
+const RECORD_AHEAD: usize = 8;
+
 #[inline]
 fn slot_of(hash: u64, slots: usize) -> usize {
     #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
@@ -251,10 +257,27 @@ impl GroupTable {
 
     /// As `find_or_create`, for a single key with no nulls: compares the key
     /// values directly.
-    #[inline(never)]
     fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
-        for (&key, group) in keys.iter().zip(groups) {
+        // `prefetch` does nothing on other targets, so they don't look ahead.
+        // A table too big for the cache misses it twice a row, for its slot
+        // and then its group's record, so both are fetched ahead.
+        let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
+        for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
+            if ahead {
+                if let Some(&next) = keys.get(i + SLOT_AHEAD) {
+                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
+                    prefetch(self.slots.as_ptr().wrapping_add(at));
+                }
+                if let Some(&next) = keys.get(i + RECORD_AHEAD) {
+                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
+                    let slot = *at!(self.slots, at);
+                    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+                    let group = (slot & !salt(slot)) as usize;
+                    let record = group.wrapping_sub(1) * self.stride;
+                    prefetch(self.records.as_ptr().wrapping_add(record));
+                }
+            }
             let hash = mix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
