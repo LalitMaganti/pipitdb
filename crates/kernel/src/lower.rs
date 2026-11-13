@@ -118,14 +118,14 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     fn apply(&mut self, step: &InputStep) -> Result<(), LowerError> {
-        let InputStep::Sort { keys, keep, .. } = step;
+        let InputStep::Sort { keys, keep, publish, .. } = step;
         let keys = keys.iter().map(|key| crate::sort::SortKey {
             column: self.query_position(key.column),
             descending: key.descending,
         });
         let keys = SlowVec::fixed_from(self.allocator, keys)?;
         let operator = match *keep {
-            Some(count) => top_k(self.allocator, keys, count)?,
+            Some(count) => top_k(self.allocator, keys, count, *publish)?,
             None => sort(self.allocator, keys)?,
         };
         self.add_operator(Step::Operator(operator))
@@ -139,6 +139,12 @@ impl<'p, 'c> Lowering<'p, 'c> {
         let InputStep::Sort { keep, .. } =
             at!(at!(node.inputs, sort.input as usize).steps, sort.step);
         *keep
+    }
+
+    /// For `node`, a scan, the column a `TopK` above publishes a cutoff on,
+    /// if any.
+    pub fn query_cutoff(&self, node: &PlanNode<'c>) -> Option<SortKey> {
+        at!(self.planned, self.plan.id_of(node) as usize).cutoff
     }
 
     /// What is known of the rows the steps added so far output.
@@ -201,14 +207,14 @@ mod tests {
     use crate::allocator::{AllocError, Allocator, Heap};
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType, Forms};
-    use crate::condition::Condition;
+    use crate::condition::{Condition, Cutoff};
     use crate::context::Context;
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
     use crate::output_properties::{DeriveContext, OutputProperties};
-    use crate::plan::{ColumnId, DynOp, FilterOp, Op, PlanNode, ScanColumn, ScanOp};
+    use crate::plan::{ColumnId, DynOp, FilterOp, NamedColumn, Op, PlanNode, ScanColumn, ScanOp};
     use crate::predicate::{Leaf, Node, Predicate};
     use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
@@ -543,6 +549,10 @@ mod tests {
         assert_eq!(pruned(&[]), (1, [1, 2].into()));
     }
 
+    /// What a scan is given to skip by: its conditions' columns, and its
+    /// cutoff's column and whether descending.
+    type SkippedBy = (StdVec<u32>, Option<(u32, bool)>);
+
     /// One batch of four rows: `a` is 1, 2, null and 0, `b` 10, 20, 30 and
     /// null.
     struct Nullable;
@@ -716,7 +726,7 @@ mod tests {
     struct Counted<'a> {
         lazy: bool,
         loads: &'a RefCell<StdVec<(u8, u8, StdVec<u16>)>>,
-        conditions: &'a RefCell<StdVec<StdVec<u32>>>,
+        conditions: &'a RefCell<StdVec<SkippedBy>>,
     }
 
     impl Scannable for Counted<'_> {
@@ -779,8 +789,11 @@ mod tests {
             _: &dyn Allocator,
             _: &[(u32, Forms)],
             conditions: &[Condition],
+            cutoff: Option<Cutoff>,
         ) -> Result<Option<DynSource<'s>>, AllocError> {
-            self.conditions.borrow_mut().push(conditions.iter().map(Condition::column).collect());
+            let columns = conditions.iter().map(Condition::column).collect();
+            let cutoff = cutoff.map(|cutoff| (cutoff.column, cutoff.descending));
+            self.conditions.borrow_mut().push((columns, cutoff));
             Ok(None)
         }
 
@@ -924,7 +937,7 @@ mod tests {
         // The filters still test them.
         assert_eq!(counted(&table, &filters, &[0]).0, [[12], [13], [20]]);
         // Each filter's, for the scan to apply: two on `a`, one on `b`.
-        assert_eq!(*conditions.borrow(), [vec![0, 0, 1]]);
+        assert_eq!(*conditions.borrow(), [(vec![0, 0, 1], None)]);
         // Without filters there's nothing to push down.
         counted(&table, &[], &[0]);
         assert_eq!(conditions.borrow().len(), 1);
@@ -942,6 +955,73 @@ mod tests {
         let (kept, _) = counted(&table, &filters, &[2, 0]);
         assert_eq!(kept, [[212, 12], [213, 13], [220, 20], [221, 21]]);
         assert!(loads.borrow().is_empty());
+    }
+
+    /// What `Counted`'s scan is given to skip by, under `stages`, bottom up:
+    /// a filter `a > 0`, `ORDER BY b DESC` or a `LIMIT` of their count.
+    fn skipped_by(stages: &[Stage]) -> StdVec<SkippedBy> {
+        let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table = Counted { lazy: false, loads: &loads, conditions: &conditions };
+        let table = DynScannable::new(&Heap, table).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut ids = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b")] {
+            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            ids.push(binding.id);
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        for stage in stages {
+            let op = match *stage {
+                Stage::Filter => {
+                    let leaf = Leaf::Compare {
+                        column: ids[0],
+                        comparison: Comparison::Greater,
+                        value: Value::Int64(0),
+                    };
+                    let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
+                    DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap()
+                }
+                Stage::OrderBy => {
+                    let key = SortKey { column: ids[1], descending: true };
+                    let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
+                    DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap()
+                }
+                Stage::Limit(count) => {
+                    DynOp::new(&Heap, crate::limit::LimitOp { count, offset: 0 }).unwrap()
+                }
+            };
+            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
+            node = plan.add_node(op, children).unwrap();
+        }
+        let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
+        assert!(plan.output.push(a).is_ok());
+        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        lower_planned(&plan).unwrap();
+        drop(plan);
+        conditions.borrow().clone()
+    }
+
+    /// A stage of `skipped_by`'s plans.
+    enum Stage {
+        Filter,
+        OrderBy,
+        Limit(u64),
+    }
+
+    #[test]
+    fn tells_scans_the_cutoff_a_top_k_above_publishes() {
+        use Stage::{Filter, Limit, OrderBy};
+        // Filters only drop rows by their values, so rows past the cutoff
+        // can be skipped below them too.
+        let skipped = skipped_by(&[Filter, OrderBy, Limit(2)]);
+        assert_eq!(skipped, [(vec![0], Some((1, true)))]);
+        // A filter over the sort leaves it whole, and a limit below it
+        // keeps the first rows, whatever their keys.
+        assert!(skipped_by(&[OrderBy, Filter, Limit(2)]).is_empty());
+        assert!(skipped_by(&[Limit(5), OrderBy, Limit(2)]).is_empty());
     }
 
     /// Reads one column, taking it in `accepts`; it's never lowered.

@@ -8,12 +8,14 @@ use crate::allocator::{AllocError, Allocator};
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use crate::row_layout::RowLayout;
+use crate::row_layout::{RowLayout, decode};
 use crate::slow_vec::SlowVec;
 use crate::sorted_rows::{SortKey, SortedRows, lay_out_keys};
 use crate::step::{Breaker, DynOperator};
 
-/// The breaker that outputs the first `count` rows sorted by `keys`.
+/// The breaker that outputs the first `count` rows sorted by `keys`. If
+/// `publish`, whenever it prunes it publishes the first key of its cutoff,
+/// an `Int64`, in the run's `Context`, for its scan to skip by.
 ///
 /// Once it holds `count` rows plus `count` or a batch's worth more,
 /// whichever is larger, it sorts them and keeps only the first `count`, by
@@ -24,13 +26,15 @@ pub fn top_k<'a>(
     allocator: &dyn Allocator,
     keys: SlowVec<SortKey>,
     count: u32,
+    publish: bool,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, TopK { keys, count })
+    DynOperator::new(allocator, TopK { keys, count, publish })
 }
 
 struct TopK {
     keys: SlowVec<SortKey>,
     count: u32,
+    publish: bool,
 }
 
 /// The rows held, the cutoff once there is one, the keys of a batch's rows
@@ -157,6 +161,9 @@ impl TopK {
         let last = self.count - 1;
         let allocator = context.allocator();
         let keys = SlowVec::fixed_from(allocator, first.keys_of(last).iter().copied())?;
+        if self.publish {
+            context.set_cutoff(decode(first.layout().slot(0), &keys, false));
+        }
         let mut strings = SlowVec::fixed(allocator, self.keys.len())?;
         let mut bytes = SlowVec::new(allocator, 1 << 31)?;
         for column in first.string_columns() {

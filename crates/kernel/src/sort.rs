@@ -237,7 +237,7 @@ mod tests {
             for keys in [KEY_THEN_VALUE, &[(0, false)], &[(2, false)], &[(2, true), (0, false)]] {
                 let all = run(rows(), sort(&Heap, by(keys)).unwrap());
                 for count in [0, 1, 100, 3000, u32::MAX] {
-                    let top = run(rows(), top_k(&Heap, by(keys), count).unwrap());
+                    let top = run(rows(), top_k(&Heap, by(keys), count, false).unwrap());
                     assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
                 }
             }

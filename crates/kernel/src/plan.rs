@@ -10,7 +10,7 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
-use crate::condition::{CONDITIONS_MAX, Condition};
+use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering, SortKey};
 use crate::names::{Name, Names};
@@ -446,6 +446,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         for column in self.columns.iter() {
             out.push_column(c.column_of(column.binding.id))?;
         }
+        out.scan = Some(c.node());
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);
             read.map(|read| SortKey { column: read.binding.id, descending })
@@ -463,10 +464,21 @@ impl<'c> Op<'c> for ScanOp<'c> {
         Ok(out)
     }
 
-    fn lower(&self, _: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+    fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
-        lowering.set_source(self.scannable.scan(lowering.allocator(), read, conditions)?);
+        let cutoff = lowering.query_cutoff(node).map(|key| {
+            let Some(scanned) = self.columns.iter().find(|c| c.binding.id == key.column) else {
+                failed!()
+            };
+            Cutoff { column: scanned.column, descending: key.descending }
+        });
+        let source = self.scannable.scan(lowering.allocator(), read, conditions, cutoff)?;
+        lowering.set_source(source);
         Ok(())
     }
 

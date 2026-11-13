@@ -122,6 +122,10 @@ pub struct OutputProperties {
     pub arrangements: Arrangements,
     /// Set while a sort can still be undone.
     pub open_sort: Option<OpenSort>,
+    /// The scan the rows are of, if each is one of its rows, kept or dropped
+    /// by its own values alone, as a filter does. An op that keeps rows by
+    /// where they are, as LIMIT does, clears it.
+    pub scan: Option<PlanNodeId>,
 }
 
 impl OutputProperties {
@@ -131,6 +135,7 @@ impl OutputProperties {
         column_count: 0,
         arrangements: Arrangements::NONE,
         open_sort: None,
+        scan: None,
     };
 
     /// Adds `column` at the next position in batches, which fail to hold
@@ -282,9 +287,16 @@ impl InputNeeds<'_> {
 /// before the node reads the input.
 pub enum InputStep {
     /// Sorts the rows by `keys`. Only the first `keep` rows in order are
-    /// read, if given. `unsorted` is what was known of the rows before it,
-    /// to undo it.
-    Sort { keys: SlowVec<SortKey>, keep: Option<u32>, unsorted: Arrangements },
+    /// read, if given; if `publish`, a cutoff on the first key is published
+    /// for a scan below to skip by. `unsorted` and `scan` are what was known
+    /// of the rows before it, to undo it.
+    Sort {
+        keys: SlowVec<SortKey>,
+        keep: Option<u32>,
+        publish: bool,
+        unsorted: Arrangements,
+        scan: Option<PlanNodeId>,
+    },
 }
 
 /// One input of a node, once planned.
@@ -297,8 +309,13 @@ pub struct PlannedInput {
 
 /// What is decided about a node before it is lowered.
 pub struct PlannedNode {
+    /// Each input's steps, and what is known of its rows after them.
     pub inputs: SlowVec<PlannedInput>,
+    /// What is known of the rows it outputs.
     pub output: OutputProperties,
+    /// For a scan: the column, and whether descending, a `TopK` above sorts
+    /// by first and publishes a cutoff on.
+    pub cutoff: Option<SortKey>,
 }
 
 /// By node, what's decided about it.
@@ -315,6 +332,11 @@ pub struct DeriveContext<'p, 'c> {
 }
 
 impl DeriveContext<'_, '_> {
+    /// The id of the node being derived.
+    pub fn node(&self) -> PlanNodeId {
+        self.self_
+    }
+
     /// What is known of input `i` once its needs are met.
     pub fn input(&self, i: u32) -> &OutputProperties {
         &at!(at!(self.planned, self.self_ as usize).inputs, i as usize).rows
@@ -332,12 +354,21 @@ impl DeriveContext<'_, '_> {
     }
 
     /// Makes the open sort `sort` output only its first `rows` rows, so it
-    /// is lowered as a `TopK`.
+    /// is lowered as a `TopK`. If the rows it sorts are of a scan, and its
+    /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
+    /// scan to skip by.
     pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
         let node = at_mut!(self.planned, sort.node as usize);
-        let InputStep::Sort { keep, .. } =
+        let InputStep::Sort { keys, keep, publish, scan, .. } =
             at_mut!(at_mut!(node.inputs, sort.input as usize).steps, sort.step);
         *keep = Some(rows);
+        let first = *at!(keys, 0);
+        let Some(scan) = *scan else { return };
+        if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
+            return;
+        }
+        *publish = true;
+        at_mut!(self.planned, scan as usize).cutoff = Some(first);
     }
 }
 
@@ -397,8 +428,8 @@ impl InputPlanner<'_> {
         // Only sorts are planned so far, and nothing after a sort before its
         // order is read, so it's the last step.
         check!(sort.step + 1 == steps.len());
-        let Some(InputStep::Sort { unsorted, .. }) = steps.pop() else { failed!() };
-        rows.arrangements = unsorted;
+        let Some(InputStep::Sort { unsorted, scan, .. }) = steps.pop() else { failed!() };
+        (rows.arrangements, rows.scan) = (unsorted, scan);
         true
     }
 
@@ -409,7 +440,9 @@ impl InputPlanner<'_> {
         self.out.steps.push(InputStep::Sort {
             keys: keys_copy,
             keep: None,
+            publish: false,
             unsorted: rows.arrangements,
+            scan: rows.scan.take(),
         })?;
         rows.arrangements = Arrangements::NONE;
         rows.arrangements.push(&[], keys);
@@ -451,7 +484,7 @@ fn plan_node_inputs(
         let mut input = InputPlanner { allocator, node: id, input: i, out };
         input.meet(planned, &node.op.needs(i))?;
     }
-    planned.push(PlannedNode { inputs, output: OutputProperties::NONE })?;
+    planned.push(PlannedNode { inputs, output: OutputProperties::NONE, cutoff: None })?;
     let mut derive = DeriveContext { plan, planned, self_: id };
     let output = node.op.derive(&mut derive)?;
     at_mut!(planned, id as usize).output = output;

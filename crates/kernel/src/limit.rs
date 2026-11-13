@@ -26,6 +26,7 @@ impl<'c> Op<'c> for LimitOp {
             c.limit_sort(sort, read);
         }
         out.drop_rows();
+        out.scan = None;
         Ok(out)
     }
 
