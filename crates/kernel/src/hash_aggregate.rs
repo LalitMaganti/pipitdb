@@ -19,6 +19,7 @@ use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
 use crate::step::{Breaker, DynOperator};
+use crate::string_pool::CACHED_SLOTS;
 
 /// The breaker that aggregates by `spec`.
 pub fn hash_aggregate<'a>(
@@ -118,6 +119,9 @@ impl Key for GroupValue {
     }
 }
 
+/// How many rows ahead `first_values` fetches a row's slot.
+const SLOT_AHEAD: usize = 16;
+
 /// The values of `input`'s rows that aren't null and that their group, in
 /// `groups`, all 0 if `None`, hadn't had before, adding them to `set`; and
 /// each one's group, and how many there are.
@@ -127,12 +131,20 @@ fn first_values(
     input: &AggregateInput,
     groups: Option<&[u32]>,
 ) -> Result<(Buffer, Buffer, usize), Error> {
+    // A set too big for the cache misses it a row, so each row's slot is
+    // fetched ahead. `prefetch` does nothing on other targets, so they don't.
+    let ahead = cfg!(target_arch = "x86_64") && set.capacity() > CACHED_SLOTS;
     let mut values = context.values_buffer(input.rows * 8)?;
     let mut firsts = context.indices_buffer(input.rows * 4)?;
     let (kept_values, kept_groups) = (values.as_mut_slice::<i64>(), firsts.as_mut_slice::<u32>());
+    let all = at!(input.values, ..input.rows);
+    let group_of = |row: usize| groups.map_or(0, |groups| *at!(groups, row));
     let mut kept = 0;
-    for (row, &value) in at!(input.values, ..input.rows).iter().enumerate() {
-        let group = groups.map_or(0, |groups| *at!(groups, row));
+    for (row, &value) in all.iter().enumerate() {
+        if ahead && let Some(&next) = all.get(row + SLOT_AHEAD) {
+            set.prefetch(GroupValue { group: group_of(row + SLOT_AHEAD), value: next }.hash());
+        }
+        let group = group_of(row);
         if input.is_valid(row)
             && set.insert(context.allocator(), GroupValue { group, value }, ())?.1
         {
