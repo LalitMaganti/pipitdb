@@ -82,6 +82,8 @@ pub struct Chunk {
     pub max: Option<i64>,
     /// How many of its values are null, if recorded.
     pub nulls: Option<u64>,
+    /// Whether `min` and `max` are values it holds, not only bounds of them.
+    pub exact: bool,
 }
 
 pub struct ParquetFile {
@@ -292,14 +294,17 @@ fn column_meta(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
     let unsigned = |value: Value<'_>| u64::try_from(value.int()?).ok();
     let data = unsigned(meta[3])?;
     let start = unsigned(meta[4]).map_or(data, |dictionary| dictionary.min(data));
-    let (mut min, mut max, mut nulls) = (None, None, None);
+    let (mut min, mut max, mut nulls, mut exact) = (None, None, None, false);
     if let Some(at) = meta[5].at() {
         // `Statistics`: the current max and min are fields 5 and 6, ordered
         // as the column's values are. 1 and 2 are older and always ordered
         // as signed, so are only right for signed integers. 3 counts nulls.
-        let mut stats = [Value::Missing; 5];
-        c.at(at).fields(&[5, 6, 1, 2, 3], &mut stats)?;
+        // 7 and 8 say whether max and min are exact: writers don't truncate
+        // integers, so they are unless they say not.
+        let mut stats = [Value::Missing; 7];
+        c.at(at).fields(&[5, 6, 1, 2, 3, 7, 8], &mut stats)?;
         nulls = unsigned(stats[4]);
+        exact = stats[5].int() != Some(0) && stats[6].int() != Some(0);
         let integer = |value: Value<'_>| integer(value.bytes()?, column);
         let signed = column.logical == Logical::Plain;
         max = integer(stats[0]).or_else(|| integer(stats[2]).filter(|_| signed));
@@ -313,6 +318,7 @@ fn column_meta(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
         min,
         max,
         nulls,
+        exact,
     })
 }
 

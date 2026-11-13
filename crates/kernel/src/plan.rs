@@ -17,7 +17,7 @@ use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate};
-use crate::scannable::DynScannable;
+use crate::scannable::{DynScannable, Summary};
 use crate::slow_vec::SlowVec;
 use crate::step::{DynTransform, Step};
 
@@ -146,6 +146,22 @@ pub trait Op<'c> {
         let _ = (allocator, columns);
         failed!()
     }
+
+    /// What's known of the rows this makes without reading them, and of
+    /// `column`'s values if given, as `Scannable::summary`. By default,
+    /// nothing.
+    fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
+        let _ = column;
+        None
+    }
+
+    /// Whether this now makes its rows from what `child`, its one child,
+    /// says of its own in `summary`, without reading them. By default, it
+    /// can't.
+    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+        let _ = (allocator, child);
+        Ok(false)
+    }
 }
 
 /// What an op gives up of its condition on a column.
@@ -163,6 +179,8 @@ type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<
 
 type TakeCondition =
     unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
+
+type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -199,6 +217,8 @@ struct OpFunctions<'c> {
     takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
     take_condition: TakeCondition,
     materialize: Materialize<'c>,
+    summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
+    answer: Answer<'c>,
 }
 
 /// Holds `T`'s table.
@@ -236,6 +256,10 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         materialize: |op, allocator, columns| unsafe {
             value_of::<T>(op).materialize(allocator, columns)
         },
+        // SAFETY: as for `lower`.
+        summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
+        // SAFETY: as for `prune`.
+        answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
     };
 }
 
@@ -327,6 +351,20 @@ impl<'c> DynOp<'c> {
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.materialize)(self.op.as_ptr(), allocator, columns) }
+    }
+
+    pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.summary)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn answer(
+        &mut self,
+        allocator: &dyn Allocator,
+        child: &DynOp<'c>,
+    ) -> Result<bool, AllocError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.answer)(self.op.as_ptr(), allocator, child) }
     }
 }
 
@@ -536,6 +574,15 @@ impl<'c> Op<'c> for ScanOp<'c> {
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
+    }
+
+    /// Its scannable's.
+    fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
+        let scanned = match column {
+            Some(column) => Some(self.columns.iter().find(|c| c.binding.id == column)?.column),
+            None => None,
+        };
+        self.scannable.summary(scanned)
     }
 }
 

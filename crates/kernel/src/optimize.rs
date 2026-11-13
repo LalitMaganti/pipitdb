@@ -12,6 +12,7 @@ use crate::slow_vec::SlowVec;
 /// Runs every pass over `plan`, with scratch memory from `allocator`.
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
+    answer_from_summaries(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -88,9 +89,9 @@ pub fn prune_columns(
     Ok(())
 }
 
-/// Removes the nodes pruning left unread, so nothing after it can reach
-/// them. Inputs come before what reads them, which removing nodes keeps
-/// true.
+/// Removes the nodes pruning or answering left unread, so nothing after it
+/// can reach them. Inputs come before what reads them, which removing nodes
+/// keeps true.
 fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
     let mut reachable = [false; PLAN_NODES_MAX];
     *at_mut!(reachable, plan.root as usize) = true;
@@ -120,6 +121,26 @@ fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
         *at!(reachable, id - 1)
     });
     plan.root = *at!(new_ids, plan.root as usize);
+}
+
+/// Has each op that can make its rows from what its one child knows of its
+/// own without reading them, such as an aggregate from a file's statistics,
+/// do so. The child is then left unread, and removed.
+pub fn answer_from_summaries(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    for id in 0..plan.nodes.len() {
+        // Children are added before their parents.
+        let (below, rest) = plan.nodes.split_at_mut(id);
+        let node = at_mut!(rest, 0);
+        let &[child] = &node.children[..] else { continue };
+        if node.op.answer(allocator, &at!(below, child as usize).op)? {
+            node.children = SlowVec::fixed(allocator, 0)?;
+        }
+    }
+    remove_unreachable_nodes(plan);
+    Ok(())
 }
 
 /// Each node's parent, and which of its children it is; `None` for the

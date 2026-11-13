@@ -2,15 +2,18 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
+use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
-use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
+use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
+use crate::step::DynSource;
 use crate::step::Step;
+use crate::values::Values;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
 /// `Int64` values, and makes an `Int64` but for `Avg`.
@@ -57,6 +60,9 @@ pub struct AggregateOp {
     pub keys: SlowVec<ColumnId>,
     /// What each group's rows make, from `Int64` columns.
     pub aggregates: SlowVec<Aggregate>,
+    /// Each aggregate's value, once known without reading any rows: then it
+    /// has no child, and outputs one row of them.
+    pub answer: Option<SlowVec<i64>>,
 }
 
 impl<'c> Op<'c> for AggregateOp {
@@ -87,9 +93,11 @@ impl<'c> Op<'c> for AggregateOp {
         for aggregate in self.aggregates.iter() {
             out.push_column(c.column_of(aggregate.binding.id))?;
         }
-        let sorted = c.input(0).sorted_by(&self.keys);
-        if !sorted.is_empty() {
-            out.arrangements.push(&[], sorted);
+        if self.answer.is_none() {
+            let sorted = c.input(0).sorted_by(&self.keys);
+            if !sorted.is_empty() {
+                out.arrangements.push(&[], sorted);
+            }
         }
         Ok(out)
     }
@@ -99,9 +107,14 @@ impl<'c> Op<'c> for AggregateOp {
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
+        let allocator = lowering.allocator();
+        if let Some(answer) = &self.answer {
+            let values = SlowVec::fixed_from(allocator, answer.iter().copied())?;
+            lowering.set_source(DynSource::new(allocator, Values { values })?);
+            return Ok(());
+        }
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
-        let allocator = lowering.allocator();
         let mut string_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
             string_keys |= u64::from(lowering.query_rows().type_of(key) == DataType::String) << k;
@@ -131,6 +144,30 @@ impl<'c> Op<'c> for AggregateOp {
         false
     }
 
+    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
+    /// knows of its rows without reading them, if it knows enough.
+    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+        if !self.keys.is_empty() {
+            return Ok(false);
+        }
+        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
+        for aggregate in self.aggregates.iter() {
+            // A summary's bounds are the least and greatest values. With no
+            // rows, there are none, and MIN and MAX are null: scanned.
+            let Some(summary) = child.summary(aggregate.input) else { return Ok(false) };
+            let value = match aggregate.function {
+                Function::CountStar => Some(summary.rows),
+                Function::Min => summary.bounds.map(|b| b.min),
+                Function::Max => summary.bounds.map(|b| b.max),
+                _ => None,
+            };
+            let Some(value) = value else { return Ok(false) };
+            values.push(value)?;
+        }
+        self.answer = Some(values);
+        Ok(true)
+    }
+
     /// Drops the aggregates nothing reads, keeping one if there are no keys:
     /// a batch with no columns has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
@@ -147,6 +184,9 @@ impl<'c> Op<'c> for AggregateOp {
     }
 
     fn reads(&self, reads: &mut Needed) {
+        if self.answer.is_some() {
+            return;
+        }
         for &key in self.keys.iter() {
             reads.need(key);
         }

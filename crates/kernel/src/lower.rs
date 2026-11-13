@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use crate::allocator::{AllocError, Allocator, Heap};
     use crate::buffer::Buffer;
+    use crate::column::Bounds;
     use crate::column::{ColumnView, DataType, Forms};
     use crate::condition::{Condition, Cutoff};
     use crate::context::Context;
@@ -218,7 +219,7 @@ mod tests {
     use crate::predicate::{Leaf, Node, Predicate};
     use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
-    use crate::scannable::{DynScannable, Scannable};
+    use crate::scannable::{DynScannable, Scannable, Summary};
     use crate::selection::{Kept, Selection};
     use crate::step::DynSource;
 
@@ -445,6 +446,7 @@ mod tests {
             let aggregate = crate::aggregate::AggregateOp {
                 keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
                 aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),
+                answer: None,
             };
             let aggregate = DynOp::new(&Heap, aggregate).unwrap();
             let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
@@ -1022,6 +1024,93 @@ mod tests {
         // keeps the first rows, whatever their keys.
         assert!(skipped_by(&[OrderBy, Filter, Limit(2)]).is_empty());
         assert!(skipped_by(&[Limit(5), OrderBy, Limit(2)]).is_empty());
+    }
+
+    /// A table of one column, `a`, of 7 rows from -3 to 9, which it says
+    /// only through `summary`, if `knows`: it has no rows to read.
+    struct Summarized {
+        knows: bool,
+    }
+
+    impl Scannable for Summarized {
+        type State<'s>
+            = ()
+        where
+            Self: 's;
+        type Loader = ();
+
+        fn column_count(&self) -> u32 {
+            1
+        }
+
+        fn column_name(&self, _: u32) -> &'static str {
+            "a"
+        }
+
+        fn column_type(&self, _: u32) -> DataType {
+            DataType::Int64
+        }
+
+        fn open(&self, _: &mut Context, _: &[(u32, Forms)]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn next(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<bool, Error> {
+            Ok(false)
+        }
+
+        fn summary(&self, column: Option<u32>) -> Option<Summary> {
+            let bounds = column.map(|_| Bounds { min: -3, max: 9 });
+            self.knows.then_some(Summary { rows: 7, bounds })
+        }
+    }
+
+    /// `COUNT(*)`, `MIN(a)` and `MAX(a)` of `Summarized`, optimized: the
+    /// pipeline's steps and its one row, or none.
+    fn summarized(knows: bool) -> (alloc::string::String, StdVec<i64>) {
+        use crate::aggregate::{Aggregate, AggregateOp, Function};
+        let table = DynScannable::new(&Heap, Summarized { knows }).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let a = plan.add_column("a", DataType::Int64).unwrap();
+        let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
+        let columns = SlowVec::fixed_from(&Heap, columns.into_iter()).unwrap();
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let mut aggregates = StdVec::new();
+        for (function, input) in
+            [(Function::CountStar, None), (Function::Min, Some(a.id)), (Function::Max, Some(a.id))]
+        {
+            let binding = plan.add_column("x", DataType::Int64).unwrap();
+            aggregates.push(Aggregate { function, input, distinct: false, binding });
+            assert!(plan.output.push(binding).is_ok());
+        }
+        let aggregate = AggregateOp {
+            keys: SlowVec::fixed(&Heap, 0).unwrap(),
+            aggregates: SlowVec::fixed_from(&Heap, aggregates.into_iter()).unwrap(),
+            answer: None,
+        };
+        let aggregate = DynOp::new(&Heap, aggregate).unwrap();
+        plan.add_node(aggregate, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        let physical = lower_planned(&plan).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut batch = RowBatch::new();
+        let mut row = StdVec::new();
+        if execution.next(&mut batch).unwrap() {
+            row = physical.columns().iter().map(|c| batch.column(c.position).int64s()[0]).collect();
+        }
+        (physical.pipeline().describe(), row)
+    }
+
+    #[test]
+    fn answers_aggregates_from_what_a_table_knows_without_reading_it() {
+        let (steps, row) = summarized(true);
+        assert_eq!(steps, "Values");
+        assert_eq!(row, [7, -3, 9]);
+        // Without a summary, it's scanned, and with no rows, has a row of
+        // zero and nulls.
+        assert_eq!(summarized(false).0, "Scan | HashAggregate");
     }
 
     /// Reads one column, taking it in `accepts`; it's never lowered.
