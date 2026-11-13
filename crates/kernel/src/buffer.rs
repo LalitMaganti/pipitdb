@@ -72,6 +72,7 @@ impl Buffer {
     /// # Safety
     ///
     /// As for `allocate_uninit` unless `zeroed`.
+    #[inline(never)]
     unsafe fn allocate_with(
         allocator: &dyn Allocator,
         size_bytes: usize,
