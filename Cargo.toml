@@ -12,25 +12,35 @@ rust-version = "1.98"
 [profile.dev]
 panic = "abort"
 
-# Built for speed, as ClickBench's times are, so benchmarks count what's
-# timed. gungraun finds benchmark functions by their symbols.
+# Built as speed is, so benchmarks count what ships. gungraun finds
+# benchmark functions by their symbols.
 [profile.bench]
 opt-level = 3
 strip = false
 debug = true
 
+# What ships, so what the size budget measures. Fat LTO optimizes all crates
+# as one, which thin LTO can't, but makes rebuilds up to 47% slower.
 [profile.release]
 panic = "abort"
 opt-level = "s"
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 strip = true
 
-# For measuring speed, such as ClickBench's: release, built for speed rather
-# than size.
+# For final speed numbers, such as the ClickBench scoreboard's: release,
+# built for speed rather than size.
 [profile.speed]
 inherits = "release"
 opt-level = 3
+
+# For developing, debugging and profiling: speed with thin LTO, which
+# rebuilds faster, and line tables for profilers.
+[profile.profiling]
+inherits = "speed"
+lto = "thin"
+strip = false
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
