@@ -1,8 +1,8 @@
 //! `LogicalPlan`: what a query does, as Perfetto's: a tree of operations over
 //! columns named by id, independent of how batches lay them out. Frontends
-//! build one; `lower` plans it, asking each operation what it needs of its
-//! inputs and what it outputs, then turns it into a pipeline, asking each to
-//! lower itself, so extensions can add operations.
+//! build one; `plan_nodes` plans it, asking each operation what it needs of
+//! its inputs and what it outputs, then `lower` turns it into a pipeline,
+//! asking each to lower itself, so extensions can add operations.
 
 use core::marker::PhantomData;
 use core::ptr::NonNull;
@@ -15,7 +15,7 @@ use crate::erase::{value_mut_of, value_of};
 use crate::lower::{LowerError, Lowering, SortKey};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
+use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate};
 use crate::scannable::DynScannable;
 use crate::slow_vec::SlowVec;
@@ -51,7 +51,7 @@ pub trait Op<'c> {
     /// What this needs of the rows of input `input`. By default, nothing.
     fn needs(&self, input: u32) -> InputNeeds<'_> {
         let _ = input;
-        InputNeeds::default()
+        InputNeeds::NONE
     }
 
     /// What is known of this node's output, given its inputs' needs are met.
@@ -179,6 +179,7 @@ pub struct DynOp<'c> {
 
 /// An op type's functions: one table for each type, which its ops share.
 struct OpFunctions<'c> {
+    // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
         NonNull<()>,
@@ -395,12 +396,24 @@ impl<'c> LogicalPlan<'c> {
         self.root = id;
         Ok(id)
     }
+
+    /// The id of `node`, one of this plan's nodes.
+    pub fn id_of(&self, node: &PlanNode<'c>) -> PlanNodeId {
+        let offset = core::ptr::from_ref(node).addr() - self.nodes.as_ptr().addr();
+        let id = offset / size_of::<PlanNode<'c>>();
+        check!(id < self.nodes.len());
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let id = id as PlanNodeId;
+        id
+    }
 }
 
 /// Reads the rows of a scannable, binding the columns in `columns`, maybe
 /// skipping some failing `conditions`.
 pub struct ScanOp<'c> {
+    /// What it reads.
     scannable: &'c DynScannable<'c>,
+    /// The scannable's columns it reads, and what each is bound to.
     columns: SlowVec<ScanColumn>,
     /// Conditions the plan pushed down from filters above, if any, which the
     /// scannable may use to skip: the filters still test every row.
@@ -428,17 +441,17 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Its columns, in order, and each order the scannable says its rows
     /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
-    fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(column.binding.id)?;
+            out.push_column(c.column_of(column.binding.id))?;
         }
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);
             read.map(|read| SortKey { column: read.binding.id, descending })
         };
         for order in self.scannable.sorted_by() {
-            let mut sorted = [SortKey { column: 0, descending: false }; 8];
+            let mut sorted = [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX];
             let mut len = 0;
             for (slot, key) in sorted.iter_mut().zip(order.iter().map_while(read)) {
                 (*slot, len) = (key, len + 1);
