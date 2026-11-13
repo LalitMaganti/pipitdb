@@ -7,7 +7,7 @@ use crate::allocator::Allocator;
 use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::Pipeline;
-use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId};
+use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
 use crate::slow_vec::SlowVec;
 use crate::sort::sort;
 use crate::step::{DynSource, Step};
@@ -60,13 +60,6 @@ impl<'c> PhysicalPlan<'c> {
     pub fn name(&self, column: OutputColumn) -> &str {
         self.names.get(column.name)
     }
-}
-
-/// A key rows are sorted by.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SortKey {
-    pub column: ColumnId,
-    pub descending: bool,
 }
 
 /// A pipeline being built from a planned plan, which each operation adds
@@ -1120,20 +1113,20 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Reads {
-        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-            failed!()
-        }
-
-        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
-            failed!()
-        }
-
         fn reads(&self, reads: &mut Needed) {
             reads.need(self.column);
         }
 
         fn accepts(&self, column: ColumnId) -> Forms {
             if column == self.column { self.accepts } else { Forms::FLAT }
+        }
+
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
         }
     }
 

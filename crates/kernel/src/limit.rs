@@ -17,6 +17,13 @@ pub struct LimitOp {
 }
 
 impl<'c> Op<'c> for LimitOp {
+    /// Makes no columns, and reads none.
+    fn prune(&mut self, _: &mut Needed) -> Pruned {
+        Pruned::Keep
+    }
+
+    fn reads(&self, _: &mut Needed) {}
+
     /// Its input's, less some rows. The sort just before, if any, only needs
     /// to output the rows read here, if a `TopK` can count them.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
@@ -44,13 +51,6 @@ impl<'c> Op<'c> for LimitOp {
         let limit = Limit { count: self.count, offset: self.offset };
         lowering.add_operator(Step::Operator(DynOperator::new(lowering.allocator(), limit)?))
     }
-
-    /// Makes no columns, and reads none.
-    fn prune(&mut self, _: &mut Needed) -> Pruned {
-        Pruned::Keep
-    }
-
-    fn reads(&self, _: &mut Needed) {}
 }
 
 /// Drops the first `offset` rows, then keeps up to `count` rows, in order, by

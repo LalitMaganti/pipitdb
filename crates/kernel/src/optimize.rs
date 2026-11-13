@@ -81,7 +81,8 @@ pub fn prune_columns(
                 *at_mut!(at_mut!(plan.nodes, parent as usize).children, slot) = id;
             }
         }
-        for (slot, &child) in at!(plan.nodes, id as usize).children.iter().enumerate() {
+        // Last first, so children are pruned first to last, as Perfetto does.
+        for (slot, &child) in at!(plan.nodes, id as usize).children.iter().enumerate().rev() {
             pending.push((child, Some((id, slot))))?;
         }
     }
@@ -367,23 +368,13 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Maker<'_> {
-        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-            failed!()
-        }
-
-        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
-            failed!()
-        }
-
         fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
             if column == 0 {
                 self.0.set(allowed);
             }
             Forms::FLAT
         }
-    }
 
-    impl<'c> Op<'c> for Reader {
         fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
             failed!()
         }
@@ -391,13 +382,23 @@ mod tests {
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
             failed!()
         }
+    }
 
+    impl<'c> Op<'c> for Reader {
         fn accepts(&self, _: ColumnId) -> Forms {
             self.accepts
         }
 
         fn passes_through(&self, _: ColumnId) -> bool {
             self.passes_through
+        }
+
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
         }
     }
 

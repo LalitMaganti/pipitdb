@@ -1,9 +1,9 @@
 //! `OrderByOp`: its child's rows sorted by keys, as `ORDER BY` does.
 
-use crate::lower::{self, LowerError, Lowering};
+use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
-use crate::plan::{Op, PlanNode};
+use crate::plan::{Op, PlanNode, SortKey};
 use crate::slow_vec::SlowVec;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
@@ -11,10 +11,18 @@ use crate::slow_vec::SlowVec;
 /// it isn't known to be, and only for as many rows as a LIMIT just above
 /// reads. It reads every column, so each is made flat before it's held.
 pub struct OrderByOp {
-    pub keys: SlowVec<lower::SortKey>,
+    pub keys: SlowVec<SortKey>,
 }
 
 impl<'c> Op<'c> for OrderByOp {
+    /// Makes no columns, and needs its keys.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        for key in self.keys.iter() {
+            needed.need(key.column);
+        }
+        Pruned::Keep
+    }
+
     fn needs(&self, _: u32) -> InputNeeds<'_> {
         let arranged = Some(Arranged { grouped_by: &[], sorted_by: &self.keys });
         InputNeeds { arranged, ..InputNeeds::NONE }
@@ -31,13 +39,5 @@ impl<'c> Op<'c> for OrderByOp {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)
-    }
-
-    /// Makes no columns, and needs its keys.
-    fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        for key in self.keys.iter() {
-            needed.need(key.column);
-        }
-        Pruned::Keep
     }
 }
