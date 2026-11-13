@@ -67,6 +67,8 @@ pub struct Position {
     indexed: bool,
     /// Whether the body has been read from, which sets the fields below.
     started: bool,
+    /// How many rows were skipped before it was, to pass over once it is.
+    deferred: usize,
     /// Where an optional column's definition levels are in the body.
     levels: (usize, usize),
     /// How far the levels have been read.
@@ -122,6 +124,7 @@ impl<'s> ChunkReader<'s> {
             left: 0,
             indexed: false,
             started: false,
+            deferred: 0,
             levels: (0, 0),
             level: Hybrid::default(),
             value: 0,
@@ -207,16 +210,23 @@ impl<'s> ChunkReader<'s> {
     }
 
     /// Passes over the next `rows` rows, which must be in the page being
-    /// read, without decoding their values. Passing over the rest of a page
-    /// that hasn't been read from doesn't read it at all.
+    /// read, without decoding their values. A page that hasn't been read from
+    /// isn't read until one of its rows is, so skipping all its rows doesn't
+    /// read it at all.
     pub fn skip(&mut self, context: &mut Context, rows: usize) -> Result<(), Error> {
         check!(rows <= self.position.left);
-        if rows == self.position.left && !self.position.started {
-            self.position.left = 0;
+        self.position.left -= rows;
+        if !self.position.started {
+            self.position.deferred += rows;
             return Ok(());
         }
         let (page, _) = self.body(context)?;
-        let page = page.as_slice::<u8>();
+        self.advance(context, page.as_slice::<u8>(), rows)
+    }
+
+    /// Moves past the next `rows` rows of `page`, the body being read,
+    /// without decoding their values.
+    fn advance(&mut self, context: &Context, page: &[u8], rows: usize) -> Result<(), Error> {
         let mut valid = rows;
         if self.column.optional {
             let levels = self.levels(page)?;
@@ -245,7 +255,6 @@ impl<'s> ChunkReader<'s> {
             }
             (false, _) => self.position.value += valid * plain::width(self.column.physical),
         }
-        self.position.left -= rows;
         Ok(())
     }
 
@@ -563,6 +572,7 @@ impl<'s> ChunkReader<'s> {
             left,
             indexed,
             started: false,
+            deferred: 0,
             levels: (0, 0),
             level: Hybrid::default(),
             value: 0,
@@ -603,6 +613,10 @@ impl<'s> ChunkReader<'s> {
                     (Hybrid::new(width), self.position.value + 1);
             }
             (self.position.level, self.position.started) = (Hybrid::new(1), true);
+            let deferred = core::mem::take(&mut self.position.deferred);
+            if deferred > 0 {
+                self.advance(context, bytes, deferred)?;
+            }
         }
         Ok((page, dictionary))
     }
@@ -1004,7 +1018,9 @@ mod tests {
             if left == 0 {
                 break;
             }
-            reader.skip(&mut context, left).unwrap();
+            // In two parts, as a scan skips a page a batch at a time.
+            reader.skip(&mut context, left / 2).unwrap();
+            reader.skip(&mut context, left - left / 2).unwrap();
         }
         assert!(source.1.get() * 10 < chunk.len);
     }
