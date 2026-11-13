@@ -20,6 +20,7 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
+use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
@@ -263,7 +264,8 @@ fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec
     let mut plan =
         compile(&Heap, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
     optimize(&Heap, &mut plan).map_err(|e| format!("{e:?}"))?;
-    let physical = lower(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
+    let planned = plan_nodes(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
+    let physical = lower(&Heap, &plan, &planned).map_err(|e| format!("{e:?}"))?;
     let mut execution = physical.pipeline().start(allocators).map_err(|e| format!("{e:?}"))?;
     let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
     let mut batch = RowBatch::new();

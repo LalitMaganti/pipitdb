@@ -14,6 +14,7 @@ use pipit_kernel::context::Context;
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
+use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
@@ -255,7 +256,8 @@ pub unsafe extern "C" fn query_rows(
     if optimize(&Heap, &mut plan).is_err() {
         return u32::MAX;
     }
-    let Ok(physical) = lower(&Heap, &plan) else { return u32::MAX };
+    let Ok(planned) = plan_nodes(&Heap, &plan) else { return u32::MAX };
+    let Ok(physical) = lower(&Heap, &plan, &planned) else { return u32::MAX };
     let allocators = QueryAllocators::new(&Heap);
     let Ok(mut execution) = physical.pipeline().start(&allocators) else { return u32::MAX };
     let mut batch = RowBatch::new();
