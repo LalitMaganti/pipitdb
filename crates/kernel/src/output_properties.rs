@@ -5,8 +5,8 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::DataType;
-use crate::lower::{LowerError, SortKey};
-use crate::plan::{ColumnId, LogicalPlan, PlanNodeId};
+use crate::lower::LowerError;
+use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::slow_vec::SlowVec;
 

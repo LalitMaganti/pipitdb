@@ -66,6 +66,69 @@ pub struct AggregateOp {
 }
 
 impl<'c> Op<'c> for AggregateOp {
+    /// Drops the aggregates nothing reads, keeping one if there are no keys:
+    /// a batch with no columns has no rows.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding.id));
+        let keep_first = !any && self.keys.is_empty();
+        let mut first = true;
+        self.aggregates.retain(|aggregate| {
+            let keep = needed.is_needed(aggregate.binding.id) || (keep_first && first);
+            first = false;
+            keep
+        });
+        self.reads(needed);
+        Pruned::Keep
+    }
+
+    fn reads(&self, reads: &mut Needed) {
+        if self.answer.is_some() {
+            return;
+        }
+        for &key in self.keys.iter() {
+            reads.need(key);
+        }
+        for input in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
+            reads.need(input);
+        }
+    }
+
+    /// Its keys in dictionaries too: a string key's entries are each
+    /// interned once, rather than each row's. Only strings come in them.
+    fn accepts(&self, column: ColumnId) -> Forms {
+        if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
+    }
+
+    /// False for every column: what comes out is one row per group, and any
+    /// column it doesn't output is gone.
+    fn passes_through(&self, _: ColumnId) -> bool {
+        false
+    }
+
+    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
+    /// knows of its rows without reading them, if it knows enough.
+    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+        if !self.keys.is_empty() {
+            return Ok(false);
+        }
+        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
+        for aggregate in self.aggregates.iter() {
+            // A summary's bounds are the least and greatest values. With no
+            // rows, there are none, and MIN and MAX are null: scanned.
+            let Some(summary) = child.summary(aggregate.input) else { return Ok(false) };
+            let value = match aggregate.function {
+                Function::CountStar => Some(summary.rows),
+                Function::Min => summary.bounds.map(|b| b.min),
+                Function::Max => summary.bounds.map(|b| b.max),
+                _ => None,
+            };
+            let Some(value) = value else { return Ok(false) };
+            values.push(value)?;
+        }
+        self.answer = Some(values);
+        Ok(true)
+    }
+
     /// What its aggregates read must be `Int64`.
     fn needs(&self, _: u32) -> InputNeeds<'_> {
         let mut needs = InputNeeds::NONE;
@@ -130,69 +193,6 @@ impl<'c> Op<'c> for AggregateOp {
         let spec = HashAggregateSpec { key_columns, string_keys, aggregates };
         let operator = hash_aggregate(allocator, spec)?;
         lowering.add_operator(Step::Operator(operator))
-    }
-
-    /// Its keys in dictionaries too: a string key's entries are each
-    /// interned once, rather than each row's. Only strings come in them.
-    fn accepts(&self, column: ColumnId) -> Forms {
-        if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
-    }
-
-    /// False for every column: what comes out is one row per group, and any
-    /// column it doesn't output is gone.
-    fn passes_through(&self, _: ColumnId) -> bool {
-        false
-    }
-
-    /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
-    /// knows of its rows without reading them, if it knows enough.
-    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
-        if !self.keys.is_empty() {
-            return Ok(false);
-        }
-        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
-        for aggregate in self.aggregates.iter() {
-            // A summary's bounds are the least and greatest values. With no
-            // rows, there are none, and MIN and MAX are null: scanned.
-            let Some(summary) = child.summary(aggregate.input) else { return Ok(false) };
-            let value = match aggregate.function {
-                Function::CountStar => Some(summary.rows),
-                Function::Min => summary.bounds.map(|b| b.min),
-                Function::Max => summary.bounds.map(|b| b.max),
-                _ => None,
-            };
-            let Some(value) = value else { return Ok(false) };
-            values.push(value)?;
-        }
-        self.answer = Some(values);
-        Ok(true)
-    }
-
-    /// Drops the aggregates nothing reads, keeping one if there are no keys:
-    /// a batch with no columns has no rows.
-    fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding.id));
-        let keep_first = !any && self.keys.is_empty();
-        let mut first = true;
-        self.aggregates.retain(|aggregate| {
-            let keep = needed.is_needed(aggregate.binding.id) || (keep_first && first);
-            first = false;
-            keep
-        });
-        self.reads(needed);
-        Pruned::Keep
-    }
-
-    fn reads(&self, reads: &mut Needed) {
-        if self.answer.is_some() {
-            return;
-        }
-        for &key in self.keys.iter() {
-            reads.need(key);
-        }
-        for input in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
-            reads.need(input);
-        }
     }
 }
 

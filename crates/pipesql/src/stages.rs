@@ -4,8 +4,8 @@
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
 use pipit_kernel::limit::LimitOp;
-use pipit_kernel::lower::SortKey;
 use pipit_kernel::order_by::OrderByOp;
+use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 

@@ -12,7 +12,7 @@ use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
-use crate::lower::{LowerError, Lowering, SortKey};
+use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
@@ -33,6 +33,13 @@ pub type ColumnId = u32;
 
 pub type PlanNodeId = u32;
 
+/// A key rows are sorted by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SortKey {
+    pub column: ColumnId,
+    pub descending: bool,
+}
+
 pub struct ColumnSchema {
     pub name: Name,
     pub data_type: DataType,
@@ -48,21 +55,6 @@ pub struct NamedColumn {
 /// An operation in a plan that reads what it borrows for `'c`, and knows how
 /// to lower itself.
 pub trait Op<'c> {
-    /// What this needs of the rows of input `input`. By default, nothing.
-    fn needs(&self, input: u32) -> InputNeeds<'_> {
-        let _ = input;
-        InputNeeds::NONE
-    }
-
-    /// What is known of this node's output, given its inputs' needs are met.
-    fn derive(&self, derive: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError>;
-
-    /// Adds what runs `node`, which holds this, to `lowering`: first its
-    /// inputs, through `Lowering::lower_input`, then the source or steps that
-    /// make what `derive` said. It decides nothing about row order.
-    fn lower(&self, node: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>)
-    -> Result<(), LowerError>;
-
     /// Drops the columns this makes that aren't in `needed`, and marks the
     /// ones it reads. By default, it drops none, and marks what `reads` does.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
@@ -162,6 +154,21 @@ pub trait Op<'c> {
         let _ = (allocator, child);
         Ok(false)
     }
+
+    /// What this needs of the rows of input `input`. By default, nothing.
+    fn needs(&self, input: u32) -> InputNeeds<'_> {
+        let _ = input;
+        InputNeeds::NONE
+    }
+
+    /// What is known of this node's output, given its inputs' needs are met.
+    fn derive(&self, derive: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError>;
+
+    /// Adds what runs `node`, which holds this, to `lowering`: first its
+    /// inputs, through `Lowering::lower_input`, then the source or steps that
+    /// make what `derive` said. It decides nothing about row order.
+    fn lower(&self, node: &PlanNode<'c>, lowering: &mut Lowering<'_, 'c>)
+    -> Result<(), LowerError>;
 }
 
 /// What an op gives up of its condition on a column.
@@ -197,17 +204,6 @@ pub struct DynOp<'c> {
 
 /// An op type's functions: one table for each type, which its ops share.
 struct OpFunctions<'c> {
-    // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
-    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
-    derive: for<'p> unsafe fn(
-        NonNull<()>,
-        &mut DeriveContext<'p, 'c>,
-    ) -> Result<OutputProperties, LowerError>,
-    lower: for<'l> unsafe fn(
-        NonNull<()>,
-        &PlanNode<'c>,
-        &mut Lowering<'l, 'c>,
-    ) -> Result<(), LowerError>,
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
     accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
@@ -219,6 +215,17 @@ struct OpFunctions<'c> {
     materialize: Materialize<'c>,
     summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
     answer: Answer<'c>,
+    // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
+    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
+    derive: for<'p> unsafe fn(
+        NonNull<()>,
+        &mut DeriveContext<'p, 'c>,
+    ) -> Result<OutputProperties, LowerError>,
+    lower: for<'l> unsafe fn(
+        NonNull<()>,
+        &PlanNode<'c>,
+        &mut Lowering<'l, 'c>,
+    ) -> Result<(), LowerError>,
 }
 
 /// Holds `T`'s table.
@@ -226,19 +233,13 @@ struct Functions<'c, T>(PhantomData<(&'c (), T)>);
 
 impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
     const TABLE: OpFunctions<'c> = OpFunctions {
-        // SAFETY: only called with this op, which outlives what it returns.
-        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
-        // SAFETY: only called with this op.
-        derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
-        // SAFETY: as for `derive`.
-        lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
-        // SAFETY: as above, and the caller has the op mutably.
+        // SAFETY: only called with this op, which the caller has mutably.
         prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
-        // SAFETY: as for `lower`.
+        // SAFETY: only called with this op.
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
-        // SAFETY: as for `lower`.
+        // SAFETY: as for `reads`.
         accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
-        // SAFETY: as for `lower`.
+        // SAFETY: as for `reads`.
         passes_through: |op, column| unsafe { value_of::<T>(op).passes_through(column) },
         // SAFETY: as for `prune`.
         allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
@@ -246,20 +247,26 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         give_condition: |op, allocator, column| unsafe {
             value_mut_of::<T>(op).give_condition(allocator, column)
         },
-        // SAFETY: as for `lower`.
+        // SAFETY: as for `reads`.
         takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
         // SAFETY: as for `prune`.
         take_condition: |op, allocator, column, condition| unsafe {
             value_mut_of::<T>(op).take_condition(allocator, column, condition)
         },
-        // SAFETY: as for `lower`.
+        // SAFETY: as for `reads`.
         materialize: |op, allocator, columns| unsafe {
             value_of::<T>(op).materialize(allocator, columns)
         },
-        // SAFETY: as for `lower`.
+        // SAFETY: as for `reads`.
         summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
         // SAFETY: as for `prune`.
         answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
+        // SAFETY: only called with this op, which outlives what it returns.
+        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
+        // SAFETY: as for `reads`.
+        derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
+        // SAFETY: as for `reads`.
+        lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
     };
 }
 
@@ -267,28 +274,6 @@ impl<'c> DynOp<'c> {
     pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
         let op = Box::new(allocator, op)?.erase();
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
-    }
-
-    pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.needs)(self, input) }
-    }
-
-    pub(crate) fn derive(
-        &self,
-        derive: &mut DeriveContext<'_, 'c>,
-    ) -> Result<OutputProperties, LowerError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.derive)(self.op.as_ptr(), derive) }
-    }
-
-    pub(crate) fn lower(
-        &self,
-        node: &PlanNode<'c>,
-        lowering: &mut Lowering<'_, 'c>,
-    ) -> Result<(), LowerError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.lower)(self.op.as_ptr(), node, lowering) }
     }
 
     pub(crate) fn prune(&mut self, needed: &mut Needed) -> Pruned {
@@ -365,6 +350,28 @@ impl<'c> DynOp<'c> {
     ) -> Result<bool, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.answer)(self.op.as_ptr(), allocator, child) }
+    }
+
+    pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.needs)(self, input) }
+    }
+
+    pub(crate) fn derive(
+        &self,
+        derive: &mut DeriveContext<'_, 'c>,
+    ) -> Result<OutputProperties, LowerError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.derive)(self.op.as_ptr(), derive) }
+    }
+
+    pub(crate) fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.lower)(self.op.as_ptr(), node, lowering) }
     }
 }
 
@@ -476,6 +483,71 @@ pub struct ScanColumn {
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
+    /// Keeps the needed columns, and at least one: a batch with no columns
+    /// has no rows.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
+        let mut i = 0;
+        self.columns.retain(|column| {
+            let keep = needed.is_needed(column.binding.id) || (!any && i == 0);
+            i += 1;
+            keep
+        });
+        Pruned::Keep
+    }
+
+    /// Reads none: it makes them.
+    fn reads(&self, _: &mut Needed) {}
+
+    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        let found = self.columns.iter_mut().find(|c| c.binding.id == column);
+        // Chosen once: a column chosen already is loaded already.
+        let Some(scanned) = found.filter(|scanned| scanned.forms == Forms::FLAT) else {
+            return Forms::FLAT;
+        };
+        scanned.forms = allowed & self.scannable.forms(scanned.column);
+        scanned.forms
+    }
+
+    /// Those on its columns.
+    fn takes_condition(&self, column: ColumnId) -> bool {
+        self.columns.iter().any(|scanned| scanned.binding.id == column)
+    }
+
+    fn take_condition(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: ColumnId,
+        condition: Predicate,
+    ) -> Result<(), AllocError> {
+        let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
+            failed!();
+        };
+        let condition = Condition::new(scanned.column, &condition);
+        let conditions = match &mut self.conditions {
+            Some(conditions) => conditions,
+            None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
+        };
+        conditions.push(condition).map_err(|_| AllocError)
+    }
+
+    fn materialize(
+        &self,
+        allocator: &dyn Allocator,
+        columns: SlowVec<(ColumnId, Forms)>,
+    ) -> Result<DynOp<'c>, AllocError> {
+        DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
+    }
+
+    /// Its scannable's.
+    fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
+        let scanned = match column {
+            Some(column) => Some(self.columns.iter().find(|c| c.binding.id == column)?.column),
+            None => None,
+        };
+        self.scannable.summary(scanned)
+    }
+
     /// Its columns, in order, and each order the scannable says its rows
     /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
@@ -519,71 +591,6 @@ impl<'c> Op<'c> for ScanOp<'c> {
         lowering.set_source(source);
         Ok(())
     }
-
-    /// Keeps the needed columns, and at least one: a batch with no columns
-    /// has no rows.
-    fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
-        let mut i = 0;
-        self.columns.retain(|column| {
-            let keep = needed.is_needed(column.binding.id) || (!any && i == 0);
-            i += 1;
-            keep
-        });
-        Pruned::Keep
-    }
-
-    /// Reads none: it makes them.
-    fn reads(&self, _: &mut Needed) {}
-
-    /// Those on its columns.
-    fn takes_condition(&self, column: ColumnId) -> bool {
-        self.columns.iter().any(|scanned| scanned.binding.id == column)
-    }
-
-    fn take_condition(
-        &mut self,
-        allocator: &dyn Allocator,
-        column: ColumnId,
-        condition: Predicate,
-    ) -> Result<(), AllocError> {
-        let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
-            failed!();
-        };
-        let condition = Condition::new(scanned.column, &condition);
-        let conditions = match &mut self.conditions {
-            Some(conditions) => conditions,
-            None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
-        };
-        conditions.push(condition).map_err(|_| AllocError)
-    }
-
-    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
-        let found = self.columns.iter_mut().find(|c| c.binding.id == column);
-        // Chosen once: a column chosen already is loaded already.
-        let Some(scanned) = found.filter(|scanned| scanned.forms == Forms::FLAT) else {
-            return Forms::FLAT;
-        };
-        scanned.forms = allowed & self.scannable.forms(scanned.column);
-        scanned.forms
-    }
-
-    fn materialize(
-        &self,
-        allocator: &dyn Allocator,
-        columns: SlowVec<(ColumnId, Forms)>,
-    ) -> Result<DynOp<'c>, AllocError> {
-        DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
-    }
-
-    /// Its scannable's.
-    fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
-        let scanned = match column {
-            Some(column) => Some(self.columns.iter().find(|c| c.binding.id == column)?.column),
-            None => None,
-        };
-        self.scannable.summary(scanned)
-    }
 }
 
 /// Loads `columns` of its one child's batches, which a scan of `scannable`
@@ -594,6 +601,15 @@ pub struct MaterializeOp<'c> {
 }
 
 impl<'c> Op<'c> for MaterializeOp<'c> {
+    /// Keeps loading the needed columns, if any.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        self.columns.retain(|&(column, _)| needed.is_needed(column));
+        if self.columns.is_empty() { Pruned::Child(0) } else { Pruned::Keep }
+    }
+
+    /// Reads none: it loads them.
+    fn reads(&self, _: &mut Needed) {}
+
     /// Its input's: it loads columns where they are.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         Ok(*c.input(0))
@@ -613,15 +629,6 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
         let transform = self.scannable.materialize(lowering.allocator(), positions, forms)?;
         lowering.add_operator(Step::Transform(transform))
     }
-
-    /// Keeps loading the needed columns, if any.
-    fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        self.columns.retain(|&(column, _)| needed.is_needed(column));
-        if self.columns.is_empty() { Pruned::Child(0) } else { Pruned::Keep }
-    }
-
-    /// Reads none: it loads them.
-    fn reads(&self, _: &mut Needed) {}
 }
 
 /// Keeps the rows of its one child that `predicate` is true for, as `WHERE`
@@ -632,25 +639,6 @@ pub struct FilterOp {
 }
 
 impl<'c> Op<'c> for FilterOp {
-    /// Its input's, less some rows.
-    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = *c.input(0);
-        out.drop_rows();
-        Ok(out)
-    }
-
-    fn lower(
-        &self,
-        node: &PlanNode<'c>,
-        lowering: &mut Lowering<'_, 'c>,
-    ) -> Result<(), LowerError> {
-        check!(node.children.len() == 1);
-        lowering.lower_input(node, 0)?;
-        let allocator = lowering.allocator();
-        let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
-        lowering.add_operator(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
-    }
-
     /// Its predicate's columns.
     fn reads(&self, reads: &mut Needed) {
         for column in self.predicate.columns() {
@@ -676,5 +664,24 @@ impl<'c> Op<'c> for FilterOp {
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         Ok(Given::Passed(self.predicate.conjuncts_on(allocator, column)?))
+    }
+
+    /// Its input's, less some rows.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        let mut out = *c.input(0);
+        out.drop_rows();
+        Ok(out)
+    }
+
+    fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
+        check!(node.children.len() == 1);
+        lowering.lower_input(node, 0)?;
+        let allocator = lowering.allocator();
+        let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
+        lowering.add_operator(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
     }
 }
