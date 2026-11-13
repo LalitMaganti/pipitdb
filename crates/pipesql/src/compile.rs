@@ -172,6 +172,7 @@ mod tests {
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
     use pipit_kernel::lower::lower;
+    use pipit_kernel::output_properties::plan_nodes;
     use pipit_kernel::query_allocators::QueryAllocators;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
@@ -243,7 +244,7 @@ mod tests {
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
         let plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -433,7 +434,7 @@ mod tests {
         let catalog = catalog();
         let mut plan = compile(&Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();
         pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();

@@ -1,12 +1,11 @@
 //! `lower`: a `LogicalPlan` to a `PhysicalPlan`, a pipeline ready to run.
-//! Planning decides first, node by node, what each needs of its inputs and
-//! what it outputs; lowering then only adds the steps that does.
+//! `plan_nodes` decides first, node by node, what each needs of its inputs
+//! and what it outputs; lowering then only adds the steps that does.
 
 use crate::allocator::AllocError;
 use crate::allocator::Allocator;
-use crate::column::DataType;
 use crate::names::{Name, Names};
-use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes, step};
+use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::Pipeline;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId};
 use crate::slow_vec::SlowVec;
@@ -14,7 +13,7 @@ use crate::sort::sort;
 use crate::step::{DynSource, Step};
 use crate::top_k::top_k;
 
-/// Why a plan couldn't be lowered.
+/// Why a plan couldn't be planned or lowered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LowerError {
     /// An allocation failed.
@@ -70,15 +69,6 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// Which rows the steps added so far output.
-#[derive(Clone, Copy)]
-enum Rows {
-    /// A node's output.
-    Output(PlanNodeId),
-    /// One of a node's inputs, once its steps have run.
-    Input(PlanNodeId, u32),
-}
-
 /// A pipeline being built from a planned plan, which each operation adds
 /// to.
 pub struct Lowering<'p, 'c> {
@@ -92,8 +82,8 @@ pub struct Lowering<'p, 'c> {
     source: Option<DynSource<'c>>,
     /// The steps after it, in order.
     steps: SlowVec<Step<'c>>,
-    /// Which rows the steps so far output.
-    rows: Rows,
+    /// What is known of the rows the steps so far output.
+    rows: &'p OutputProperties,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -105,21 +95,23 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     fn lower_node(&mut self, id: PlanNodeId) -> Result<(), LowerError> {
-        let node = at!(self.plan.nodes, id as usize);
-        self.rows = Rows::Output(id);
+        let (plan, planned) = (self.plan, self.planned);
+        let node = at!(plan.nodes, id as usize);
+        let output = &at!(planned, id as usize).output;
+        self.rows = output;
         node.op.lower(node, self)?;
-        self.rows = Rows::Output(id);
+        self.rows = output;
         Ok(())
     }
 
     /// Lowers input `input` of `node`, the node being lowered, then the
     /// steps planning chose to meet its needs.
     pub fn lower_input(&mut self, node: &PlanNode<'c>, input: u32) -> Result<(), LowerError> {
-        let id = self.id_of(node);
+        let id = self.plan.id_of(node);
         self.lower_node(*at!(node.children, input as usize))?;
-        self.rows = Rows::Input(id, input);
-        let Some(planned) = at!(self.planned, id as usize) else { failed!() };
-        for step in at!(planned.inputs, input as usize).steps.iter() {
+        let planned = at!(at!(self.planned, id as usize).inputs, input as usize);
+        self.rows = &planned.rows;
+        for step in planned.steps.iter() {
             self.apply(step)?;
         }
         Ok(())
@@ -142,37 +134,22 @@ impl<'p, 'c> Lowering<'p, 'c> {
     /// How many of its first rows the open sort just below outputs, if it
     /// outputs only those.
     pub fn query_sort_keep(&self) -> Option<u32> {
-        let sort = self.rows().open_sort?;
-        let InputStep::Sort { keep, .. } = step(self.planned, sort);
+        let sort = self.query_rows().open_sort?;
+        let node = at!(self.planned, sort.node as usize);
+        let InputStep::Sort { keep, .. } =
+            at!(at!(node.inputs, sort.input as usize).steps, sort.step);
         *keep
     }
 
     /// For `node`, a scan, the column a `TopK` above publishes a cutoff on,
     /// if any.
     pub fn query_cutoff(&self, node: &PlanNode<'c>) -> Option<SortKey> {
-        let Some(planned) = at!(self.planned, self.id_of(node) as usize) else { failed!() };
-        planned.cutoff
+        at!(self.planned, self.plan.id_of(node) as usize).cutoff
     }
 
-    fn id_of(&self, node: &PlanNode<'c>) -> PlanNodeId {
-        let Some(id) = self.plan.nodes.iter().position(|n| core::ptr::eq(n, node)) else {
-            failed!()
-        };
-        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
-        let id = id as PlanNodeId;
-        id
-    }
-
-    fn rows(&self) -> &OutputProperties {
-        let (id, input) = match self.rows {
-            Rows::Output(id) => (id, None),
-            Rows::Input(id, input) => (id, Some(input)),
-        };
-        let Some(planned) = at!(self.planned, id as usize) else { failed!() };
-        match input {
-            None => &planned.output,
-            Some(input) => &at!(planned.inputs, input as usize).rows,
-        }
+    /// What is known of the rows the steps added so far output.
+    pub fn query_rows(&self) -> &OutputProperties {
+        self.rows
     }
 
     /// Makes `source` the pipeline's.
@@ -186,32 +163,27 @@ impl<'p, 'c> Lowering<'p, 'c> {
         Ok(self.steps.push(step)?)
     }
 
-    /// What `column` holds.
-    pub fn query_type(&self, column: ColumnId) -> DataType {
-        at!(self.plan.columns, column as usize).data_type
-    }
-
     /// Where `column` is in batches.
     pub fn query_position(&self, column: ColumnId) -> u32 {
-        let Some(position) = self.rows().position_of(column) else { failed!() };
+        let Some(position) = self.query_rows().position_of(column) else { failed!() };
         position
     }
 }
 
-/// Plans `plan`, then builds its pipeline from its root, with memory from
-/// `allocator`.
+/// Builds the pipeline of `plan`, once `planned` by `plan_nodes`, from its
+/// root, with memory from `allocator`.
 pub fn lower<'c>(
     allocator: &dyn Allocator,
     plan: &LogicalPlan<'c>,
+    planned: &Planned,
 ) -> Result<PhysicalPlan<'c>, LowerError> {
-    let planned = plan_nodes(allocator, plan)?;
     let mut lowering = Lowering {
         plan,
-        planned: &planned,
+        planned,
         allocator,
         source: None,
         steps: SlowVec::new(allocator, LOWERED_STEPS_MAX)?,
-        rows: Rows::Output(plan.root),
+        rows: &at!(planned, plan.root as usize).output,
     };
     lowering.lower_node(plan.root)?;
 
@@ -240,14 +212,20 @@ mod tests {
     use crate::error::Error;
     use crate::filter::{Comparison, Value};
     use crate::optimize::{Needed, choose_forms};
-    use crate::output_properties::{Arrangements, DeriveContext, OutputProperties};
+    use crate::output_properties::plan_nodes;
+    use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{ColumnId, DynOp, FilterOp, NamedColumn, Op, PlanNode, ScanColumn, ScanOp};
     use crate::predicate::{Leaf, Node, Predicate};
     use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable};
     use crate::selection::{Kept, Selection};
-    use crate::step::{DynOperator, DynSource};
+    use crate::step::DynSource;
+
+    /// Plans `plan`, then lowers it.
+    fn lower_planned<'c>(plan: &LogicalPlan<'c>) -> Result<PhysicalPlan<'c>, LowerError> {
+        lower(&Heap, plan, &plan_nodes(&Heap, plan)?)
+    }
 
     /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20,
     /// declared sorted in the orders it holds.
@@ -334,7 +312,7 @@ mod tests {
         plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
 
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower_planned(&plan).unwrap();
         let names: StdVec<&str> = physical.columns().iter().map(|&c| physical.name(c)).collect();
         assert_eq!(names, ["b", "a"]);
 
@@ -352,11 +330,10 @@ mod tests {
     /// it descends.
     type Ask<'t> = (&'t [ColumnId], &'t [(ColumnId, bool)]);
 
-    /// Lowers its child, then, if `breaker`, a breaker, and asks lowering
-    /// which of `asks` hold: each is keys to group by and keys to sort by
-    /// within groups, by column, a sort key's with whether it descends.
+    /// Records which of `asks` hold of its input's rows: each is keys to
+    /// group by and keys to sort by within groups, by column, a sort key's
+    /// with whether it descends.
     struct Knows<'t> {
-        breaker: bool,
         asks: &'t [Ask<'t>],
         known: &'t RefCell<StdVec<bool>>,
         sorted_by_b: &'t RefCell<usize>,
@@ -364,10 +341,7 @@ mod tests {
 
     impl<'c> Op<'c> for Knows<'_> {
         fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-            let mut out = *c.input(0);
-            if self.breaker {
-                out.arrangements = Arrangements::NONE;
-            }
+            let out = *c.input(0);
             for &(keys, sorted_by) in self.asks {
                 let sorted_by: StdVec<SortKey> = sorted_by
                     .iter()
@@ -384,53 +358,18 @@ mod tests {
             node: &PlanNode<'c>,
             lowering: &mut Lowering<'_, 'c>,
         ) -> Result<(), LowerError> {
-            lowering.lower_input(node, 0)?;
-            if self.breaker {
-                let operator = DynOperator::new(lowering.allocator(), Nothing)?;
-                lowering.add_operator(Step::Operator(operator))?;
-            }
-            Ok(())
+            lowering.lower_input(node, 0)
         }
     }
 
-    /// Outputs nothing.
-    struct Nothing;
-
-    impl crate::step::Operator for Nothing {
-        type State = ();
-
-        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn execute(
-            &self,
-            _: &mut Context,
-            (): &mut (),
-            _: &RowBatch,
-            _: &mut RowBatch,
-        ) -> Result<crate::step::Progress, Error> {
-            Ok(crate::step::Progress::NeedInput)
-        }
-
-        fn finish(
-            &self,
-            _: &mut Context,
-            (): &mut (),
-            _: &mut RowBatch,
-        ) -> Result<crate::step::Progress, Error> {
-            Ok(crate::step::Progress::NeedInput)
-        }
-    }
-
-    /// Which of `asks` hold of `Ab`'s rows, scanning its columns `read`, after
-    /// a breaker if `breaker`; and how many keys `b` alone sorts by.
-    fn knows(read: &[u32], breaker: bool, asks: &[Ask]) -> (StdVec<bool>, usize) {
-        knows_of(AB, read, breaker, asks)
+    /// Which of `asks` hold of `Ab`'s rows, scanning its columns `read`; and
+    /// how many keys `b` alone sorts by.
+    fn knows(read: &[u32], asks: &[Ask]) -> (StdVec<bool>, usize) {
+        knows_of(AB, read, asks)
     }
 
     /// As `knows`, of `table`.
-    fn knows_of(table: Ab, read: &[u32], breaker: bool, asks: &[Ask]) -> (StdVec<bool>, usize) {
+    fn knows_of(table: Ab, read: &[u32], asks: &[Ask]) -> (StdVec<bool>, usize) {
         let (known, sorted_by_b) = (RefCell::new(StdVec::new()), RefCell::new(0));
         let table = DynScannable::new(&Heap, table).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
@@ -445,11 +384,11 @@ mod tests {
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
-        let op = Knows { breaker, asks, known: &known, sorted_by_b: &sorted_by_b };
+        let op = Knows { asks, known: &known, sorted_by_b: &sorted_by_b };
         let op = DynOp::new(&Heap, op).unwrap();
         plan.add_node(op, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
         assert!(plan.output.push(bindings[read[0] as usize]).is_ok());
-        lower(&Heap, &plan).unwrap();
+        lower_planned(&plan).unwrap();
         drop(plan);
         (known.into_inner(), sorted_by_b.into_inner())
     }
@@ -471,28 +410,12 @@ mod tests {
             (&[], &[(0, true)]),
         ];
         let expected = [true, true, true, true, true, true, false, false, false];
-        assert_eq!(knows(&[0, 1], false, asks), (expected.to_vec(), 0));
+        assert_eq!(knows(&[0, 1], asks), (expected.to_vec(), 0));
         // Without `a` read, nothing is known of `b`'s order.
-        assert_eq!(knows(&[1], false, &asks[6..8]), ([false, false].to_vec(), 0));
-        // A breaker's rows are new.
-        assert_eq!(knows(&[0, 1], true, &asks[1..2]), ([false].to_vec(), 0));
+        assert_eq!(knows(&[1], &asks[6..8]), ([false, false].to_vec(), 0));
         // Declared sorted by `b` alone too, it's known to be in both orders.
         let both = Ab(&[&[(0, false), (1, false)], &[(1, false)]]);
-        assert_eq!(knows_of(both, &[0, 1], false, &asks[5..8]), ([true, true, true].to_vec(), 1));
-    }
-
-    #[test]
-    fn keeps_the_start_of_sorts_too_long_to_hold() {
-        let mut rows = OutputProperties::NONE;
-        let key = |column| SortKey { column, descending: false };
-        let sorted_by: StdVec<SortKey> = (0..10).map(key).collect();
-        rows.arrangements.push(&[10], &sorted_by);
-        assert!(rows.is_arranged(&[10], &sorted_by[..7]));
-        assert!(!rows.is_arranged(&[10], &sorted_by[..8]));
-        // Grouping by too many keys says nothing of grouping by fewer.
-        let keys: StdVec<ColumnId> = (0..9).collect();
-        rows.arrangements.push(&keys, &[]);
-        assert!(!rows.is_arranged(&keys[..8], &[]));
+        assert_eq!(knows_of(both, &[0, 1], &asks[5..8]), ([true, true, true].to_vec(), 1));
     }
 
     /// The steps of `Ab` scanned, its rows counted by `groups` of its
@@ -540,7 +463,7 @@ mod tests {
                 .unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
-        lower(&Heap, &plan).unwrap().pipeline().describe()
+        lower_planned(&plan).unwrap().pipeline().describe()
     }
 
     #[test]
@@ -559,6 +482,9 @@ mod tests {
     fn keeps_only_the_first_rows_a_limit_reads() {
         assert_eq!(ordered(None, &[(1, false)], Some((10, 0))), "Scan | TopK");
         assert_eq!(ordered(None, &[(1, false)], Some((10, 5))), "Scan | TopK | Limit");
+        // A TopK counts its rows in `u32`, so keeping more is a sort and a
+        // LIMIT, which counts in `u64`.
+        assert_eq!(ordered(None, &[(1, false)], Some((1 << 40, 0))), "Scan | Sort | Limit");
         // Rows already in order are only limited.
         assert_eq!(ordered(None, &[(0, false)], Some((10, 0))), "Scan | Limit");
         let grouped = ordered(Some(&[1]), &[(1, true)], Some((1, 0)));
@@ -586,7 +512,7 @@ mod tests {
             node = plan.add_node(order_by, children).unwrap();
         }
         assert!(plan.output.push(ids[0]).is_ok());
-        assert_eq!(lower(&Heap, &plan).unwrap().pipeline().describe(), "Scan | Sort");
+        assert_eq!(lower_planned(&plan).unwrap().pipeline().describe(), "Scan | Sort");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -607,7 +533,7 @@ mod tests {
         }
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -717,7 +643,7 @@ mod tests {
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -783,11 +709,11 @@ mod tests {
             plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
             plan
         };
-        assert_eq!(lower(&Heap, &plan(70)).err(), Some(LowerError::TooManyColumns));
+        assert_eq!(lower_planned(&plan(70)).err(), Some(LowerError::TooManyColumns));
         // Pruned to the two in the output, it fits.
         let mut narrow = plan(2);
         crate::optimize::optimize(&Heap, &mut narrow).unwrap();
-        assert!(lower(&Heap, &narrow).is_ok());
+        assert!(lower_planned(&narrow).is_ok());
     }
 
     /// Three batches of four rows of `a`, `b` and `c`: row `r` of batch `n`
@@ -946,7 +872,7 @@ mod tests {
         }
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower(&Heap, &plan).unwrap();
+        let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
@@ -1073,7 +999,7 @@ mod tests {
         let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
         assert!(plan.output.push(a).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
-        lower(&Heap, &plan).unwrap();
+        lower_planned(&plan).unwrap();
         drop(plan);
         conditions.borrow().clone()
     }

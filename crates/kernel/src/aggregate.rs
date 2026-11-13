@@ -7,7 +7,7 @@ use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, OutputProperties};
+use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{ColumnId, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::Step;
@@ -60,30 +60,37 @@ pub struct AggregateOp {
 }
 
 impl<'c> Op<'c> for AggregateOp {
+    /// What its aggregates read must be `Int64`.
+    fn needs(&self, _: u32) -> InputNeeds<'_> {
+        let mut needs = InputNeeds::NONE;
+        for column in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
+            needs.types_then.push(column, DataType::Int64);
+        }
+        needs
+    }
+
     /// A row per group: its keys, then its aggregates. Groups are output in
     /// the order first seen, so if the input is sorted by the keys, the
-    /// output is too. Its keys must be `Int64` or strings, and what its
-    /// aggregates read `Int64`.
+    /// output is too. Its keys must be `Int64` or strings, which are all the
+    /// hash aggregate groups by.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        for id in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
-            if c.query_type(id) != DataType::Int64 {
-                return Err(LowerError::WrongType(id));
-            }
-        }
         for &key in self.keys.iter() {
-            if !matches!(c.query_type(key), DataType::Int64 | DataType::String) {
+            if !matches!(c.input(0).type_of(key), DataType::Int64 | DataType::String) {
                 return Err(LowerError::WrongType(key));
             }
         }
         check!(self.keys.len() <= KEYS_MAX);
         let mut out = OutputProperties::NONE;
         for &key in self.keys.iter() {
-            out.push_column(key)?;
+            out.push_column(c.column_of(key))?;
         }
         for aggregate in self.aggregates.iter() {
-            out.push_column(aggregate.binding.id)?;
+            out.push_column(c.column_of(aggregate.binding.id))?;
         }
-        out.arrangements.push(&[], c.input(0).sorted_by(&self.keys));
+        let sorted = c.input(0).sorted_by(&self.keys);
+        if !sorted.is_empty() {
+            out.arrangements.push(&[], sorted);
+        }
         Ok(out)
     }
 
@@ -97,7 +104,7 @@ impl<'c> Op<'c> for AggregateOp {
         let allocator = lowering.allocator();
         let mut string_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
-            string_keys |= u64::from(lowering.query_type(key) == DataType::String) << k;
+            string_keys |= u64::from(lowering.query_rows().type_of(key) == DataType::String) << k;
         }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
         let key_columns = SlowVec::fixed_from(allocator, keys)?;
