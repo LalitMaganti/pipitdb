@@ -49,8 +49,7 @@ impl<T> SlowVec<T> {
     /// grows: for lists whose length is known.
     #[inline]
     pub fn fixed(allocator: &dyn Allocator, len: usize) -> Result<SlowVec<T>, AllocError> {
-        let max = len.next_power_of_two();
-        SlowVec::empty(allocator, max, max)
+        SlowVec::empty(allocator, len, len)
     }
 
     /// `values`, in a `SlowVec` that never grows.
@@ -83,8 +82,7 @@ impl<T> SlowVec<T> {
         T: Primitive,
     {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        let max = len.next_power_of_two();
-        let mut raw = RawVec::new(allocator, size_of::<T>(), max, max, true)?;
+        let mut raw = RawVec::new(allocator, size_of::<T>(), len, len, true)?;
         raw.len = len;
         Ok(SlowVec { raw, values: PhantomData })
     }
@@ -93,7 +91,8 @@ impl<T> SlowVec<T> {
         self.raw.capacity as usize
     }
 
-    /// An empty `SlowVec` with room for `capacity` values, 0 or `max`.
+    /// An empty `SlowVec` with room for `capacity` values, 0 or `max`,
+    /// rounded up.
     #[inline]
     fn empty(
         allocator: &dyn Allocator,
@@ -238,7 +237,8 @@ fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
 
 impl RawVec {
     /// Room for `capacity` values of `item` bytes, zeroed if `zeroed`, and
-    /// at most `max`, which is at least `capacity`.
+    /// at most `max`, which is at least `capacity`: both rounded up to a
+    /// power of two, but for a `capacity` of 0.
     #[inline(never)]
     fn new(
         allocator: &dyn Allocator,
@@ -247,7 +247,8 @@ impl RawVec {
         max: usize,
         zeroed: bool,
     ) -> Result<RawVec, AllocError> {
-        let Ok(max) = u32::try_from(max) else { return Err(AllocError) };
+        let capacity = if capacity == 0 { 0 } else { capacity.next_power_of_two() };
+        let Ok(max) = u32::try_from(max.next_power_of_two()) else { return Err(AllocError) };
         let values = match capacity {
             // Nothing to allocate; aligned for any value, as slices need.
             0 => NonNull::<Aligned>::dangling().cast(),
