@@ -6,6 +6,7 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
+use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{Op, PlanNode};
 use crate::row_batch::RowBatch;
 use crate::step::{DynOperator, Operator, Progress, Step};
@@ -16,22 +17,31 @@ pub struct LimitOp {
 }
 
 impl<'c> Op<'c> for LimitOp {
+    /// Its input's, less some rows. The sort just before, if any, only needs
+    /// to output the rows read here, if a `TopK` can count them.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        let mut out = *c.input(0);
+        let read = self.count.checked_add(self.offset).and_then(|read| u32::try_from(read).ok());
+        if let (Some(sort), Some(read)) = (out.open_sort, read) {
+            c.limit_sort(sort, read);
+        }
+        out.drop_rows();
+        Ok(out)
+    }
+
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
-        let read = self.offset.checked_add(self.count).and_then(|read| u32::try_from(read).ok());
-        let took = lowering.lower_first(*at!(node.children, 0), read)?;
-        // The child makes no more rows than read, so with no offset, they're
-        // the rows wanted.
-        if took && self.offset == 0 {
+        lowering.lower_input(node, 0)?;
+        // A sort which outputs only the rows read here leaves nothing to drop.
+        if self.offset == 0 && lowering.query_sort_keep().map(u64::from) == Some(self.count) {
             return Ok(());
         }
         let limit = Limit { count: self.count, offset: self.offset };
-        lowering
-            .add_order_independent(Step::Operator(DynOperator::new(lowering.allocator(), limit)?))
+        lowering.add_operator(Step::Operator(DynOperator::new(lowering.allocator(), limit)?))
     }
 
     /// Makes no columns, and reads none.
