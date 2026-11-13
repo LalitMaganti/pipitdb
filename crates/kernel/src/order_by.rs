@@ -2,7 +2,7 @@
 
 use crate::lower::{self, LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
+use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{Op, PlanNode};
 use crate::slow_vec::SlowVec;
 
@@ -16,7 +16,8 @@ pub struct OrderByOp {
 
 impl<'c> Op<'c> for OrderByOp {
     fn needs(&self, _: u32) -> InputNeeds<'_> {
-        InputNeeds { sorted_by: Some(&self.keys) }
+        let arranged = Some(Arranged { grouped_by: &[], sorted_by: &self.keys });
+        InputNeeds { arranged, ..InputNeeds::NONE }
     }
 
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
