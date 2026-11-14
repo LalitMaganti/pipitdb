@@ -86,21 +86,22 @@ pub fn count_tokens(source: &[u8]) -> u32 {
     count
 }
 
-/// Batches of `BATCH_ROWS_MAX` rows, all sharing the same columns.
+/// Batches of `BATCH_ROWS_MAX` rows, all sharing one column.
 pub struct Repeat {
-    columns: Vec<ColumnView>,
+    column: ColumnView,
     batches: u32,
 }
 
 impl Repeat {
-    /// Batches of one column.
     #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
     pub fn new(batches: u32) -> Repeat {
         let size_bytes = BATCH_ROWS_MAX as usize * 8;
         let values = Buffer::allocate(&Heap, size_bytes).expect("allocates");
-        let column = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
-            .expect("allocates");
-        Repeat { columns: vec![column], batches }
+        Repeat {
+            column: ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
+                .expect("allocates"),
+            batches,
+        }
     }
 }
 
@@ -117,7 +118,31 @@ impl Source for Repeat {
         }
         *made += 1;
         batch.reset(BATCH_ROWS_MAX);
-        Ok(self.columns.iter().all(|column| batch.push_column(column.clone()).is_ok()))
+        Ok(batch.push_column(self.column.clone()).is_ok())
+    }
+}
+
+/// Batches of `BATCH_ROWS_MAX` rows, all sharing two columns.
+pub struct Pair {
+    columns: [ColumnView; 2],
+    batches: u32,
+}
+
+impl Source for Pair {
+    type State = u32;
+
+    fn new_state(&self, _: &mut Context) -> Result<u32, Error> {
+        Ok(0)
+    }
+
+    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> Result<bool, Error> {
+        if *made == self.batches {
+            return Ok(false);
+        }
+        *made += 1;
+        batch.reset(BATCH_ROWS_MAX);
+        let [a, b] = &self.columns;
+        Ok(batch.push_column(a.clone()).is_ok() && batch.push_column(b.clone()).is_ok())
     }
 }
 
@@ -149,7 +174,7 @@ pub fn compute_pipeline(
         ColumnView::new(&mut Context::new(&Heap), data_type, values, validity).expect("allocates")
     };
     #[expect(clippy::cast_possible_wrap, reason = "small integers")]
-    let columns = vec![
+    let columns = [
         column(|row| (row * 7919 % 1000) as i64, 0.5, 0),
         column(|row| (row % 97 + 1) as i64, 0.25, 5),
     ];
@@ -161,7 +186,7 @@ pub fn compute_pipeline(
     let mut owned = SlowVec::fixed(&Heap, 1).expect("allocates");
     let step = Step::Transform(DynTransform::new(&Heap, compute).expect("allocates"));
     assert!(owned.push(step).is_ok(), "fixed for one");
-    let source = DynSource::new(&Heap, Repeat { columns, batches }).expect("allocates");
+    let source = DynSource::new(&Heap, Pair { columns, batches }).expect("allocates");
     Pipeline::new(source, owned)
 }
 
