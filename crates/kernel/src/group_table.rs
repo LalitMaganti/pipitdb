@@ -602,12 +602,6 @@ fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
     }
     check!(keys.iter().all(|keys| keys.len() >= hashes.len()));
     check!(nulls.is_none_or(|nulls| nulls.len() >= hashes.len()));
-    if let ([keys], None) = (keys, nulls) {
-        for (hash, key) in hashes.iter_mut().zip(words(keys)) {
-            *hash = mix(key);
-        }
-        return;
-    }
     hashes.fill(SEED);
     for keys in keys {
         for (hash, key) in hashes.iter_mut().zip(words(keys)) {

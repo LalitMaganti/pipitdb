@@ -532,14 +532,16 @@ mod tests {
                     (Some(2), None)
                 ],
                 alloc::vec![(Some(1), Some(30)), (None, None), (Some(2), None)],
+                // No key is null, so the batch has no null words.
+                alloc::vec![(Some(1), Some(60)), (Some(1), Some(1000))],
             ],
             dropped: alloc::vec![1],
         };
         let expected = [
             // `k` null: one row, of 5.
             alloc::vec![None, Some(1), Some(1), Some(5), Some(5), Some(5)],
-            // `k` = 1: 10 and 30.
-            alloc::vec![Some(1), Some(2), Some(2), Some(40), Some(10), Some(30)],
+            // `k` = 1: 10, 30 and 60.
+            alloc::vec![Some(1), Some(3), Some(3), Some(100), Some(10), Some(60)],
             // `k` = 2: only nulls, so `SUM`, `MIN` and `MAX` are null.
             alloc::vec![Some(2), Some(2), Some(0), None, None, None],
         ];
