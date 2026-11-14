@@ -351,10 +351,14 @@ mod tests {
         // Integers widen to meet floats.
         assert_eq!(kept("FROM t |> SELECT f / a AS x"), [0.5, 1.25]);
         assert_eq!(kept("FROM t |> SELECT -a AS x, 7 AS y"), [-1.0, -2.0]);
+        // `%` binds as `*` does, and takes the sign of its left side, as in SQLite.
+        assert_eq!(kept("FROM t |> SELECT a + b % 3 AS x"), [2.0, 4.0]);
+        assert_eq!(kept("FROM t |> SELECT -b % 3 AS x"), [-1.0, -2.0]);
         let smallest = kept("FROM t |> SELECT -9223372036854775808 AS x");
         assert_eq!(smallest, [-9_223_372_036_854_775_808.0; 2]);
         // Dividing by zero, or by NULL, is NULL.
         assert_eq!(kept("FROM t |> EXTEND b / (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> EXTEND b % (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> EXTEND a + NULL AS x |> WHERE x IS NULL |> SELECT a").len(), 2);
         // An integer overflow fails the query.
         let catalog = catalog();
@@ -430,6 +434,7 @@ mod tests {
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
         assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::ExpectedName, 17));
         assert_eq!(error("FROM t |> EXTEND NULL - s AS x"), (ErrorCode::ExpectedNumber, 17));
+        assert_eq!(error("FROM t |> EXTEND f % 2 AS x"), (ErrorCode::ExpectedInteger, 17));
         assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> SELECT a > 1 AS x"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> SELECT 'x' AS x"), (ErrorCode::Unsupported, 17));

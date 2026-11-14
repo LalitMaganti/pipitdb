@@ -29,6 +29,8 @@ pub enum TokenKind {
     Greater,
     GreaterEqual,
     End,
+    // Added after `End`, so an `ExpectedToken` detail keeps its number.
+    Percent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,11 +40,14 @@ pub struct Token {
 }
 
 impl TokenKind {
+    /// The highest kind. Update it when adding one.
+    pub const LAST: TokenKind = TokenKind::Percent;
+
     pub fn from_u8(value: u8) -> Option<TokenKind> {
-        if value > TokenKind::End as u8 {
+        if value > TokenKind::LAST as u8 {
             return None;
         }
-        // SAFETY: `TokenKind` is a `u8` with no gaps up to `End`, the last.
+        // SAFETY: `TokenKind` is a `u8` with no gaps up to `LAST`.
         Some(unsafe { core::mem::transmute::<u8, TokenKind>(value) })
     }
 }
@@ -59,7 +64,7 @@ const LESS: u8 = 38;
 const GREATER: u8 = 39;
 const INVALID: u8 = 40;
 
-const _: () = assert!((TokenKind::End as u8) < SPACE);
+const _: () = assert!((TokenKind::LAST as u8) < SPACE);
 
 /// The class of each byte, as in SQLite's `aiClass`. A byte that is a token
 /// on its own maps to its `TokenKind`. Rust always computes a `static` at
@@ -88,6 +93,7 @@ const fn classes() -> [u8; 256] {
             b'+' => TokenKind::Plus as u8,
             b'-' => TokenKind::Minus as u8,
             b'/' => TokenKind::Slash as u8,
+            b'%' => TokenKind::Percent as u8,
             b'=' => TokenKind::Equal as u8,
             _ => INVALID,
         };

@@ -58,6 +58,7 @@ pub enum Operator {
     Subtract,
     Multiply,
     Divide,
+    Modulo,
     Like,
     IsNull,
     IsNotNull,

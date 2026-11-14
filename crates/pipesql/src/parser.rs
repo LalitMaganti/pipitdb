@@ -152,7 +152,7 @@ const SUM: u8 = 9;
 const PRODUCT: u8 = 11;
 const NEGATE: u8 = 13;
 
-const TOKEN_KIND_COUNT: usize = TokenKind::End as usize + 1;
+const TOKEN_KIND_COUNT: usize = TokenKind::LAST as usize + 1;
 
 /// The binary operator each token kind stands for, and its binding power.
 /// `AND` and `OR` are identifiers, so they are handled separately.
@@ -170,6 +170,7 @@ const fn infix() -> [Option<(Operator, u8)>; TOKEN_KIND_COUNT] {
     infix[TokenKind::Minus as usize] = Some((Operator::Subtract, SUM));
     infix[TokenKind::Star as usize] = Some((Operator::Multiply, PRODUCT));
     infix[TokenKind::Slash as usize] = Some((Operator::Divide, PRODUCT));
+    infix[TokenKind::Percent as usize] = Some((Operator::Modulo, PRODUCT));
     infix
 }
 
@@ -646,8 +647,8 @@ mod tests {
             "(Or (And (Greater (Add a (Multiply b (Negate c))) 1) (Not (Equal d 'x'))) e)"
         );
         assert_eq!(
-            parse("(a - b) - c * (d / 2.5)"),
-            "(Subtract (Subtract a b) (Multiply c (Divide d 2.5)))"
+            parse("(a - b) - c * (d / 2.5) % e"),
+            "(Subtract (Subtract a b) (Modulo (Multiply c (Divide d 2.5)) e))"
         );
     }
 
