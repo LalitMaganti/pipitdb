@@ -64,6 +64,9 @@ struct State {
 /// How many groups `groups` holds before it's emptied into partitions, so it
 /// stays in the cache.
 const SWITCH_GROUPS: usize = if cfg!(test) { 2 } else { 1 << 20 };
+/// The most words a partition row can take.
+const ROW_WORDS_MAX: usize =
+    2 + KEYS_MAX + 3 * BATCH_COLUMNS_MAX as usize + BATCH_COLUMNS_MAX as usize;
 /// How many partitions groups are split into, by their hashes' low bits,
 /// which a table's slots don't use.
 const PARTS: usize = 1 << 10;
@@ -161,15 +164,19 @@ impl HashAggregate {
         let stride = state.groups.row_stride();
         let groups = state.groups.len();
         let records = state.groups.records();
+        let width = radix.width;
+        let mut row = [0_i64; ROW_WORDS_MAX];
         for (g, record) in records.chunks_exact(stride).enumerate() {
             let hash = hash_record(at!(record, ..1 + key_count));
-            let part = at_mut!(radix.parts, hash as usize % PARTS);
-            part.push(hash.cast_signed())?;
-            part.extend_from_slice(record)?;
-            for seen in state.seen.iter() {
-                part.push(i64::from(seen.is_seen(g)))?;
+            *at_mut!(row, 0) = hash.cast_signed();
+            at_mut!(row, 1..1 + stride).copy_from_slice(record);
+            for (out, seen) in at_mut!(row, 1 + stride..width).iter_mut().zip(state.seen.iter()) {
+                *out = i64::from(seen.is_seen(g));
             }
+            at_mut!(radix.parts, hash as usize % PARTS).extend_from_slice(at!(row, ..width))?;
         }
+        crate::aggregate::SPILLED_BYTES
+            .fetch_add(groups * width * 8, core::sync::atomic::Ordering::Relaxed);
         // A refill that found almost no repeats isn't worth probing for.
         radix.raw = switched && groups * 100 >= state.rows_since_clear * 90;
         state.groups.clear();
@@ -228,17 +235,25 @@ impl HashAggregate {
             offset += function.state_words();
         }
         let Some(radix) = &mut state.radix else { failed!() };
+        let width = radix.width;
+        let mut out = [0_i64; ROW_WORDS_MAX];
         for (row, &hash) in hashes.iter().enumerate() {
-            let part = at_mut!(radix.parts, hash as usize % PARTS);
-            part.push(hash.cast_signed())?;
-            part.push(nulls.map_or(0, |nulls| at!(nulls, row).cast_signed()))?;
-            for words in words {
-                part.push(*at!(words, row))?;
+            *at_mut!(out, 0) = hash.cast_signed();
+            *at_mut!(out, 1) = nulls.map_or(0, |nulls| at!(nulls, row).cast_signed());
+            for (k, words) in words.iter().enumerate() {
+                *at_mut!(out, 2 + k) = *at!(words, row);
             }
-            let start = row * words_per_row;
-            part.extend_from_slice(at!(states, start..start + self.state_words))?;
-            part.extend_from_slice(at!(seen, row * aggregates..(row + 1) * aggregates))?;
+            let start = 2 + key_count;
+            let from = row * words_per_row;
+            at_mut!(out, start..start + self.state_words)
+                .copy_from_slice(at!(states, from..from + self.state_words));
+            let start = start + self.state_words;
+            at_mut!(out, start..width)
+                .copy_from_slice(at!(seen, row * aggregates..(row + 1) * aggregates));
+            at_mut!(radix.parts, hash as usize % PARTS).extend_from_slice(at!(out, ..width))?;
         }
+        crate::aggregate::SPILLED_BYTES
+            .fetch_add(rows * width * 8, core::sync::atomic::Ordering::Relaxed);
         if overflow { Err(Error::Overflow) } else { Ok(()) }
     }
 

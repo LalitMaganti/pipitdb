@@ -157,8 +157,12 @@ fn main() -> Result<(), String> {
                 #[expect(clippy::cast_precision_loss, reason = "a report")]
                 let read = codecs.bytes.get() as f64 / 1e6;
                 let pages = codecs.pages.get();
+                let spilled = pipit_kernel::aggregate::SPILLED_BYTES
+                    .swap(0, std::sync::atomic::Ordering::Relaxed)
+                    as f64
+                    / 1e6;
                 eprintln!(
-                    "Q{number}: {elapsed:?} peak {peak:.1} MB read {read:.1} MB in {pages} pages"
+                    "Q{number}: {elapsed:?} peak {peak:.1} MB read {read:.1} MB in {pages} pages spilled {spilled:.1} MB"
                 );
             }
             Err(error) => eprintln!("Q{number}: {error}"),

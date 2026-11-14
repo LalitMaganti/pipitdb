@@ -221,3 +221,6 @@ pub struct AggregateCall {
     /// `COUNT(DISTINCT x)` does. Perfetto's has no such flag: #288.
     pub distinct: bool,
 }
+
+/// How many bytes grouping wrote to partitions, for measuring (prototype).
+pub static SPILLED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
