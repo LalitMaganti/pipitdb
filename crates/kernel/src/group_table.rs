@@ -173,28 +173,67 @@ impl GroupTable {
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         self.grow(context.allocator(), self.len() + count)?;
-        let mut hashes = context.values_buffer(count * 8)?;
-        let hashes = at_mut!(hashes.as_mut_slice(), ..count);
-        hash_rows(hashes, keys, nulls);
-        // Rows often come in runs of one key, as a session's do: only a
-        // run's first row is found, and the rest take its group.
+        // Rows often come in runs of one key, as a session's do: then only
+        // each run's first row is found, and the rest take its group.
         let mut starts = context.indices_buffer(count * 4)?;
-        let starts = at_mut!(starts.as_mut_slice::<u32>(), ..count);
-        mark_runs(starts, keys, nulls);
-        if let ([keys], None) = (keys, nulls) {
-            return self.find_values(hashes, starts, keys, groups);
+        let runs = run_starts(keys, nulls, at_mut!(starts.as_mut_slice::<u32>(), ..count));
+        if runs * 4 > count * 3 {
+            return self.find_rows(context, keys, nulls, groups);
         }
-        self.find_hashed(hashes, starts, keys, nulls, groups)
+        let starts = at!(starts.as_slice::<u32>(), ..runs);
+        let mut firsts = [const { None }; KEYS_MAX];
+        for (first, keys) in firsts.iter_mut().zip(keys) {
+            let mut words = context.values_buffer(runs * 8)?;
+            gather(words.as_mut_slice(), keys, starts);
+            *first = Some(words);
+        }
+        let mut first_nulls = None;
+        if let Some(nulls) = nulls {
+            let mut words = context.values_buffer(runs * 8)?;
+            gather(words.as_mut_slice(), nulls, starts);
+            first_nulls = Some(words);
+        }
+        let mut first_keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+        for (keys, first) in first_keys.iter_mut().zip(&firsts) {
+            *keys = first.as_ref().map_or(&[], |first| at!(first.as_slice(), ..runs));
+        }
+        let first_nulls = first_nulls.as_ref().map(|nulls| at!(nulls.as_slice(), ..runs));
+        let mut run_groups = context.indices_buffer(runs * 4)?;
+        let run_groups = at_mut!(run_groups.as_mut_slice::<u32>(), ..runs);
+        let first_keys = at!(first_keys, ..self.keys);
+        self.find_rows(context, first_keys, first_nulls, run_groups)?;
+        for (i, (&start, &group)) in starts.iter().zip(run_groups.iter()).enumerate() {
+            let end = starts.get(i + 1).map_or(count, |&end| end as usize);
+            at_mut!(groups, start as usize..end).fill(group);
+        }
+        Ok(())
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
-    /// null word unless none are null, and each row's hash, and whether it
-    /// starts a run.
+    /// null word unless none are null.
+    fn find_rows(
+        &mut self,
+        context: &mut Context,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
+        let count = groups.len();
+        let mut hashes = context.values_buffer(count * 8)?;
+        let hashes = at_mut!(hashes.as_mut_slice(), ..count);
+        hash_rows(hashes, keys, nulls);
+        if let ([keys], None) = (keys, nulls) {
+            return self.find_values(hashes, keys, groups);
+        }
+        self.find_hashed(hashes, keys, nulls, groups)
+    }
+
+    /// As `find_or_create`, given each key as a word a row, and each row's
+    /// null word unless none are null, and each row's hash.
     #[inline(never)]
     fn find_hashed(
         &mut self,
         hashes: &[u64],
-        starts: &[u32],
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
         groups: &mut [u32],
@@ -202,18 +241,13 @@ impl GroupTable {
         let count = groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
-        check!(hashes.len() == count && starts.len() == count);
+        check!(hashes.len() == count);
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
-        let mut last = 0;
-        for (row, (group, &start)) in groups.iter_mut().zip(starts).enumerate() {
-            if start == 0 {
-                *group = last;
-                continue;
-            }
+        for (row, group) in groups.iter_mut().enumerate() {
             if ahead {
                 self.fetch_ahead(hash_of, row);
             }
@@ -233,7 +267,6 @@ impl GroupTable {
                 Ok(group) => group,
                 Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
-            last = *group;
         }
         Ok(())
     }
@@ -294,11 +327,10 @@ impl GroupTable {
     }
 
     /// As `find_or_create`, for a single key with no nulls, given each row's
-    /// hash, and whether it starts a run: compares the key values directly.
+    /// hash: compares the key values directly.
     fn find_values(
         &mut self,
         hashes: &[u64],
-        starts: &[u32],
         keys: &[i64],
         groups: &mut [u32],
     ) -> Result<(), Error> {
@@ -306,13 +338,7 @@ impl GroupTable {
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
-        let mut last = 0;
-        let rows = keys.iter().zip(hashes).zip(starts).zip(groups).enumerate();
-        for (i, (((&key, &hash), &start), group)) in rows {
-            if start == 0 {
-                *group = last;
-                continue;
-            }
+        for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
@@ -327,7 +353,6 @@ impl GroupTable {
                 Ok(group) => group,
                 Err(at) => self.add(at, hash, &[0, key])?,
             };
-            last = *group;
         }
         Ok(())
     }
@@ -614,28 +639,45 @@ fn combine(hash: u64, word: u64) -> u64 {
     hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
-/// Marks in `starts` each row of `keys`, whose null words are `nulls` unless
-/// none are null, that starts a run of one key, a key at a time, so each
-/// pass is a tight loop.
-fn mark_runs(starts: &mut [u32], keys: &[&[i64]], nulls: Option<&[u64]>) {
+/// Writes the rows of `keys`, whose null words are `nulls` unless none are
+/// null, that start a run of one key to `starts`, and returns how many there
+/// are. Marks each row a key at a time, so each pass is a tight loop.
+fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usize {
     let count = starts.len();
     check!(count > 0);
     check!(keys.iter().all(|keys| keys.len() >= count));
     check!(nulls.is_none_or(|nulls| nulls.len() >= count));
+    // First whether each row differs from the one before, in `starts`.
     starts.fill(0);
-    *at_mut!(starts, 0) = 1;
-    let mut differ = |words: &[i64]| {
+    let mut differ = |words: &[u64]| {
         let pairs = at!(words, ..count - 1).iter().zip(at!(words, 1..count));
         for (start, (before, word)) in at_mut!(starts, 1..).iter_mut().zip(pairs) {
             *start |= u32::from(before != word);
         }
     };
     for keys in keys {
-        differ(keys);
+        // SAFETY: of one size and alignment, with every bit pattern valid.
+        differ(unsafe { core::slice::from_raw_parts(keys.as_ptr().cast(), keys.len()) });
     }
     if let Some(nulls) = nulls {
-        // SAFETY: of one size and alignment, with every bit pattern valid.
-        differ(unsafe { core::slice::from_raw_parts(nulls.as_ptr().cast(), nulls.len()) });
+        differ(nulls);
+    }
+    *at_mut!(starts, 0) = 1;
+    let mut runs = 0;
+    for row in 0..count {
+        let start = *at!(starts, row) != 0;
+        #[expect(clippy::cast_possible_truncation, reason = "at most a batch's rows")]
+        let row_index = row as u32;
+        *at_mut!(starts, runs) = row_index;
+        runs += usize::from(start);
+    }
+    runs
+}
+
+/// Writes the words of `words` at `rows` to `out`.
+fn gather<T: Copy>(out: &mut [T], words: &[T], rows: &[u32]) {
+    for (out, &row) in out.iter_mut().zip(rows) {
+        *out = *at!(words, row as usize);
     }
 }
 
