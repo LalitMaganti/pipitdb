@@ -22,8 +22,7 @@ pub fn compile_expr(compiler: &Compiler<'_, '_>, node: Node) -> Result<(Expr, Da
     let data_type = check_expr_type(&expr, &type_of).map_err(|error| {
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
-            // The parser has no `%` yet.
-            ExprError::Integers => pipit_kernel::failed!(),
+            ExprError::Integers => ErrorCode::ExpectedInteger,
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, compiler.span(node))
@@ -113,6 +112,7 @@ fn compile(
                 Operator::Subtract => ExprOp::Sub,
                 Operator::Multiply => ExprOp::Mul,
                 Operator::Divide => ExprOp::Div,
+                Operator::Modulo => ExprOp::Mod,
                 _ => {
                     return Err(Error::unsupported(
                         Unsupported::SelectExpression,

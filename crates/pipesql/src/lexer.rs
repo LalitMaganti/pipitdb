@@ -22,6 +22,7 @@ pub enum TokenKind {
     Plus,
     Minus,
     Slash,
+    Percent,
     Equal,
     NotEqual,
     Less,
@@ -88,6 +89,7 @@ const fn classes() -> [u8; 256] {
             b'+' => TokenKind::Plus as u8,
             b'-' => TokenKind::Minus as u8,
             b'/' => TokenKind::Slash as u8,
+            b'%' => TokenKind::Percent as u8,
             b'=' => TokenKind::Equal as u8,
             _ => INVALID,
         };

@@ -63,6 +63,8 @@ pub enum ErrorCode {
     ExpectedNumber = 27,
     /// A computed column has no name, as `x + 1` without `AS y`.
     ExpectedName = 28,
+    /// `%` with a float on either side.
+    ExpectedInteger = 29,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -112,7 +114,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::ExpectedName;
+    pub const LAST: ErrorCode = ErrorCode::ExpectedInteger;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

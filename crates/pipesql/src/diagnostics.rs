@@ -83,9 +83,10 @@ fn describe(found: &str, error: &Error) -> Message {
                 pipit_kernel::predicate::PREDICATE_NODES_MAX
             ),
         ),
-        ErrorCode::ExpressionTooLarge | ErrorCode::ExpectedNumber | ErrorCode::ExpectedName => {
-            expression(error.code)
-        }
+        ErrorCode::ExpressionTooLarge
+        | ErrorCode::ExpectedNumber
+        | ErrorCode::ExpectedName
+        | ErrorCode::ExpectedInteger => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -115,6 +116,7 @@ fn expression(code: ErrorCode) -> (String, String) {
             "a computed column needs a name".into(),
             "name it with `AS`, as in `x + 1 AS y`".into(),
         ),
+        ErrorCode::ExpectedInteger => ("`%` needs integers".into(), "this reads a float".into()),
         _ => pipit_kernel::failed!(),
     }
 }
@@ -204,6 +206,7 @@ fn token(kind: TokenKind) -> &'static str {
         TokenKind::Plus => "`+`",
         TokenKind::Minus => "`-`",
         TokenKind::Slash => "`/`",
+        TokenKind::Percent => "`%`",
         TokenKind::Equal => "`=`",
         TokenKind::NotEqual => "`!=`",
         TokenKind::Less => "`<`",
