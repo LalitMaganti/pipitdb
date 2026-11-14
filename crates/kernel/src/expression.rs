@@ -30,7 +30,7 @@ pub enum ExprOp {
     Mul,
     /// `a / b`.
     Div,
-    /// `a % b`, of integers.
+    /// `a % b`. Of Int64s only.
     Mod,
 }
 
@@ -69,7 +69,8 @@ pub struct ExprProgram {
 }
 
 /// Adds one column to each batch for each program. Programs read only the
-/// columns the batch came with.
+/// columns the batch came with, which mustn't be lazy, and the batch must
+/// have room for a column more for each.
 pub struct Compute {
     pub programs: SlowVec<ExprProgram>,
 }

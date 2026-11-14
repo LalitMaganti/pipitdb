@@ -166,11 +166,15 @@ pub extern "C" fn run_column(value: i64) -> i64 {
 }
 
 /// The sum of `row op value` over rows `0..count`, computed as doubles if
-/// `doubles`, or 0 if that fails. `op` picks `+ - * / %`.
+/// `doubles`, or 0 if that fails. `op` picks `+ - * / %`; `%` is of
+/// integers only.
 #[unsafe(no_mangle)]
 pub extern "C" fn compute_sum(count: u32, op: u8, value: i64, doubles: bool) -> i64 {
     use ExprOp::{Add, Column, Constant, Div, Mod, Mul, Sub, ToDouble};
     let Some(&op) = [Add, Sub, Mul, Div, Mod].get(usize::from(op)) else { return 0 };
+    if doubles && op == Mod {
+        return 0;
+    }
     let Ok(mut values) = Buffer::allocate(&Heap, count as usize * 8) else { return 0 };
     values.as_mut_slice::<i64>().iter_mut().zip(0..).for_each(|(cell, row)| *cell = row);
     let mut context = Context::new(&Heap);
