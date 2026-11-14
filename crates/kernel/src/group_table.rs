@@ -76,6 +76,38 @@ pub(crate) struct GroupTable {
 /// No number, or no group.
 const NONE: u32 = u32::MAX;
 
+/// A batch's keys, as `GroupTable::load_keys` loads them: each key as a word
+/// a row, 0 where null, and a word a row of which keys are null, unless none
+/// are.
+pub(crate) struct LoadedKeys {
+    /// Each key's words, unless they're the column's own.
+    copies: [Option<Buffer>; KEYS_MAX],
+    /// Each row's null word, unless no key is null.
+    nulls: Option<Buffer>,
+}
+
+impl LoadedKeys {
+    /// The words of each of `columns`' first `count` rows.
+    pub(crate) fn keys<'a>(
+        &'a self,
+        columns: &[&'a ColumnView],
+        count: usize,
+    ) -> [&'a [i64]; KEYS_MAX] {
+        let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+        for ((keys, copy), column) in keys.iter_mut().zip(&self.copies).zip(columns) {
+            *keys = match copy {
+                Some(copy) => copy.as_slice(),
+                None => at!(column.int64s(), ..count),
+            };
+        }
+        keys
+    }
+
+    pub(crate) fn nulls(&self) -> Option<&[u64]> {
+        self.nulls.as_ref().map(Buffer::as_slice)
+    }
+}
+
 /// A string key's dictionary, and the ids of its entries: kept while
 /// batches share it, as a chunk's do, so each entry is interned once.
 struct Interned {
@@ -115,6 +147,17 @@ impl GroupTable {
         })
     }
 
+    /// Forgets every group, keeping the memory for the next ones.
+    pub(crate) fn clear(&mut self) {
+        self.records.clear();
+        self.slots.fill(0);
+    }
+
+    /// Each group's null word, keys and payload, `row_stride()` words each.
+    pub(crate) fn records(&self) -> &[i64] {
+        &self.records
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.records.len() / self.stride
     }
@@ -151,27 +194,10 @@ impl GroupTable {
             let Some(ids) = ids else { failed!() };
             return self.find_numbered(ids.as_slice(), numbers.as_slice(), groups);
         }
-        // Each key as a word a row, 0 where null, and a word a row of which
-        // keys are null, unless none are.
-        let mut copies = [const { None }; KEYS_MAX];
-        let mut nulls: Option<Buffer> = None;
-        for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
-            if self.string_keys >> k & 1 != 0 {
-                let interned = at_mut!(self.dictionaries, k);
-                load_string_ids(context, interned, column, select, count, copy, None)?;
-            } else {
-                load_key_words(context, column, select, count, k, copy, &mut nulls)?;
-            }
-        }
-        let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
-        for ((keys, copy), column) in keys.iter_mut().zip(&copies).zip(columns) {
-            *keys = match copy {
-                Some(copy) => copy.as_slice(),
-                None => at!(column.int64s(), ..count),
-            };
-        }
+        let loaded = self.load_keys(context, columns, select, count)?;
+        let keys = loaded.keys(columns, count);
         let keys = at!(keys, ..self.keys);
-        let nulls = nulls.as_ref().map(Buffer::as_slice);
+        let nulls = loaded.nulls();
         self.grow(context.allocator(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
@@ -207,6 +233,45 @@ impl GroupTable {
             at_mut!(groups, start as usize..end).fill(group);
         }
         Ok(())
+    }
+
+    /// Loads the first `count` rows `select` keeps of `columns`, all if it's
+    /// empty, as `find_or_create` reads them.
+    pub(crate) fn load_keys(
+        &mut self,
+        context: &mut Context,
+        columns: &[&ColumnView],
+        select: &[u16],
+        count: usize,
+    ) -> Result<LoadedKeys, Error> {
+        let mut copies = [const { None }; KEYS_MAX];
+        let mut nulls: Option<Buffer> = None;
+        for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
+            if self.string_keys >> k & 1 != 0 {
+                let interned = at_mut!(self.dictionaries, k);
+                load_string_ids(context, interned, column, select, count, copy, None)?;
+            } else {
+                load_key_words(context, column, select, count, k, copy, &mut nulls)?;
+            }
+        }
+        Ok(LoadedKeys { copies, nulls })
+    }
+
+    /// As `find_or_create`, given each key as a word a row, each row's null
+    /// word unless none are null, and each row's hash.
+    pub(crate) fn find_hashes(
+        &mut self,
+        allocator: &dyn Allocator,
+        hashes: &[u64],
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
+        self.grow(allocator, self.len() + groups.len())?;
+        if let ([keys], None) = (keys, nulls) {
+            return self.find_values(hashes, keys, groups);
+        }
+        self.find_hashed(hashes, keys, nulls, groups)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
@@ -639,6 +704,14 @@ fn combine(hash: u64, word: u64) -> u64 {
     hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
+/// The hash of a group's `record`, its null word then its keys, as
+/// `hash_rows` hashes a row of them.
+pub(crate) fn hash_record(record: &[i64]) -> u64 {
+    let Some((&null, keys)) = record.split_first() else { failed!() };
+    let hash = keys.iter().fold(SEED, |hash, &key| combine(hash, key.cast_unsigned()));
+    if null == 0 { hash } else { combine(hash, null.cast_unsigned()) }
+}
+
 /// Writes the rows of `keys`, whose null words are `nulls` unless none are
 /// null, that start a run of one key to `starts`, and returns how many there
 /// are. Marks each row a key at a time, so each pass is a tight loop.
@@ -689,7 +762,7 @@ fn gather(out: &mut [i64], words: &[i64], rows: &[u32]) {
 /// The hash of each row of `keys`, whose null words are `nulls` unless none
 /// are null, to `hashes`, as Perfetto's `GroupTable::Hash`: a key at a time,
 /// so each pass is a tight loop.
-fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
+pub(crate) fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
     fn words(keys: &[i64]) -> impl Iterator<Item = u64> + '_ {
         keys.iter().map(|&key| key.cast_unsigned())
     }

@@ -123,6 +123,11 @@ impl SeenBytes {
         Ok(SeenBytes { bytes: SlowVec::new(allocator, GROUPS_MAX)?, tracking: false, groups: 0 })
     }
 
+    /// Whether `group` has seen a value.
+    pub(crate) fn is_seen(&self, group: usize) -> bool {
+        !self.tracking || *at!(self.bytes, group) != 0
+    }
+
     /// What to pass as `GroupStates::seen` for a batch with `groups` groups
     /// in all, whose input holds nulls if `nulls`.
     pub(crate) fn get(
@@ -196,6 +201,32 @@ pub(crate) fn make_aggregate_function(function: Function) -> &'static dyn Aggreg
         // Flips the sign: words order as the values do, the least being zero.
         Function::Max => &Extreme { mask: 1 << 63 },
         Function::Avg => &Avg,
+    }
+}
+
+/// Adds the partial state `from` of `function` into `into`, as if `into`'s
+/// group had read `from`'s rows too.
+pub(crate) fn combine_states(
+    function: Function,
+    into: &mut [i64],
+    from: &[i64],
+    overflow: &mut bool,
+) {
+    match function {
+        Function::CountStar | Function::Count => *at_mut!(into, 0) += *at!(from, 0),
+        Function::Sum => {
+            let (sum, o) = at!(into, 0).overflowing_add(*at!(from, 0));
+            *at_mut!(into, 0) = sum;
+            *overflow |= o;
+        }
+        Function::Min | Function::Max => {
+            let best = at!(into, 0).cast_unsigned().max(at!(from, 0).cast_unsigned());
+            *at_mut!(into, 0) = best.cast_signed();
+        }
+        Function::Avg => {
+            set_int128(into, int128(into) + int128(from));
+            *at_mut!(into, AVG_COUNT) += *at!(from, AVG_COUNT);
+        }
     }
 }
 

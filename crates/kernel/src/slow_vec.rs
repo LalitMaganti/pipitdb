@@ -157,6 +157,14 @@ impl<T> SlowVec<T> {
         Ok(())
     }
 
+    /// Empties it, keeping its memory for the next values.
+    pub fn clear(&mut self)
+    where
+        T: Primitive,
+    {
+        self.raw.len = 0;
+    }
+
     /// Empties it and frees its memory, so it holds no more than one made by
     /// `new`.
     pub fn free(&mut self)
