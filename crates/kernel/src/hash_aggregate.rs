@@ -13,7 +13,7 @@ use crate::column::{ColumnView, DataType, Forms};
 use crate::context::Context;
 use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
-use crate::group_table::{GroupTable, KEYS_MAX, hash_record, hash_rows};
+use crate::group_table::{GroupTable, KEYS_MAX, hash_record, hash_rows, run_starts};
 use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
@@ -55,15 +55,13 @@ struct State {
     distinct: SlowVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
-    /// Once `groups` outgrew the cache, the groups it held, by partition.
+    /// Once `groups` outgrew its budget, the partitions evicted from it.
     radix: Option<Radix>,
-    /// How many rows `groups` has read since it was last emptied.
-    rows_since_clear: usize,
 }
 
 /// How many groups `groups` holds before it's emptied into partitions, so it
 /// stays in the cache.
-const SWITCH_GROUPS: usize = if cfg!(test) { 2 } else { 1 << 20 };
+const SWITCH_GROUPS: usize = if cfg!(test) { 4 } else { 1 << 20 };
 /// The most words a partition row can take.
 const ROW_WORDS_MAX: usize =
     2 + KEYS_MAX + 3 * BATCH_COLUMNS_MAX as usize + BATCH_COLUMNS_MAX as usize;
@@ -78,8 +76,8 @@ struct Radix {
     /// seen a value.
     parts: SlowVec<SlowVec<i64>>,
     width: usize,
-    /// Whether rows skip `groups`, which found too few repeats.
-    raw: bool,
+    /// Whether each partition was evicted: its rows skip `groups`.
+    evicted: [bool; PARTS],
     /// The partition being output, its groups, and how many are.
     merged: Option<Merged>,
     /// The next partition to combine.
@@ -146,52 +144,76 @@ impl HashAggregate {
         Ok(seen)
     }
 
-    /// Empties `groups` into the partitions, and decides whether later rows
-    /// should skip it.
-    fn drain(&self, context: &mut Context, state: &mut State) -> Result<(), Error> {
+    /// Evicts partitions from `groups` until it holds at most three quarters
+    /// of its budget, writing their groups out, and keeping the rest.
+    fn evict(&self, context: &mut Context, state: &mut State) -> Result<(), Error> {
         let allocator = context.allocator();
         let key_count = self.spec.key_columns.len();
-        let switched = state.radix.is_some();
         if state.radix.is_none() {
             let mut parts = SlowVec::fixed(allocator, PARTS)?;
             for _ in 0..PARTS {
                 parts.push(SlowVec::new(allocator, 1 << 31)?)?;
             }
             let width = 2 + key_count + self.state_words + self.spec.aggregates.len();
-            state.radix = Some(Radix { parts, width, raw: false, merged: None, next: 0 });
+            let evicted = [false; PARTS];
+            state.radix = Some(Radix { parts, width, evicted, merged: None, next: 0 });
         }
         let Some(radix) = &mut state.radix else { failed!() };
         let stride = state.groups.row_stride();
-        let groups = state.groups.len();
         let records = state.groups.records();
+        let hash_of = |record: &[i64]| hash_record(at!(record, ..1 + key_count));
+        let mut counts = [0_usize; PARTS];
+        for record in records.chunks_exact(stride) {
+            *at_mut!(counts, hash_of(record) as usize % PARTS) += 1;
+        }
+        let mut resident = state.groups.len();
+        for p in (0..PARTS).rev() {
+            if resident <= SWITCH_GROUPS / 4 * 3 {
+                break;
+            }
+            if !*at!(radix.evicted, p) {
+                *at_mut!(radix.evicted, p) = true;
+                resident -= *at!(counts, p);
+            }
+        }
         let width = radix.width;
+        let mut kept = SlowVec::new(allocator, 1 << 31)?;
         let mut row = [0_i64; ROW_WORDS_MAX];
+        let mut spilled = 0;
         for (g, record) in records.chunks_exact(stride).enumerate() {
-            let hash = hash_record(at!(record, ..1 + key_count));
+            let hash = hash_of(record);
             *at_mut!(row, 0) = hash.cast_signed();
             at_mut!(row, 1..1 + stride).copy_from_slice(record);
             for (out, seen) in at_mut!(row, 1 + stride..width).iter_mut().zip(state.seen.iter()) {
                 *out = i64::from(seen.is_seen(g));
             }
-            at_mut!(radix.parts, hash as usize % PARTS).extend_from_slice(at!(row, ..width))?;
+            let p = hash as usize % PARTS;
+            if *at!(radix.evicted, p) {
+                at_mut!(radix.parts, p).extend_from_slice(at!(row, ..width))?;
+                spilled += 1;
+            } else {
+                kept.extend_from_slice(at!(row, ..width))?;
+            }
         }
         crate::aggregate::SPILLED_BYTES
-            .fetch_add(groups * width * 8, core::sync::atomic::Ordering::Relaxed);
-        // A refill that found almost no repeats isn't worth probing for.
-        radix.raw = switched && groups * 100 >= state.rows_since_clear * 90;
+            .fetch_add(spilled * width * 8, core::sync::atomic::Ordering::Relaxed);
         state.groups.clear();
         state.seen = self.new_seen(allocator)?;
-        state.rows_since_clear = 0;
+        self.merge_rows(context, &kept, width, &mut state.groups, &mut state.seen)?;
         Ok(())
     }
 
-    /// Appends each row of `input` to its partition as a group of its own.
-    fn consume_raw(
+    /// Splits the rows `input` keeps into those of resident partitions, to
+    /// `resident`, and those of evicted ones, to `evicted`, as rows of the
+    /// batch.
+    fn split(
         &self,
         context: &mut Context,
         state: &mut State,
         input: &Flat,
         rows: usize,
+        resident: &mut SlowVec<u16>,
+        evicted: &mut SlowVec<u16>,
     ) -> Result<(), Error> {
         let key_count = self.spec.key_columns.len();
         let mut keys = [input.column(0); KEYS_MAX];
@@ -201,94 +223,137 @@ impl HashAggregate {
         let keys = at!(keys, ..key_count);
         let loaded = state.groups.load_keys(context, keys, input.select(), rows)?;
         let words = loaded.keys(keys, rows);
+        let mut hashes = context.values_buffer(rows * 8)?;
+        let hashes = at_mut!(hashes.as_mut_slice::<u64>(), ..rows);
+        hash_rows(hashes, at!(words, ..key_count), loaded.nulls());
+        let Some(radix) = &state.radix else { failed!() };
+        let select = input.select();
+        for (i, &hash) in hashes.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+            let row = if select.is_empty() { i as u16 } else { *at!(select, i) };
+            if *at!(radix.evicted, hash as usize % PARTS) {
+                evicted.push(row)?;
+            } else {
+                resident.push(row)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the rows `select` keeps of `input` to their evicted
+    /// partitions, a group for each run of one key.
+    fn consume_evicted(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        input: &Flat,
+        select: &[u16],
+    ) -> Result<(), Error> {
+        let rows = select.len();
+        let key_count = self.spec.key_columns.len();
+        let mut keys = [input.column(0); KEYS_MAX];
+        for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
+            *key = input.column(column);
+        }
+        let keys = at!(keys, ..key_count);
+        let loaded = state.groups.load_keys(context, keys, select, rows)?;
+        let words = loaded.keys(keys, rows);
         let words = at!(words, ..key_count);
         let nulls = loaded.nulls();
         let mut hashes = context.values_buffer(rows * 8)?;
         let hashes = at_mut!(hashes.as_mut_slice::<u64>(), ..rows);
         hash_rows(hashes, words, nulls);
-        // Each row's state, as if it were its own group.
-        let words_per_row = self.state_words.max(1);
-        let mut states = SlowVec::zeroed(context.allocator(), rows * words_per_row)?;
-        let mut seen = SlowVec::zeroed(context.allocator(), rows * self.spec.aggregates.len())?;
+        // Each run's rows as one group.
+        let mut starts = context.indices_buffer(rows * 4)?;
+        let starts = at_mut!(starts.as_mut_slice::<u32>(), ..rows);
+        let runs = run_starts(words, nulls, starts);
+        let starts = at!(starts, ..runs);
         let mut ids = context.indices_buffer(rows * 4)?;
         let ids = at_mut!(ids.as_mut_slice::<u32>(), ..rows);
-        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
-        for (i, id) in ids.iter_mut().enumerate() {
-            *id = i as u32;
+        for (run, &start) in starts.iter().enumerate() {
+            let end = starts.get(run + 1).map_or(rows, |&end| end as usize);
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+            at_mut!(ids, start as usize..end).fill(run as u32);
         }
-        let (mut overflow, mut offset) = (false, 0);
+        let words_per_run = self.state_words.max(1);
         let aggregates = self.spec.aggregates.len();
+        let mut states = SlowVec::zeroed(context.allocator(), runs * words_per_run)?;
+        let mut seen = SlowVec::zeroed(context.allocator(), runs * aggregates.max(1))?;
+        let (mut overflow, mut offset) = (false, 0);
         for (a, call) in self.spec.aggregates.iter().enumerate() {
             let function = make_aggregate_function(call.function);
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
             if function.reads_input() {
-                loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
+                loaded = buffers.load(context, input.column(call.column), select, rows)?;
             }
-            for row in 0..rows {
+            for (row, &run) in ids.iter().enumerate() {
                 let held = !function.tracks_seen() || loaded.is_valid(row);
-                *at_mut!(seen, row * aggregates + a) = i64::from(held);
+                *at_mut!(seen, run as usize * aggregates + a) |= i64::from(held);
             }
             let words = at_mut!(states, offset..);
-            let group_states = GroupStates { words, stride: words_per_row, seen: None };
+            let group_states = GroupStates { words, stride: words_per_run, seen: None };
             function.update(&loaded, ids, group_states, &mut overflow);
             offset += function.state_words();
         }
         let Some(radix) = &mut state.radix else { failed!() };
         let width = radix.width;
         let mut out = [0_i64; ROW_WORDS_MAX];
-        for (row, &hash) in hashes.iter().enumerate() {
+        for (run, &start) in starts.iter().enumerate() {
+            let row = start as usize;
+            let hash = *at!(hashes, row);
             *at_mut!(out, 0) = hash.cast_signed();
             *at_mut!(out, 1) = nulls.map_or(0, |nulls| at!(nulls, row).cast_signed());
             for (k, words) in words.iter().enumerate() {
                 *at_mut!(out, 2 + k) = *at!(words, row);
             }
-            let start = 2 + key_count;
-            let from = row * words_per_row;
-            at_mut!(out, start..start + self.state_words)
+            let at = 2 + key_count;
+            let from = run * words_per_run;
+            at_mut!(out, at..at + self.state_words)
                 .copy_from_slice(at!(states, from..from + self.state_words));
-            let start = start + self.state_words;
-            at_mut!(out, start..width)
-                .copy_from_slice(at!(seen, row * aggregates..(row + 1) * aggregates));
+            let at = at + self.state_words;
+            at_mut!(out, at..width)
+                .copy_from_slice(at!(seen, run * aggregates..run * aggregates + aggregates));
             at_mut!(radix.parts, hash as usize % PARTS).extend_from_slice(at!(out, ..width))?;
         }
         crate::aggregate::SPILLED_BYTES
-            .fetch_add(rows * width * 8, core::sync::atomic::Ordering::Relaxed);
+            .fetch_add(runs * width * 8, core::sync::atomic::Ordering::Relaxed);
         if overflow { Err(Error::Overflow) } else { Ok(()) }
     }
 
-    /// Combines partition `p`'s partial groups into one table.
-    fn merge(&self, context: &mut Context, radix: &mut Radix, p: usize) -> Result<Merged, Error> {
+    /// Combines partial groups `rows`, `width` words each, into `table`,
+    /// whose groups have seen values as `seen` says.
+    fn merge_rows(
+        &self,
+        context: &mut Context,
+        rows: &[i64],
+        width: usize,
+        table: &mut GroupTable,
+        seen: &mut SlowVec<SeenBytes>,
+    ) -> Result<(), Error> {
         let allocator = context.allocator();
         let key_count = self.spec.key_columns.len();
-        let mut table =
-            GroupTable::new(allocator, key_count, self.spec.string_keys, self.state_words)?;
-        let mut seen = self.new_seen(allocator)?;
-        let width = radix.width;
-        let part = at_mut!(radix.parts, p);
-        let rows = part.len() / width;
+        let row_count = rows.len() / width;
         let batch = BATCH_ROWS_MAX as usize;
         let mut overflow = false;
-        for start in (0..rows).step_by(batch) {
-            let count = batch.min(rows - start);
-            let block = at!(part, start * width..(start + count) * width);
+        for start in (0..row_count).step_by(batch) {
+            let count = batch.min(row_count - start);
+            let block = at!(rows, start * width..(start + count) * width);
             let mut hashes = context.values_buffer(count * 8)?;
             let mut nulls = context.values_buffer(count * 8)?;
             let mut key_words = [const { None }; KEYS_MAX];
             for (k, words) in key_words.iter_mut().take(key_count).enumerate() {
                 let mut buffer = context.values_buffer(count * 8)?;
-                for (out, row) in
-                    buffer.as_mut_slice::<i64>().iter_mut().zip(block.chunks_exact(width))
-                {
+                let out = buffer.as_mut_slice::<i64>().iter_mut();
+                for (out, row) in out.zip(block.chunks_exact(width)) {
                     *out = *at!(row, 2 + k);
                 }
                 *words = Some(buffer);
             }
             let (hash_out, null_out) = (hashes.as_mut_slice::<u64>(), nulls.as_mut_slice::<u64>());
             let mut any_null = false;
-            for ((hash, null), row) in
-                hash_out.iter_mut().zip(null_out.iter_mut()).zip(block.chunks_exact(width))
-            {
+            let outs = hash_out.iter_mut().zip(null_out.iter_mut());
+            for ((hash, null), row) in outs.zip(block.chunks_exact(width)) {
                 *hash = at!(row, 0).cast_unsigned();
                 *null = at!(row, 1).cast_unsigned();
                 any_null |= *null != 0;
@@ -306,7 +371,6 @@ impl HashAggregate {
             let stride = table.row_stride();
             let payloads = table.payloads();
             let mut offset = 0;
-            let aggregates = self.spec.aggregates.len();
             for (a, call) in self.spec.aggregates.iter().enumerate() {
                 let function = make_aggregate_function(call.function);
                 let words = function.state_words();
@@ -320,24 +384,28 @@ impl HashAggregate {
                 for (&group, row) in groups.iter().zip(block.chunks_exact(width)) {
                     let from = at!(row, 2 + key_count + offset..2 + key_count + offset + words);
                     let at = group as usize * stride + offset;
-                    combine_states(
-                        call.function,
-                        at_mut!(payloads, at..at + words),
-                        from,
-                        &mut overflow,
-                    );
+                    let into = at_mut!(payloads, at..at + words);
+                    combine_states(call.function, into, from, &mut overflow);
                     if let Some(marks) = &mut marks {
                         *at_mut!(marks, group as usize) |= u8::from(*at!(row, seen_at) != 0);
                     }
                 }
                 offset += words;
-                let _ = aggregates;
             }
         }
+        if overflow { Err(Error::Overflow) } else { Ok(()) }
+    }
+
+    /// Combines partition `p`'s partial groups into one table.
+    fn merge(&self, context: &mut Context, radix: &mut Radix, p: usize) -> Result<Merged, Error> {
+        let allocator = context.allocator();
+        let key_count = self.spec.key_columns.len();
+        let mut table =
+            GroupTable::new(allocator, key_count, self.spec.string_keys, self.state_words)?;
+        let mut seen = self.new_seen(allocator)?;
+        let part = at_mut!(radix.parts, p);
+        self.merge_rows(context, part, radix.width, &mut table, &mut seen)?;
         part.free();
-        if overflow {
-            return Err(Error::Overflow);
-        }
         Ok(Merged { groups: table, seen, served: 0 })
     }
 
@@ -530,16 +598,7 @@ impl Breaker for HashAggregate {
             let set = if call.distinct { Some(FlatHashMap::for_len(allocator, 0)?) } else { None };
             distinct.push(set)?;
         }
-        Ok(State {
-            groups,
-            total,
-            consumed: false,
-            seen,
-            distinct,
-            emitted: 0,
-            radix: None,
-            rows_since_clear: 0,
-        })
+        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0, radix: None })
     }
 
     fn consume(
@@ -553,20 +612,59 @@ impl Breaker for HashAggregate {
             return Ok(());
         }
         let input = Flat::new(context, input, self.read())?;
+        state.consumed = true;
         if self.radix_eligible() {
             if state.groups.len() + rows > SWITCH_GROUPS {
-                self.drain(context, state)?;
+                self.evict(context, state)?;
             }
-            if state.radix.as_ref().is_some_and(|radix| radix.raw) {
-                state.consumed = true;
-                return self.consume_raw(context, state, &input, rows);
+            if state.radix.is_some() {
+                let allocator = context.allocator();
+                let mut resident = SlowVec::fixed(allocator, rows)?;
+                let mut evicted = SlowVec::fixed(allocator, rows)?;
+                self.split(context, state, &input, rows, &mut resident, &mut evicted)?;
+                if !evicted.is_empty() {
+                    self.consume_evicted(context, state, &input, &evicted)?;
+                }
+                if resident.is_empty() {
+                    return Ok(());
+                }
+                return self.consume_into_table(context, state, &input, &resident, resident.len());
             }
-            state.rows_since_clear += rows;
         }
+        self.consume_into_table(context, state, &input, input.select(), rows)
+    }
+
+    fn finalize(&self, _: &mut Context, _: &mut State) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn serve(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        output: &mut RowBatch,
+    ) -> Result<bool, Error> {
+        if state.radix.is_some() && state.emitted == state.groups.len() {
+            return self.serve_radix(context, state, output);
+        }
+        self.serve_table(context, state, output)
+    }
+}
+
+impl HashAggregate {
+    /// As `consume`, for the rows `select` keeps of `input`, all if empty,
+    /// `rows` of them, into `groups`.
+    fn consume_into_table(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        input: &Flat,
+        select: &[u16],
+        rows: usize,
+    ) -> Result<(), Error> {
         // Find each row's group. Groups are numbered in the order first seen,
         // so a row starts a new group when its number equals the group count.
         // With no keys, every row is in the one group.
-        state.consumed = true;
         let mut numbers = None;
         if !self.spec.key_columns.is_empty() {
             let mut keys = [input.column(0); KEYS_MAX];
@@ -575,7 +673,7 @@ impl Breaker for HashAggregate {
             }
             let keys = at!(keys, ..self.spec.key_columns.len());
             let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
-            state.groups.find_or_create(context, keys, input.select(), groups)?;
+            state.groups.find_or_create(context, keys, select, groups)?;
         }
         let group_count = self.group_count(state);
         let State { groups, total, seen, distinct, .. } = state;
@@ -587,7 +685,7 @@ impl Breaker for HashAggregate {
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
             if function.reads_input() {
-                loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
+                loaded = buffers.load(context, input.column(call.column), select, rows)?;
             }
             let seen = if function.tracks_seen() {
                 at_mut!(seen, a).get(group_count, loaded.valid.is_some())?
@@ -618,22 +716,13 @@ impl Breaker for HashAggregate {
         if overflow { Err(Error::Overflow) } else { Ok(()) }
     }
 
-    fn finalize(&self, context: &mut Context, state: &mut State) -> Result<(), Error> {
-        if state.radix.is_some() && state.groups.len() > 0 {
-            self.drain(context, state)?;
-        }
-        Ok(())
-    }
-
-    fn serve(
+    /// As `serve`, from `groups`.
+    fn serve_table(
         &self,
         context: &mut Context,
         state: &mut State,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        if state.radix.is_some() {
-            return self.serve_radix(context, state, output);
-        }
         let groups = self.group_count(state);
         // Output up to a full batch of groups.
         let first = state.emitted;
@@ -669,7 +758,7 @@ impl Breaker for HashAggregate {
             let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
-        Ok(state.emitted < groups)
+        Ok(state.emitted < groups || state.radix.is_some())
     }
 }
 

@@ -715,7 +715,7 @@ pub(crate) fn hash_record(record: &[i64]) -> u64 {
 /// Writes the rows of `keys`, whose null words are `nulls` unless none are
 /// null, that start a run of one key to `starts`, and returns how many there
 /// are. Marks each row a key at a time, so each pass is a tight loop.
-fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usize {
+pub(crate) fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usize {
     let count = starts.len();
     check!(count > 0);
     check!(keys.iter().all(|keys| keys.len() >= count));
