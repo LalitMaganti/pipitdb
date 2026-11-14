@@ -83,6 +83,24 @@ fn describe(found: &str, error: &Error) -> Message {
                 pipit_kernel::predicate::PREDICATE_NODES_MAX
             ),
         ),
+        ErrorCode::ExpressionTooLarge | ErrorCode::ExpectedNumber | ErrorCode::ExpectedName => {
+            expression(error.code)
+        }
+        ErrorCode::UnknownTable
+        | ErrorCode::UnknownColumn
+        | ErrorCode::AmbiguousColumn
+        | ErrorCode::ListedTwice
+        | ErrorCode::NoColumnsLeft
+        | ErrorCode::DuplicateColumn
+        | ErrorCode::UnknownFunction => named(found, error.code),
+        ErrorCode::Unsupported => unsupported(found, error.detail),
+    };
+    Message { title, label }
+}
+
+/// The title and label for an error about a computed column, `code`.
+fn expression(code: ErrorCode) -> (String, String) {
+    match code {
         ErrorCode::ExpressionTooLarge => (
             "the expression is too large".into(),
             format!(
@@ -97,16 +115,8 @@ fn describe(found: &str, error: &Error) -> Message {
             "a computed column needs a name".into(),
             "name it with `AS`, as in `x + 1 AS y`".into(),
         ),
-        ErrorCode::UnknownTable
-        | ErrorCode::UnknownColumn
-        | ErrorCode::AmbiguousColumn
-        | ErrorCode::ListedTwice
-        | ErrorCode::NoColumnsLeft
-        | ErrorCode::DuplicateColumn
-        | ErrorCode::UnknownFunction => named(found, error.code),
-        ErrorCode::Unsupported => unsupported(found, error.detail),
-    };
-    Message { title, label }
+        _ => pipit_kernel::failed!(),
+    }
 }
 
 /// The title and label for an error about what a name names, `code`.
