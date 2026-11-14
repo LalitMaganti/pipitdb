@@ -65,7 +65,23 @@ fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(plan.pipeline())))
 }
 
-library_benchmark_group!(name = perfetto_filter_group, benchmarks = [perfetto_filter]);
+// Perfetto's `expression_benchmark.cc`, over 16 batches.
+#[library_benchmark]
+#[bench::int_add(pipitdb_bench::perfetto_expression(0, 16))]
+#[bench::int_mul(pipitdb_bench::perfetto_expression(1, 16))]
+#[bench::int_div(pipitdb_bench::perfetto_expression(2, 16))]
+#[bench::int_add_nullable(pipitdb_bench::perfetto_expression(3, 16))]
+#[bench::int_div_nullable(pipitdb_bench::perfetto_expression(4, 16))]
+#[bench::double_add(pipitdb_bench::perfetto_expression(5, 16))]
+#[bench::double_mul(pipitdb_bench::perfetto_expression(6, 16))]
+fn perfetto_expression(pipeline: Pipeline<'static>) -> u64 {
+    black_box(pipitdb_bench::run(black_box(&pipeline)))
+}
+
+library_benchmark_group!(
+    name = perfetto_filter_group,
+    benchmarks = [perfetto_filter, perfetto_expression]
+);
 
 #[library_benchmark]
 #[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]

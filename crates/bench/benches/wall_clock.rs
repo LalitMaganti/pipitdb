@@ -149,6 +149,17 @@ fn perfetto_filter(c: &mut Criterion) {
     group.finish();
 }
 
+/// Perfetto's `expression_benchmark.cc`: 512 batches of 2,048 rows.
+fn perfetto_expression(c: &mut Criterion) {
+    let mut group = c.benchmark_group("perfetto_expression");
+    group.throughput(Throughput::Elements(512 * 2048));
+    for (i, (name, ..)) in pipitdb_bench::PERFETTO_EXPRESSIONS.iter().enumerate() {
+        let pipeline = pipitdb_bench::perfetto_expression(i, 512);
+        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
+    }
+    group.finish();
+}
+
 /// Interning 100,000 strings, and getting them back.
 fn string_pool(c: &mut Criterion) {
     let mut group = c.benchmark_group("string_pool");
@@ -171,6 +182,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter, string_pool
+    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter, perfetto_expression, string_pool
 }
 criterion_main!(benches);

@@ -5,6 +5,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
+use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
@@ -120,6 +121,92 @@ impl Source for Repeat {
         Ok(batch.push_column(self.column.clone()).is_ok())
     }
 }
+
+/// Batches of `BATCH_ROWS_MAX` rows, all sharing two columns.
+pub struct Pair {
+    columns: [ColumnView; 2],
+    batches: u32,
+}
+
+impl Source for Pair {
+    type State = u32;
+
+    fn new_state(&self, _: &mut Context) -> Result<u32, Error> {
+        Ok(0)
+    }
+
+    fn next(&self, _: &mut Context, made: &mut u32, batch: &mut RowBatch) -> Result<bool, Error> {
+        if *made == self.batches {
+            return Ok(false);
+        }
+        *made += 1;
+        batch.reset(BATCH_ROWS_MAX);
+        let [a, b] = &self.columns;
+        Ok(batch.push_column(a.clone()).is_ok() && batch.push_column(b.clone()).is_ok())
+    }
+}
+
+/// Perfetto's `expression_benchmark.cc`: `op` over columns `a` and `b` of
+/// `data_type`, with one row in ten null in each if `nulls`, for `batches`
+/// batches.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn compute_pipeline(
+    op: ExprOp,
+    data_type: DataType,
+    nulls: bool,
+    batches: u32,
+) -> Pipeline<'static> {
+    let rows = BATCH_ROWS_MAX as usize;
+    let column = |value: fn(usize) -> i64, scale: f64, null: usize| {
+        let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+        let mut validity = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+        validity.as_mut_slice::<u8>().fill(0);
+        for row in 0..rows {
+            #[expect(clippy::cast_precision_loss, reason = "small integers")]
+            let float = value(row) as f64 * scale;
+            values.as_mut_slice::<i64>()[row] = match data_type {
+                DataType::Float64 => float.to_bits().cast_signed(),
+                _ => value(row),
+            };
+            validity.as_mut_slice::<u8>()[row / 8] |= u8::from(row % 10 != null) << (row % 8);
+        }
+        let validity = nulls.then_some(validity);
+        ColumnView::new(&mut Context::new(&Heap), data_type, values, validity).expect("allocates")
+    };
+    #[expect(clippy::cast_possible_wrap, reason = "small integers")]
+    let columns = [
+        column(|row| (row * 7919 % 1000) as i64, 0.5, 0),
+        column(|row| (row % 97 + 1) as i64, 0.25, 5),
+    ];
+    let step = |op, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
+    let steps = [step(ExprOp::Column, 0, 0), step(ExprOp::Column, 1, 0), step(op, 0, 1)];
+    let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).expect("allocates");
+    let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps }].into_iter());
+    let compute = Compute { programs: programs.expect("allocates") };
+    let mut owned = SlowVec::fixed(&Heap, 1).expect("allocates");
+    let step = Step::Transform(DynTransform::new(&Heap, compute).expect("allocates"));
+    assert!(owned.push(step).is_ok(), "fixed for one");
+    let source = DynSource::new(&Heap, Pair { columns, batches }).expect("allocates");
+    Pipeline::new(source, owned)
+}
+
+/// Case `index` of `PERFETTO_EXPRESSIONS`, over `batches` batches.
+pub fn perfetto_expression(index: usize, batches: u32) -> Pipeline<'static> {
+    let (_, op, data_type, nulls) = PERFETTO_EXPRESSIONS[index];
+    compute_pipeline(op, data_type, nulls, batches)
+}
+
+/// Perfetto's `expression_benchmark.cc`'s cases: names, ops, types and
+/// whether there are nulls.
+pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 7] = [
+    ("int_add", ExprOp::Add, DataType::Int64, false),
+    ("int_mul", ExprOp::Mul, DataType::Int64, false),
+    ("int_div", ExprOp::Div, DataType::Int64, false),
+    ("int_add_nullable", ExprOp::Add, DataType::Int64, true),
+    ("int_div_nullable", ExprOp::Div, DataType::Int64, true),
+    ("double_add", ExprOp::Add, DataType::Float64, false),
+    ("double_mul", ExprOp::Mul, DataType::Float64, false),
+];
 
 /// Does nothing, to measure what a transform costs the pipeline.
 pub struct PassTransform;
