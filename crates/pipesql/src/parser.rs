@@ -152,7 +152,7 @@ const SUM: u8 = 9;
 const PRODUCT: u8 = 11;
 const NEGATE: u8 = 13;
 
-const TOKEN_KIND_COUNT: usize = TokenKind::LAST as usize + 1;
+const TOKEN_KIND_COUNT: usize = TokenKind::End as usize + 1;
 
 /// The binary operator each token kind stands for, and its binding power.
 /// `AND` and `OR` are identifiers, so they are handled separately.

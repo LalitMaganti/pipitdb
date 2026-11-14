@@ -206,6 +206,7 @@ fn token(kind: TokenKind) -> &'static str {
         TokenKind::Plus => "`+`",
         TokenKind::Minus => "`-`",
         TokenKind::Slash => "`/`",
+        TokenKind::Percent => "`%`",
         TokenKind::Equal => "`=`",
         TokenKind::NotEqual => "`!=`",
         TokenKind::Less => "`<`",
@@ -213,7 +214,6 @@ fn token(kind: TokenKind) -> &'static str {
         TokenKind::Greater => "`>`",
         TokenKind::GreaterEqual => "`>=`",
         TokenKind::End => "the end of the query",
-        TokenKind::Percent => "`%`",
     }
 }
 
