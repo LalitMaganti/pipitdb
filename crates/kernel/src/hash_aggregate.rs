@@ -63,7 +63,7 @@ struct State {
 
 /// How many groups `groups` holds before it's emptied into partitions, so it
 /// stays in the cache.
-const SWITCH_GROUPS: usize = if cfg!(test) { 2 } else { 1 << 15 };
+const SWITCH_GROUPS: usize = if cfg!(test) { 2 } else { 1 << 20 };
 /// How many partitions groups are split into, by their hashes' low bits,
 /// which a table's slots don't use.
 const PARTS: usize = 1 << 10;
