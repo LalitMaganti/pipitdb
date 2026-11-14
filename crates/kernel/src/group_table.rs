@@ -28,14 +28,14 @@ fn salt(hash: u64) -> u64 {
 /// How many of a slot's low bits hold the group number plus one.
 const GROUP_BITS: u32 = 27;
 
-/// The slot that `hash` starts probing from, out of `slots`, a power of two.
-/// It's picked by the hash's top bits, which a slot stores, so growing the
-/// table doesn't need to hash any key again.
-/// How many rows ahead `find_values` fetches a row's slot, and its group's
+/// How many rows ahead `fetch_ahead` fetches a row's slot, and its group's
 /// record.
 const SLOT_AHEAD: usize = 16;
 const RECORD_AHEAD: usize = 8;
 
+/// The slot that `hash` starts probing from, out of `slots`, a power of two.
+/// It's picked by the hash's top bits, which a slot stores, so growing the
+/// table doesn't need to hash any key again.
 #[inline]
 fn slot_of(hash: u64, slots: usize) -> usize {
     #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
@@ -173,17 +173,21 @@ impl GroupTable {
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         self.grow(context.allocator(), self.len() + count)?;
+        let mut hashes = context.values_buffer(count * 8)?;
+        let hashes = at_mut!(hashes.as_mut_slice(), ..count);
+        hash_rows(hashes, keys, nulls);
         if let ([keys], None) = (keys, nulls) {
-            return self.find_values(keys, groups);
+            return self.find_values(hashes, keys, groups);
         }
-        self.find_hashed(keys, nulls, groups)
+        self.find_hashed(hashes, keys, nulls, groups)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
-    /// null word unless none are null.
+    /// null word unless none are null, and each row's hash.
     #[inline(never)]
     fn find_hashed(
         &mut self,
+        hashes: &[u64],
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
         groups: &mut [u32],
@@ -191,31 +195,52 @@ impl GroupTable {
         let count = groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
+        check!(hashes.len() == count);
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
-        // SAFETY: as above, and `stored` is a group's record.
-        let equal = |stored: *const i64, row: usize| unsafe {
-            (*stored).cast_unsigned() == null(row)
-                && keys
-                    .iter()
-                    .enumerate()
-                    .all(|(k, keys)| *stored.add(1 + k) == *keys.get_unchecked(row))
-        };
+        let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
+        let hash_of = |i: usize| hashes.get(i).copied();
         for (row, group) in groups.iter_mut().enumerate() {
-            // SAFETY: each key has a word for each row, checked above.
-            let hash = unsafe { hash_row(keys, row, null(row)) };
+            if ahead {
+                self.fetch_ahead(hash_of, row);
+            }
+            let hash = *at!(hashes, row);
             let (records, stride) = (self.records.as_ptr(), self.stride);
-            let found = probe(&self.slots, hash, |group| {
-                // SAFETY: a group in a slot has a record.
-                equal(unsafe { records.add(group * stride) }, row)
-            });
-            *group = match found {
+            // SAFETY: a group in a slot has a record, and each key a word for
+            // each row, checked above.
+            let equal = |group: usize| unsafe {
+                let stored = records.add(group * stride);
+                (*stored).cast_unsigned() == null(row)
+                    && keys
+                        .iter()
+                        .enumerate()
+                        .all(|(k, keys)| *stored.add(1 + k) == *keys.get_unchecked(row))
+            };
+            *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
                 Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
         }
         Ok(())
+    }
+
+    /// Fetches the slot of the row `SLOT_AHEAD` rows after row `i`, and the
+    /// record of the group in the first slot of the row `RECORD_AHEAD` after,
+    /// given each row's hash by `hash_of`. A table too big for the cache
+    /// misses it twice a row, for its slot and then its group's record.
+    #[inline]
+    fn fetch_ahead(&self, hash_of: impl Fn(usize) -> Option<u64>, i: usize) {
+        if let Some(next) = hash_of(i + SLOT_AHEAD) {
+            prefetch(self.slots.as_ptr().wrapping_add(slot_of(next, self.slots.len())));
+        }
+        if let Some(next) = hash_of(i + RECORD_AHEAD) {
+            let slot = *at!(self.slots, slot_of(next, self.slots.len()));
+            #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+            let group = (slot & !salt(slot)) as usize;
+            let record = group.wrapping_sub(1) * self.stride;
+            prefetch(self.records.as_ptr().wrapping_add(record));
+        }
     }
 
     /// As `find_or_create`, for a single key, a string, given each row's id
@@ -255,30 +280,22 @@ impl GroupTable {
         Ok(group)
     }
 
-    /// As `find_or_create`, for a single key with no nulls: compares the key
-    /// values directly.
-    fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
+    /// As `find_or_create`, for a single key with no nulls, given each row's
+    /// hash: compares the key values directly.
+    fn find_values(
+        &mut self,
+        hashes: &[u64],
+        keys: &[i64],
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         // `prefetch` does nothing on other targets, so they don't look ahead.
-        // A table too big for the cache misses it twice a row, for its slot
-        // and then its group's record, so both are fetched ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
-        for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
+        let hash_of = |i: usize| hashes.get(i).copied();
+        for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
             if ahead {
-                if let Some(&next) = keys.get(i + SLOT_AHEAD) {
-                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
-                    prefetch(self.slots.as_ptr().wrapping_add(at));
-                }
-                if let Some(&next) = keys.get(i + RECORD_AHEAD) {
-                    let at = slot_of(mix(next.cast_unsigned()), self.slots.len());
-                    let slot = *at!(self.slots, at);
-                    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-                    let group = (slot & !salt(slot)) as usize;
-                    let record = group.wrapping_sub(1) * self.stride;
-                    prefetch(self.records.as_ptr().wrapping_add(record));
-                }
+                self.fetch_ahead(hash_of, i);
             }
-            let hash = mix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
             // SAFETY: a group in a slot has a record, of at least two words.
@@ -576,19 +593,30 @@ fn combine(hash: u64, word: u64) -> u64 {
     hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
-/// The hash of row `row` of `keys`, whose null word is `null`, as Perfetto's
-/// `GroupTable::Hash`.
-///
-/// # Safety
-///
-/// Each of `keys` must have a word for row `row`.
-#[inline]
-unsafe fn hash_row(keys: &[&[i64]], row: usize, null: u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let key = |keys: &[i64]| unsafe { keys.get_unchecked(row) }.cast_unsigned();
-    if let ([keys], 0) = (keys, null) {
-        return mix(key(keys));
+/// The hash of each row of `keys`, whose null words are `nulls` unless none
+/// are null, to `hashes`, as Perfetto's `GroupTable::Hash`: a key at a time,
+/// so each pass is a tight loop.
+fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
+    fn words(keys: &[i64]) -> impl Iterator<Item = u64> + '_ {
+        keys.iter().map(|&key| key.cast_unsigned())
     }
-    let hash = keys.iter().fold(SEED, |hash, keys| combine(hash, key(keys)));
-    if null == 0 { hash } else { combine(hash, null) }
+    check!(keys.iter().all(|keys| keys.len() >= hashes.len()));
+    check!(nulls.is_none_or(|nulls| nulls.len() >= hashes.len()));
+    if let ([keys], None) = (keys, nulls) {
+        for (hash, key) in hashes.iter_mut().zip(words(keys)) {
+            *hash = mix(key);
+        }
+        return;
+    }
+    hashes.fill(SEED);
+    for keys in keys {
+        for (hash, key) in hashes.iter_mut().zip(words(keys)) {
+            *hash = combine(*hash, key);
+        }
+    }
+    for (hash, &null) in hashes.iter_mut().zip(nulls.unwrap_or_default()) {
+        if null != 0 {
+            *hash = combine(*hash, null);
+        }
+    }
 }
