@@ -176,18 +176,25 @@ impl GroupTable {
         let mut hashes = context.values_buffer(count * 8)?;
         let hashes = at_mut!(hashes.as_mut_slice(), ..count);
         hash_rows(hashes, keys, nulls);
+        // Rows often come in runs of one key, as a session's do: only a
+        // run's first row is found, and the rest take its group.
+        let mut starts = context.indices_buffer(count * 4)?;
+        let starts = at_mut!(starts.as_mut_slice::<u32>(), ..count);
+        mark_runs(starts, keys, nulls);
         if let ([keys], None) = (keys, nulls) {
-            return self.find_values(hashes, keys, groups);
+            return self.find_values(hashes, starts, keys, groups);
         }
-        self.find_hashed(hashes, keys, nulls, groups)
+        self.find_hashed(hashes, starts, keys, nulls, groups)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
-    /// null word unless none are null, and each row's hash.
+    /// null word unless none are null, and each row's hash, and whether it
+    /// starts a run.
     #[inline(never)]
     fn find_hashed(
         &mut self,
         hashes: &[u64],
+        starts: &[u32],
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
         groups: &mut [u32],
@@ -195,13 +202,18 @@ impl GroupTable {
         let count = groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
-        check!(hashes.len() == count);
+        check!(hashes.len() == count && starts.len() == count);
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
-        for (row, group) in groups.iter_mut().enumerate() {
+        let mut last = 0;
+        for (row, (group, &start)) in groups.iter_mut().zip(starts).enumerate() {
+            if start == 0 {
+                *group = last;
+                continue;
+            }
             if ahead {
                 self.fetch_ahead(hash_of, row);
             }
@@ -221,6 +233,7 @@ impl GroupTable {
                 Ok(group) => group,
                 Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
+            last = *group;
         }
         Ok(())
     }
@@ -281,10 +294,11 @@ impl GroupTable {
     }
 
     /// As `find_or_create`, for a single key with no nulls, given each row's
-    /// hash: compares the key values directly.
+    /// hash, and whether it starts a run: compares the key values directly.
     fn find_values(
         &mut self,
         hashes: &[u64],
+        starts: &[u32],
         keys: &[i64],
         groups: &mut [u32],
     ) -> Result<(), Error> {
@@ -292,7 +306,13 @@ impl GroupTable {
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
-        for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
+        let mut last = 0;
+        let rows = keys.iter().zip(hashes).zip(starts).zip(groups).enumerate();
+        for (i, (((&key, &hash), &start), group)) in rows {
+            if start == 0 {
+                *group = last;
+                continue;
+            }
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
@@ -307,6 +327,7 @@ impl GroupTable {
                 Ok(group) => group,
                 Err(at) => self.add(at, hash, &[0, key])?,
             };
+            last = *group;
         }
         Ok(())
     }
@@ -591,6 +612,31 @@ const SEED: u64 = 0xe17a_1465;
 #[inline]
 fn combine(hash: u64, word: u64) -> u64 {
     hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
+}
+
+/// Marks in `starts` each row of `keys`, whose null words are `nulls` unless
+/// none are null, that starts a run of one key, a key at a time, so each
+/// pass is a tight loop.
+fn mark_runs(starts: &mut [u32], keys: &[&[i64]], nulls: Option<&[u64]>) {
+    let count = starts.len();
+    check!(count > 0);
+    check!(keys.iter().all(|keys| keys.len() >= count));
+    check!(nulls.is_none_or(|nulls| nulls.len() >= count));
+    starts.fill(0);
+    *at_mut!(starts, 0) = 1;
+    let mut differ = |words: &[i64]| {
+        let pairs = at!(words, ..count - 1).iter().zip(at!(words, 1..count));
+        for (start, (before, word)) in at_mut!(starts, 1..).iter_mut().zip(pairs) {
+            *start |= u32::from(before != word);
+        }
+    };
+    for keys in keys {
+        differ(keys);
+    }
+    if let Some(nulls) = nulls {
+        // SAFETY: of one size and alignment, with every bit pattern valid.
+        differ(unsafe { core::slice::from_raw_parts(nulls.as_ptr().cast(), nulls.len()) });
+    }
 }
 
 /// The hash of each row of `keys`, whose null words are `nulls` unless none
