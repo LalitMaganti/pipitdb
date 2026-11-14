@@ -1,15 +1,20 @@
-//! `Compute`: a transform which adds a column computed from each row's
-//! values, as Perfetto's.
+//! Expressions over a row's columns, as Perfetto's: `Expr`, as a plan holds
+//! one; `ComputeOp`, the op that adds columns computed by them; and
+//! `Compute`, the transform that runs it.
 
-use crate::allocator::AllocError;
+use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::lower::{LowerError, Lowering};
+use crate::optimize::{Needed, Pruned};
+use crate::output_properties::{Column, DeriveContext, OutputProperties};
+use crate::plan::{ColumnId, Op, PlanNode};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
-use crate::step::Transform;
+use crate::step::{DynTransform, Step, Transform};
 
 /// What a step of an `ExprProgram` computes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -348,6 +353,241 @@ fn nonzero(divisor: Option<(&[i64], bool)>, at: usize, count: usize) -> u64 {
         .iter()
         .enumerate()
         .fold(0, |nonzero, (k, &word)| nonzero | u64::from(word << u32::from(doubles) != 0) << k)
+}
+
+/// The most nodes an `Expr` has, so typing one needs only the stack.
+pub const EXPR_NODES_MAX: usize = 1 << 8;
+
+/// A scalar expression over the columns of a row, as a plan holds it: column
+/// references, numbers, NULL and arithmetic.
+///
+/// It has the shape of an `ExprProgram`: nodes in post-order, each reading
+/// only nodes before it, the last being the result. A `Column` node's `a` is
+/// a `ColumnId` rather than a batch position, and only a `Constant` node's
+/// `data_type` means anything: the rest are typed when the plan is lowered.
+///
+/// Only expressions whose meaning is the same as SQLite's are accepted.
+/// Arithmetic on strings is an error, and an integer overflow fails the query
+/// where SQLite would answer with a double.
+pub struct Expr {
+    pub nodes: SlowVec<ExprStep>,
+}
+
+/// Why an expression can't be computed: what it needed instead, or memory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExprError {
+    /// Numbers, not strings, in arithmetic.
+    Numbers,
+    /// Integers on both sides of `%`.
+    Integers,
+    /// An allocation failed.
+    OutOfMemory,
+}
+
+impl From<AllocError> for ExprError {
+    fn from(_: AllocError) -> ExprError {
+        ExprError::OutOfMemory
+    }
+}
+
+/// A step of no value, reading registers `a` and `b`.
+const fn step(op: ExprOp, data_type: DataType, a: u32, b: u32) -> ExprStep {
+    ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 }
+}
+
+/// Types an expression's nodes in order and, given the rows it reads,
+/// appends the steps computing them to a program. Without them it only
+/// checks, as compiling does.
+struct Typer<'t> {
+    /// Each column's type.
+    type_of: &'t dyn Fn(ColumnId) -> DataType,
+    /// The rows the program reads, and its steps so far, if building one.
+    build: Option<(&'t OutputProperties, &'t mut SlowVec<ExprStep>)>,
+    /// By node, its type, and the register holding it. A bare NULL has no
+    /// type of its own: it takes the type of whatever it meets.
+    nodes: [(Option<DataType>, u32); EXPR_NODES_MAX],
+}
+
+impl Typer<'_> {
+    /// The type of the expression's result.
+    #[inline(never)]
+    fn run(&mut self, expr: &Expr) -> Result<Option<DataType>, ExprError> {
+        check!(!expr.nodes.is_empty() && expr.nodes.len() <= EXPR_NODES_MAX);
+        for (i, node) in expr.nodes.iter().enumerate() {
+            *at_mut!(self.nodes, i) = self.type_node(node)?;
+        }
+        Ok(at!(self.nodes, expr.nodes.len() - 1).0)
+    }
+
+    /// The register holding node `i` as `data_type`: a null of that type for
+    /// a bare NULL, an integer widened for a double.
+    fn materialize(&mut self, i: u32, data_type: DataType) -> Result<u32, ExprError> {
+        let (node_type, register) = *at!(self.nodes, i as usize);
+        match node_type {
+            None => self.add(step(ExprOp::Null, data_type, 0, 0)),
+            Some(DataType::Int64) if data_type == DataType::Float64 => {
+                self.add(step(ExprOp::ToDouble, data_type, register, 0))
+            }
+            Some(_) => Ok(register),
+        }
+    }
+
+    /// Appends `step`, if building, and returns its register.
+    fn add(&mut self, step: ExprStep) -> Result<u32, ExprError> {
+        let Some((_, steps)) = &mut self.build else { return Ok(0) };
+        steps.push(step)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `4 * EXPR_NODES_MAX`")]
+        Ok(steps.len() as u32 - 1)
+    }
+
+    /// `node`'s type, and the register holding it.
+    fn type_node(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+        let (a, b) = (node.a as usize, node.b as usize);
+        match node.op {
+            ExprOp::Column => {
+                let data_type = (self.type_of)(node.a);
+                let mut read = step(ExprOp::Column, data_type, node.a, 0);
+                if let Some((rows, _)) = &self.build {
+                    let Some(position) = rows.position_of(node.a) else { failed!() };
+                    read.a = position;
+                }
+                Ok((Some(data_type), self.add(read)?))
+            }
+            ExprOp::Constant => Ok((Some(node.data_type), self.add(*node)?)),
+            ExprOp::Null => Ok((None, 0)),
+            ExprOp::ToDouble => failed!(),
+            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
+                let (a_type, b_type) = (at!(self.nodes, a).0, at!(self.nodes, b).0);
+                let either = |data_type| a_type == Some(data_type) || b_type == Some(data_type);
+                if either(DataType::String) {
+                    return Err(ExprError::Numbers);
+                }
+                if node.op == ExprOp::Mod && either(DataType::Float64) {
+                    return Err(ExprError::Integers);
+                }
+                // Any arithmetic with NULL is NULL.
+                if a_type.is_none() || b_type.is_none() {
+                    return Ok((None, 0));
+                }
+                let data_type =
+                    if either(DataType::Float64) { DataType::Float64 } else { DataType::Int64 };
+                let a = self.materialize(node.a, data_type)?;
+                let b = self.materialize(node.b, data_type)?;
+                Ok((Some(data_type), self.add(step(node.op, data_type, a, b))?))
+            }
+        }
+    }
+}
+
+/// The type `expr` computes, given each column's type, as compiling checks
+/// it.
+pub fn check_expr_type(
+    expr: &Expr,
+    type_of: &dyn Fn(ColumnId) -> DataType,
+) -> Result<DataType, ExprError> {
+    let mut typer = Typer { type_of, build: None, nodes: [(None, 0); EXPR_NODES_MAX] };
+    // A result which is only ever NULL is a column of Int64 nulls.
+    Ok(typer.run(expr)?.unwrap_or(DataType::Int64))
+}
+
+/// Marks the columns `expr` reads.
+pub fn mark_expr_columns(expr: &Expr, needed: &mut Needed) {
+    for node in expr.nodes.iter().filter(|node| node.op == ExprOp::Column) {
+        needed.need(node.a);
+    }
+}
+
+/// The program computing `expr`, with columns at their positions in `rows`.
+pub fn type_expr(
+    allocator: &dyn Allocator,
+    rows: &OutputProperties,
+    expr: &Expr,
+) -> Result<ExprProgram, ExprError> {
+    // Each node takes at most three steps, and a NULL result one more.
+    let mut steps = SlowVec::new(allocator, 4 * EXPR_NODES_MAX)?;
+    let type_of = |column| rows.type_of(column);
+    let nodes = [(None, 0); EXPR_NODES_MAX];
+    let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes };
+    let result = typer.run(expr)?.unwrap_or(DataType::Int64);
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let register = typer.materialize(expr.nodes.len() as u32 - 1, result)?;
+    // Unlike Perfetto's, no column is only ever NULL, so the last node's step
+    // is the last.
+    check!(register as usize == steps.len() - 1);
+    Ok(ExprProgram { steps })
+}
+
+/// A column a `ComputeOp` adds.
+pub struct ComputeItem {
+    /// The column.
+    pub output: ColumnId,
+    /// What computes its values.
+    pub expr: Expr,
+}
+
+/// Adds columns computed from the rows of its one child: what `SELECT`,
+/// `EXTEND` and `SET` add for an item which is more than a column. Those
+/// stages add it, so it has no syntax of its own.
+pub struct ComputeOp {
+    pub items: SlowVec<ComputeItem>,
+}
+
+/// An error typing the expression of `column`, as lowering reports it.
+fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
+    match error {
+        ExprError::OutOfMemory => LowerError::OutOfMemory,
+        ExprError::Numbers | ExprError::Integers => LowerError::WrongType(column),
+    }
+}
+
+impl<'c> Op<'c> for ComputeOp {
+    /// Drops the items whose columns aren't needed, and itself with the
+    /// last of them.
+    fn prune(&mut self, needed: &mut Needed) -> Pruned {
+        self.items.retain(|item| needed.is_needed(item.output));
+        if self.items.is_empty() {
+            return Pruned::Child(0);
+        }
+        self.reads(needed);
+        Pruned::Keep
+    }
+
+    /// Its expressions' columns.
+    fn reads(&self, reads: &mut Needed) {
+        for item in self.items.iter() {
+            mark_expr_columns(&item.expr, reads);
+        }
+    }
+
+    /// Its input's, with each item's column after them.
+    fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+        let input = c.input(0);
+        let mut out = *input;
+        for item in self.items.iter() {
+            let data_type = check_expr_type(&item.expr, &|column| input.type_of(column))
+                .map_err(|error| lower_error(error, item.output))?;
+            out.push_column(Column { id: item.output, data_type })?;
+        }
+        Ok(out)
+    }
+
+    fn lower(
+        &self,
+        node: &PlanNode<'c>,
+        lowering: &mut Lowering<'_, 'c>,
+    ) -> Result<(), LowerError> {
+        check!(node.children.len() == 1);
+        lowering.lower_input(node, 0)?;
+        let allocator = lowering.allocator();
+        let mut programs = SlowVec::fixed(allocator, self.items.len())?;
+        for item in self.items.iter() {
+            let program = type_expr(allocator, lowering.query_rows(), &item.expr)
+                .map_err(|error| lower_error(error, item.output))?;
+            programs.push(program)?;
+        }
+        let compute = DynTransform::new(allocator, Compute { programs })?;
+        lowering.add_operator(Step::Transform(compute))
+    }
 }
 
 #[cfg(test)]

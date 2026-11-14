@@ -83,6 +83,9 @@ fn describe(found: &str, error: &Error) -> Message {
                 pipit_kernel::predicate::PREDICATE_NODES_MAX
             ),
         ),
+        ErrorCode::ExpressionTooLarge | ErrorCode::ExpectedNumber | ErrorCode::ExpectedName => {
+            expression(error.code)
+        }
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -93,6 +96,27 @@ fn describe(found: &str, error: &Error) -> Message {
         ErrorCode::Unsupported => unsupported(found, error.detail),
     };
     Message { title, label }
+}
+
+/// The title and label for an error about a computed column, `code`.
+fn expression(code: ErrorCode) -> (String, String) {
+    match code {
+        ErrorCode::ExpressionTooLarge => (
+            "the expression is too large".into(),
+            format!(
+                "expressions are limited to {} parts",
+                pipit_kernel::expression::EXPR_NODES_MAX
+            ),
+        ),
+        ErrorCode::ExpectedNumber => {
+            ("arithmetic needs numbers".into(), "this reads a string".into())
+        }
+        ErrorCode::ExpectedName => (
+            "a computed column needs a name".into(),
+            "name it with `AS`, as in `x + 1 AS y`".into(),
+        ),
+        _ => pipit_kernel::failed!(),
+    }
 }
 
 /// The title and label for an error about what a name names, `code`.
@@ -124,7 +148,10 @@ fn named(found: &str, code: ErrorCode) -> (String, String) {
 fn unsupported(found: &str, detail: u16) -> (String, String) {
     match detail {
         what if what == Unsupported::SelectExpression as u16 => {
-            ("only column names can be used here yet".into(), "not a column's name".into())
+            (
+                "only arithmetic on columns, integers and `NULL` can be computed yet".into(),
+                "can't compute this yet".into(),
+            )
         }
         what if what == Unsupported::Where as u16 => (
             "only comparisons of a column with a number, or of a string column with a string, can filter yet"
@@ -136,7 +163,7 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "a float can't hold this integer exactly".into(),
         ),
         what if what == Unsupported::Decimal as u16 => (
-            "numbers with a decimal point can't be compared yet".into(),
+            "numbers with a decimal point can't be read yet".into(),
             "not an integer".into(),
         ),
         what if what == Unsupported::Limit as u16 => {

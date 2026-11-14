@@ -342,6 +342,32 @@ mod tests {
     }
 
     #[test]
+    fn computes_columns() {
+        assert_eq!(kept("FROM t |> SELECT a + b AS c"), [11.0, 22.0]);
+        assert_eq!(kept("FROM t |> EXTEND b - a * 2 AS c |> SELECT c"), [8.0, 16.0]);
+        // Every item sees the scope before the stage.
+        assert_eq!(kept("FROM t |> SET a = a * 10, b = a |> SELECT b"), [1.0, 2.0]);
+        assert_eq!(kept("FROM t |> SET a = a * 10 |> SELECT a"), [10.0, 20.0]);
+        // Integers widen to meet floats.
+        assert_eq!(kept("FROM t |> SELECT f / a AS x"), [0.5, 1.25]);
+        assert_eq!(kept("FROM t |> SELECT -a AS x, 7 AS y"), [-1.0, -2.0]);
+        let smallest = kept("FROM t |> SELECT -9223372036854775808 AS x");
+        assert_eq!(smallest, [-9_223_372_036_854_775_808.0; 2]);
+        // Dividing by zero, or by NULL, is NULL.
+        assert_eq!(kept("FROM t |> EXTEND b / (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> EXTEND a + NULL AS x |> WHERE x IS NULL |> SELECT a").len(), 2);
+        // An integer overflow fails the query.
+        let catalog = catalog();
+        let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
+        let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
+        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.pipeline().start(&query).unwrap();
+        let overflow = execution.next(&mut RowBatch::new()).err();
+        assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
+    }
+
+    #[test]
     fn limits_rows() {
         assert_eq!(kept("FROM t |> LIMIT 1 |> SELECT b"), [10.0]);
         assert_eq!(kept("FROM t |> LIMIT 5 OFFSET 1 |> SELECT b"), [20.0]);
@@ -397,12 +423,23 @@ mod tests {
         assert_eq!(error("FROM t |> DROP c"), (ErrorCode::UnknownColumn, 15));
         assert_eq!(error("FROM t |> DROP a, b, f, s"), (ErrorCode::NoColumnsLeft, 15));
         assert_eq!(error("FROM t |> RENAME a AS b, A AS c"), (ErrorCode::ListedTwice, 25));
-        assert_eq!(error("FROM t |> SET a = a + 1"), (ErrorCode::Unsupported, 18));
+        assert_eq!(error("FROM t |> SET a = s + 1"), (ErrorCode::ExpectedNumber, 18));
         assert_eq!(error("FROM t |> EXTEND a |> SELECT a"), (ErrorCode::AmbiguousColumn, 29));
         assert_eq!(error("FROM t |> LIMIT a"), (ErrorCode::Unsupported, 16));
         assert_eq!(error("FROM t |> LIMIT 1 OFFSET 1, 2"), (ErrorCode::Unsupported, 28));
         assert_eq!(error("FROM t |> SELECT b |> SELECT a"), (ErrorCode::UnknownColumn, 29));
-        assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT a + 1"), (ErrorCode::ExpectedName, 17));
+        assert_eq!(error("FROM t |> EXTEND NULL - s AS x"), (ErrorCode::ExpectedNumber, 17));
+        assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT a > 1 AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT 'x' AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT 1.5 AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(
+            error("FROM t |> SELECT 9223372036854775808 AS x"),
+            (ErrorCode::NumberTooLarge, 17)
+        );
+        let long = format!("FROM t |> SELECT a{} AS x", " + a".repeat(200));
+        assert_eq!(error(&long), (ErrorCode::ExpressionTooLarge, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
         assert_eq!(error("FROM t |> WHERE a > b"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE a + 1 > 2"), (ErrorCode::Unsupported, 16));
@@ -429,17 +466,26 @@ mod tests {
         assert_eq!(error("FROM t |> WHERE DISTINCT a"), (ErrorCode::ExpectedExpression, 16));
     }
 
-    #[test]
-    fn reads_only_the_columns_selected() {
+    /// How many columns `query`'s batches have once optimized, and its
+    /// result column's values.
+    fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, b"FROM t |> SELECT b").unwrap();
+        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
         pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
         let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
         let mut execution = physical.pipeline().start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
-        assert_eq!(batch.column_count(), 1);
-        assert_eq!(batch.column(physical.columns()[0].position).int64s(), [10, 20]);
+        let values = batch.column(physical.columns()[0].position).int64s().to_vec();
+        (batch.column_count(), values)
+    }
+
+    #[test]
+    fn reads_only_the_columns_selected() {
+        assert_eq!(optimized("FROM t |> SELECT b"), (1, [10, 20].to_vec()));
+        // Only `b` is read, and only `d` computed.
+        let computed = "FROM t |> EXTEND a + 1 AS c, b * 2 AS d |> SELECT d";
+        assert_eq!(optimized(computed), (2, [20, 40].to_vec()));
     }
 }
