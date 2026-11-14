@@ -401,6 +401,7 @@ mod tests {
     use crate::allocator::{Heap, LimitAllocator};
 
     #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
     fn interns_strings() {
         let mut pool = StringPool::new(&Heap).unwrap();
         let large = alloc::vec![b'x'; LARGE_STRING_BYTES_MIN];
@@ -430,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
     fn interns_a_batch_as_one_at_a_time() {
         // Small enough to intern a row at a time, then past `CACHED_SLOTS`,
         // when a batch is looked up at once.
