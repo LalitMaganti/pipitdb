@@ -3,7 +3,9 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
+use pipit_kernel::expression::{ComputeItem, ComputeOp};
 use pipit_kernel::limit::LimitOp;
+use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
@@ -13,6 +15,7 @@ use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::condition::compile_condition;
 use crate::error::{Error, ErrorCode, Unsupported};
+use crate::expression::{compile_expr, is_null};
 use crate::keywords::same_word;
 use crate::registry::{Item, Point, Rule, Shared};
 
@@ -118,22 +121,22 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     Ok(())
 }
 
-// These stages only change which columns are in scope and what they're
-// called, as Perfetto's: nothing runs. Where one could take an expression,
-// it takes a column's name for now.
+// These stages change which columns are in scope and what they're called,
+// as Perfetto's. An item which is just a column runs nothing; any other
+// expression is added to a `ComputeOp`.
 
-/// `SELECT a, b AS c`: the named columns, in that order, are the new scope.
+/// `SELECT a, b + 1 AS c`: the items, in that order, are the new scope.
 fn compile_select(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     project(compiler, stage, false)
 }
 
-/// `EXTEND a AS c`: adds the named columns to the scope. Each is found in
-/// the scope before the stage.
+/// `EXTEND a * 2 AS c`: adds the items to the scope. Each sees only the
+/// scope before the stage.
 fn compile_extend(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     project(compiler, stage, true)
 }
 
-/// The column each item of `stage`'s list names, under its alias if it has
+/// The column of each item of `stage`'s list, under its alias if it has
 /// one, after the scope's columns if `extend`, are the new scope.
 fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result<(), Error> {
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
@@ -141,11 +144,16 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
         scope.extend_from_slice(&compiler.scope)?;
     }
     let list = compiler.node(stage.first_child());
+    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
-        let column = value_of(compiler, value)?;
-        scope.push(named(compiler, column, alias)?)?;
+        let name = match alias {
+            Some(alias) => Some(compiler.plan.names.add(compiler.text(alias.span()))?),
+            None => None,
+        };
+        scope.push(value_of(compiler, value, name, &mut computed)?)?;
     }
+    add_compute(compiler, computed)?;
     compiler.scope = scope;
     Ok(())
 }
@@ -198,8 +206,8 @@ fn compile_rename(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
     change_in_place(compiler, stage, true)
 }
 
-/// `SET a = b`: replaces the values of columns in place, all at once, as
-/// they were before the stage.
+/// `SET a = b + 1`: replaces the values of columns in place, all at once,
+/// computed from the scope before the stage.
 fn compile_set(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     change_in_place(compiler, stage, false)
 }
@@ -216,6 +224,7 @@ fn change_in_place(
     let list = compiler.node(stage.first_child());
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
+    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
     let target = u32::from(!renames);
     for i in 0..list.child_count() {
         let found = compiler.find_column(listed_once(compiler, list, i, target)?)?;
@@ -228,9 +237,11 @@ fn change_in_place(
             let alias = compiler.node(item.first_child() + 1);
             column.name = compiler.plan.names.add(compiler.text(alias.span()))?;
         } else {
-            column.id = value_of(compiler, compiler.node(item.first_child()))?.id;
+            let value = compiler.node(item.first_child());
+            column.id = value_of(compiler, value, Some(found.name), &mut computed)?.id;
         }
     }
+    add_compute(compiler, computed)?;
     compiler.scope = scope;
     Ok(())
 }
@@ -256,12 +267,40 @@ fn listed_once(
     Ok(name(i))
 }
 
-/// The column `value` names: only names, for now.
-fn value_of(compiler: &Compiler<'_, '_>, value: Node) -> Result<NamedColumn, Error> {
-    if value.tag() != Tag::Name {
-        return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(value)));
+/// The column `value` names, under `name` if given; or else a new column
+/// named `name`, which `value` computes, added to `computed`.
+fn value_of(
+    compiler: &mut Compiler<'_, '_>,
+    value: Node,
+    name: Option<Name>,
+    computed: &mut SlowVec<ComputeItem>,
+) -> Result<NamedColumn, Error> {
+    if value.tag() == Tag::Name && !is_null(compiler, value) {
+        let column = compiler.find_column(value)?;
+        return Ok(NamedColumn { name: name.unwrap_or(column.name), id: column.id });
     }
-    compiler.find_column(value)
+    let Some(name) = name else {
+        return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
+    };
+    let (expr, data_type) = compile_expr(compiler, value)?;
+    let column = compiler.plan.add_named_column(name, data_type)?;
+    computed.push(ComputeItem { output: column.id, expr })?;
+    Ok(column)
+}
+
+/// Adds the `ComputeOp` for a stage's `computed` columns, if it has any.
+fn add_compute(
+    compiler: &mut Compiler<'_, '_>,
+    computed: SlowVec<ComputeItem>,
+) -> Result<(), Error> {
+    if computed.is_empty() {
+        return Ok(());
+    }
+    let allocator = compiler.allocator();
+    let compute = DynOp::new(allocator, ComputeOp { items: computed })?;
+    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
+    compiler.plan.add_node(compute, children)?;
+    Ok(())
 }
 
 /// `ORDER BY a, b DESC`: the rows sorted by `a`, then `b` descending,

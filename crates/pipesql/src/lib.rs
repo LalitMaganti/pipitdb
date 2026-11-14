@@ -13,6 +13,7 @@ mod condition;
 #[cfg(feature = "diagnostics")]
 pub mod diagnostics;
 pub mod error;
+pub mod expression;
 pub mod keywords;
 pub mod lexer;
 pub mod parser;

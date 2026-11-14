@@ -57,20 +57,26 @@ pub enum ErrorCode {
     ExpectedWord = 24,
     /// A call names no function there is.
     UnknownFunction = 25,
+    /// An expression has more than `EXPR_NODES_MAX` parts.
+    ExpressionTooLarge = 26,
+    /// Arithmetic on a string.
+    ExpectedNumber = 27,
+    /// A computed column has no name, as `x + 1` without `AS y`.
+    ExpectedName = 28,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u16)]
 pub enum Unsupported {
-    /// Anything but a column's name where a stage takes a column.
+    /// An expression that isn't arithmetic on columns, integers and `NULL`.
     SelectExpression = 1,
     /// A condition that isn't comparisons of a column with a number,
     /// combined with `AND`, `OR` and `NOT`.
     Where = 2,
     /// An integer compared with a float column that can't hold it exactly.
     NumberType = 3,
-    /// A number with a decimal point, which conditions can't compare yet.
+    /// A number with a decimal point, which can't be read yet.
     Decimal = 4,
     /// A `LIMIT` or `OFFSET` that isn't one integer.
     Limit = 5,
@@ -106,7 +112,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::UnknownFunction;
+    pub const LAST: ErrorCode = ErrorCode::ExpectedName;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {
