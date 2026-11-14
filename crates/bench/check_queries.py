@@ -44,6 +44,10 @@ def same(a, b):
     # pipitdb has no dates: it gives a day number where DuckDB gives a date.
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", b):
         return a == str((datetime.date.fromisoformat(b) - datetime.date(1970, 1, 1)).days)
+    # Nor times: it gives seconds since 1970 where DuckDB gives a timestamp.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", b):
+        time = datetime.datetime.fromisoformat(b).replace(tzinfo=datetime.timezone.utc)
+        return a == str(int(time.timestamp()))
     try:
         x, y = float(a), float(b)
     except ValueError:
