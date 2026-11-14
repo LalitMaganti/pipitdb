@@ -551,11 +551,15 @@ mod tests {
     #[test]
     fn groups_by_two_keys() {
         let rows = Rows {
+            // Mostly runs of one key, which are found once each.
             batches: alloc::vec![alloc::vec![
+                (Some(1), Some(1)),
                 (Some(1), Some(1)),
                 (Some(1), Some(2)),
                 (Some(1), Some(1)),
                 (None, Some(1)),
+                (None, Some(1)),
+                (None, None),
                 (None, None),
             ]],
             dropped: Vec::new(),
@@ -563,9 +567,9 @@ mod tests {
         let mut by_both = spec(&[0, 1]);
         by_both.aggregates.retain(|call| call.function == Function::CountStar);
         let expected = [
-            alloc::vec![None, None, Some(1)],
-            alloc::vec![None, Some(1), Some(1)],
-            alloc::vec![Some(1), Some(1), Some(2)],
+            alloc::vec![None, None, Some(2)],
+            alloc::vec![None, Some(1), Some(2)],
+            alloc::vec![Some(1), Some(1), Some(3)],
             alloc::vec![Some(1), Some(2), Some(1)],
         ];
         assert_eq!(run(rows, by_both).unwrap(), expected);
