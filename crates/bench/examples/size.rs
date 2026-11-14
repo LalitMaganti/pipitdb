@@ -26,10 +26,12 @@ use pipit_pipesql::registry::Registry;
 static REGISTRY: Registry =
     Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION]);
 use pipit_kernel::error::Error;
-use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep};
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Catalog, DynScannable, Scannable};
 use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::spill::{Block, LogId, SpillStore, read_column, write_column};
+use pipit_kernel::step::Transform;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn column_sum(count: u32, value: i64) -> i64 {
@@ -161,6 +163,54 @@ pub extern "C" fn run_column(value: i64) -> i64 {
         return 0;
     };
     column.int64s()[0]
+}
+
+/// The sum of `row op value` over rows `0..count`, computed as doubles if
+/// `doubles`, or 0 if that fails. `op` picks `+ - * / %`; `%` is of
+/// integers only.
+#[unsafe(no_mangle)]
+pub extern "C" fn compute_sum(count: u32, op: u8, value: i64, doubles: bool) -> i64 {
+    use ExprOp::{Add, Column, Constant, Div, Mod, Mul, Sub, ToDouble};
+    let Some(&op) = [Add, Sub, Mul, Div, Mod].get(usize::from(op)) else { return 0 };
+    if doubles && op == Mod {
+        return 0;
+    }
+    let Ok(mut values) = Buffer::allocate(&Heap, count as usize * 8) else { return 0 };
+    values.as_mut_slice::<i64>().iter_mut().zip(0..).for_each(|(cell, row)| *cell = row);
+    let mut context = Context::new(&Heap);
+    let Ok(column) = ColumnView::new(&mut context, DataType::Int64, values, None) else {
+        return 0;
+    };
+    let (data_type, row) = if doubles { (DataType::Float64, 1) } else { (DataType::Int64, 0) };
+    #[expect(clippy::cast_precision_loss, reason = "any value will do")]
+    let double_value = value as f64;
+    let step =
+        |op, data_type, a| ExprStep { op, data_type, a, b: 2, int_value: value, double_value };
+    let steps = [
+        step(Column, DataType::Int64, 0),
+        step(ToDouble, DataType::Float64, 0),
+        step(Constant, data_type, 0),
+        step(op, data_type, row),
+    ];
+    let Ok(steps) = SlowVec::fixed_from(&Heap, steps.into_iter()) else { return 0 };
+    let Ok(programs) = SlowVec::fixed_from(&Heap, [ExprProgram { steps }].into_iter()) else {
+        return 0;
+    };
+    let compute = Compute { programs };
+    let Ok(mut state) = compute.new_state(&mut context) else { return 0 };
+    let mut batch = RowBatch::new();
+    batch.reset(count.min(BATCH_ROWS_MAX));
+    if batch.push_column(column.slice(0, batch.row_count())).is_err()
+        || compute.process(&mut context, &mut state, &mut batch).is_err()
+    {
+        return 0;
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "any value will do")]
+    let sum = match data_type {
+        DataType::Float64 => batch.column(1).float64s().iter().sum::<f64>() as i64,
+        _ => batch.column(1).int64s().iter().sum(),
+    };
+    sum
 }
 
 /// How many rows a lazy column of `rows` rows has, its values unread, or 0
