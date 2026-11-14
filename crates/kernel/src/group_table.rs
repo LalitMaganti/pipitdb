@@ -173,6 +173,52 @@ impl GroupTable {
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         self.grow(context.allocator(), self.len() + count)?;
+        // Rows often come in runs of one key, as a session's do: then only
+        // each run's first row is found, and the rest take its group.
+        let mut starts = context.indices_buffer(count * 4)?;
+        let runs = run_starts(keys, nulls, at_mut!(starts.as_mut_slice::<u32>(), ..count));
+        if runs * 4 > count * 3 {
+            return self.find_rows(context, keys, nulls, groups);
+        }
+        let starts = at!(starts.as_slice::<u32>(), ..runs);
+        let mut firsts = [const { None }; KEYS_MAX];
+        for (first, keys) in firsts.iter_mut().zip(keys) {
+            let mut words = context.values_buffer(runs * 8)?;
+            gather(words.as_mut_slice(), keys, starts);
+            *first = Some(words);
+        }
+        let mut first_nulls = None;
+        if let Some(nulls) = nulls {
+            let mut words = context.values_buffer(runs * 8)?;
+            gather(words.as_mut_slice(), as_signed(nulls), starts);
+            first_nulls = Some(words);
+        }
+        let mut first_keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+        for (keys, first) in first_keys.iter_mut().zip(&firsts) {
+            *keys = first.as_ref().map_or(&[], |first| at!(first.as_slice(), ..runs));
+        }
+        let first_nulls = first_nulls.as_ref().map(|nulls| at!(nulls.as_slice(), ..runs));
+        let mut run_groups = context.indices_buffer(runs * 4)?;
+        let run_groups = at_mut!(run_groups.as_mut_slice::<u32>(), ..runs);
+        let first_keys = at!(first_keys, ..self.keys);
+        self.find_rows(context, first_keys, first_nulls, run_groups)?;
+        for (i, (&start, &group)) in starts.iter().zip(run_groups.iter()).enumerate() {
+            let end = starts.get(i + 1).map_or(count, |&end| end as usize);
+            at_mut!(groups, start as usize..end).fill(group);
+        }
+        Ok(())
+    }
+
+    /// As `find_or_create`, given each key as a word a row, and each row's
+    /// null word unless none are null.
+    fn find_rows(
+        &mut self,
+        context: &mut Context,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
+        let count = groups.len();
         let mut hashes = context.values_buffer(count * 8)?;
         let hashes = at_mut!(hashes.as_mut_slice(), ..count);
         hash_rows(hashes, keys, nulls);
@@ -591,6 +637,53 @@ const SEED: u64 = 0xe17a_1465;
 #[inline]
 fn combine(hash: u64, word: u64) -> u64 {
     hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
+}
+
+/// Writes the rows of `keys`, whose null words are `nulls` unless none are
+/// null, that start a run of one key to `starts`, and returns how many there
+/// are. Marks each row a key at a time, so each pass is a tight loop.
+fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usize {
+    let count = starts.len();
+    check!(count > 0);
+    check!(keys.iter().all(|keys| keys.len() >= count));
+    check!(nulls.is_none_or(|nulls| nulls.len() >= count));
+    // First whether each row differs from the one before, in `starts`.
+    starts.fill(0);
+    let mut differ = |words: &[i64]| {
+        let pairs = at!(words, ..count - 1).iter().zip(at!(words, 1..count));
+        for (start, (before, word)) in at_mut!(starts, 1..).iter_mut().zip(pairs) {
+            *start |= u32::from(before != word);
+        }
+    };
+    for keys in keys {
+        differ(keys);
+    }
+    if let Some(nulls) = nulls {
+        differ(as_signed(nulls));
+    }
+    *at_mut!(starts, 0) = 1;
+    let mut runs = 0;
+    for row in 0..count {
+        let start = *at!(starts, row) != 0;
+        #[expect(clippy::cast_possible_truncation, reason = "at most a batch's rows")]
+        let row_index = row as u32;
+        *at_mut!(starts, runs) = row_index;
+        runs += usize::from(start);
+    }
+    runs
+}
+
+/// `words` as signed words.
+fn as_signed(words: &[u64]) -> &[i64] {
+    // SAFETY: of one size and alignment, with every bit pattern valid.
+    unsafe { core::slice::from_raw_parts(words.as_ptr().cast(), words.len()) }
+}
+
+/// Writes the words of `words` at `rows` to `out`.
+fn gather(out: &mut [i64], words: &[i64], rows: &[u32]) {
+    for (out, &row) in out.iter_mut().zip(rows) {
+        *out = *at!(words, row as usize);
+    }
 }
 
 /// The hash of each row of `keys`, whose null words are `nulls` unless none
