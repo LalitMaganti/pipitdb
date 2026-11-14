@@ -28,14 +28,14 @@ fn salt(hash: u64) -> u64 {
 /// How many of a slot's low bits hold the group number plus one.
 const GROUP_BITS: u32 = 27;
 
-/// The slot that `hash` starts probing from, out of `slots`, a power of two.
-/// It's picked by the hash's top bits, which a slot stores, so growing the
-/// table doesn't need to hash any key again.
-/// How many rows ahead `find_values` fetches a row's slot, and its group's
+/// How many rows ahead `fetch_ahead` fetches a row's slot, and its group's
 /// record.
 const SLOT_AHEAD: usize = 16;
 const RECORD_AHEAD: usize = 8;
 
+/// The slot that `hash` starts probing from, out of `slots`, a power of two.
+/// It's picked by the hash's top bits, which a slot stores, so growing the
+/// table doesn't need to hash any key again.
 #[inline]
 fn slot_of(hash: u64, slots: usize) -> usize {
     #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
@@ -600,17 +600,16 @@ fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
     fn words(keys: &[i64]) -> impl Iterator<Item = u64> + '_ {
         keys.iter().map(|&key| key.cast_unsigned())
     }
-    let Some((first, rest)) = keys.split_first() else { failed!() };
-    if rest.is_empty() && nulls.is_none() {
-        for (hash, key) in hashes.iter_mut().zip(words(first)) {
+    check!(keys.iter().all(|keys| keys.len() >= hashes.len()));
+    check!(nulls.is_none_or(|nulls| nulls.len() >= hashes.len()));
+    if let ([keys], None) = (keys, nulls) {
+        for (hash, key) in hashes.iter_mut().zip(words(keys)) {
             *hash = mix(key);
         }
         return;
     }
-    for (hash, key) in hashes.iter_mut().zip(words(first)) {
-        *hash = combine(SEED, key);
-    }
-    for keys in rest {
+    hashes.fill(SEED);
+    for keys in keys {
         for (hash, key) in hashes.iter_mut().zip(words(keys)) {
             *hash = combine(*hash, key);
         }
