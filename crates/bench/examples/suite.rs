@@ -161,8 +161,12 @@ fn main() -> Result<(), String> {
                     .swap(0, std::sync::atomic::Ordering::Relaxed)
                     as f64
                     / 1e6;
+                let evictions = pipit_kernel::aggregate::EVICTIONS
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                let rebuilt = pipit_kernel::aggregate::REBUILT_GROUPS
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
-                    "Q{number}: {elapsed:?} peak {peak:.1} MB read {read:.1} MB in {pages} pages spilled {spilled:.1} MB"
+                    "Q{number}: {elapsed:?} peak {peak:.1} MB read {read:.1} MB in {pages} pages spilled {spilled:.1} MB evictions {evictions} rebuilt {rebuilt}"
                 );
             }
             Err(error) => eprintln!("Q{number}: {error}"),

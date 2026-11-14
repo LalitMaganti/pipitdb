@@ -224,3 +224,8 @@ pub struct AggregateCall {
 
 /// How many bytes grouping wrote to partitions, for measuring (prototype).
 pub static SPILLED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// How many times grouping evicted partitions, and how many groups it kept and re-inserted (prototype).
+pub static EVICTIONS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub static REBUILT_GROUPS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);

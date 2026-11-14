@@ -199,6 +199,9 @@ impl HashAggregate {
             .fetch_add(spilled * width * 8, core::sync::atomic::Ordering::Relaxed);
         state.groups.clear();
         state.seen = self.new_seen(allocator)?;
+        crate::aggregate::EVICTIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::aggregate::REBUILT_GROUPS
+            .fetch_add(kept.len() / width, core::sync::atomic::Ordering::Relaxed);
         self.merge_rows(context, &kept, width, &mut state.groups, &mut state.seen)?;
         Ok(())
     }
