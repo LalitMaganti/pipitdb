@@ -79,8 +79,7 @@ pub struct ComputeState {
     /// By program, then step, a constant step's value at every row a batch
     /// can have, made once per run.
     constants: SlowVec<SlowVec<Option<ColumnView>>>,
-    /// By step, what each computed for the program being run. Emptied after
-    /// each, so the buffers they shared can be reused.
+    /// By step, what each computed for the program last run.
     registers: SlowVec<Option<ColumnView>>,
 }
 
@@ -110,9 +109,8 @@ impl Transform for Compute {
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
         for (program, constants) in self.programs.iter().zip(state.constants.iter()) {
-            let result = run(context, program, constants, &mut state.registers, batch);
-            state.registers.iter_mut().for_each(|register| *register = None);
-            let Ok(()) = batch.push_column(result?) else { failed!() };
+            let result = run(context, program, constants, &mut state.registers, batch)?;
+            let Ok(()) = batch.push_column(result) else { failed!() };
         }
         Ok(())
     }
