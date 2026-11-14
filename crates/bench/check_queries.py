@@ -15,6 +15,7 @@ table named after it, less a trailing `_N`, as the `suite` example names
 them.
 """
 
+import datetime
 import pathlib
 import re
 import subprocess
@@ -40,6 +41,9 @@ def rows_by_query(lines):
 def same(a, b):
     if a == b:
         return True
+    # pipitdb has no dates: it gives a day number where DuckDB gives a date.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", b):
+        return a == str((datetime.date.fromisoformat(b) - datetime.date(1970, 1, 1)).days)
     try:
         x, y = float(a), float(b)
     except ValueError:
