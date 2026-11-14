@@ -173,20 +173,21 @@ impl GroupTable {
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         self.grow(context.allocator(), self.len() + count)?;
-        if let ([keys], None) = (keys, nulls) {
-            return self.find_values(keys, groups);
-        }
         let mut hashes = context.values_buffer(count * 8)?;
-        self.find_hashed(hashes.as_mut_slice(), keys, nulls, groups)
+        let hashes = at_mut!(hashes.as_mut_slice(), ..count);
+        hash_rows(hashes, keys, nulls);
+        if let ([keys], None) = (keys, nulls) {
+            return self.find_values(hashes, keys, groups);
+        }
+        self.find_hashed(hashes, keys, nulls, groups)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
-    /// null word unless none are null. Hashes every row to `hashes`, a key at
-    /// a time, before finding any, so slots and records can be fetched ahead.
+    /// null word unless none are null, and each row's hash.
     #[inline(never)]
     fn find_hashed(
         &mut self,
-        hashes: &mut [u64],
+        hashes: &[u64],
         keys: &[&[i64]],
         nulls: Option<&[u64]>,
         groups: &mut [u32],
@@ -194,9 +195,8 @@ impl GroupTable {
         let count = groups.len();
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
+        check!(hashes.len() == count);
         check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
-        let hashes = at_mut!(hashes, ..count);
-        hash_rows(hashes, keys, nulls);
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
@@ -280,18 +280,22 @@ impl GroupTable {
         Ok(group)
     }
 
-    /// As `find_or_create`, for a single key with no nulls: compares the key
-    /// values directly.
-    fn find_values(&mut self, keys: &[i64], groups: &mut [u32]) -> Result<(), Error> {
+    /// As `find_or_create`, for a single key with no nulls, given each row's
+    /// hash: compares the key values directly.
+    fn find_values(
+        &mut self,
+        hashes: &[u64],
+        keys: &[i64],
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
         check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
-        let hash_of = |i: usize| keys.get(i).map(|&key| mix(key.cast_unsigned()));
-        for (i, (&key, group)) in keys.iter().zip(groups).enumerate() {
+        let hash_of = |i: usize| hashes.get(i).copied();
+        for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
-            let hash = mix(key.cast_unsigned());
             let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
             // SAFETY: a group in a slot has a record, of at least two words.
