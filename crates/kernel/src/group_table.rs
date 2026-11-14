@@ -190,7 +190,7 @@ impl GroupTable {
         let mut first_nulls = None;
         if let Some(nulls) = nulls {
             let mut words = context.values_buffer(runs * 8)?;
-            gather(words.as_mut_slice(), nulls, starts);
+            gather(words.as_mut_slice(), as_signed(nulls), starts);
             first_nulls = Some(words);
         }
         let mut first_keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
@@ -649,18 +649,17 @@ fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usi
     check!(nulls.is_none_or(|nulls| nulls.len() >= count));
     // First whether each row differs from the one before, in `starts`.
     starts.fill(0);
-    let mut differ = |words: &[u64]| {
+    let mut differ = |words: &[i64]| {
         let pairs = at!(words, ..count - 1).iter().zip(at!(words, 1..count));
         for (start, (before, word)) in at_mut!(starts, 1..).iter_mut().zip(pairs) {
             *start |= u32::from(before != word);
         }
     };
     for keys in keys {
-        // SAFETY: of one size and alignment, with every bit pattern valid.
-        differ(unsafe { core::slice::from_raw_parts(keys.as_ptr().cast(), keys.len()) });
+        differ(keys);
     }
     if let Some(nulls) = nulls {
-        differ(nulls);
+        differ(as_signed(nulls));
     }
     *at_mut!(starts, 0) = 1;
     let mut runs = 0;
@@ -674,8 +673,14 @@ fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usi
     runs
 }
 
+/// `words` as signed words.
+fn as_signed(words: &[u64]) -> &[i64] {
+    // SAFETY: of one size and alignment, with every bit pattern valid.
+    unsafe { core::slice::from_raw_parts(words.as_ptr().cast(), words.len()) }
+}
+
 /// Writes the words of `words` at `rows` to `out`.
-fn gather<T: Copy>(out: &mut [T], words: &[T], rows: &[u32]) {
+fn gather(out: &mut [i64], words: &[i64], rows: &[u32]) {
     for (out, &row) in out.iter_mut().zip(rows) {
         *out = *at!(words, row as usize);
     }
