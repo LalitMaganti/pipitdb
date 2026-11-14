@@ -196,8 +196,19 @@ impl GroupTable {
         }
         let loaded = self.load_keys(context, columns, select, count)?;
         let keys = loaded.keys(columns, count);
-        let keys = at!(keys, ..self.keys);
-        let nulls = loaded.nulls();
+        self.find_loaded(context, at!(keys, ..self.keys), loaded.nulls(), groups)
+    }
+
+    /// As `find_or_create`, given each key as a word a row, and each row's
+    /// null word unless none are null.
+    pub(crate) fn find_loaded(
+        &mut self,
+        context: &mut Context,
+        keys: &[&[i64]],
+        nulls: Option<&[u64]>,
+        groups: &mut [u32],
+    ) -> Result<(), Error> {
+        let count = groups.len();
         self.grow(context.allocator(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.

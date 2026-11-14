@@ -203,66 +203,23 @@ impl HashAggregate {
         Ok(())
     }
 
-    /// Splits the rows `input` keeps into those of resident partitions, to
-    /// `resident`, and those of evicted ones, to `evicted`, as rows of the
-    /// batch.
-    fn split(
-        &self,
-        context: &mut Context,
-        state: &mut State,
-        input: &Flat,
-        rows: usize,
-        resident: &mut SlowVec<u16>,
-        evicted: &mut SlowVec<u16>,
-    ) -> Result<(), Error> {
-        let key_count = self.spec.key_columns.len();
-        let mut keys = [input.column(0); KEYS_MAX];
-        for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
-            *key = input.column(column);
-        }
-        let keys = at!(keys, ..key_count);
-        let loaded = state.groups.load_keys(context, keys, input.select(), rows)?;
-        let words = loaded.keys(keys, rows);
-        let mut hashes = context.values_buffer(rows * 8)?;
-        let hashes = at_mut!(hashes.as_mut_slice::<u64>(), ..rows);
-        hash_rows(hashes, at!(words, ..key_count), loaded.nulls());
-        let Some(radix) = &state.radix else { failed!() };
-        let select = input.select();
-        for (i, &hash) in hashes.iter().enumerate() {
-            #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
-            let row = if select.is_empty() { i as u16 } else { *at!(select, i) };
-            if *at!(radix.evicted, hash as usize % PARTS) {
-                evicted.push(row)?;
-            } else {
-                resident.push(row)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Appends the rows `select` keeps of `input` to their evicted
     /// partitions, a group for each run of one key.
+    /// `words`, `nulls` and `hashes` are those rows' keys, null words and
+    /// hashes.
+    #[expect(clippy::too_many_arguments, reason = "a prototype")]
     fn consume_evicted(
         &self,
         context: &mut Context,
         state: &mut State,
         input: &Flat,
         select: &[u16],
+        words: &[&[i64]],
+        nulls: Option<&[u64]>,
+        hashes: &[u64],
     ) -> Result<(), Error> {
         let rows = select.len();
         let key_count = self.spec.key_columns.len();
-        let mut keys = [input.column(0); KEYS_MAX];
-        for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
-            *key = input.column(column);
-        }
-        let keys = at!(keys, ..key_count);
-        let loaded = state.groups.load_keys(context, keys, select, rows)?;
-        let words = loaded.keys(keys, rows);
-        let words = at!(words, ..key_count);
-        let nulls = loaded.nulls();
-        let mut hashes = context.values_buffer(rows * 8)?;
-        let hashes = at_mut!(hashes.as_mut_slice::<u64>(), ..rows);
-        hash_rows(hashes, words, nulls);
         // Each run's rows as one group.
         let mut starts = context.indices_buffer(rows * 4)?;
         let starts = at_mut!(starts.as_mut_slice::<u32>(), ..rows);
@@ -618,20 +575,10 @@ impl Breaker for HashAggregate {
                 self.evict(context, state)?;
             }
             if state.radix.is_some() {
-                let allocator = context.allocator();
-                let mut resident = SlowVec::fixed(allocator, rows)?;
-                let mut evicted = SlowVec::fixed(allocator, rows)?;
-                self.split(context, state, &input, rows, &mut resident, &mut evicted)?;
-                if !evicted.is_empty() {
-                    self.consume_evicted(context, state, &input, &evicted)?;
-                }
-                if resident.is_empty() {
-                    return Ok(());
-                }
-                return self.consume_into_table(context, state, &input, &resident, resident.len());
+                return self.consume_split(context, state, &input, rows);
             }
         }
-        self.consume_into_table(context, state, &input, input.select(), rows)
+        self.consume_into_table(context, state, &input, input.select(), rows, None)
     }
 
     fn finalize(&self, _: &mut Context, _: &mut State) -> Result<(), Error> {
@@ -652,8 +599,103 @@ impl Breaker for HashAggregate {
 }
 
 impl HashAggregate {
+    /// As `consume`, once partitions were evicted: loads and hashes the keys
+    /// once, then sends rows of resident partitions to `groups` and the rest
+    /// to their partitions.
+    fn consume_split(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        input: &Flat,
+        rows: usize,
+    ) -> Result<(), Error> {
+        let key_count = self.spec.key_columns.len();
+        let mut keys = [input.column(0); KEYS_MAX];
+        for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
+            *key = input.column(column);
+        }
+        let keys = at!(keys, ..key_count);
+        let loaded = state.groups.load_keys(context, keys, input.select(), rows)?;
+        let words = loaded.keys(keys, rows);
+        let words = at!(words, ..key_count);
+        let nulls = loaded.nulls();
+        let mut hashes = context.values_buffer(rows * 8)?;
+        let hashes = at_mut!(hashes.as_mut_slice::<u64>(), ..rows);
+        hash_rows(hashes, words, nulls);
+        let Some(radix) = &state.radix else { failed!() };
+        // Each side's rows of the batch, and where they are among `rows`.
+        let mut sides = [[0_u16; BATCH_ROWS_MAX as usize]; 2];
+        let mut at = [context.indices_buffer(rows * 4)?, context.indices_buffer(rows * 4)?];
+        let mut counts = [0; 2];
+        let select = input.select();
+        for (i, &hash) in hashes.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+            let row = if select.is_empty() { i as u16 } else { *at!(select, i) };
+            let side = usize::from(*at!(radix.evicted, hash as usize % PARTS));
+            let n = *at!(counts, side);
+            *at_mut!(at_mut!(sides, side), n) = row;
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+            let i = i as u32;
+            *at_mut!(at_mut!(at, side).as_mut_slice::<u32>(), n) = i;
+            *at_mut!(counts, side) += 1;
+        }
+        for side in [1, 0] {
+            let count = *at!(counts, side);
+            if count == 0 {
+                continue;
+            }
+            let positions = at!(at!(at, side).as_slice::<u32>(), ..count);
+            let mut copies = [const { None }; KEYS_MAX];
+            for (copy, words) in copies.iter_mut().zip(words) {
+                let mut buffer = context.values_buffer(count * 8)?;
+                let out = buffer.as_mut_slice::<i64>().iter_mut();
+                for (out, &i) in out.zip(positions) {
+                    *out = *at!(words, i as usize);
+                }
+                *copy = Some(buffer);
+            }
+            let mut side_keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
+            for (keys, copy) in side_keys.iter_mut().zip(&copies) {
+                *keys = copy.as_ref().map_or(&[], |copy| at!(copy.as_slice(), ..count));
+            }
+            let side_keys = at!(side_keys, ..key_count);
+            let mut null_copy = None;
+            if let Some(nulls) = nulls {
+                let mut buffer = context.values_buffer(count * 8)?;
+                for (out, &i) in buffer.as_mut_slice::<u64>().iter_mut().zip(positions) {
+                    *out = *at!(nulls, i as usize);
+                }
+                null_copy = Some(buffer);
+            }
+            let side_nulls = null_copy.as_ref().map(|nulls| at!(nulls.as_slice::<u64>(), ..count));
+            let select = at!(at!(sides, side), ..count);
+            if side == 1 {
+                let mut side_hashes = context.values_buffer(count * 8)?;
+                let out = side_hashes.as_mut_slice::<u64>().iter_mut();
+                for (out, &i) in out.zip(positions) {
+                    *out = *at!(hashes, i as usize);
+                }
+                let side_hashes = at!(side_hashes.as_slice::<u64>(), ..count);
+                self.consume_evicted(
+                    context,
+                    state,
+                    input,
+                    select,
+                    side_keys,
+                    side_nulls,
+                    side_hashes,
+                )?;
+            } else {
+                let preloaded = Some((side_keys, side_nulls));
+                self.consume_into_table(context, state, input, select, count, preloaded)?;
+            }
+        }
+        Ok(())
+    }
+
     /// As `consume`, for the rows `select` keeps of `input`, all if empty,
-    /// `rows` of them, into `groups`.
+    /// `rows` of them, into `groups`, given their keys and null words if
+    /// they were loaded already.
     fn consume_into_table(
         &self,
         context: &mut Context,
@@ -661,6 +703,7 @@ impl HashAggregate {
         input: &Flat,
         select: &[u16],
         rows: usize,
+        preloaded: Option<(&[&[i64]], Option<&[u64]>)>,
     ) -> Result<(), Error> {
         // Find each row's group. Groups are numbered in the order first seen,
         // so a row starts a new group when its number equals the group count.
@@ -673,7 +716,10 @@ impl HashAggregate {
             }
             let keys = at!(keys, ..self.spec.key_columns.len());
             let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
-            state.groups.find_or_create(context, keys, select, groups)?;
+            match preloaded {
+                Some((words, nulls)) => state.groups.find_loaded(context, words, nulls, groups)?,
+                None => state.groups.find_or_create(context, keys, select, groups)?,
+            }
         }
         let group_count = self.group_count(state);
         let State { groups, total, seen, distinct, .. } = state;
