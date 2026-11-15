@@ -343,6 +343,20 @@ mod tests {
     }
 
     #[test]
+    fn knows_which_columns_can_be_null() {
+        let catalog = catalog();
+        let query = b"FROM t |> EXTEND a + 1 AS x, a / 2 AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
+        let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
+        let nullable = |name: &str| {
+            let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
+            column.unwrap().nullable
+        };
+        // The table has no nulls; dividing may make one, and a sum of none is one.
+        assert!(!nullable("a") && !nullable("x") && !nullable("c"));
+        assert!(nullable("y") && nullable("total"));
+    }
+
+    #[test]
     fn computes_columns() {
         assert_eq!(kept("FROM t |> SELECT a + b AS c"), [11.0, 22.0]);
         assert_eq!(kept("FROM t |> EXTEND b - a * 2 AS c |> SELECT c"), [8.0, 16.0]);

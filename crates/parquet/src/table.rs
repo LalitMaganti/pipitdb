@@ -585,6 +585,15 @@ mod tests {
     }
 
     #[test]
+    fn knows_columns_without_nulls_from_their_statistics() {
+        // Both files' columns are optional; only `NULLS` counts any nulls.
+        let none = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        assert!((0..3).all(|column| !none.column_nullable(column)));
+        let some = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS]).unwrap();
+        assert!((0..3).all(|column| some.column_nullable(column)));
+    }
+
+    #[test]
     fn scans_files_as_one_table() {
         let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
         assert_eq!(table.column_count(), 3);
