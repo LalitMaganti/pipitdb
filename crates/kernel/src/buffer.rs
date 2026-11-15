@@ -49,6 +49,7 @@ pub(crate) const HEADER_BYTES: usize = size_of::<Header>();
 impl Buffer {
     /// Allocates `size_bytes` zeroed bytes from `allocator`, which must
     /// outlive the buffer and its clones.
+    #[inline(never)]
     pub fn allocate(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
         // SAFETY: the bytes come zeroed.
         unsafe { Buffer::allocate_with(allocator, size_bytes, true, BUFFER_ALIGNMENT_BYTES) }
@@ -60,6 +61,7 @@ impl Buffer {
     ///
     /// No byte may be read, through `as_slice` or otherwise, before it is
     /// written.
+    #[inline(never)]
     pub unsafe fn allocate_uninit(
         allocator: &dyn Allocator,
         size_bytes: usize,
