@@ -178,7 +178,7 @@ fn in_list(
 
 /// `node`, a string literal, added to the plan's literals, a quote for each
 /// `''`, and its id there.
-fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> {
+pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> {
     let quoted = compiler.bytes(node.span());
     // Between its quotes, which the lexer checked are there.
     let inside = at!(quoted, 1..quoted.len() - 1);

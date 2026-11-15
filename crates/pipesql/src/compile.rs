@@ -376,6 +376,11 @@ mod tests {
         assert_eq!(kept("FROM t |> EXTEND b / (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> EXTEND b % (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> EXTEND a + NULL AS x |> WHERE x IS NULL |> SELECT a").len(), 2);
+        // String literals, as lengths here, which later stages read.
+        assert_eq!(kept("FROM t |> SELECT 'it''s' AS x"), [4.0, 4.0]);
+        assert_eq!(kept("FROM t |> SELECT '' AS x"), [0.0, 0.0]);
+        let grouped = "FROM t |> EXTEND 'ab' AS k |> WHERE k = 'ab' |> AGGREGATE count(*) AS c GROUP BY k |> SELECT c";
+        assert_eq!(kept(grouped), [2.0]);
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
@@ -457,7 +462,8 @@ mod tests {
         assert_eq!(error("FROM t |> EXTEND f % 2 AS x"), (ErrorCode::ExpectedInteger, 17));
         assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> SELECT a > 1 AS x"), (ErrorCode::Unsupported, 17));
-        assert_eq!(error("FROM t |> SELECT 'x' AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT 'x' + 1 AS x"), (ErrorCode::ExpectedNumber, 17));
+        assert_eq!(error("FROM t |> SELECT -'x' AS x"), (ErrorCode::ExpectedNumber, 18));
         assert_eq!(error("FROM t |> SELECT 1.5 AS x"), (ErrorCode::Unsupported, 17));
         assert_eq!(
             error("FROM t |> SELECT 9223372036854775808 AS x"),
