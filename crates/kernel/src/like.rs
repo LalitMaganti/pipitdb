@@ -107,7 +107,15 @@ fn find(text: &[u8], segment: &[u8]) -> Option<usize> {
         && last != b'_'
     {
         let gap = segment.len() - 1;
-        while let (Some(firsts), Some(lasts)) = (block_at(text, at), block_at(text, at + gap)) {
+        // Where a block's last byte, `gap` on, is still in `text`.
+        let blocks_end = text.len().saturating_sub(gap + 31);
+        while at < blocks_end {
+            // SAFETY: `at + gap + 32` is at most `text.len()`, so both
+            // blocks are in it.
+            let (firsts, lasts) = unsafe {
+                let block = |at: usize| &*text.as_ptr().add(at).cast::<[u8; 32]>();
+                (block(at), block(at + gap))
+            };
             let mut found = block::pairs(firsts, lasts, first, last);
             while found != 0 {
                 let candidate = at + found.trailing_zeros() as usize;
@@ -127,11 +135,6 @@ fn find(text: &[u8], segment: &[u8]) -> Option<usize> {
         at += 1;
     }
     None
-}
-
-/// The 32 bytes of `text` from `at`, if there are as many.
-fn block_at(text: &[u8], at: usize) -> Option<&[u8; 32]> {
-    text.get(at..)?.first_chunk::<32>()
 }
 
 /// Where `byte` first is in `text`. Blocks of 32 bytes without it are skipped
