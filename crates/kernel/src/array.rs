@@ -101,8 +101,7 @@ impl<T: Primitive> Array<T> {
         let bytes = size_of::<T>().checked_mul(len).ok_or(AllocError)?;
         let values = match bytes {
             0 => NonNull::dangling(),
-            _ if zeroed => allocator.allocate_zeroed(layout(bytes)?)?.cast(),
-            _ => allocator.allocate(layout(bytes)?)?.cast(),
+            _ => allocate_bytes(allocator, bytes, zeroed)?.cast(),
         };
         // SAFETY: only the lifetime changes; the allocator outlives the values.
         let allocator = unsafe {
@@ -134,14 +133,36 @@ impl<T: Primitive> DerefMut for Array<T> {
 impl<T: Primitive> Drop for Array<T> {
     fn drop(&mut self) {
         let bytes = size_of::<T>() * self.len;
-        if bytes == 0 {
-            return;
+        if bytes != 0 {
+            // SAFETY: allocated by `allocate_bytes`, with these bytes, from
+            // this allocator, which outlives it.
+            unsafe { free_bytes(self.allocator, self.values.cast(), bytes) };
         }
-        let Ok(layout) = layout(bytes) else { failed!() };
-        // SAFETY: allocated with this layout from this allocator, which
-        // outlives it.
-        unsafe { self.allocator.as_ref().deallocate(self.values.cast(), layout) };
     }
+}
+
+/// `bytes` of memory, zeroed if `zeroed`. Out of line, and of no type, so
+/// every `Array` shares it.
+#[inline(never)]
+fn allocate_bytes(
+    allocator: &dyn Allocator,
+    bytes: usize,
+    zeroed: bool,
+) -> Result<NonNull<u8>, AllocError> {
+    let layout = layout(bytes)?;
+    if zeroed { allocator.allocate_zeroed(layout) } else { allocator.allocate(layout) }
+}
+
+/// Frees `bytes` at `values`.
+///
+/// # Safety
+///
+/// They must be from `allocate_bytes`, with `allocator`, which still lives.
+#[inline(never)]
+unsafe fn free_bytes(allocator: NonNull<dyn Allocator>, values: NonNull<u8>, bytes: usize) {
+    let Ok(layout) = layout(bytes) else { failed!() };
+    // SAFETY: as the caller promises.
+    unsafe { allocator.as_ref().deallocate(values, layout) };
 }
 
 #[cfg(test)]
