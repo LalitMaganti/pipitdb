@@ -2,10 +2,10 @@
 //! a `GroupTable` and the aggregate functions, as Perfetto's
 //! `HashAggregate` does.
 
-use crate::aggregate::{Function, HashAggregateSpec};
+use crate::aggregate::{AggregateCall, Function, HashAggregateSpec};
 use crate::aggregate_function::{
-    AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, finalize_to_buffer,
-    make_aggregate_function,
+    AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, StringExtreme,
+    finalize_to_buffer, make_aggregate_function,
 };
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
@@ -60,9 +60,7 @@ struct State {
 impl HashAggregate {
     fn new(spec: HashAggregateSpec) -> HashAggregate {
         check!(spec.key_columns.len() <= KEYS_MAX);
-        let calls = spec.aggregates.iter();
-        let state_words =
-            calls.map(|call| make_aggregate_function(call.function).state_words()).sum();
+        let state_words = spec.aggregates.iter().copied().map(state_words).sum();
         HashAggregate { spec, state_words }
     }
 
@@ -103,6 +101,20 @@ impl HashAggregate {
         let inputs =
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
+    }
+}
+
+/// The function that computes `call`, if it's `MIN` or `MAX` of strings.
+fn string_extreme(call: AggregateCall) -> Option<StringExtreme> {
+    (call.input_type == DataType::String)
+        .then(|| StringExtreme { max: call.function == Function::Max })
+}
+
+/// How many words of state `call` keeps for each group.
+fn state_words(call: AggregateCall) -> usize {
+    match string_extreme(call) {
+        Some(_) => StringExtreme::STATE_WORDS,
+        None => make_aggregate_function(call.function).state_words(),
     }
 }
 
@@ -223,6 +235,7 @@ impl Breaker for HashAggregate {
         let mut distinct = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
         for call in self.spec.aggregates.iter() {
             check!(!call.distinct || call.function != Function::CountStar);
+            check!(!call.distinct || string_extreme(*call).is_none());
             let set = if call.distinct { Some(FlatHashMap::for_len(allocator, 0)?) } else { None };
             distinct.push(set)?;
         }
@@ -261,6 +274,14 @@ impl Breaker for HashAggregate {
         let mut overflow = false;
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
+            let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
+            if let Some(extreme) = string_extreme(*call) {
+                let states = Self::states(base, offset, None);
+                offset += StringExtreme::STATE_WORDS;
+                let column = input.column(call.column);
+                extreme.update(context, column, input.select(), rows, numbers, states)?;
+                continue;
+            }
             let function = make_aggregate_function(call.function);
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
@@ -274,7 +295,6 @@ impl Breaker for HashAggregate {
             };
             let states = Self::states(base, offset, seen);
             offset += function.state_words();
-            let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
             if let Some(set) = at_mut!(distinct, a) {
                 // Only the rows with values their group hasn't had, as if the
                 // batch were only those.
@@ -327,6 +347,13 @@ impl Breaker for HashAggregate {
         let base = self.state_base(table, &total);
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
+            if string_extreme(*call).is_some() {
+                let states = Self::states(base, offset, None);
+                offset += StringExtreme::STATE_WORDS;
+                let column = StringExtreme::finalize(context, &states, numbers)?;
+                let Ok(()) = output.push_column(column) else { failed!() };
+                continue;
+            }
             let function = make_aggregate_function(call.function);
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
@@ -337,7 +364,7 @@ impl Breaker for HashAggregate {
             };
             let states = Self::states(base, offset, seen);
             offset += function.state_words();
-            let output_type = call.function.output_type();
+            let output_type = call.function.output_type(call.input_type);
             let column = finalize_to_buffer(context, function, output_type, states, numbers)?;
             let Ok(()) = output.push_column(column) else { failed!() };
         }
@@ -353,7 +380,6 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::aggregate::AggregateCall;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
     use crate::column::DataType;
@@ -480,6 +506,7 @@ mod tests {
             function,
             column: 1,
             distinct: false,
+            input_type: DataType::Int64,
         });
         HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
@@ -632,6 +659,54 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_least_and_greatest_strings_by_their_bytes() {
+        // By the integer at 1, `MIN` and `MAX` of the string at 0, the
+        // digits of the integer there, so "100" is less than "9".
+        let rows = || Rows {
+            batches: alloc::vec![
+                alloc::vec![
+                    (Some(9), Some(1)),
+                    (Some(10), Some(1)),
+                    (None, Some(1)),
+                    (Some(5), Some(2))
+                ],
+                alloc::vec![(Some(100), Some(1)), (Some(7), Some(2)), (None, Some(3))],
+            ],
+            dropped: alloc::vec![1],
+        };
+        let spec = |keys: &[u32]| {
+            let calls = [Function::Min, Function::Max].map(|function| AggregateCall {
+                function,
+                column: 0,
+                distinct: false,
+                input_type: DataType::String,
+            });
+            HashAggregateSpec {
+                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                string_keys: 0,
+                nullable_keys: u64::MAX,
+                aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
+            }
+        };
+        let digits = ["9", "10", "5", "100", "7"].map(|text| Some(String::from(text)));
+        let entries = strings(&[digits.as_slice(), &[None]].concat());
+        for dictionaries in [Vec::new(), alloc::vec![entries.clone(), entries]] {
+            let rows = || StringKeys(rows(), dictionaries.clone());
+            assert_eq!(
+                run(rows(), spec(&[1])).unwrap(),
+                [
+                    alloc::vec![Some(1), Some(100), Some(9)],
+                    alloc::vec![Some(2), Some(5), Some(5)],
+                    alloc::vec![Some(3), None, None],
+                ]
+            );
+            assert_eq!(run(rows(), spec(&[])).unwrap(), [alloc::vec![Some(100), Some(9)]]);
+        }
+        let none = StringKeys(Rows { batches: Vec::new(), dropped: Vec::new() }, Vec::new());
+        assert_eq!(run(none, spec(&[])).unwrap(), [alloc::vec![None, None]]);
+    }
+
+    #[test]
     fn tables_sharing_a_pool_number_their_own_groups() {
         let mut context = Context::new(&Heap);
         let mut tables = [(); 2].map(|()| GroupTable::new(&Heap, 1, 1, u64::MAX, 0).unwrap());
@@ -696,6 +771,7 @@ mod tests {
                 function,
                 column: 1,
                 distinct: false,
+                input_type: DataType::Int64,
             });
             let spec = HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
@@ -711,7 +787,12 @@ mod tests {
         }
         // With no rows, the mean is null.
         let rows = Rows { batches: Vec::new(), dropped: Vec::new() };
-        let call = AggregateCall { function: Function::Avg, column: 1, distinct: false };
+        let call = AggregateCall {
+            function: Function::Avg,
+            column: 1,
+            distinct: false,
+            input_type: DataType::Int64,
+        };
         let spec = HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
             string_keys: 0,
@@ -732,8 +813,12 @@ mod tests {
             (Function::Sum, false),
         ];
         let spec = |keys: &[u32]| {
-            let calls =
-                calls.map(|(function, distinct)| AggregateCall { function, column: 1, distinct });
+            let calls = calls.map(|(function, distinct)| AggregateCall {
+                function,
+                column: 1,
+                distinct,
+                input_type: DataType::Int64,
+            });
             HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
                 string_keys: 0,

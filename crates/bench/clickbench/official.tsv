@@ -19,8 +19,8 @@
 18	FROM hits |> EXTEND EventTime / 60 % 60 AS m |> AGGREGATE count(*) AS c GROUP BY UserID, m, SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT UserID, extract(minute FROM toDateTime(EventTime)) AS m, SearchPhrase, COUNT(*) FROM hits GROUP BY UserID, m, SearchPhrase ORDER BY COUNT(*) DESC LIMIT 10
 19	FROM hits |> WHERE UserID = 435090932899640449 |> SELECT UserID	SELECT UserID FROM hits WHERE UserID = 435090932899640449
 20	FROM hits |> WHERE URL LIKE '%google%' |> AGGREGATE count(*)	SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
-21		SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
-22		SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+21	FROM hits |> WHERE URL LIKE '%google%' AND SearchPhrase != '' |> AGGREGATE min(URL), count(*) AS c GROUP BY SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT SearchPhrase, MIN(URL), COUNT(*) AS c FROM hits WHERE URL LIKE '%google%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
+22	FROM hits |> WHERE Title LIKE '%Google%' AND NOT URL LIKE '%.google.%' AND SearchPhrase != '' |> AGGREGATE min(URL), min(Title), count(*) AS c, count(DISTINCT UserID) GROUP BY SearchPhrase |> ORDER BY c DESC |> LIMIT 10	SELECT SearchPhrase, MIN(URL), MIN(Title), COUNT(*) AS c, COUNT(DISTINCT UserID) FROM hits WHERE Title LIKE '%Google%' AND URL NOT LIKE '%.google.%' AND SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10
 23		SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10
 24	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY EventTime |> SELECT SearchPhrase |> LIMIT 10	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY EventTime LIMIT 10
 25	FROM hits |> WHERE SearchPhrase != '' |> ORDER BY SearchPhrase |> SELECT SearchPhrase |> LIMIT 10	SELECT SearchPhrase FROM hits WHERE SearchPhrase <> '' ORDER BY SearchPhrase LIMIT 10

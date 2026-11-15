@@ -2,14 +2,18 @@
 //! each group, and how it updates and outputs it, a batch at a time, as
 //! Perfetto's do, for the operators that aggregate.
 
+use core::cmp::Ordering;
+
 use crate::aggregate::Function;
 use crate::allocator::{AllocError, Allocator};
 use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Validity};
+use crate::column::{ColumnView, DataType, Form, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::group_table::write_strings;
 use crate::row_batch::BATCH_ROWS_MAX;
+use crate::string_pool::Id;
 
 /// What an aggregate reads of one batch: a value a row, contiguous, and
 /// which rows hold one.
@@ -495,6 +499,73 @@ impl AggregateFunction for Extreme {
             *value = (states.word(group).cast_unsigned() ^ self.mask).cast_signed();
         }
         write_seen(valid, groups, &states);
+    }
+}
+
+/// `MIN` or `MAX` of strings: a group's least or greatest, by their bytes,
+/// null if it holds none. The state is the string's id in the run's pool, 0
+/// for none, so it needs no seen bytes.
+pub(crate) struct StringExtreme {
+    /// Whether the greatest string is wanted, rather than the least.
+    pub(crate) max: bool,
+}
+
+impl StringExtreme {
+    /// How many words of state each group keeps.
+    pub(crate) const STATE_WORDS: usize = 1;
+
+    /// Adds the first `rows` rows that `select` keeps of `column`, all if
+    /// it's empty, into the state of their group, `groups[row]`, or of
+    /// group 0 if `None`.
+    pub(crate) fn update(
+        &self,
+        context: &mut Context,
+        column: &ColumnView,
+        select: &[u16],
+        rows: usize,
+        groups: Option<&[u32]>,
+        mut states: GroupStates,
+    ) -> Result<(), Error> {
+        check!(column.data_type() == DataType::String);
+        let values = column.values();
+        let strings = values.strings();
+        let form = column.form();
+        let wanted = if self.max { Ordering::Greater } else { Ordering::Less };
+        let allocator = context.allocator();
+        let pool = context.string_pool()?;
+        for i in 0..rows {
+            let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+            let value = match form {
+                Form::Flat => row,
+                Form::Dictionary(indices) => *at!(indices, row) as usize,
+                Form::Constant => failed!(),
+            };
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's value")]
+            if values.is_null(value as u32) {
+                continue;
+            }
+            let candidate = strings.get(value);
+            let state = states.word_mut(groups.map_or(0, |groups| *at!(groups, i)));
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
+            let best = pool.get(Id::raw(*state as u32));
+            if best.is_none_or(|best| candidate.cmp(best) == wanted) {
+                *state = i64::from(pool.intern_string(allocator, Some(candidate))?.raw_id());
+            }
+        }
+        Ok(())
+    }
+
+    /// The string of each of `groups`, as a string column.
+    pub(crate) fn finalize(
+        context: &mut Context,
+        states: &GroupStates,
+        groups: &[u32],
+    ) -> Result<ColumnView, Error> {
+        let mut ids = context.values_buffer(groups.len() * 8)?;
+        for (id, &group) in ids.as_mut_slice::<i64>().iter_mut().zip(groups) {
+            *id = states.word(group);
+        }
+        write_strings(context, at!(ids.as_slice::<i64>(), ..groups.len()))
     }
 }
 
