@@ -133,7 +133,8 @@ pub struct OutputProperties {
 impl OutputProperties {
     /// No columns, and nothing known.
     pub const NONE: OutputProperties = OutputProperties {
-        columns: [Column { id: 0, data_type: DataType::Int64, nullable: true };
+        // Unused, and all zero, so copies are cheap.
+        columns: [Column { id: 0, data_type: DataType::Int64, nullable: false };
             BATCH_COLUMNS_MAX as usize],
         column_count: 0,
         arrangements: Arrangements::NONE,
