@@ -8,7 +8,7 @@ use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
+use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::DynSource;
@@ -142,24 +142,11 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(true)
     }
 
-    /// What its aggregates read must be `Int64`, but for `MIN` and `MAX`,
-    /// whose types `derive` checks.
-    fn needs(&self, _: u32) -> InputNeeds<'_> {
-        let mut needs = InputNeeds::NONE;
-        let integers = self
-            .aggregates
-            .iter()
-            .filter(|aggregate| !matches!(aggregate.function, Function::Min | Function::Max));
-        for column in integers.filter_map(|aggregate| aggregate.input) {
-            needs.types_then.push(column, DataType::Int64);
-        }
-        needs
-    }
-
     /// A row per group: its keys, then its aggregates. Groups are output in
     /// the order first seen, so if the input is sorted by the keys, the
     /// output is too. Its keys must be `Int64` or strings, which are all the
-    /// hash aggregate groups by.
+    /// hash aggregate groups by, and its aggregates' inputs of types their
+    /// functions read.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         for &key in self.keys.iter() {
             if !matches!(c.input(0).type_of(key), DataType::Int64 | DataType::String) {

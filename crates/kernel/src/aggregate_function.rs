@@ -504,11 +504,16 @@ impl AggregateFunction for Extreme {
 
 /// `MIN` or `MAX` of strings: a group's least or greatest, by their bytes,
 /// null if it holds none. The state is the string's id in the run's pool, 0
-/// for none, so it needs no seen bytes.
+/// for none, so it needs no seen bytes. While a batch is read, it's instead
+/// `BATCH_ROW` and the row of the batch's best so far, and only each group's
+/// best of the batch is interned, so strings beaten within it never are.
 pub(crate) struct StringExtreme {
     /// Whether the greatest string is wanted, rather than the least.
     pub(crate) max: bool,
 }
+
+/// Marks a `StringExtreme` state that holds a row of the batch being read.
+const BATCH_ROW: i64 = 1 << 32;
 
 impl StringExtreme {
     /// How many words of state each group keeps.
@@ -530,27 +535,53 @@ impl StringExtreme {
         let values = column.values();
         let strings = values.strings();
         let form = column.form();
-        let wanted = if self.max { Ordering::Greater } else { Ordering::Less };
-        let allocator = context.allocator();
-        let pool = context.string_pool()?;
-        for i in 0..rows {
-            let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+        // The string at batch row `row`, or `None` if it's null.
+        let string = |row: usize| {
             let value = match form {
                 Form::Flat => row,
                 Form::Dictionary(indices) => *at!(indices, row) as usize,
                 Form::Constant => failed!(),
             };
             #[expect(clippy::cast_possible_truncation, reason = "a batch's value")]
-            if values.is_null(value as u32) {
-                continue;
+            (!values.is_null(value as u32)).then(|| strings.get(value))
+        };
+        let wanted = if self.max { Ordering::Greater } else { Ordering::Less };
+        let mut touched = context.indices_buffer(rows * 4)?;
+        let touched = touched.as_mut_slice::<u32>();
+        let mut count = 0;
+        let allocator = context.allocator();
+        let pool = context.string_pool()?;
+        for i in 0..rows {
+            let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
+            let Some(candidate) = string(row) else { continue };
+            let group = groups.map_or(0, |groups| *at!(groups, i));
+            let state = *states.word_mut(group);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a row or an id"
+            )]
+            let best = if state & BATCH_ROW != 0 {
+                string((state & !BATCH_ROW) as usize)
+            } else {
+                pool.get(Id::raw(state as u32))
+            };
+            let better = best.is_none_or(|best| candidate.cmp(best) == wanted);
+            if better {
+                if state & BATCH_ROW == 0 {
+                    *at_mut!(touched, count) = group;
+                    count += 1;
+                }
+                #[expect(clippy::cast_possible_wrap, reason = "a batch's row")]
+                let row = row as i64;
+                *states.word_mut(group) = BATCH_ROW | row;
             }
-            let candidate = strings.get(value);
-            let state = states.word_mut(groups.map_or(0, |groups| *at!(groups, i)));
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
-            let best = pool.get(Id::raw(*state as u32));
-            if best.is_none_or(|best| candidate.cmp(best) == wanted) {
-                *state = i64::from(pool.intern_string(allocator, Some(candidate))?.raw_id());
-            }
+        }
+        for &group in at!(touched, ..count) {
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a row")]
+            let row = (states.word(group) & !BATCH_ROW) as usize;
+            *states.word_mut(group) =
+                i64::from(pool.intern_string(allocator, string(row))?.raw_id());
         }
         Ok(())
     }
