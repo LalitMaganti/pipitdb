@@ -8,11 +8,11 @@ use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
 
-/// How many bits of an id say which block its string is in.
-const BLOCK_INDEX_BITS: u32 = 9;
-
 /// How many bits of an id say where in its block its string is.
 const BLOCK_OFFSET_BITS: u32 = 22;
+
+/// How many bits of an id say which block its string is in: the rest of 31.
+const BLOCK_INDEX_BITS: u32 = 31 - BLOCK_OFFSET_BITS;
 
 const LARGE_STRING_FLAG_MASK: u32 = 1 << 31;
 const BLOCK_OFFSET_MASK: u32 = (1 << BLOCK_OFFSET_BITS) - 1;
