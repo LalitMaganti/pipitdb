@@ -190,7 +190,8 @@ impl<'c> Op<'c> for AggregateOp {
             column: aggregate.input.map_or(0, |id| lowering.query_position(id)),
         });
         let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
-        let spec = HashAggregateSpec { key_columns, string_keys, aggregates };
+        let nullable_keys = u64::MAX;
+        let spec = HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates };
         let operator = hash_aggregate(allocator, spec)?;
         lowering.add_operator(Step::Operator(operator))
     }
@@ -206,6 +207,9 @@ pub struct HashAggregateSpec {
     /// learns this from the first batch, but a group-by here serves a batch
     /// with its keys' types even if none came.
     pub string_keys: u64,
+    /// Bit `k` set if key `k` can be null. A table of keys that can't be
+    /// keeps no null bits.
+    pub nullable_keys: u64,
     /// Each aggregate.
     pub aggregates: SlowVec<AggregateCall>,
 }

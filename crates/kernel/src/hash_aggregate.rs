@@ -211,6 +211,7 @@ impl Breaker for HashAggregate {
             allocator,
             self.spec.key_columns.len(),
             self.spec.string_keys,
+            self.spec.nullable_keys,
             self.state_words,
         )?;
         let mut total = SlowVec::new(allocator, self.state_words.next_power_of_two().max(1))?;
@@ -483,6 +484,7 @@ mod tests {
         HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
             string_keys: 0,
+            nullable_keys: u64::MAX,
             aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
         }
     }
@@ -551,6 +553,26 @@ mod tests {
     }
 
     #[test]
+    fn groups_keys_that_cant_be_null_without_null_bits() {
+        let rows = || Rows {
+            batches: alloc::vec![alloc::vec![
+                (Some(1), Some(1)),
+                (Some(1), Some(2)),
+                (Some(2), Some(1)),
+                (Some(1), Some(1)),
+            ]],
+            dropped: Vec::new(),
+        };
+        let mut by_both = spec(&[0, 1]);
+        by_both.aggregates.retain(|call| call.function == Function::CountStar);
+        let nullable = run(rows(), by_both).unwrap();
+        let mut by_both = spec(&[0, 1]);
+        by_both.aggregates.retain(|call| call.function == Function::CountStar);
+        by_both.nullable_keys = 0;
+        assert_eq!(run(rows(), by_both).unwrap(), nullable);
+    }
+
+    #[test]
     fn groups_by_two_keys() {
         let rows = Rows {
             // Mostly runs of one key, which are found once each.
@@ -612,7 +634,7 @@ mod tests {
     #[test]
     fn tables_sharing_a_pool_number_their_own_groups() {
         let mut context = Context::new(&Heap);
-        let mut tables = [(); 2].map(|()| GroupTable::new(&Heap, 1, 1, 0).unwrap());
+        let mut tables = [(); 2].map(|()| GroupTable::new(&Heap, 1, 1, u64::MAX, 0).unwrap());
         let column = |texts: &[Option<&str>]| {
             strings(&texts.iter().map(|text| text.map(String::from)).collect::<Vec<_>>())
         };
@@ -678,6 +700,7 @@ mod tests {
             let spec = HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
                 string_keys: 0,
+                nullable_keys: u64::MAX,
                 aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
             };
             let out = run(rows, spec).unwrap();
@@ -692,6 +715,7 @@ mod tests {
         let spec = HashAggregateSpec {
             key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
             string_keys: 0,
+            nullable_keys: u64::MAX,
             aggregates: SlowVec::fixed_from(&Heap, [call].into_iter()).unwrap(),
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
@@ -713,6 +737,7 @@ mod tests {
             HashAggregateSpec {
                 key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
                 string_keys: 0,
+                nullable_keys: u64::MAX,
                 aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
             }
         };
