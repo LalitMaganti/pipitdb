@@ -5,6 +5,7 @@
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::{AllocError, Allocator};
 use crate::array::Array;
+use crate::blocks::Blocks;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
@@ -56,7 +57,7 @@ pub(crate) struct GroupTable {
     /// Each group's null bits, then its keys, then its payload, `stride`
     /// words each. Keeping them together means comparing a group reads one
     /// cache line.
-    records: SlowVec<i64>,
+    records: Blocks<i64>,
     /// How many words each group takes.
     stride: usize,
     /// How many keys there are.
@@ -102,11 +103,7 @@ impl GroupTable {
         let stride = 1 + keys + payload_words;
         Ok(GroupTable {
             slots: SlowVec::new(allocator, 1)?,
-            // A `SlowVec` holds at most 2^31 values.
-            records: SlowVec::new(
-                allocator,
-                (GROUPS_MAX * stride).next_power_of_two().min(1 << 31),
-            )?,
+            records: Blocks::new(allocator, stride)?,
             stride,
             keys,
             string_keys,
@@ -117,13 +114,13 @@ impl GroupTable {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.records.len() / self.stride
+        self.records.len()
     }
 
-    /// The payloads: group g's starts at `g * row_stride()`.
-    pub(crate) fn payloads(&mut self) -> &mut [i64] {
-        let start = 1 + self.keys;
-        self.records.get_mut(start..).unwrap_or_default()
+    /// Where each block of records starts, as `Blocks::starts`, and where a
+    /// record's payload starts in it.
+    pub(crate) fn payloads(&mut self) -> (&[*mut i64], usize) {
+        (self.records.starts(), 1 + self.keys)
     }
 
     /// How many words apart consecutive groups' payloads are.
@@ -145,6 +142,7 @@ impl GroupTable {
         check!(columns.len() == self.keys);
         let count = groups.len();
         if (self.keys, self.string_keys) == (1, 1) {
+            self.records.reserve(context.allocator(), self.len() + count)?;
             let (mut ids, mut numbers) = (None, context.indices_buffer(count * 4)?);
             let (interned, column) = (at_mut!(self.dictionaries, 0), at!(columns, 0));
             let out = Some(numbers.as_mut_slice());
@@ -243,7 +241,7 @@ impl GroupTable {
         check!(keys.iter().all(|keys| keys.len() >= count));
         check!(nulls.is_none_or(|nulls| nulls.len() >= count));
         check!(hashes.len() == count);
-        check!(self.records.len() == self.len() * self.stride && self.stride > keys.len());
+        check!(self.stride > keys.len());
         // SAFETY: checked above.
         let null = |row: usize| nulls.map_or(0, |nulls| unsafe { *nulls.get_unchecked(row) });
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
@@ -253,11 +251,10 @@ impl GroupTable {
                 self.fetch_ahead(hash_of, row);
             }
             let hash = *at!(hashes, row);
-            let (records, stride) = (self.records.as_ptr(), self.stride);
             // SAFETY: a group in a slot has a record, and each key a word for
             // each row, checked above.
             let equal = |group: usize| unsafe {
-                let stored = records.add(group * stride);
+                let stored = self.records.record_ptr(group).cast_const();
                 (*stored).cast_unsigned() == null(row)
                     && keys
                         .iter()
@@ -285,8 +282,9 @@ impl GroupTable {
             let slot = *at!(self.slots, slot_of(next, self.slots.len()));
             #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
             let group = (slot & !salt(slot)) as usize;
-            let record = group.wrapping_sub(1) * self.stride;
-            prefetch(self.records.as_ptr().wrapping_add(record));
+            if group != 0 {
+                prefetch(self.records.record_ptr(group - 1).cast_const());
+            }
         }
     }
 
@@ -335,7 +333,7 @@ impl GroupTable {
         keys: &[i64],
         groups: &mut [u32],
     ) -> Result<(), Error> {
-        check!(self.records.len() == self.len() * self.stride && self.stride >= 2);
+        check!(self.stride >= 2);
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
@@ -343,11 +341,10 @@ impl GroupTable {
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
-            let (records, stride) = (self.records.as_ptr(), self.stride);
             // A stored group is its null bits, zero here, then its key.
             // SAFETY: a group in a slot has a record, of at least two words.
             let equal = |group: usize| unsafe {
-                let stored = records.add(group * stride);
+                let stored = self.records.record_ptr(group).cast_const();
                 *stored == 0 && *stored.add(1) == key
             };
             *group = match probe(&self.slots, hash, equal) {
@@ -375,10 +372,9 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
-        let start = self.records.len();
-        self.records.extend_zeroed(self.stride)?;
-        *at_mut!(self.records, start) = null.cast_signed();
-        for (word, keys) in at_mut!(self.records, start + 1..).iter_mut().zip(keys) {
+        let record = self.records.push();
+        *at_mut!(record, 0) = null.cast_signed();
+        for (word, keys) in at_mut!(record, 1..).iter_mut().zip(keys) {
             *word = *at!(keys, row);
         }
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
@@ -401,9 +397,7 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
-        let start = self.records.len();
-        self.records.extend_zeroed(self.stride)?;
-        at_mut!(self.records, start..start + key.len()).copy_from_slice(key);
+        at_mut!(self.records.push(), ..key.len()).copy_from_slice(key);
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
         Ok(group as u32)
     }
@@ -411,6 +405,7 @@ impl GroupTable {
     /// Doubles the slots until at most two thirds are used by `groups`
     /// groups, and puts each group back in its slot.
     fn grow(&mut self, allocator: &dyn Allocator, groups: usize) -> Result<(), Error> {
+        self.records.reserve(allocator, groups.min(GROUPS_MAX))?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
         while groups * 3 > capacity * 2 {
@@ -440,28 +435,28 @@ impl GroupTable {
         k: usize,
         range: core::ops::Range<usize>,
     ) -> Result<ColumnView, Error> {
-        let stride = self.stride;
-        let records = at!(self.records, range.start * stride..range.end * stride);
         let rows = range.len();
-        if self.string_keys >> k & 1 != 0 {
-            return write_strings(context, records, stride, k);
-        }
         let mut values = context.values_buffer(rows * 8)?;
         let out = values.as_mut_slice::<i64>().iter_mut();
         let mut nulls = false;
-        for (out, record) in out.zip(records.chunks_exact(stride)) {
+        for (out, group) in out.zip(range.clone()) {
+            let record = self.records.record(group);
             *out = *at!(record, 1 + k);
             nulls |= *at!(record, 0) >> k & 1 != 0;
+        }
+        if self.string_keys >> k & 1 != 0 {
+            return write_strings(context, at!(values.as_slice::<i64>(), ..rows));
         }
         if !nulls {
             return Ok(ColumnView::new(context, DataType::Int64, values, None)?);
         }
         let mut validity = context.small_buffer(rows.div_ceil(8))?;
-        let records = records.chunks(8 * stride);
-        for (bits, records) in validity.as_mut_slice::<u8>().iter_mut().zip(records) {
-            let records = records.chunks_exact(stride).enumerate();
-            *bits = records
-                .fold(0, |bits, (i, record)| bits | u8::from(*at!(record, 0) >> k & 1 == 0) << i);
+        let starts = range.clone().step_by(8);
+        for (bits, start) in validity.as_mut_slice::<u8>().iter_mut().zip(starts) {
+            let groups = (start..range.end.min(start + 8)).enumerate();
+            *bits = groups.fold(0, |bits, (i, group)| {
+                bits | u8::from(*at!(self.records.record(group), 0) >> k & 1 == 0) << i
+            });
         }
         Ok(ColumnView::new(context, DataType::Int64, values, Some(validity))?)
     }
@@ -538,18 +533,12 @@ fn load_string_ids(
     Ok(())
 }
 
-/// Key `k`, a string key, of `records`, `stride` words each, as a string
-/// column.
+/// The strings of `ids`, a string key's, as a string column.
 #[inline(never)]
-fn write_strings(
-    context: &mut Context,
-    records: &[i64],
-    stride: usize,
-    k: usize,
-) -> Result<ColumnView, Error> {
-    let rows = records.len() / stride;
+fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
+    let rows = ids.len();
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
-    let id = |row: usize| Id::raw(*at!(records, row * stride + 1 + k) as u32);
+    let id = |row: usize| Id::raw(*at!(ids, row) as u32);
     let mut views = context.values_buffer(rows * 8)?;
     let mut validity = context.small_buffer(rows.div_ceil(8))?;
     let valid = validity.as_mut_slice::<u8>();

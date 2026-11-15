@@ -9,6 +9,7 @@ pub mod aggregate;
 mod aggregate_function;
 pub mod allocator;
 mod array;
+mod blocks;
 pub mod boxed;
 pub mod buffer;
 pub mod bytes;
