@@ -43,6 +43,8 @@ pub struct SortKey {
 pub struct ColumnSchema {
     pub name: Name,
     pub data_type: DataType,
+    /// Whether it can hold a null.
+    pub nullable: bool,
 }
 
 /// A name in a scope or result. Several names can refer to one column.
@@ -411,9 +413,10 @@ impl<'c> LogicalPlan<'c> {
         &mut self,
         name: &str,
         data_type: DataType,
+        nullable: bool,
     ) -> Result<NamedColumn, AllocError> {
         let name = self.names.add(name)?;
-        self.add_named_column(name, data_type)
+        self.add_named_column(name, data_type, nullable)
     }
 
     /// As `add_column`, for a name already in `names`.
@@ -422,9 +425,10 @@ impl<'c> LogicalPlan<'c> {
         &mut self,
         name: Name,
         data_type: DataType,
+        nullable: bool,
     ) -> Result<NamedColumn, AllocError> {
         let id = self.columns.len() as ColumnId;
-        self.columns.push(ColumnSchema { name, data_type })?;
+        self.columns.push(ColumnSchema { name, data_type, nullable })?;
         Ok(NamedColumn { name, id })
     }
 

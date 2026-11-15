@@ -407,7 +407,7 @@ mod tests {
     fn allowed(passes_through: bool) -> Forms {
         let allowed = Cell::new(Forms::FLAT);
         let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let column = plan.add_column("a", DataType::String).unwrap();
+        let column = plan.add_column("a", DataType::String, true).unwrap();
         let mut node = plan
             .add_node(
                 DynOp::new(&Heap, Maker(&allowed)).unwrap(),

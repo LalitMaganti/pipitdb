@@ -104,7 +104,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let mut reads = SlowVec::fixed(self.allocator, count as usize)?;
         let mut columns = SlowVec::new(self.allocator, PLAN_COLUMNS_MAX)?;
         for i in 0..count {
-            let binding = self.plan.add_column(table.column_name(i), table.column_type(i))?;
+            let (name, data_type) = (table.column_name(i), table.column_type(i));
+            let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
             reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
             columns.push(binding)?;
         }

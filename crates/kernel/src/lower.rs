@@ -296,8 +296,8 @@ mod tests {
     fn lowers_a_scan_with_its_output_in_order() {
         let table = DynScannable::new(&Heap, AB).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let a = plan.add_column("a", DataType::Int64).unwrap();
-        let b = plan.add_column("b", DataType::Int64).unwrap();
+        let a = plan.add_column("a", DataType::Int64, true).unwrap();
+        let b = plan.add_column("b", DataType::Int64, true).unwrap();
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let a_column = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
         let b_column = ScanColumn { column: 1, binding: b, forms: Forms::FLAT };
@@ -368,8 +368,8 @@ mod tests {
         let table = DynScannable::new(&Heap, table).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let bindings = [
-            plan.add_column("a", DataType::Int64).unwrap(),
-            plan.add_column("b", DataType::Int64).unwrap(),
+            plan.add_column("a", DataType::Int64, true).unwrap(),
+            plan.add_column("b", DataType::Int64, true).unwrap(),
         ];
         let mut columns = SlowVec::fixed(&Heap, read.len()).unwrap();
         for &column in read {
@@ -425,14 +425,14 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
         let mut input = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         if let Some(groups) = groups {
-            let binding = plan.add_column("n", DataType::Int64).unwrap();
+            let binding = plan.add_column("n", DataType::Int64, true).unwrap();
             let function = crate::aggregate::Function::CountStar;
             let aggregate =
                 crate::aggregate::Aggregate { function, input: None, distinct: false, binding };
@@ -493,7 +493,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             ids.push(binding);
         }
@@ -517,7 +517,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
@@ -622,7 +622,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
@@ -694,7 +694,7 @@ mod tests {
             let mut plan = LogicalPlan::new(&Heap).unwrap();
             let mut columns = SlowVec::fixed(&Heap, 70).unwrap();
             for column in 0..70 {
-                let binding = plan.add_column("c", DataType::Int64).unwrap();
+                let binding = plan.add_column("c", DataType::Int64, true).unwrap();
                 assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
                 if (column as usize) < output {
                     assert!(plan.output.push(binding).is_ok());
@@ -848,7 +848,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 3).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b"), (2, "c")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
@@ -962,7 +962,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             ids.push(binding.id);
         }
@@ -1064,7 +1064,7 @@ mod tests {
         use crate::aggregate::{Aggregate, AggregateOp, Function};
         let table = DynScannable::new(&Heap, Summarized { knows }).unwrap();
         let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let a = plan.add_column("a", DataType::Int64).unwrap();
+        let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
         let columns = SlowVec::fixed_from(&Heap, columns.into_iter()).unwrap();
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
@@ -1073,7 +1073,7 @@ mod tests {
         for (function, input) in
             [(Function::CountStar, None), (Function::Min, Some(a.id)), (Function::Max, Some(a.id))]
         {
-            let binding = plan.add_column("x", DataType::Int64).unwrap();
+            let binding = plan.add_column("x", DataType::Int64, true).unwrap();
             aggregates.push(Aggregate { function, input, distinct: false, binding });
             assert!(plan.output.push(binding).is_ok());
         }
@@ -1144,7 +1144,7 @@ mod tests {
         let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }

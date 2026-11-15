@@ -335,6 +335,17 @@ impl<'a> Scannable for ParquetTable<'a> {
         data_type
     }
 
+    /// A required column holds no nulls, and nor does an optional one whose
+    /// every row group counts none. One that doesn't count them may.
+    fn column_nullable(&self, column: u32) -> bool {
+        let c = column as usize;
+        let counts_nulls = |footer: &ParquetFile, group| footer.chunk(group, c).nulls != Some(0);
+        self.files.iter().any(|file| {
+            at!(file.footer.columns(), c).optional
+                && (0..file.footer.row_groups()).any(|group| counts_nulls(&file.footer, group))
+        })
+    }
+
     /// Constant where a page's run of one entry covers a batch, dictionary
     /// for strings' dictionary pages, and lazy, loaded a batch at a time.
     fn forms(&self, _: u32) -> Forms {

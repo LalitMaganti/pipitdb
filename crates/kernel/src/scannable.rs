@@ -45,6 +45,12 @@ pub trait Scannable {
     /// What `column` holds. Every batch's `column` has this type.
     fn column_type(&self, column: u32) -> DataType;
 
+    /// Whether `column` can hold a null. A scannable that can't tell says it
+    /// can.
+    fn column_nullable(&self, _column: u32) -> bool {
+        true
+    }
+
     /// A read of `columns`, in that order, from the first row, each with
     /// the forms it may be written in, some of those `forms` says it can
     /// write it in. What depends only on which columns are read
@@ -177,6 +183,7 @@ pub struct DynScannable<'a> {
     column_count: unsafe fn(NonNull<()>) -> u32,
     column_name: unsafe fn(NonNull<()>, u32) -> *const str,
     column_type: unsafe fn(NonNull<()>, u32) -> DataType,
+    column_nullable: unsafe fn(NonNull<()>, u32) -> bool,
     state_layout: Layout,
     open: ScannableOpen,
     drop_state: unsafe fn(NonNull<u8>),
@@ -210,6 +217,10 @@ impl<'a> DynScannable<'a> {
             // SAFETY: as above.
             column_type: |scannable, column| unsafe {
                 value_of::<T>(scannable).column_type(column)
+            },
+            // SAFETY: as above.
+            column_nullable: |scannable, column| unsafe {
+                value_of::<T>(scannable).column_nullable(column)
             },
             state_layout: Layout::new::<T::State<'a>>(),
             // SAFETY: as above. The state borrows the scan's columns, which
@@ -276,6 +287,11 @@ impl<'a> DynScannable<'a> {
     pub fn column_type(&self, column: u32) -> DataType {
         // SAFETY: as above.
         unsafe { (self.column_type)(self.scannable.as_ptr(), column) }
+    }
+
+    pub fn column_nullable(&self, column: u32) -> bool {
+        // SAFETY: called with its own scannable.
+        unsafe { (self.column_nullable)(self.scannable.as_ptr(), column) }
     }
 
     /// The forms `column` can be written in.

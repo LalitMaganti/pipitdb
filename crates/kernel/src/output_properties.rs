@@ -92,6 +92,8 @@ impl Arrangements {
 pub struct Column {
     pub id: ColumnId,
     pub data_type: DataType,
+    /// Whether it can hold a null.
+    pub nullable: bool,
 }
 
 /// The most recent sort, while nothing has read its order: it can still be
@@ -131,7 +133,8 @@ pub struct OutputProperties {
 impl OutputProperties {
     /// No columns, and nothing known.
     pub const NONE: OutputProperties = OutputProperties {
-        columns: [Column { id: 0, data_type: DataType::Int64 }; BATCH_COLUMNS_MAX as usize],
+        columns: [Column { id: 0, data_type: DataType::Int64, nullable: true };
+            BATCH_COLUMNS_MAX as usize],
         column_count: 0,
         arrangements: Arrangements::NONE,
         open_sort: None,
@@ -163,6 +166,12 @@ impl OutputProperties {
     pub fn type_of(&self, column: ColumnId) -> DataType {
         let Some(position) = self.position_of(column) else { failed!() };
         at!(self.columns, position as usize).data_type
+    }
+
+    /// Whether `column` can hold a null.
+    pub fn nullable_of(&self, column: ColumnId) -> bool {
+        let Some(position) = self.position_of(column) else { failed!() };
+        at!(self.columns, position as usize).nullable
     }
 
     /// Whether the rows are grouped by `keys`, and each group sorted by
@@ -347,10 +356,12 @@ impl DeriveContext<'_, '_> {
     pub fn column_of(&self, id: ColumnId) -> Column {
         for input in at!(self.planned, self.self_ as usize).inputs.iter() {
             if input.rows.position_of(id).is_some() {
-                return Column { id, data_type: input.rows.type_of(id) };
+                let (data_type, nullable) = (input.rows.type_of(id), input.rows.nullable_of(id));
+                return Column { id, data_type, nullable };
             }
         }
-        Column { id, data_type: at!(self.plan.columns, id as usize).data_type }
+        let column = at!(self.plan.columns, id as usize);
+        Column { id, data_type: column.data_type, nullable: column.nullable }
     }
 
     /// Makes the open sort `sort` output only its first `rows` rows, so it

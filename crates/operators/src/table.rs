@@ -109,6 +109,11 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
+    fn column_nullable(&self, column: u32) -> bool {
+        let views = self.row_groups.iter().map(|group| at!(group.columns, column as usize));
+        views.into_iter().any(|view| view.validity().is_some())
+    }
+
     fn forms(&self, column: u32) -> Forms {
         at!(self.columns, column as usize).2
     }

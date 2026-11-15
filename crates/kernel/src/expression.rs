@@ -481,6 +481,17 @@ impl Typer<'_> {
 
 /// The type `expr` computes, given each column's type, as compiling checks
 /// it.
+/// Whether `expr` can compute a null, given whether each column it reads
+/// can hold one: it can if one can, or if it divides, by zero perhaps, or
+/// has a `NULL`.
+pub fn expr_can_be_null(expr: &Expr, nullable_of: &dyn Fn(ColumnId) -> bool) -> bool {
+    expr.nodes.iter().any(|node| match node.op {
+        ExprOp::Column => nullable_of(node.a),
+        ExprOp::Div | ExprOp::Mod | ExprOp::Null => true,
+        _ => false,
+    })
+}
+
 pub fn check_expr_type(
     expr: &Expr,
     type_of: &dyn Fn(ColumnId) -> DataType,
@@ -566,7 +577,8 @@ impl<'c> Op<'c> for ComputeOp {
         for item in self.items.iter() {
             let data_type = check_expr_type(&item.expr, &|column| input.type_of(column))
                 .map_err(|error| lower_error(error, item.output))?;
-            out.push_column(Column { id: item.output, data_type })?;
+            let nullable = expr_can_be_null(&item.expr, &|column| input.nullable_of(column));
+            out.push_column(Column { id: item.output, data_type, nullable })?;
         }
         Ok(out)
     }
