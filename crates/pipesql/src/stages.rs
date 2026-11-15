@@ -3,7 +3,7 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
-use pipit_kernel::expression::{ComputeItem, ComputeOp};
+use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
@@ -283,7 +283,9 @@ fn value_of(
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
     let (expr, data_type) = compile_expr(compiler, value)?;
-    let column = compiler.plan.add_named_column(name, data_type)?;
+    let columns = &compiler.plan.columns;
+    let nullable = expr_can_be_null(&expr, &|column| at!(columns, column as usize).nullable);
+    let column = compiler.plan.add_named_column(name, data_type, nullable)?;
     computed.push(ComputeItem { output: column.id, expr })?;
     Ok(column)
 }
@@ -416,7 +418,9 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
                 ")",
             ])?,
         };
-        let binding = compiler.plan.add_named_column(name, function.output_type())?;
+        // A count is 0 for a group of nulls, where the others are null.
+        let nullable = !matches!(function, Function::CountStar | Function::Count);
+        let binding = compiler.plan.add_named_column(name, function.output_type(), nullable)?;
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }

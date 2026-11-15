@@ -109,6 +109,12 @@ impl Scannable for Table {
         at!(self.columns, column as usize).1
     }
 
+    fn column_nullable(&self, column: u32) -> bool {
+        let views = self.row_groups.iter().map(|group| at!(group.columns, column as usize));
+        // A view of any form holds a null if its values, or itself, can.
+        views.into_iter().any(|view| view.has_nulls() || view.values().validity().is_some())
+    }
+
     fn forms(&self, column: u32) -> Forms {
         at!(self.columns, column as usize).2
     }
@@ -261,6 +267,8 @@ mod tests {
         indices.as_mut_slice::<u32>().copy_from_slice(&[1, 0, 1]);
         let dictionary = ColumnView::dictionary(&mut context, &int64s(5..7), indices).unwrap();
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
+        // Its dictionary's entries hold no nulls.
+        assert!(!table.column_nullable(0));
         for forms in [Forms::FLAT | Forms::DICTIONARY, Forms::FLAT] {
             let read = [(0, forms)];
             let mut state = table.open(&mut context, &read).unwrap();

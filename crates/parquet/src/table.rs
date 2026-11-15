@@ -335,6 +335,17 @@ impl<'a> Scannable for ParquetTable<'a> {
         data_type
     }
 
+    /// A required column holds no nulls, and nor does an optional one whose
+    /// every row group counts none. One that doesn't count them may.
+    fn column_nullable(&self, column: u32) -> bool {
+        let c = column as usize;
+        let counts_nulls = |footer: &ParquetFile, group| footer.chunk(group, c).nulls != Some(0);
+        self.files.iter().any(|file| {
+            at!(file.footer.columns(), c).optional
+                && (0..file.footer.row_groups()).any(|group| counts_nulls(&file.footer, group))
+        })
+    }
+
     /// Constant where a page's run of one entry covers a batch, dictionary
     /// for strings' dictionary pages, and lazy, loaded a batch at a time.
     fn forms(&self, _: u32) -> Forms {
@@ -571,6 +582,15 @@ mod tests {
                 assert_eq!(cells(&mut context, &column), cells(&mut context, eager), "batch {b}");
             }
         }
+    }
+
+    #[test]
+    fn knows_columns_without_nulls_from_their_statistics() {
+        // Both files' columns are optional; only `NULLS` counts any nulls.
+        let none = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        assert!((0..3).all(|column| !none.column_nullable(column)));
+        let some = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS]).unwrap();
+        assert!((0..3).all(|column| some.column_nullable(column)));
     }
 
     #[test]
