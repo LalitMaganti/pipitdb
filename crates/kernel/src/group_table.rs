@@ -563,9 +563,10 @@ fn load_string_ids(
     Ok(())
 }
 
-/// The strings of `ids`, a string key's, as a string column.
+/// The strings of `ids`, ids in the run's pool, 0 for null, as a string
+/// column.
 #[inline(never)]
-fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
+pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
     let rows = ids.len();
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);

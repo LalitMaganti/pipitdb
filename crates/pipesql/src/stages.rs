@@ -402,25 +402,22 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             Tag::Name => (function, Some(compiler.find_column(argument)?.id)),
             _ => return Err(unsupported),
         };
-        let input_type = input.map(|id| at!(compiler.plan.columns, id as usize).data_type);
-        if input_type.is_some_and(|data_type| data_type != DataType::Int64) {
+        let input_type =
+            input.map_or(DataType::Int64, |id| at!(compiler.plan.columns, id as usize).data_type);
+        if input.is_some() && !function.reads(input_type) {
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
-        let distinct_word = if distinct { "DISTINCT " } else { "" };
         let name = match alias {
             Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
-            None => compiler.plan.names.add_parts(&[
-                function_name,
-                "(",
-                distinct_word,
-                argument,
-                ")",
-            ])?,
+            None => aggregate_name(compiler, function_name, distinct, argument)?,
         };
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
-        let binding = compiler.plan.add_named_column(name, function.output_type(), nullable)?;
+        let output_type = function.output_type(input_type);
+        let binding = compiler.plan.add_named_column(name, output_type, nullable)?;
+        // The least or greatest of the distinct values is that of them all.
+        let distinct = distinct && !matches!(function, Function::Min | Function::Max);
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
@@ -429,6 +426,17 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     compiler.plan.add_node(aggregate, children)?;
     compiler.scope = scope;
     Ok(())
+}
+
+/// The name of an aggregate without an alias, such as `count(DISTINCT a)`.
+fn aggregate_name(
+    compiler: &mut Compiler<'_, '_>,
+    function: &str,
+    distinct: bool,
+    argument: &str,
+) -> Result<Name, Error> {
+    let distinct = if distinct { "DISTINCT " } else { "" };
+    Ok(compiler.plan.names.add_parts(&[function, "(", distinct, argument, ")"])?)
 }
 
 #[cfg(test)]

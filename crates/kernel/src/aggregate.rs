@@ -8,7 +8,7 @@ use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
-use crate::output_properties::{DeriveContext, InputNeeds, OutputProperties};
+use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::slow_vec::SlowVec;
 use crate::step::DynSource;
@@ -16,7 +16,7 @@ use crate::step::Step;
 use crate::values::Values;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
-/// `Int64` values, and makes an `Int64` but for `Avg`.
+/// `Int64` values, but for `Min` and `Max`, which read strings too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Function {
     /// How many rows there are.
@@ -35,9 +35,22 @@ pub enum Function {
 }
 
 impl Function {
-    /// The type of what it makes.
-    pub fn output_type(self) -> DataType {
-        if self == Function::Avg { DataType::Float64 } else { DataType::Int64 }
+    /// The type of what it makes of values of `input`.
+    pub fn output_type(self, input: DataType) -> DataType {
+        match self {
+            Function::Avg => DataType::Float64,
+            Function::Min | Function::Max => input,
+            Function::CountStar | Function::Count | Function::Sum => DataType::Int64,
+        }
+    }
+
+    /// Whether it reads values of `input`. Perfetto's read only integers:
+    /// #383.
+    pub fn reads(self, input: DataType) -> bool {
+        match self {
+            Function::Min | Function::Max => matches!(input, DataType::Int64 | DataType::String),
+            _ => input == DataType::Int64,
+        }
     }
 }
 
@@ -58,7 +71,7 @@ pub struct Aggregate {
 pub struct AggregateOp {
     /// The `Int64` and string columns rows are grouped by.
     pub keys: SlowVec<ColumnId>,
-    /// What each group's rows make, from `Int64` columns.
+    /// What each group's rows make, from the columns each function reads.
     pub aggregates: SlowVec<Aggregate>,
     /// Each aggregate's value, once known without reading any rows: then it
     /// has no child, and outputs one row of them.
@@ -129,19 +142,11 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(true)
     }
 
-    /// What its aggregates read must be `Int64`.
-    fn needs(&self, _: u32) -> InputNeeds<'_> {
-        let mut needs = InputNeeds::NONE;
-        for column in self.aggregates.iter().filter_map(|aggregate| aggregate.input) {
-            needs.types_then.push(column, DataType::Int64);
-        }
-        needs
-    }
-
     /// A row per group: its keys, then its aggregates. Groups are output in
     /// the order first seen, so if the input is sorted by the keys, the
     /// output is too. Its keys must be `Int64` or strings, which are all the
-    /// hash aggregate groups by.
+    /// hash aggregate groups by, and its aggregates' inputs of types their
+    /// functions read.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         for &key in self.keys.iter() {
             if !matches!(c.input(0).type_of(key), DataType::Int64 | DataType::String) {
@@ -149,6 +154,16 @@ impl<'c> Op<'c> for AggregateOp {
             }
         }
         check!(self.keys.len() <= KEYS_MAX);
+        // Answered, it has no input to check.
+        if self.answer.is_none() {
+            for aggregate in self.aggregates.iter() {
+                if let Some(input) = aggregate.input
+                    && !aggregate.function.reads(c.input(0).type_of(input))
+                {
+                    return Err(LowerError::WrongType(input));
+                }
+            }
+        }
         let mut out = OutputProperties::NONE;
         for &key in self.keys.iter() {
             out.push_column(c.column_of(key))?;
@@ -188,6 +203,9 @@ impl<'c> Op<'c> for AggregateOp {
             function: aggregate.function,
             distinct: aggregate.distinct,
             column: aggregate.input.map_or(0, |id| lowering.query_position(id)),
+            input_type: aggregate
+                .input
+                .map_or(DataType::Int64, |id| lowering.query_rows().type_of(id)),
         });
         let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
         let mut nullable_keys = 0;
@@ -227,4 +245,6 @@ pub struct AggregateCall {
     /// Whether it reads only the values of each group it hasn't before, as
     /// `COUNT(DISTINCT x)` does. Perfetto's has no such flag: #288.
     pub distinct: bool,
+    /// The type of the column it reads: `Int64` for `COUNT(*)`.
+    pub input_type: DataType,
 }

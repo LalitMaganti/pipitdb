@@ -417,6 +417,10 @@ mod tests {
         let strings = run("FROM t |> AGGREGATE count(*) GROUP BY s");
         let s = (b"s".to_vec(), [4.0, 0.0].to_vec());
         assert_eq!(strings, [s, (b"count(*)".to_vec(), [1.0, 1.0].to_vec())]);
+        // The empty string is the least.
+        let extremes = run("FROM t |> AGGREGATE min(s), max(DISTINCT s)");
+        let least = (b"min(s)".to_vec(), [0.0].to_vec());
+        assert_eq!(extremes, [least, (b"max(DISTINCT s)".to_vec(), [4.0].to_vec())]);
     }
 
     #[test]
@@ -481,6 +485,7 @@ mod tests {
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE min(f)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
         assert_eq!(error("FROM t |> AGGREGATE count(DISTINCT *)"), (ErrorCode::Unsupported, 20));
