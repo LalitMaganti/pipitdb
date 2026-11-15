@@ -238,7 +238,10 @@ impl GroupTable {
         let hashes = at_mut!(hashes.as_mut_slice(), ..count);
         hash_rows(hashes, keys, nulls);
         if let ([keys], None) = (keys, nulls) {
-            return self.find_values(hashes, keys, groups);
+            return match self.first {
+                0 => self.find_values::<false>(hashes, keys, groups),
+                _ => self.find_values::<true>(hashes, keys, groups),
+            };
         }
         self.find_hashed(hashes, keys, nulls, groups)
     }
@@ -344,14 +347,16 @@ impl GroupTable {
     }
 
     /// As `find_or_create`, for a single key with no nulls, given each row's
-    /// hash: compares the key values directly.
-    fn find_values(
+    /// hash: compares the key values directly. Records start with a null word
+    /// if `NULL_WORD`: a constant, so the loop holds no check for it.
+    fn find_values<const NULL_WORD: bool>(
         &mut self,
         hashes: &[u64],
         keys: &[i64],
         groups: &mut [u32],
     ) -> Result<(), Error> {
-        check!(self.stride > self.first);
+        let first = usize::from(NULL_WORD);
+        check!(self.first == first && self.stride > first);
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
@@ -359,7 +364,6 @@ impl GroupTable {
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
-            let first = self.first;
             // A stored group is its null bits, zero here, if it has them, then
             // its key.
             // SAFETY: a group in a slot has a record, with its key.
