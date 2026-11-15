@@ -4,6 +4,7 @@
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
@@ -36,11 +37,72 @@ impl<T: Primitive> Array<T> {
     /// `len` zeroes: fresh memory from the system is zero already, so a big
     /// one costs nothing to make.
     pub(crate) fn zeroed(allocator: &dyn Allocator, len: usize) -> Result<Array<T>, AllocError> {
+        Array::allocate(allocator, len, true)
+    }
+
+    /// `len` values, value `i` being `value(i)`, each written once.
+    pub(crate) fn from_fn(
+        allocator: &dyn Allocator,
+        len: usize,
+        mut value: impl FnMut(usize) -> T,
+    ) -> Result<Array<T>, AllocError> {
+        let array = Array::<T>::allocate(allocator, len, false)?;
+        for i in 0..len {
+            // SAFETY: there's room for `len` values.
+            unsafe { array.values.as_ptr().add(i).write(value(i)) };
+        }
+        Ok(array)
+    }
+
+    /// `len` values, written a chunk of up to `chunk` at a time by
+    /// `write(start, out)`, which writes every one of `out`, values `start`
+    /// on.
+    pub(crate) fn from_chunks(
+        allocator: &dyn Allocator,
+        len: usize,
+        chunk: usize,
+        mut write: impl FnMut(usize, &mut [MaybeUninit<T>]),
+    ) -> Result<Array<T>, AllocError> {
+        check!(chunk > 0);
+        let array = Array::<T>::allocate(allocator, len, false)?;
+        for start in (0..len).step_by(chunk) {
+            let count = chunk.min(len - start);
+            // SAFETY: values `start..start + count` are within the array, and
+            // only reached through this slice until written.
+            let out = unsafe {
+                core::slice::from_raw_parts_mut(array.values.as_ptr().add(start).cast(), count)
+            };
+            write(start, out);
+        }
+        Ok(array)
+    }
+
+    /// The values of `values`, in order.
+    pub(crate) fn from_iter(
+        allocator: &dyn Allocator,
+        mut values: impl ExactSizeIterator<Item = T>,
+    ) -> Result<Array<T>, AllocError> {
+        let Some(first) = values.next() else { return Array::allocate(allocator, 0, false) };
+        let len = values.len() + 1;
+        Array::from_fn(
+            allocator,
+            len,
+            |i| if i == 0 { first } else { values.next().unwrap_or(first) },
+        )
+    }
+
+    /// Room for `len` values, zeroed if `zeroed`, else unwritten: callers
+    /// that don't zero write each value before it's read.
+    fn allocate(
+        allocator: &dyn Allocator,
+        len: usize,
+        zeroed: bool,
+    ) -> Result<Array<T>, AllocError> {
         let bytes = size_of::<T>().checked_mul(len).ok_or(AllocError)?;
-        let values = if bytes == 0 {
-            NonNull::dangling()
-        } else {
-            allocator.allocate_zeroed(layout(bytes)?)?.cast()
+        let values = match bytes {
+            0 => NonNull::dangling(),
+            _ if zeroed => allocator.allocate_zeroed(layout(bytes)?)?.cast(),
+            _ => allocator.allocate(layout(bytes)?)?.cast(),
         };
         // SAFETY: only the lifetime changes; the allocator outlives the values.
         let allocator = unsafe {
@@ -50,25 +112,14 @@ impl<T: Primitive> Array<T> {
         };
         Ok(Array { values, len, allocator, owns: PhantomData })
     }
-
-    /// The values of `values`, in order.
-    pub(crate) fn from_iter(
-        allocator: &dyn Allocator,
-        values: impl ExactSizeIterator<Item = T>,
-    ) -> Result<Array<T>, AllocError> {
-        let mut array = Array::zeroed(allocator, values.len())?;
-        for (out, value) in array.iter_mut().zip(values) {
-            *out = value;
-        }
-        Ok(array)
-    }
 }
 
 impl<T: Primitive> Deref for Array<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        // SAFETY: `len` values, all written, as zeroes at least.
+        // SAFETY: `len` values, all written: zeroed, or by `from_fn` or
+        // `from_chunks`.
         unsafe { core::slice::from_raw_parts(self.values.as_ptr(), self.len) }
     }
 }
