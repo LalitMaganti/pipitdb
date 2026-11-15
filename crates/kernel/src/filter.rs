@@ -9,12 +9,12 @@
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
+use crate::array::Array;
 use crate::column::{ColumnView, DataType, Form, Values};
 use crate::eight;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::murmur_hash;
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Comparison {
@@ -330,7 +330,7 @@ pub struct Entries {
     /// What the condition is wanted to be for the entries with bits set.
     want: bool,
     /// Bit `e` is set if the condition is `want` for entry `e`.
-    bits: Option<SlowVec<u64>>,
+    bits: Option<Array<u64>>,
     /// How many bits are set.
     matched: u32,
     /// The entry whose bit is set, if it's the only one.
@@ -351,7 +351,7 @@ impl Entries {
             && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));
         if !found {
             let values = column.values();
-            let mut bits = SlowVec::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
+            let mut bits = Array::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
             set(values, &mut bits);
             self.matched = bits.iter().map(|word| word.count_ones()).sum();
             if self.matched == 1 {

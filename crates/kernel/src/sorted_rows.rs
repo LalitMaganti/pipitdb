@@ -4,6 +4,7 @@
 //! and rows are copied out once, in that order.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::array::Array;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
@@ -353,12 +354,13 @@ fn rank_strings(
     allocator: &dyn Allocator,
     rows: &RowStore,
     column: u32,
-) -> Result<SlowVec<u32>, Error> {
+) -> Result<Array<u32>, Error> {
     let string = |row: &u32| rows.string(column, *row).unwrap_or_default();
-    let mut order = SlowVec::fixed_from(allocator, 0..rows.len())?;
-    let mut scratch = SlowVec::<u32>::zeroed(allocator, rows.len() as usize)?;
+    let mut order = Array::from_iter(allocator, 0..rows.len())?;
+    let mut scratch = Array::<u32>::zeroed(allocator, rows.len() as usize)?;
     msd_radix_sort(allocator, &mut order, &mut scratch, string)?;
-    let mut ranks = SlowVec::<u32>::zeroed(allocator, rows.len() as usize)?;
+    // The sort is done with its scratch, so the ranks go there.
+    let mut ranks = scratch;
     let mut rank = 0;
     for (i, row) in order.iter().enumerate() {
         if i > 0 && string(row) != string(at!(order, i - 1)) {
