@@ -64,28 +64,23 @@ impl RawBlocks {
     /// As `Blocks::reserve`.
     #[inline(never)]
     fn reserve(&mut self, allocator: &dyn Allocator, len: usize) -> Result<(), AllocError> {
-        if self.first < BLOCK_RECORDS && self.first < len {
-            let mut first = self.first.max(FIRST_RECORDS);
-            while first < len.min(BLOCK_RECORDS) {
-                first *= 2;
-            }
-            let mut block = Array::zeroed(allocator, first * self.record_bytes)?;
-            let used = self.len * self.record_bytes;
-            if let Some(old) = self.arrays.first() {
+        while self.capacity() < len {
+            // The first block grows, in place of itself, until it's whole.
+            let grow = self.first < BLOCK_RECORDS;
+            let records = if grow {
+                len.next_power_of_two().clamp(FIRST_RECORDS, BLOCK_RECORDS)
+            } else {
+                BLOCK_RECORDS
+            };
+            let mut block = Array::zeroed(allocator, records * self.record_bytes)?;
+            if grow && let Some(old) = self.arrays.pop() {
+                self.starts.pop();
+                let used = self.len * self.record_bytes;
                 at_mut!(block, ..used).copy_from_slice(at!(old, ..used));
             }
-            let start = block.as_mut_ptr();
-            if self.arrays.is_empty() {
-                self.arrays.push(block)?;
-                self.starts.push(start)?;
-            } else {
-                *at_mut!(self.arrays, 0) = block;
-                *at_mut!(self.starts, 0) = start;
+            if grow {
+                self.first = records;
             }
-            self.first = first;
-        }
-        while self.capacity() < len {
-            let mut block = Array::zeroed(allocator, BLOCK_RECORDS * self.record_bytes)?;
             self.starts.push(block.as_mut_ptr())?;
             self.arrays.push(block)?;
         }
