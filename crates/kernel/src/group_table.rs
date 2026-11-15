@@ -60,6 +60,9 @@ pub(crate) struct GroupTable {
     records: Blocks<i64>,
     /// How many words each group takes.
     stride: usize,
+    /// Where a record's keys start: after its null word, if a key can be
+    /// null, else first.
+    first: usize,
     /// How many keys there are.
     keys: usize,
     /// Bit `k` set if key `k` is a string, stored as its id, which is 0 if
@@ -90,21 +93,25 @@ struct Interned {
 }
 
 impl GroupTable {
-    /// A table of `keys` keys, those in `string_keys` strings, with
-    /// `payload_words` zeroed words after each group's keys for the caller
-    /// to store per-group data.
+    /// A table of `keys` keys, those in `string_keys` strings and those in
+    /// `nullable_keys` possibly null, with `payload_words` zeroed words after
+    /// each group's keys for the caller to store per-group data.
     pub(crate) fn new(
         allocator: &dyn Allocator,
         keys: usize,
         string_keys: u64,
+        nullable_keys: u64,
         payload_words: usize,
     ) -> Result<GroupTable, AllocError> {
         check!(keys <= KEYS_MAX);
-        let stride = 1 + keys + payload_words;
+        // A null string is a key of its own, so only other keys need the word.
+        let first = usize::from(nullable_keys & !string_keys != 0);
+        let stride = first + keys + payload_words;
         Ok(GroupTable {
             slots: SlowVec::new(allocator, 1)?,
             records: Blocks::new(allocator, stride)?,
             stride,
+            first,
             keys,
             string_keys,
             dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
@@ -120,7 +127,7 @@ impl GroupTable {
     /// Where each block of records starts, as `Blocks::starts`, and where a
     /// record's payload starts in it.
     pub(crate) fn payloads(&mut self) -> (&[*mut i64], usize) {
-        (self.records.starts(), 1 + self.keys)
+        (self.records.starts(), self.first + self.keys)
     }
 
     /// How many words apart consecutive groups' payloads are.
@@ -171,6 +178,8 @@ impl GroupTable {
         }
         let keys = at!(keys, ..self.keys);
         let nulls = nulls.as_ref().map(Buffer::as_slice);
+        // Only a table with null words takes keys that can be null.
+        check!(self.first == 1 || nulls.is_none());
         self.grow(context.allocator(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
@@ -251,15 +260,16 @@ impl GroupTable {
                 self.fetch_ahead(hash_of, row);
             }
             let hash = *at!(hashes, row);
+            let first = self.first;
             // SAFETY: a group in a slot has a record, and each key a word for
             // each row, checked above.
             let equal = |group: usize| unsafe {
                 let stored = self.records.record_ptr(group).cast_const();
-                (*stored).cast_unsigned() == null(row)
+                (first == 0 || (*stored).cast_unsigned() == null(row))
                     && keys
                         .iter()
                         .enumerate()
-                        .all(|(k, keys)| *stored.add(1 + k) == *keys.get_unchecked(row))
+                        .all(|(k, keys)| *stored.add(first + k) == *keys.get_unchecked(row))
             };
             *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
@@ -317,7 +327,8 @@ impl GroupTable {
     #[cold]
     #[inline(never)]
     fn add_numbered(&mut self, number: u32, id: i64) -> Result<u32, Error> {
-        let group = self.push(&[0, id])?;
+        let key = [0, id];
+        let group = self.push(at!(key, 1 - self.first..))?;
         match number {
             NO_NUMBER => self.null_group = group,
             _ => *at_mut!(self.number_groups, number as usize) = group,
@@ -333,7 +344,7 @@ impl GroupTable {
         keys: &[i64],
         groups: &mut [u32],
     ) -> Result<(), Error> {
-        check!(self.stride >= 2);
+        check!(self.stride > self.first);
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
@@ -341,15 +352,20 @@ impl GroupTable {
             if ahead {
                 self.fetch_ahead(hash_of, i);
             }
-            // A stored group is its null bits, zero here, then its key.
-            // SAFETY: a group in a slot has a record, of at least two words.
+            let first = self.first;
+            // A stored group is its null bits, zero here, if it has them, then
+            // its key.
+            // SAFETY: a group in a slot has a record, with its key.
             let equal = |group: usize| unsafe {
                 let stored = self.records.record_ptr(group).cast_const();
-                *stored == 0 && *stored.add(1) == key
+                (first == 0 || *stored == 0) && *stored.add(first) == key
             };
             *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
-                Err(at) => self.add(at, hash, &[0, key])?,
+                Err(at) => {
+                    let record = [0, key];
+                    self.add(at, hash, at!(record, 1 - first..))?
+                }
             };
         }
         Ok(())
@@ -372,9 +388,12 @@ impl GroupTable {
         if group == GROUPS_MAX {
             return Err(Error::OutOfMemory);
         }
+        let first = self.first;
         let record = self.records.push();
-        *at_mut!(record, 0) = null.cast_signed();
-        for (word, keys) in at_mut!(record, 1..).iter_mut().zip(keys) {
+        if first == 1 {
+            *at_mut!(record, 0) = null.cast_signed();
+        }
+        for (word, keys) in at_mut!(record, first..).iter_mut().zip(keys) {
             *word = *at!(keys, row);
         }
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
@@ -441,8 +460,8 @@ impl GroupTable {
         let mut nulls = false;
         for (out, group) in out.zip(range.clone()) {
             let record = self.records.record(group);
-            *out = *at!(record, 1 + k);
-            nulls |= *at!(record, 0) >> k & 1 != 0;
+            *out = *at!(record, self.first + k);
+            nulls |= self.first == 1 && *at!(record, 0) >> k & 1 != 0;
         }
         if self.string_keys >> k & 1 != 0 {
             return write_strings(context, at!(values.as_slice::<i64>(), ..rows));
