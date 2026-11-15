@@ -229,3 +229,35 @@ pub static SPILLED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::
 pub static EVICTIONS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 pub static REBUILT_GROUPS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// The bytes a grouping's table may take before it evicts partitions, or 0
+/// for no limit (prototype).
+pub static GROUP_BUDGET_BYTES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Where evicted partitions go (prototype): appended to, read back in chunks,
+/// and dropped once combined.
+pub trait SpillLog: Sync {
+    fn append(&self, part: usize, words: &[i64]);
+    /// Reads up to `out.len()` words of partition `part` from word `at`, and
+    /// returns how many.
+    fn read(&self, part: usize, at: usize, out: &mut [i64]) -> usize;
+    fn drop_part(&self, part: usize);
+}
+
+static mut SPILL_LOG: Option<&'static dyn SpillLog> = None;
+
+/// Sets where evicted partitions go (prototype).
+///
+/// # Safety
+///
+/// Call before any query runs, from one thread.
+pub unsafe fn set_spill_log(log: &'static dyn SpillLog) {
+    // SAFETY: as the caller promises.
+    unsafe { SPILL_LOG = Some(log) };
+}
+
+pub(crate) fn spill_log() -> Option<&'static dyn SpillLog> {
+    // SAFETY: only written before queries run.
+    unsafe { *core::ptr::addr_of!(SPILL_LOG) }
+}

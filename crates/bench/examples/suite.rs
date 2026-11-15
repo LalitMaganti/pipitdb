@@ -106,7 +106,76 @@ fn open_files(paths: &[String]) -> Result<Vec<(String, Vec<FileSource>)>, String
     Ok(files)
 }
 
+/// Evicted partitions in a file each, under a directory (prototype).
+struct FileSpill {
+    dir: std::path::PathBuf,
+    files: std::sync::Mutex<Vec<Option<std::fs::File>>>,
+}
+
+impl pipit_kernel::aggregate::SpillLog for FileSpill {
+    fn append(&self, part: usize, words: &[i64]) {
+        use std::io::Write;
+        let mut files = self.files.lock().unwrap();
+        if files.len() <= part {
+            files.resize_with(part + 1, || None);
+        }
+        let file = files[part].get_or_insert_with(|| {
+            let path = self.dir.join(part.to_string());
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("a spill file")
+        });
+        // SAFETY: any words are bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) };
+        file.write_all(bytes).expect("spills");
+    }
+
+    fn read(&self, part: usize, at: usize, out: &mut [i64]) -> usize {
+        use std::os::unix::fs::FileExt;
+        let files = self.files.lock().unwrap();
+        let Some(Some(file)) = files.get(part) else { return 0 };
+        // SAFETY: any bytes are words.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), out.len() * 8) };
+        let mut read = 0;
+        while read < bytes.len() {
+            let n = file.read_at(&mut bytes[read..], (at * 8 + read) as u64).expect("reads");
+            if n == 0 {
+                break;
+            }
+            read += n;
+        }
+        read / 8
+    }
+
+    fn drop_part(&self, part: usize) {
+        let mut files = self.files.lock().unwrap();
+        if let Some(slot) = files.get_mut(part)
+            && slot.take().is_some()
+        {
+            let _ = std::fs::remove_file(self.dir.join(part.to_string()));
+        }
+    }
+}
+
 fn main() -> Result<(), String> {
+    if let Ok(budget) = std::env::var("PIPIT_GROUP_BUDGET_MB") {
+        let budget: usize = budget.parse().map_err(|_| "PIPIT_GROUP_BUDGET_MB")?;
+        pipit_kernel::aggregate::GROUP_BUDGET_BYTES
+            .store(budget << 20, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::path::PathBuf::from(
+            std::env::var("PIPIT_SPILL_DIR").unwrap_or_else(|_| "/tmp/pipit-spill".into()),
+        );
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let log = Box::leak(Box::new(FileSpill { dir, files: std::sync::Mutex::new(Vec::new()) }));
+        // SAFETY: before any query runs, on this thread.
+        unsafe { pipit_kernel::aggregate::set_spill_log(log) };
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let queries = take_queries(&mut args)?;
     let files = open_files(&args)?;

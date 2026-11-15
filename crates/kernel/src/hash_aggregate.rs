@@ -61,13 +61,17 @@ struct State {
 
 /// How many groups `groups` holds before it's emptied into partitions, so it
 /// stays in the cache.
-const SWITCH_GROUPS: usize = if cfg!(test) { 4 } else { 1 << 20 };
+/// How many words a partition holds in memory before they're appended to
+/// the spill log.
+const PART_BUFFER_WORDS: usize = 1 << 13;
+/// How many words of a partition are read back from the spill log at once.
+const READ_WORDS: usize = 1 << 18;
 /// The most words a partition row can take.
 const ROW_WORDS_MAX: usize =
     2 + KEYS_MAX + 3 * BATCH_COLUMNS_MAX as usize + BATCH_COLUMNS_MAX as usize;
 /// How many partitions groups are split into, by their hashes' low bits,
 /// which a table's slots don't use.
-const PARTS: usize = 1 << 10;
+const PARTS: usize = 1 << 6;
 
 /// Groups, or single rows, waiting to be combined, by partition.
 struct Radix {
@@ -127,6 +131,38 @@ impl HashAggregate {
         GroupStates { words, stride, seen }
     }
 
+    /// How many groups `groups` may hold, from the budget.
+    fn switch_groups(&self) -> usize {
+        if cfg!(test) {
+            return 4;
+        }
+        let budget =
+            crate::aggregate::GROUP_BUDGET_BYTES.load(core::sync::atomic::Ordering::Relaxed);
+        if budget == 0 {
+            return usize::MAX;
+        }
+        // A record, a slot at two thirds full, and a seen byte for each
+        // aggregate.
+        let per_group = (1 + self.spec.key_columns.len() + self.state_words) * 8
+            + 12
+            + self.spec.aggregates.len();
+        budget / per_group
+    }
+
+    /// Appends partial groups `words` to partition `p`, sending a full
+    /// buffer to the spill log.
+    fn append(radix: &mut Radix, p: usize, words: &[i64]) -> Result<(), Error> {
+        let part = at_mut!(radix.parts, p);
+        part.extend_from_slice(words)?;
+        if part.len() >= PART_BUFFER_WORDS
+            && let Some(log) = crate::aggregate::spill_log()
+        {
+            log.append(p, part);
+            part.clear();
+        }
+        Ok(())
+    }
+
     /// Whether groups can be split into partitions: not without keys, nor
     /// with a single string key, found by its number, nor with `DISTINCT`.
     fn radix_eligible(&self) -> bool {
@@ -168,7 +204,7 @@ impl HashAggregate {
         }
         let mut resident = state.groups.len();
         for p in (0..PARTS).rev() {
-            if resident <= SWITCH_GROUPS / 4 * 3 {
+            if resident <= self.switch_groups() / 4 * 3 {
                 break;
             }
             if !*at!(radix.evicted, p) {
@@ -189,7 +225,7 @@ impl HashAggregate {
             }
             let p = hash as usize % PARTS;
             if *at!(radix.evicted, p) {
-                at_mut!(radix.parts, p).extend_from_slice(at!(row, ..width))?;
+                Self::append(radix, p, at!(row, ..width))?;
                 spilled += 1;
             } else {
                 kept.extend_from_slice(at!(row, ..width))?;
@@ -274,7 +310,7 @@ impl HashAggregate {
             let at = at + self.state_words;
             at_mut!(out, at..width)
                 .copy_from_slice(at!(seen, run * aggregates..run * aggregates + aggregates));
-            at_mut!(radix.parts, hash as usize % PARTS).extend_from_slice(at!(out, ..width))?;
+            Self::append(radix, hash as usize % PARTS, at!(out, ..width))?;
         }
         crate::aggregate::SPILLED_BYTES
             .fetch_add(runs * width * 8, core::sync::atomic::Ordering::Relaxed);
@@ -363,8 +399,25 @@ impl HashAggregate {
         let mut table =
             GroupTable::new(allocator, key_count, self.spec.string_keys, self.state_words)?;
         let mut seen = self.new_seen(allocator)?;
+        let width = radix.width;
+        if let Some(log) = crate::aggregate::spill_log() {
+            // Whole rows at a time.
+            let chunk = READ_WORDS / width * width;
+            let mut buffer = SlowVec::zeroed(allocator, chunk)?;
+            let mut at = 0;
+            loop {
+                let read = log.read(p, at, &mut buffer);
+                if read == 0 {
+                    break;
+                }
+                check!(read % width == 0);
+                self.merge_rows(context, at!(buffer, ..read), width, &mut table, &mut seen)?;
+                at += read;
+            }
+            log.drop_part(p);
+        }
         let part = at_mut!(radix.parts, p);
-        self.merge_rows(context, part, radix.width, &mut table, &mut seen)?;
+        self.merge_rows(context, part, width, &mut table, &mut seen)?;
         part.free();
         Ok(Merged { groups: table, seen, served: 0 })
     }
@@ -574,7 +627,7 @@ impl Breaker for HashAggregate {
         let input = Flat::new(context, input, self.read())?;
         state.consumed = true;
         if self.radix_eligible() {
-            if state.groups.len() + rows > SWITCH_GROUPS {
+            if state.groups.len() + rows > self.switch_groups() {
                 self.evict(context, state)?;
             }
             if state.radix.is_some() {
