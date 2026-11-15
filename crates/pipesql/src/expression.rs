@@ -24,12 +24,16 @@ pub fn compile_expr(
     let expr = Expr { nodes };
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
     let data_type = check_expr_type(&expr, &type_of).map_err(|error| {
+        let span = compiler.span(node);
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
             ExprError::Integers => ErrorCode::ExpectedInteger,
+            ExprError::Kinds => ErrorCode::ExpectedOneKind,
+            ExprError::Types => ErrorCode::ExpectedOneType,
+            ExprError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
-        Error::new(code, compiler.span(node))
+        Error::new(code, span)
     })?;
     Ok((expr, data_type))
 }
@@ -107,6 +111,12 @@ fn compile(
                 Operator::Multiply => ExprOp::Mul,
                 Operator::Divide => ExprOp::Div,
                 Operator::Modulo => ExprOp::Mod,
+                Operator::Equal => ExprOp::Eq,
+                Operator::NotEqual => ExprOp::Ne,
+                Operator::Less => ExprOp::Lt,
+                Operator::LessEqual => ExprOp::Le,
+                Operator::Greater => ExprOp::Gt,
+                Operator::GreaterEqual => ExprOp::Ge,
                 _ => {
                     return Err(Error::unsupported(
                         Unsupported::SelectExpression,

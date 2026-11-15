@@ -86,7 +86,9 @@ fn describe(found: &str, error: &Error) -> Message {
         ErrorCode::ExpressionTooLarge
         | ErrorCode::ExpectedNumber
         | ErrorCode::ExpectedName
-        | ErrorCode::ExpectedInteger => expression(error.code),
+        | ErrorCode::ExpectedInteger
+        | ErrorCode::ExpectedOneKind
+        | ErrorCode::ExpectedOneType => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -117,6 +119,14 @@ fn expression(code: ErrorCode) -> (String, String) {
             "name it with `AS`, as in `x + 1 AS y`".into(),
         ),
         ErrorCode::ExpectedInteger => ("`%` needs integers".into(), "this reads a float".into()),
+        ErrorCode::ExpectedOneKind => (
+            "a comparison needs values of one kind".into(),
+            "this compares a number with a string".into(),
+        ),
+        ErrorCode::ExpectedOneType => (
+            "a comparison needs values of one type".into(),
+            "multiply the integer by 1.0 to compare it as a double".into(),
+        ),
         _ => pipit_kernel::failed!(),
     }
 }
@@ -151,7 +161,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
     match detail {
         what if what == Unsupported::SelectExpression as u16 => {
             (
-                "only arithmetic on columns, integers and `NULL` can be computed yet".into(),
+                "only arithmetic and comparisons of columns, integers, strings and `NULL` can be computed yet"
+                    .into(),
                 "can't compute this yet".into(),
             )
         }

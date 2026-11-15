@@ -178,8 +178,16 @@ pub fn compute_pipeline(
         column(|row| (row * 7919 % 1000) as i64, 0.5, 0),
         column(|row| (row % 97 + 1) as i64, 0.25, 5),
     ];
-    let step = |op, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
-    let steps = [step(ExprOp::Column, 0, 0), step(ExprOp::Column, 1, 0), step(op, 0, 1)];
+    let step =
+        |op, data_type, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
+    // A comparison is an Int64, whatever it compares.
+    let comparison = matches!(op, ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le);
+    let result = if comparison { DataType::Int64 } else { data_type };
+    let steps = [
+        step(ExprOp::Column, data_type, 0, 0),
+        step(ExprOp::Column, data_type, 1, 0),
+        step(op, result, 0, 1),
+    ];
     let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).expect("allocates");
     let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps }].into_iter());
     let compute = Compute { programs: programs.expect("allocates") };
@@ -198,7 +206,7 @@ pub fn perfetto_expression(index: usize, batches: u32) -> Pipeline<'static> {
 
 /// Perfetto's `expression_benchmark.cc`'s cases: names, ops, types and
 /// whether there are nulls.
-pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 7] = [
+pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 11] = [
     ("int_add", ExprOp::Add, DataType::Int64, false),
     ("int_mul", ExprOp::Mul, DataType::Int64, false),
     ("int_div", ExprOp::Div, DataType::Int64, false),
@@ -206,6 +214,10 @@ pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 7] = [
     ("int_div_nullable", ExprOp::Div, DataType::Int64, true),
     ("double_add", ExprOp::Add, DataType::Float64, false),
     ("double_mul", ExprOp::Mul, DataType::Float64, false),
+    ("int_lt", ExprOp::Lt, DataType::Int64, false),
+    ("int_ne", ExprOp::Ne, DataType::Int64, false),
+    ("int_lt_nullable", ExprOp::Lt, DataType::Int64, true),
+    ("double_lt", ExprOp::Lt, DataType::Float64, false),
 ];
 
 /// Does nothing, to measure what a transform costs the pipeline.

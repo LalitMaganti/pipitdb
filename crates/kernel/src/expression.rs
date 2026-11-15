@@ -39,6 +39,19 @@ pub enum ExprOp {
     Div,
     /// `a % b`. Of Int64s only.
     Mod,
+    /// `a = b`, of one type, as an Int64 0 or 1: null if either is null, as
+    /// are the other comparisons.
+    Eq,
+    /// `a != b`.
+    Ne,
+    /// `a < b`. Strings are ordered by their bytes.
+    Lt,
+    /// `a <= b`.
+    Le,
+    /// `a > b`.
+    Gt,
+    /// `a >= b`.
+    Ge,
 }
 
 /// One step of an `ExprProgram`. Step `i` computes register `i` from the
@@ -197,6 +210,9 @@ fn run(
             ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
                 arithmetic(context, step, registers, batch.selection())?
             }
+            ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
+                compare(context, step, registers)?
+            }
         };
         *at_mut!(registers, i) = Some(value);
     }
@@ -260,7 +276,7 @@ fn int_arithmetic(op: ExprOp, x: &[i64], y: &[i64], o: &mut [i64]) -> bool {
         ExprOp::Mul => each(x, y, o, |a, b| fits(a.overflowing_mul(b))),
         ExprOp::Div => each(x, y, o, |a, b| fits(a.overflowing_div(nonzero(b)))),
         ExprOp::Mod => each(x, y, o, |a, b| (a.wrapping_rem(nonzero(b)), true)),
-        ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble => failed!(),
+        _ => failed!(),
     }
 }
 
@@ -270,10 +286,81 @@ fn double_arithmetic(op: ExprOp, x: &[f64], y: &[f64], o: &mut [f64]) {
         ExprOp::Sub => each(x, y, o, |a, b| (a - b, true)),
         ExprOp::Mul => each(x, y, o, |a, b| (a * b, true)),
         ExprOp::Div => each(x, y, o, |a, b| (a / b, true)),
-        ExprOp::Mod | ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble => {
-            failed!()
-        }
+        _ => failed!(),
     };
+}
+
+/// Computes the comparison `step`, as `Eq`, `Lt` or `Le`, so that there are
+/// fewer copies of the loops: `a > b` is `b < a`, `a >= b` is `b <= a`, and
+/// `a != b` is the opposite of `a = b`, which holds for doubles too.
+#[inline(never)]
+fn compare(
+    context: &mut Context,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let swap = matches!(step.op, ExprOp::Gt | ExprOp::Ge);
+    let (a, b) = if swap { (step.b, step.a) } else { (step.a, step.b) };
+    let (a, b) = (register(registers, a), register(registers, b));
+    let op = match step.op {
+        ExprOp::Ne => ExprOp::Eq,
+        ExprOp::Gt => ExprOp::Lt,
+        ExprOp::Ge => ExprOp::Le,
+        op => op,
+    };
+    let rows = a.row_count() as usize;
+    let validity = validity(context, a, Some(b), None)?;
+    let mut values = context.values_buffer(rows * 8)?;
+    let o = values.as_mut_slice::<i64>();
+    match a.data_type() {
+        DataType::Int64 => compare_numbers(op, a.int64s(), b.int64s(), o),
+        DataType::Float64 => compare_numbers(op, a.float64s(), b.float64s(), o),
+        DataType::String => compare_strings(op, a, b, o),
+    }
+    if step.op == ExprOp::Ne {
+        for o in o.iter_mut() {
+            *o ^= 1;
+        }
+    }
+    ColumnView::new(context, DataType::Int64, values, validity)
+}
+
+/// `x op y` at every row, as 0 or 1, for `op` `Eq`, `Lt` or `Le`.
+fn compare_numbers<T: PartialOrd + Copy>(op: ExprOp, x: &[T], y: &[T], o: &mut [i64]) {
+    match op {
+        ExprOp::Eq => compare_each(x, y, o, |a, b| a == b),
+        ExprOp::Lt => compare_each(x, y, o, |a, b| a < b),
+        _ => compare_each(x, y, o, |a, b| a <= b),
+    }
+}
+
+/// The loop for each comparison and type, kept to the comparison itself.
+#[inline(never)]
+fn compare_each<T: Copy>(x: &[T], y: &[T], o: &mut [i64], f: impl Fn(T, T) -> bool) {
+    check!(x.len() == o.len() && y.len() == o.len());
+    for ((o, &x), &y) in o.iter_mut().zip(x).zip(y) {
+        *o = i64::from(f(x, y));
+    }
+}
+
+/// As `compare_numbers`, for strings, by their bytes, at the rows where
+/// neither is null: others' views may not be of their bytes.
+fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
+    let (left, right) = (a.string_values(), b.string_values());
+    for (row, o) in o.iter_mut().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+        let at = row as u32;
+        if a.is_null(at) || b.is_null(at) {
+            *o = 0;
+            continue;
+        }
+        let order = left.get(row).cmp(right.get(row));
+        *o = i64::from(match op {
+            ExprOp::Eq => order.is_eq(),
+            ExprOp::Lt => order.is_lt(),
+            _ => order.is_le(),
+        });
+    }
 }
 
 /// An overflowing operation's result, and whether it fit.
@@ -399,6 +486,13 @@ pub enum ExprError {
     Numbers,
     /// Integers on both sides of `%`.
     Integers,
+    /// Values of one kind, numbers or strings, on both sides of a comparison.
+    Kinds,
+    /// Values of one type on both sides of a comparison, unless one is an
+    /// integer literal compared with a double.
+    Types,
+    /// An integer literal compared with a double which can hold it exactly.
+    Inexact,
     /// An allocation failed.
     OutOfMemory,
 }
@@ -433,7 +527,7 @@ impl Typer<'_> {
     fn run(&mut self, expr: &Expr) -> Result<Option<DataType>, ExprError> {
         check!(!expr.nodes.is_empty() && expr.nodes.len() <= EXPR_NODES_MAX);
         for (i, node) in expr.nodes.iter().enumerate() {
-            *at_mut!(self.nodes, i) = self.type_node(node)?;
+            *at_mut!(self.nodes, i) = self.type_node(&expr.nodes, node)?;
         }
         Ok(at!(self.nodes, expr.nodes.len() - 1).0)
     }
@@ -459,8 +553,12 @@ impl Typer<'_> {
         Ok(steps.len() as u32 - 1)
     }
 
-    /// `node`'s type, and the register holding it.
-    fn type_node(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+    /// `node`, one of `nodes`, its type, and the register holding it.
+    fn type_node(
+        &mut self,
+        nodes: &[ExprStep],
+        node: &ExprStep,
+    ) -> Result<(Option<DataType>, u32), ExprError> {
         let (a, b) = (node.a as usize, node.b as usize);
         match node.op {
             ExprOp::Column => {
@@ -494,7 +592,52 @@ impl Typer<'_> {
                 let b = self.materialize(node.b, data_type)?;
                 Ok((Some(data_type), self.add(step(node.op, data_type, a, b))?))
             }
+            ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
+                self.type_comparison(nodes, node)
+            }
         }
+    }
+
+    /// Types the comparison `node`, one of `nodes`, which is an Int64.
+    fn type_comparison(
+        &mut self,
+        nodes: &[ExprStep],
+        node: &ExprStep,
+    ) -> Result<(Option<DataType>, u32), ExprError> {
+        let (a_type, b_type) =
+            (at!(self.nodes, node.a as usize).0, at!(self.nodes, node.b as usize).0);
+        let string = |data_type| data_type == Some(DataType::String);
+        if a_type.is_some() && b_type.is_some() && string(a_type) != string(b_type) {
+            return Err(ExprError::Kinds);
+        }
+        // A comparison with NULL is NULL.
+        let (Some(a_type), Some(b_type)) = (a_type, b_type) else { return Ok((None, 0)) };
+        let mut a = at!(self.nodes, node.a as usize).1;
+        let mut b = at!(self.nodes, node.b as usize).1;
+        if a_type != b_type {
+            // An integer literal compared with a double is that double, as
+            // a filter compares it.
+            let literal = |i: u32| {
+                let node = at!(nodes, i as usize);
+                (node.op == ExprOp::Constant && node.data_type == DataType::Int64)
+                    .then_some(node.int_value)
+            };
+            let (side, value) = match (a_type, literal(node.a), literal(node.b)) {
+                (DataType::Int64, Some(value), _) => (&mut a, value),
+                (DataType::Float64, _, Some(value)) => (&mut b, value),
+                _ => return Err(ExprError::Types),
+            };
+            #[expect(clippy::cast_precision_loss, reason = "checked to be exact")]
+            let double = value as f64;
+            #[expect(clippy::cast_possible_truncation, reason = "a check, not a use")]
+            if double as i128 != i128::from(value) {
+                return Err(ExprError::Inexact);
+            }
+            let mut constant = step(ExprOp::Constant, DataType::Float64, 0, 0);
+            constant.double_value = double;
+            *side = self.add(constant)?;
+        }
+        Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, b))?))
     }
 }
 
@@ -570,7 +713,11 @@ pub struct ComputeOp {
 fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
     match error {
         ExprError::OutOfMemory => LowerError::OutOfMemory,
-        ExprError::Numbers | ExprError::Integers => LowerError::WrongType(column),
+        ExprError::Numbers
+        | ExprError::Integers
+        | ExprError::Kinds
+        | ExprError::Types
+        | ExprError::Inexact => LowerError::WrongType(column),
     }
 }
 
@@ -817,6 +964,26 @@ mod tests {
         let expected: StdVec<Option<i64>> =
             (3..23).map(|i| (i % 3 != 0 && (i + 1) % 3 != 0).then_some(-1)).collect();
         assert_eq!(run(b, batch(&[n, m])), expected);
+    }
+
+    /// Each comparison, as 0 or 1, null where either side is.
+    #[test]
+    fn comparisons() {
+        let cases = [
+            (ExprOp::Eq, [0, 1, 0, 0]),
+            (ExprOp::Ne, [1, 0, 1, 1]),
+            (ExprOp::Lt, [1, 0, 0, 0]),
+            (ExprOp::Le, [1, 1, 0, 0]),
+            (ExprOp::Gt, [0, 0, 1, 1]),
+            (ExprOp::Ge, [0, 1, 1, 1]),
+        ];
+        for (op, [first, second, fourth, fifth]) in cases {
+            let mut b = Builder(StdVec::new());
+            let (n, twenty) = (b.push(ExprOp::Column, INT, 0, 0), b.int(20));
+            b.push(op, INT, n, twenty);
+            let expected = [Some(first), Some(second), None, Some(fourth), Some(fifth)];
+            assert_eq!(run(b, batch(&[column(&N)])), expected, "{op:?}");
+        }
     }
 
     /// A string constant is every row's, read from the statement's literals,

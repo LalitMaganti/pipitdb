@@ -376,6 +376,17 @@ mod tests {
         assert_eq!(kept("FROM t |> EXTEND b / (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> EXTEND b % (a - 1) AS x |> WHERE x IS NULL |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> EXTEND a + NULL AS x |> WHERE x IS NULL |> SELECT a").len(), 2);
+        // Comparisons, as 0 or 1, with a literal on either side, an integer
+        // literal compared with a double as one, and NULL where either is.
+        assert_eq!(kept("FROM t |> SELECT a > 1 AS x"), [0.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT 1 >= a AS x"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT b != a * 10 AS x"), [0.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT f > 2 AS x"), [0.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT 1 < f AS x"), [0.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT s < 'j' AS x"), [1.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT s = '' AS x"), [0.0, 1.0]);
+        assert_eq!(kept("FROM n |> EXTEND x = 1 AS y |> WHERE y IS NULL |> SELECT x").len(), 1);
+        assert_eq!(kept("FROM t |> EXTEND a > 1 AS big |> WHERE big = 1 |> SELECT a"), [2.0]);
         // String literals, as lengths here, which later stages read.
         assert_eq!(kept("FROM t |> SELECT 'it''s' AS x"), [4.0, 4.0]);
         assert_eq!(kept("FROM t |> SELECT '' AS x"), [0.0, 0.0]);
@@ -461,7 +472,10 @@ mod tests {
         assert_eq!(error("FROM t |> EXTEND NULL - s AS x"), (ErrorCode::ExpectedNumber, 17));
         assert_eq!(error("FROM t |> EXTEND f % 2 AS x"), (ErrorCode::ExpectedInteger, 17));
         assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
-        assert_eq!(error("FROM t |> SELECT a > 1 AS x"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
+        assert_eq!(error("FROM t |> SELECT f > a AS x"), (ErrorCode::ExpectedOneType, 17));
+        let inexact = "FROM t |> SELECT f = 9007199254740993 AS x";
+        assert_eq!(error(inexact), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> SELECT 'x' + 1 AS x"), (ErrorCode::ExpectedNumber, 17));
         assert_eq!(error("FROM t |> SELECT -'x' AS x"), (ErrorCode::ExpectedNumber, 18));
         assert_eq!(error("FROM t |> SELECT 1.5 AS x"), (ErrorCode::Unsupported, 17));

@@ -65,6 +65,11 @@ pub enum ErrorCode {
     ExpectedName = 28,
     /// `%` with a float on either side.
     ExpectedInteger = 29,
+    /// A comparison of a number with a string.
+    ExpectedOneKind = 30,
+    /// A comparison of an integer with a double, unless the integer is a
+    /// literal.
+    ExpectedOneType = 31,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.

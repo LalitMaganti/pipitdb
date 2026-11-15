@@ -74,6 +74,10 @@ fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
 #[bench::int_div_nullable(pipitdb_bench::perfetto_expression(4, 16))]
 #[bench::double_add(pipitdb_bench::perfetto_expression(5, 16))]
 #[bench::double_mul(pipitdb_bench::perfetto_expression(6, 16))]
+#[bench::int_lt(pipitdb_bench::perfetto_expression(7, 16))]
+#[bench::int_ne(pipitdb_bench::perfetto_expression(8, 16))]
+#[bench::int_lt_nullable(pipitdb_bench::perfetto_expression(9, 16))]
+#[bench::double_lt(pipitdb_bench::perfetto_expression(10, 16))]
 fn perfetto_expression(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
