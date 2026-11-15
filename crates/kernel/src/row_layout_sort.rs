@@ -8,6 +8,7 @@
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
+use crate::array::Array;
 use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
@@ -232,7 +233,7 @@ pub(crate) enum Sorted {
     /// Each row's word, in order. If they hold every byte that varies, at
     /// `varying`, `fixed` is the bytes of the first row, as every other byte
     /// is in every row.
-    Words { words: SlowVec<u64>, packing: Words, varying: SlowVec<u32>, fixed: Option<SlowVec<u8>> },
+    Words { words: Array<u64>, packing: Words, varying: SlowVec<u32>, fixed: Option<SlowVec<u8>> },
 }
 
 impl Sorted {
@@ -410,10 +411,13 @@ pub(crate) fn sort_row_layout(
     if in_words {
         fixed = Some(SlowVec::fixed_from(allocator, rows.get(0).iter().copied())?);
     }
-    let mut words = SlowVec::fixed(allocator, count as usize)?;
+    let mut words = Array::zeroed(allocator, count as usize)?;
     for from in (0..count).step_by(BATCH_ROWS_MAX as usize) {
         let to = count.min(from + BATCH_ROWS_MAX);
-        words.extend_within((from..to).map(|r| packing.word(row_layout.get(r), first, r)));
+        let out = at_mut!(words, from as usize..to as usize).iter_mut();
+        for (out, r) in out.zip(from..to) {
+            *out = packing.word(row_layout.get(r), first, r);
+        }
         if in_words {
             row_layout.let_go_below(to, true);
         }
@@ -424,9 +428,9 @@ pub(crate) fn sort_row_layout(
     let mut scratch = Scratch::new(allocator, count as usize)?;
     // 3. Merge the runs, or sort.
     if existing.runs_len > 0 {
-        let mut other = SlowVec::<u64>::zeroed(allocator, count as usize)?;
+        let mut other = Array::zeroed(allocator, count as usize)?;
         if merge_runs(&mut words, &mut other, &mut existing) {
-            words.copy_from_slice(&other);
+            words = other;
         }
     } else {
         sort_words(&mut words, &mut scratch);

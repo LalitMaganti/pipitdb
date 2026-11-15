@@ -4,6 +4,7 @@
 
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::{AllocError, Allocator};
+use crate::array::Array;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
@@ -84,7 +85,7 @@ struct Interned {
     dictionary: ColumnView,
     /// Each entry's id, and its number above, or 0 until a row with it is
     /// found.
-    ids: SlowVec<u64>,
+    ids: Array<u64>,
 }
 
 impl GroupTable {
@@ -507,7 +508,7 @@ fn load_string_ids(
         Form::Dictionary(indices) => {
             if !interned.as_ref().is_some_and(|interned| interned.dictionary.shares_values(column))
             {
-                let ids = SlowVec::zeroed(allocator, values.len() as usize)?;
+                let ids = Array::zeroed(allocator, values.len() as usize)?;
                 *interned = Some(Interned { dictionary: column.clone(), ids });
             }
             let Some(Interned { ids: entries, .. }) = interned else { failed!() };
