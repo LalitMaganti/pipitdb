@@ -20,6 +20,7 @@ use crate::predicate::{Filter, Predicate};
 use crate::scannable::{DynScannable, Summary};
 use crate::slow_vec::SlowVec;
 use crate::step::{DynTransform, Step};
+use crate::string_pool::{Id, StringPool};
 
 /// The most columns a plan can have.
 pub const PLAN_COLUMNS_MAX: usize = 1 << 10;
@@ -395,6 +396,9 @@ pub struct LogicalPlan<'c> {
     pub root: PlanNodeId,
     /// The columns of the result, in order.
     pub output: SlowVec<NamedColumn>,
+    /// The strings its conditions compare with: made with the first, as
+    /// most statements have none. Its runs read them through their context.
+    literals: Option<StringPool>,
 }
 
 impl<'c> LogicalPlan<'c> {
@@ -405,7 +409,27 @@ impl<'c> LogicalPlan<'c> {
             nodes: SlowVec::new(allocator, PLAN_NODES_MAX)?,
             root: 0,
             output: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            literals: None,
         })
+    }
+
+    /// Adds `literal` to its literals, allocating from `allocator`, which
+    /// must outlive the plan, and returns its id there.
+    pub fn add_literal(
+        &mut self,
+        allocator: &dyn Allocator,
+        literal: &[u8],
+    ) -> Result<Id, AllocError> {
+        let literals = match &mut self.literals {
+            Some(literals) => literals,
+            None => self.literals.insert(StringPool::new(allocator)?),
+        };
+        literals.intern_string(allocator, Some(literal))
+    }
+
+    /// The strings its conditions compare with, for its runs to read.
+    pub fn literals(&self) -> Option<&StringPool> {
+        self.literals.as_ref()
     }
 
     /// A new column, with a copy of `name`.

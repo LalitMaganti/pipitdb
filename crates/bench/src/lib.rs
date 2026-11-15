@@ -257,7 +257,7 @@ impl Operator for PassOperator {
 /// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
     let query = QueryAllocators::new(&Heap);
-    let Ok(mut execution) = pipeline.start(&query) else { return 0 };
+    let Ok(mut execution) = pipeline.start(&query, None) else { return 0 };
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while execution.next(&mut batch) == Ok(true) {
@@ -495,12 +495,14 @@ pub fn string_dictionary() -> ColumnView {
     ColumnView::dictionary(&mut context, &entries, indices).expect("allocates")
 }
 
-/// `x = 'iPad'`, over the first column.
+/// `x = 'iPad'`, over the first column, and its statement's literals.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn ipad_predicate() -> Predicate {
-    let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, start: 0, len: 4 };
+pub fn ipad_predicate() -> (Predicate, StringPool) {
+    let mut literals = StringPool::new(&Heap).expect("allocates");
+    let string = literals.intern_string(&Heap, Some(b"iPad")).expect("allocates");
+    let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, string };
     let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).expect("allocates");
-    Predicate::with_literals(&Heap, nodes, b"iPad", &[]).expect("allocates")
+    (Predicate::new(nodes), literals)
 }
 
 /// Keeps `iPad`s: 1 in 8.
@@ -530,18 +532,28 @@ pub fn predicate(shape: &str) -> Predicate {
     )
 }
 
-/// Runs `predicate` over `batches` batches of `column`, returning the rows kept.
+/// Runs `predicate`, with its statement's `literals`, over `batches` batches
+/// of `column`, returning the rows kept.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn run_predicate(predicate: &Predicate, column: &ColumnView, batches: u32) -> u64 {
+pub fn run_predicate(
+    predicate: &Predicate,
+    literals: Option<&StringPool>,
+    column: &ColumnView,
+    batches: u32,
+) -> u64 {
     let mut context = Context::new(&Heap);
     context.reserve_selections(predicate.depth() as usize).expect("allocates");
     let mut entries = predicate.new_entries(&Heap).expect("allocates");
+    let sets = predicate.new_sets(&Heap, literals).expect("allocates");
     let mut batch = RowBatch::new();
     let mut kept = 0;
     for _ in 0..batches {
         batch.reset(column.row_count());
         let _ = batch.push_column(column.clone());
-        predicate.select(&Heap, context.selections(), &mut entries, &mut batch).expect("allocates");
+        let selections = context.selections();
+        predicate
+            .select(&Heap, literals, &sets, selections, &mut entries, &mut batch)
+            .expect("allocates");
         kept += u64::from(batch.selection().len());
     }
     kept

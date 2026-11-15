@@ -113,7 +113,7 @@ fn filter(
 #[bench::not(pipitdb_bench::predicate("not"))]
 fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
     let column = pipitdb_bench::filter_column(false);
-    black_box(pipitdb_bench::run_predicate(black_box(&predicate), &column, 100))
+    black_box(pipitdb_bench::run_predicate(black_box(&predicate), None, &column, 100))
 }
 
 #[library_benchmark]

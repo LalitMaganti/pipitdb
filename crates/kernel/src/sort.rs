@@ -151,7 +151,7 @@ mod tests {
         assert!(steps.push(Step::Operator(step)).is_ok());
         let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query).unwrap();
+        let mut execution = pipeline.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch).unwrap() {

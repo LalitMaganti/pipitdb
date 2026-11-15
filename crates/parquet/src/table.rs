@@ -681,7 +681,7 @@ mod tests {
                 table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
             let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
             let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query).unwrap();
+            let mut execution = pipeline.start(&query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let column = batch.column(0);
@@ -733,7 +733,7 @@ mod tests {
             let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).unwrap();
             let pipeline = Pipeline::new(source, steps);
             let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query).unwrap();
+            let mut execution = pipeline.start(&query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let (selection, column) = (batch.selection(), batch.column(0));

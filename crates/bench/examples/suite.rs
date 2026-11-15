@@ -266,7 +266,8 @@ fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec
     optimize(&Heap, &mut plan).map_err(|e| format!("{e:?}"))?;
     let planned = plan_nodes(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
     let physical = lower(&Heap, &plan, &planned).map_err(|e| format!("{e:?}"))?;
-    let mut execution = physical.pipeline().start(allocators).map_err(|e| format!("{e:?}"))?;
+    let mut execution =
+        physical.pipeline().start(allocators, plan.literals()).map_err(|e| format!("{e:?}"))?;
     let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
     let mut batch = RowBatch::new();
     while execution.next(&mut batch).map_err(|e| format!("{e:?}"))? {

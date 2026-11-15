@@ -17,6 +17,7 @@ use crate::row_batch::RowBatch;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 use crate::step::Transform;
+use crate::string_pool::{Id, StringPool};
 
 /// The most nodes a predicate can have.
 pub const PREDICATE_NODES_MAX: usize = 1 << 6;
@@ -40,19 +41,17 @@ pub enum Leaf {
         value: Value,
     },
     /// The string column at `column` in a batch, compared byte by byte with
-    /// bytes `start..start + len` of the predicate's strings.
+    /// `string`, one of the statement's literals.
     CompareString {
         column: u32,
         comparison: Comparison,
-        start: u32,
-        len: u32,
+        string: Id,
     },
     /// The string column at `column` in a batch, matched with the `LIKE`
-    /// pattern in bytes `start..start + len` of the predicate's strings.
+    /// pattern `pattern`, one of the statement's literals.
     Like {
         column: u32,
-        start: u32,
-        len: u32,
+        pattern: Id,
     },
     IsNull {
         column: u32,
@@ -64,9 +63,9 @@ pub enum Leaf {
         start: u32,
         len: u32,
     },
-    /// The string column at `column` in a batch, one of the strings that
-    /// values `start..start + len` of the predicate's values place in its
-    /// strings: each its start in the high 32 bits, and length in the low.
+    /// The string column at `column` in a batch, one of the strings whose
+    /// ids in the statement's literals are values `start..start + len` of the
+    /// predicate's values.
     InStrings {
         column: u32,
         start: u32,
@@ -77,79 +76,70 @@ pub enum Leaf {
 /// Its root is its last node.
 pub struct Predicate {
     nodes: SlowVec<Node>,
-    /// The values of its `IN` lists, then the bytes of the strings its
-    /// conditions compare with, if it has any: shared by its copies.
-    literals: Option<Buffer>,
-    /// How many values `literals` starts with.
-    value_count: usize,
-    /// For each node, if any is an `IN` list of more than
-    /// `filter::IN_SCAN_MAX` values, the set of them.
-    sets: Option<SlowVec<Option<Set>>>,
+    /// The values of its `IN` lists, if it has any: shared by its copies.
+    values: Option<Buffer>,
     depth: u32,
 }
 
 /// An `IN` list of more than `filter::IN_SCAN_MAX` values, kept in a hash
-/// map, as Perfetto keeps one, and made once, as Perfetto casts a list once
-/// for each run of a query. Integers and strings share one map type, so its
+/// map, as Perfetto keeps one, and made once for each run of a query, as
+/// Perfetto casts a list. Integers and strings share one map type, so its
 /// code is compiled once.
-type Set = FlatHashMap<filter::Listed, ()>;
+pub type Set = FlatHashMap<filter::Listed, ()>;
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
     pub fn new(nodes: SlowVec<Node>) -> Predicate {
-        Predicate::checked(nodes, None, 0)
+        Predicate::checked(nodes, None)
     }
 
-    /// A predicate of `nodes`, whose string comparisons compare with bytes
-    /// of `strings`, and whose `IN` lists are of `values`. Lists of more than
-    /// `filter::IN_SCAN_MAX` values are put in sets, from `allocator`.
-    pub fn with_literals(
+    /// A predicate of `nodes`, whose `IN` lists are of `values`.
+    pub fn with_values(
         allocator: &dyn Allocator,
         nodes: SlowVec<Node>,
-        strings: &[u8],
         values: &[i64],
     ) -> Result<Predicate, AllocError> {
-        let mut literals = None;
-        if !strings.is_empty() || !values.is_empty() {
-            // Whole words, as the values are read as them.
-            let bytes = (size_of_val(values) + strings.len()).next_multiple_of(size_of::<i64>());
-            let mut buffer = Buffer::allocate(allocator, bytes)?;
-            at_mut!(buffer.as_mut_slice::<i64>(), ..values.len()).copy_from_slice(values);
-            let at = size_of_val(values);
-            at_mut!(buffer.as_mut_slice::<u8>(), at..at + strings.len()).copy_from_slice(strings);
-            literals = Some(buffer);
+        let mut buffer = None;
+        if !values.is_empty() {
+            let mut held = Buffer::allocate(allocator, size_of_val(values))?;
+            held.as_mut_slice::<i64>().copy_from_slice(values);
+            buffer = Some(held);
         }
-        Predicate::sharing(allocator, nodes, literals, values.len())
+        Ok(Predicate::checked(nodes, buffer))
     }
 
-    /// A predicate of `nodes`, and of `literals`, starting with
-    /// `value_count` values, which may be another's.
-    fn sharing(
+    /// For each node, the set of its `IN` list's values if it has more than
+    /// `filter::IN_SCAN_MAX` of them, for `select`: none if no list does.
+    /// String lists' values are ids in `literals`.
+    pub fn new_sets(
+        &self,
         allocator: &dyn Allocator,
-        nodes: SlowVec<Node>,
-        literals: Option<Buffer>,
-        value_count: usize,
-    ) -> Result<Predicate, AllocError> {
-        let mut predicate = Predicate::checked(nodes, literals, value_count);
+        literals: Option<&StringPool>,
+    ) -> Result<SlowVec<Option<Set>>, AllocError> {
         let long = |node: &Node| match *node {
             Node::Leaf(Leaf::In { len, .. } | Leaf::InStrings { len, .. }) => {
                 len as usize > filter::IN_SCAN_MAX
             }
             _ => false,
         };
-        if predicate.nodes.iter().any(long) {
-            let mut sets = SlowVec::fixed(allocator, predicate.nodes.len())?;
-            for &node in predicate.nodes.iter() {
-                sets.push(predicate.set_of(allocator, node)?)?;
-            }
-            predicate.sets = Some(sets);
+        if !self.nodes.iter().any(long) {
+            return SlowVec::fixed(allocator, 0);
         }
-        Ok(predicate)
+        let mut sets = SlowVec::fixed(allocator, self.nodes.len())?;
+        for &node in self.nodes.iter() {
+            sets.push(self.set_of(allocator, literals, node)?)?;
+        }
+        Ok(sets)
     }
 
     /// The set of node `node`'s values, if it's an `IN` list of more than
     /// `filter::IN_SCAN_MAX` of them.
-    fn set_of(&self, allocator: &dyn Allocator, node: Node) -> Result<Option<Set>, AllocError> {
+    fn set_of(
+        &self,
+        allocator: &dyn Allocator,
+        literals: Option<&StringPool>,
+        node: Node,
+    ) -> Result<Option<Set>, AllocError> {
         let (strings, start, len) = match node {
             Node::Leaf(Leaf::In { start, len, .. }) => (false, start, len),
             Node::Leaf(Leaf::InStrings { start, len, .. }) => (true, start, len),
@@ -162,7 +152,7 @@ impl Predicate {
         // A value listed twice is put in twice, which is harmless.
         for &value in at!(self.values(), start as usize..(start + len) as usize) {
             let hash = if strings {
-                murmur_hash::bytes(self.placed_string(value))
+                murmur_hash::bytes(literal(literals, value))
             } else {
                 murmur_hash::mix(value.cast_unsigned())
             };
@@ -171,40 +161,23 @@ impl Predicate {
         Ok(Some(set))
     }
 
-    /// The string of an `IN` list that `packed` places in its strings.
-    fn placed_string(&self, packed: i64) -> &[u8] {
-        let (start, len) = placed(packed);
-        at!(self.strings(), start as usize..(start + len) as usize)
-    }
-
     /// The values of its `IN` lists.
     fn values(&self) -> &[i64] {
-        self.literals.as_ref().map_or(&[], |literals| at!(literals.as_slice(), ..self.value_count))
+        self.values.as_ref().map_or(&[], Buffer::as_slice)
     }
 
-    /// The bytes of the strings its conditions compare with.
-    fn strings(&self) -> &[u8] {
-        let values = self.value_count * size_of::<i64>();
-        self.literals.as_ref().map_or(&[], |literals| at!(literals.as_slice(), values..))
-    }
-
-    /// A predicate of `nodes`, checked to be one, and of `literals`, but
-    /// without sets.
-    fn checked(nodes: SlowVec<Node>, literals: Option<Buffer>, value_count: usize) -> Predicate {
+    /// A predicate of `nodes`, checked to be one, and of `values`.
+    fn checked(nodes: SlowVec<Node>, values: Option<Buffer>) -> Predicate {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
-        let literal_bytes = literals.as_ref().map_or(0, Buffer::size_bytes);
-        check!(value_count * size_of::<i64>() <= literal_bytes);
-        let bytes = literal_bytes - value_count * size_of::<i64>();
-        let within = |start: u32, len: u32, end: usize| {
-            (start as usize).checked_add(len as usize).is_some_and(|last| last <= end)
-        };
+        let value_count =
+            values.as_ref().map_or(0, |values| values.size_bytes() / size_of::<i64>());
+        // Each string's id is checked to be one of the literals where it's read.
         check!(nodes.iter().all(|node| match *node {
-            Node::Leaf(Leaf::CompareString { start, len, .. } | Leaf::Like { start, len, .. }) => {
-                within(start, len, bytes)
-            }
-            // Each value's string is checked to be in `strings` where it's read.
             Node::Leaf(Leaf::In { start, len, .. } | Leaf::InStrings { start, len, .. }) => {
-                len != 0 && within(start, len, value_count)
+                len != 0
+                    && (start as usize)
+                        .checked_add(len as usize)
+                        .is_some_and(|end| end <= value_count)
             }
             _ => true,
         }));
@@ -226,7 +199,7 @@ impl Predicate {
             };
         }
         let depth = *at!(depths, nodes.len() - 1);
-        Predicate { nodes, literals, value_count, sets: None, depth }
+        Predicate { nodes, values, depth }
     }
 
     /// Its nodes, the last its root.
@@ -252,8 +225,7 @@ impl Predicate {
         if root.is_none() {
             return Ok(None);
         }
-        let literals = self.literals.clone();
-        Ok(Some(Predicate::sharing(allocator, nodes, literals, self.value_count)?))
+        Ok(Some(Predicate::checked(nodes, self.values.clone())))
     }
 
     /// Copies node `node`'s conjuncts that read only `column` to `nodes`,
@@ -338,12 +310,11 @@ impl Predicate {
             Node::Leaf(Leaf::Compare { column, comparison, value }) => {
                 Node::Leaf(Leaf::Compare { column: renumber(column), comparison, value })
             }
-            Node::Leaf(Leaf::CompareString { column, comparison, start, len }) => {
-                let column = renumber(column);
-                Node::Leaf(Leaf::CompareString { column, comparison, start, len })
+            Node::Leaf(Leaf::CompareString { column, comparison, string }) => {
+                Node::Leaf(Leaf::CompareString { column: renumber(column), comparison, string })
             }
-            Node::Leaf(Leaf::Like { column, start, len }) => {
-                Node::Leaf(Leaf::Like { column: renumber(column), start, len })
+            Node::Leaf(Leaf::Like { column, pattern }) => {
+                Node::Leaf(Leaf::Like { column: renumber(column), pattern })
             }
             Node::Leaf(Leaf::IsNull { column }) => {
                 Node::Leaf(Leaf::IsNull { column: renumber(column) })
@@ -357,7 +328,7 @@ impl Predicate {
             node => node,
         });
         let nodes = SlowVec::fixed_from(allocator, nodes)?;
-        Predicate::sharing(allocator, nodes, self.literals.clone(), self.value_count)
+        Ok(Predicate::checked(nodes, self.values.clone()))
     }
 
     /// Where each node keeps the dictionary entries it found, for `select`.
@@ -366,23 +337,25 @@ impl Predicate {
     }
 
     /// Narrows `batch`'s selection to the rows this is true for, working in
-    /// `scratch`, which holds at least `depth` selections. Its leaves keep
-    /// the entries of dictionary columns they find in `entries`, made by
-    /// `new_entries`, allocating from `allocator`.
+    /// `scratch`, which holds at least `depth` selections. Its strings are
+    /// ids in `literals`, and its long `IN` lists in `sets`, made by
+    /// `new_sets`. Its leaves keep the entries of dictionary columns they find
+    /// in `entries`, made by `new_entries`, allocating from `allocator`.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX` nodes")]
     #[inline]
     pub fn select(
         &self,
         allocator: &dyn Allocator,
+        literals: Option<&StringPool>,
+        sets: &[Option<Set>],
         scratch: &mut [Selection],
         entries: &mut [Entries],
         batch: &mut RowBatch,
     ) -> Result<(), AllocError> {
         check!(scratch.len() >= self.depth as usize && entries.len() == self.nodes.len());
         let (columns, selection) = batch.columns_and_selection();
-        let (strings, values) = (self.strings(), self.values());
-        let sets = self.sets.as_deref().unwrap_or(&[]);
-        let mut inputs = Inputs { columns, strings, values, sets, entries, allocator };
+        let values = self.values();
+        let mut inputs = Inputs { columns, literals, values, sets, entries, allocator };
         let root = self.nodes.len() as u32 - 1;
         self.narrow(&mut inputs, scratch, root, true, selection)
     }
@@ -443,8 +416,8 @@ impl Predicate {
 struct Inputs<'b> {
     /// The batch's columns.
     columns: &'b [ColumnView],
-    /// The bytes its string comparisons compare with.
-    strings: &'b [u8],
+    /// The statement's literals, which its strings are ids in.
+    literals: Option<&'b StringPool>,
     /// The values of its `IN` lists.
     values: &'b [i64],
     /// For each node, the set of its `IN` list's values, if it's long.
@@ -486,9 +459,9 @@ impl Leaf {
                 let column = at!(inputs.columns, column as usize);
                 filter::compare(column, comparison, value, selection, dropped);
             }
-            Leaf::CompareString { column, comparison, start, len } => {
+            Leaf::CompareString { column, comparison, string } => {
                 let comparison = if want { comparison } else { negated(comparison) };
-                let string = at!(inputs.strings, start as usize..(start + len) as usize);
+                let string = literal(inputs.literals, i64::from(string.raw_id()));
                 let column = at!(inputs.columns, column as usize);
                 if !matches!(column.form(), Form::Dictionary(_)) {
                     filter::compare_string(column, comparison, string, selection, dropped);
@@ -500,8 +473,8 @@ impl Leaf {
                 })?;
                 filter::keep_entries(column, entries, selection, dropped);
             }
-            Leaf::Like { column, start, len } => {
-                let pattern = at!(inputs.strings, start as usize..(start + len) as usize);
+            Leaf::Like { column, pattern } => {
+                let pattern = literal(inputs.literals, i64::from(pattern.raw_id()));
                 let column = at!(inputs.columns, column as usize);
                 if !matches!(column.form(), Form::Dictionary(_)) {
                     filter::like(column, pattern, want, selection, dropped);
@@ -532,7 +505,7 @@ impl Leaf {
 }
 
 /// Narrows `selection` to the rows node `node`, `column IN (...)` of the
-/// strings `values` place, is `want` for, as `Leaf::narrow` does.
+/// strings whose ids are `values`, is `want` for, as `Leaf::narrow` does.
 fn in_strings(
     inputs: &mut Inputs<'_>,
     node: u32,
@@ -542,11 +515,8 @@ fn in_strings(
     want: bool,
     selection: &mut Selection,
 ) -> Result<(), AllocError> {
-    let strings = inputs.strings;
-    let string = move |packed: i64| {
-        let (start, len) = placed(packed);
-        at!(strings, start as usize..(start + len) as usize)
-    };
+    let literals = inputs.literals;
+    let string = move |id: i64| literal(literals, id);
     let scanned = |cell: &[u8]| values.iter().any(|&packed| string(packed) == cell);
     let found = |set: &Set, cell: &[u8]| {
         let equal = |held: &filter::Listed| string(held.value) == cell;
@@ -573,18 +543,11 @@ fn in_strings(
     Ok(())
 }
 
-/// A string of an `IN` list, at `start` in a predicate's strings and `len`
-/// bytes long, as `Leaf::InStrings` places it.
-pub fn place(start: u32, len: u32) -> i64 {
-    (u64::from(start) << 32 | u64::from(len)).cast_signed()
-}
-
-/// Where a string of an `IN` list is in a predicate's strings: its start and
-/// length, from `packed`, as `place` packs them.
-pub fn placed(packed: i64) -> (u32, u32) {
-    let packed = packed.cast_unsigned();
-    #[expect(clippy::cast_possible_truncation, reason = "the two halves")]
-    ((packed >> 32) as u32, packed as u32)
+/// The literal whose id in `literals` is `id`, which must be one.
+fn literal(literals: Option<&StringPool>, id: i64) -> &[u8] {
+    let Ok(id) = u32::try_from(id) else { failed!() };
+    let Some(string) = literals.and_then(|literals| literals.get(Id::raw(id))) else { failed!() };
+    string
 }
 
 /// The comparison true for exactly the non-null rows `comparison` is false
@@ -614,23 +577,40 @@ pub struct Filter {
     pub predicate: Predicate,
 }
 
-impl Transform for Filter {
+/// What a run of a `Filter` keeps between batches.
+pub struct FilterState {
+    /// The sets of its predicate's long `IN` lists.
+    sets: SlowVec<Option<Set>>,
     /// Where each node keeps the dictionary entries it found.
-    type State = SlowVec<Entries>;
+    entries: SlowVec<Entries>,
+}
 
-    fn new_state(&self, context: &mut Context) -> Result<SlowVec<Entries>, Error> {
+impl Transform for Filter {
+    type State = FilterState;
+
+    fn new_state(&self, context: &mut Context) -> Result<FilterState, Error> {
         context.reserve_selections(self.predicate.depth() as usize)?;
-        Ok(self.predicate.new_entries(context.allocator())?)
+        let allocator = context.allocator();
+        let sets = self.predicate.new_sets(allocator, context.literals())?;
+        Ok(FilterState { sets, entries: self.predicate.new_entries(allocator)? })
     }
 
     fn process(
         &self,
         context: &mut Context,
-        entries: &mut SlowVec<Entries>,
+        state: &mut FilterState,
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
-        let allocator = context.allocator();
-        Ok(self.predicate.select(allocator, context.selections(), entries, batch)?)
+        let (allocator, literals) = (context.allocator(), context.literals());
+        let FilterState { sets, entries } = state;
+        Ok(self.predicate.select(
+            allocator,
+            literals,
+            sets,
+            context.selections(),
+            entries,
+            batch,
+        )?)
     }
 }
 
@@ -721,10 +701,11 @@ mod tests {
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
         let mut entries = predicate.new_entries(&Heap).unwrap();
+        let sets = predicate.new_sets(&Heap, None).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(6);
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
-        predicate.select(&Heap, &mut scratch, &mut entries, &mut batch).unwrap();
+        predicate.select(&Heap, None, &sets, &mut scratch, &mut entries, &mut batch).unwrap();
         match batch.selection().kept() {
             Kept::Prefix => (0..6).collect(),
             Kept::None => StdVec::new(),
@@ -791,15 +772,8 @@ mod tests {
         let kept = |nodes: &[Node]| {
             // Then 100 to 119, for a list long enough for a set.
             let values: StdVec<i64> = [3, 5, 2, 7, 9, 11].into_iter().chain(100..120).collect();
-            kept_by(
-                &Predicate::with_literals(
-                    &Heap,
-                    SlowVec::fixed_from(&Heap, nodes.iter().copied()).unwrap(),
-                    &[],
-                    &values,
-                )
-                .unwrap(),
-            )
+            let nodes = SlowVec::fixed_from(&Heap, nodes.iter().copied()).unwrap();
+            kept_by(&Predicate::with_values(&Heap, nodes, &values).unwrap())
         };
         assert_eq!(kept(&[Node::Leaf(a_in)]), [2, 4, 5]);
         // A list of more than four values.
@@ -838,23 +812,46 @@ mod tests {
         ColumnView::dictionary(&mut Context::new(&Heap), values, buffer).unwrap()
     }
 
-    /// `x <comparison> 'b'`, or `NOT` that, over the first column.
-    fn compare_b(comparison: Comparison, not: bool) -> Predicate {
-        let leaf = Leaf::CompareString { column: 0, comparison, start: 0, len: 1 };
-        let nodes = [Node::Leaf(leaf), Node::Not(0)];
-        let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
-        Predicate::with_literals(&Heap, nodes.unwrap(), b"b", &[]).unwrap()
+    /// A statement's literals, holding `strings`.
+    fn literals(strings: &[&[u8]]) -> StringPool {
+        let mut literals = StringPool::new(&Heap).unwrap();
+        for &string in strings {
+            literals.intern_string(&Heap, Some(string)).unwrap();
+        }
+        literals
     }
 
-    /// The rows `predicate` keeps of a batch of `column`, its entries kept in
-    /// `entries` between batches.
-    fn kept_of(predicate: &Predicate, entries: &mut [Entries], column: &ColumnView) -> StdVec<u16> {
+    /// The id of `string`, one of `literals`.
+    fn id(literals: &mut StringPool, string: &[u8]) -> Id {
+        literals.intern_string(&Heap, Some(string)).unwrap()
+    }
+
+    /// `x <comparison> 'b'`, or `NOT` that, over the first column, and its
+    /// literals.
+    fn compare_b(comparison: Comparison, not: bool) -> (Predicate, StringPool) {
+        let mut literals = literals(&[]);
+        let string = id(&mut literals, b"b");
+        let leaf = Leaf::CompareString { column: 0, comparison, string };
+        let nodes = [Node::Leaf(leaf), Node::Not(0)];
+        let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
+        (Predicate::new(nodes.unwrap()), literals)
+    }
+
+    /// The rows `predicate`, with `literals`, keeps of a batch of `column`,
+    /// its entries kept in `entries` between batches.
+    fn kept_of(
+        (predicate, literals): (&Predicate, &StringPool),
+        entries: &mut [Entries],
+        column: &ColumnView,
+    ) -> StdVec<u16> {
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
+        let sets = predicate.new_sets(&Heap, Some(literals)).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(column.row_count());
         assert!(batch.push_column(column.clone()).is_ok());
-        predicate.select(&Heap, &mut scratch, entries, &mut batch).unwrap();
+        let literals = Some(literals);
+        predicate.select(&Heap, literals, &sets, &mut scratch, entries, &mut batch).unwrap();
         match batch.selection().kept() {
             Kept::Prefix => (0..u16::try_from(column.row_count()).unwrap()).collect(),
             Kept::None => StdVec::new(),
@@ -881,10 +878,10 @@ mod tests {
             Comparison::GreaterEqual,
         ] {
             for not in [false, true] {
-                let predicate = compare_b(comparison, not);
+                let (predicate, literals) = compare_b(comparison, not);
                 let mut entries = predicate.new_entries(&Heap).unwrap();
-                let expected = kept_of(&predicate, &mut entries, &flat);
-                assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
+                let expected = kept_of((&predicate, &literals), &mut entries, &flat);
+                assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
             }
         }
         // `x LIKE '_'` keeps entries 0, 2 and 3, and `NOT x LIKE '_'` entry 4:
@@ -893,23 +890,26 @@ mod tests {
             (0..).zip(&indices).filter(|(_, e)| kept.contains(e)).map(|(row, _)| row).collect()
         };
         for (not, expected) in [(false, rows_of(&[0, 2, 3])), (true, rows_of(&[4]))] {
-            let nodes = [Node::Leaf(Leaf::Like { column: 0, start: 0, len: 1 }), Node::Not(0)];
+            let mut literals = literals(&[]);
+            let pattern = id(&mut literals, b"_");
+            let nodes = [Node::Leaf(Leaf::Like { column: 0, pattern }), Node::Not(0)];
             let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
-            let predicate = Predicate::with_literals(&Heap, nodes.unwrap(), b"_", &[]).unwrap();
+            let predicate = Predicate::new(nodes.unwrap());
             let mut entries = predicate.new_entries(&Heap).unwrap();
-            assert_eq!(kept_of(&predicate, &mut entries, &flat), expected);
-            assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
         }
         // `x IN ('b', 'c')` keeps entries 0 and 3, and `NOT` that entries 2 and
         // 4, whether the list is scanned, or long enough for a set: 'b' and
         // 'c' then 20 strings of two bytes, and 'b' again.
-        let strings: StdVec<u8> =
-            b"bc".iter().copied().chain((0..20).flat_map(|i| [b'x', i])).collect();
-        let places: StdVec<i64> = [place(0, 1), place(1, 1)]
+        let mut literals = literals(&[]);
+        let strings: StdVec<StdVec<u8>> = [b"b".to_vec(), b"c".to_vec()]
             .into_iter()
-            .chain((0..20).map(|i| place(2 + 2 * i, 2)))
-            .chain([place(0, 1)])
+            .chain((0..20).map(|i| [b'x', i].to_vec()))
+            .chain([b"b".to_vec()])
             .collect();
+        let ids: StdVec<i64> =
+            strings.iter().map(|string| i64::from(id(&mut literals, string).raw_id())).collect();
         for (len, not, expected) in [
             (2, false, rows_of(&[0, 3])),
             (2, true, rows_of(&[2, 4])),
@@ -918,11 +918,10 @@ mod tests {
         ] {
             let nodes = [Node::Leaf(Leaf::InStrings { column: 0, start: 0, len }), Node::Not(0)];
             let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
-            let predicate =
-                Predicate::with_literals(&Heap, nodes.unwrap(), &strings, &places).unwrap();
+            let predicate = Predicate::with_values(&Heap, nodes.unwrap(), &ids).unwrap();
             let mut entries = predicate.new_entries(&Heap).unwrap();
-            assert_eq!(kept_of(&predicate, &mut entries, &flat), expected);
-            assert_eq!(kept_of(&predicate, &mut entries, &dictionary), expected);
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
         }
     }
 
@@ -930,9 +929,9 @@ mod tests {
     fn keeps_all_or_none_when_every_entry_or_none_matches() {
         let dictionary = indexed(&strings(&[Some("a"), Some("c")]), &[1, 0, 1]);
         let kept = |comparison| {
-            let predicate = compare_b(comparison, false);
+            let (predicate, literals) = compare_b(comparison, false);
             let mut entries = predicate.new_entries(&Heap).unwrap();
-            kept_of(&predicate, &mut entries, &dictionary)
+            kept_of((&predicate, &literals), &mut entries, &dictionary)
         };
         assert_eq!(kept(Comparison::Equal), []);
         assert_eq!(kept(Comparison::NotEqual), [0, 1, 2]);
@@ -940,27 +939,29 @@ mod tests {
 
     #[test]
     fn keeps_a_dictionarys_entries_while_batches_share_it() {
-        let predicate = compare_b(Comparison::Greater, false);
-        let mut entries = predicate.new_entries(&Heap).unwrap();
+        let (predicate, literals) = compare_b(Comparison::Greater, false);
+        let predicate = (&predicate, &literals);
+        let mut entries = predicate.0.new_entries(&Heap).unwrap();
         let values = strings(&[Some("a"), Some("c"), None, Some("d")]);
         let first = indexed(&values, &[0, 1, 2, 3]);
         let second = indexed(&values, &[3, 3, 0, 1]);
         // Another chunk's batch: its dictionary is its own.
         let other = indexed(&strings(&[Some("z"), Some("b")]), &[1, 0, 0, 1]);
         assert!(first.shares_values(&second) && !first.shares_values(&other));
-        assert_eq!(kept_of(&predicate, &mut entries, &first), [1, 3]);
+        assert_eq!(kept_of(predicate, &mut entries, &first), [1, 3]);
         // The second batch reuses the first's entries' bits.
-        assert_eq!(kept_of(&predicate, &mut entries, &second), [0, 1, 3]);
-        assert_eq!(kept_of(&predicate, &mut entries, &other), [1, 2]);
-        assert_eq!(kept_of(&predicate, &mut entries, &first), [1, 3]);
+        assert_eq!(kept_of(predicate, &mut entries, &second), [0, 1, 3]);
+        assert_eq!(kept_of(predicate, &mut entries, &other), [1, 2]);
+        assert_eq!(kept_of(predicate, &mut entries, &first), [1, 3]);
     }
 
     #[test]
     fn takes_dictionaries_only_of_columns_it_compares_with_strings() {
+        let string = id(&mut literals(&[]), b"b");
         let leaves = [
-            Leaf::CompareString { column: 0, comparison: Comparison::Equal, start: 0, len: 1 },
+            Leaf::CompareString { column: 0, comparison: Comparison::Equal, string },
             Leaf::Compare { column: 1, comparison: Comparison::Equal, value: Value::Int64(1) },
-            Leaf::CompareString { column: 2, comparison: Comparison::Equal, start: 0, len: 1 },
+            Leaf::CompareString { column: 2, comparison: Comparison::Equal, string },
             Leaf::IsNull { column: 2 },
         ];
         let nodes = [
@@ -973,7 +974,7 @@ mod tests {
             Node::And(4, 5),
         ];
         let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
-        let predicate = Predicate::with_literals(&Heap, nodes, b"b", &[]).unwrap();
+        let predicate = Predicate::new(nodes);
         // A string column, an integer one, one also tested for nulls, and one
         // it doesn't read.
         let only: StdVec<bool> = (0..4).map(|c| predicate.compares_only_strings(c)).collect();

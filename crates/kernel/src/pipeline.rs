@@ -18,6 +18,7 @@ use crate::query_allocators::QueryAllocators;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, Progress, Step};
+use crate::string_pool::StringPool;
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -36,12 +37,16 @@ impl<'a> Pipeline<'a> {
     /// metadata allocator, which steps' states also allocate from; batches
     /// allocate from its other allocators. A run takes `QueryAllocators`,
     /// not any allocator, so its column buffers always come from fixed
-    /// allocators.
-    pub fn start<'r>(&'r self, query: &'r QueryAllocators<'_>) -> Result<Execution<'r>, Error> {
+    /// allocators. `literals` are its statement's, which its steps read.
+    pub fn start<'r>(
+        &'r self,
+        query: &'r QueryAllocators<'_>,
+        literals: Option<&'r StringPool>,
+    ) -> Result<Execution<'r>, Error> {
         let size_bytes = self.layout(|_, _| {})?.0.size();
         // SAFETY: `Execution::new` writes every byte it reads.
         let memory = unsafe { Buffer::allocate_uninit(query.metadata, size_bytes)? };
-        Execution::new(self, query, memory)
+        Execution::new(self, query, literals, memory)
     }
 
     /// A `Segment` per segment, a `Slot` per step, then the source's state,
@@ -165,12 +170,13 @@ impl<'p> Execution<'p> {
     fn new(
         pipeline: &'p Pipeline<'p>,
         query: &'p QueryAllocators<'_>,
+        literals: Option<&'p StringPool>,
         mut buffer: Buffer,
     ) -> Result<Execution<'p>, Error> {
         let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
             failed!();
         };
-        let mut context = Context::for_query(query);
+        let mut context = Context::for_query(query, literals);
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
             failed!();
         };
@@ -863,7 +869,7 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 2 }, []);
         let expected = [[[0, 0], [1, -1]], [[2, -2], [3, -3]]];
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), expected);
+        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
     }
 
     #[test]
@@ -872,7 +878,7 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 2 }, [transform(Reverse), transform(position)]);
         let expected = [[[0, 0, 0], [-1, 1, 0]], [[-2, 2, 1], [-3, 3, 1]]];
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), expected);
+        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
     }
 
     #[test]
@@ -881,7 +887,7 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
         let expected = [[[0, 0, 0]], [[1, -1, 1]], [[2, -2, 2]], [[3, -3, 3]]];
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), expected);
+        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
     }
 
     #[test]
@@ -889,7 +895,7 @@ mod tests {
         let steps = [operator(Split), transform(SkipOdd), operator(Sum)];
         let pipeline = pipeline(Numbers { batches: 3 }, steps);
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), [[[2 + 4]]]);
+        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), [[[2 + 4]]]);
     }
 
     #[test]
@@ -897,7 +903,7 @@ mod tests {
         let live = Counting(Cell::new(0));
         let pipeline = pipeline(Counted { live: &live }, [operator(Released { live: &live })]);
         let query = QueryAllocators::new(&Heap);
-        assert!(batches(&mut pipeline.start(&query).unwrap()).is_empty());
+        assert!(batches(&mut pipeline.start(&query, None).unwrap()).is_empty());
     }
 
     #[test]
@@ -906,7 +912,7 @@ mod tests {
         assert_eq!(pipeline.describe(), "Numbers | Backwards");
         let query = QueryAllocators::new(&Heap);
         assert_eq!(
-            batches(&mut pipeline.start(&query).unwrap()),
+            batches(&mut pipeline.start(&query, None).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
     }
@@ -915,7 +921,7 @@ mod tests {
     fn steps_after_an_operator_see_only_batches_with_rows() {
         let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards), transform(SkipOdd)]);
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query).unwrap()), [[[5], [4]], [[1], [0]]]);
+        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), [[[5], [4]], [[1], [0]]]);
     }
 
     #[test]
@@ -925,9 +931,9 @@ mod tests {
         let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
 
         let query = QueryAllocators::new(&Heap);
-        let mut first = pipeline.start(&query).unwrap();
+        let mut first = pipeline.start(&query, None).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut second = pipeline.start(&query).unwrap();
+        let mut second = pipeline.start(&query, None).unwrap();
         assert_eq!(batches(&mut first), batches(&mut second));
         // Ours, the pipeline's step, and a state for each run.
         assert_eq!(Rc::strong_count(&live), 4);
@@ -941,7 +947,7 @@ mod tests {
     fn states_allocate_and_can_fail() {
         let boxed = pipeline(Numbers { batches: 1 }, [transform(Boxed { fail: false })]);
         let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut boxed.start(&query).unwrap()), [[[0, 0, 7], [1, -1, 7]]]);
+        assert_eq!(batches(&mut boxed.start(&query, None).unwrap()), [[[0, 0, 7], [1, -1, 7]]]);
 
         // The states made before the one that fails are dropped.
         let live = Rc::new(());
@@ -949,7 +955,7 @@ mod tests {
         let steps = [transform(position), transform(Boxed { fail: true })];
         let failing = pipeline(Numbers { batches: 1 }, steps);
         let query = QueryAllocators::new(&Heap);
-        assert!(failing.start(&query).is_err());
+        assert!(failing.start(&query, None).is_err());
         assert_eq!(Rc::strong_count(&live), 2);
     }
 
@@ -957,7 +963,7 @@ mod tests {
     fn passes_selections_on_and_skips_batches_with_none() {
         let even = pipeline(Numbers { batches: 3 }, [transform(KeepEven), transform(KeepEven)]);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = even.start(&query).unwrap();
+        let mut execution = even.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut kept = alloc::vec::Vec::new();
         while execution.next(&mut batch).unwrap() {
@@ -969,18 +975,18 @@ mod tests {
 
         let none = pipeline(Numbers { batches: 3 }, [transform(KeepNone)]);
         let query = QueryAllocators::new(&Heap);
-        assert!(!none.start(&query).unwrap().next(&mut RowBatch::new()).unwrap());
+        assert!(!none.start(&query, None).unwrap().next(&mut RowBatch::new()).unwrap());
         // Steps after one that keeps no rows don't run: this one would fail.
         let stopped =
             pipeline(Numbers { batches: 3 }, [transform(KeepNone), transform(FailSecond)]);
-        assert_eq!(stopped.start(&query).unwrap().next(&mut RowBatch::new()), Ok(false));
+        assert_eq!(stopped.start(&query, None).unwrap().next(&mut RowBatch::new()), Ok(false));
     }
 
     #[test]
     fn a_failing_step_ends_the_run() {
         let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond)]);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = failing.start(&query).unwrap();
+        let mut execution = failing.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         assert_eq!(execution.next(&mut batch), Ok(true));
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
@@ -992,7 +998,7 @@ mod tests {
     fn operators_dont_finish_after_a_failure_before_them() {
         let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond), operator(Sum)]);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = failing.start(&query).unwrap();
+        let mut execution = failing.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         // A sum of the first batch alone would be wrong.
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));

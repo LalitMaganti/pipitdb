@@ -157,7 +157,7 @@ mod tests {
         assert!(steps.push(Step::Operator(limit)).is_ok());
         let pipeline = Pipeline::new(source, steps);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query).unwrap();
+        let mut execution = pipeline.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut rows = Vec::new();
         while execution.next(&mut batch).unwrap() {

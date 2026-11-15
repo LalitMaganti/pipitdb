@@ -247,7 +247,7 @@ mod tests {
         let plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
         let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
@@ -382,7 +382,7 @@ mod tests {
         let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
         let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
     }
@@ -500,7 +500,7 @@ mod tests {
         pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
         let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let values = batch.column(physical.columns()[0].position).int64s().to_vec();

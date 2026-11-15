@@ -122,16 +122,18 @@ fn filter(c: &mut Criterion) {
     for shape in ["and", "or", "not"] {
         let predicate = pipitdb_bench::predicate(shape);
         group.bench_function(shape, |b| {
-            b.iter(|| pipitdb_bench::run_predicate(black_box(&predicate), &plain, 1000));
+            b.iter(|| pipitdb_bench::run_predicate(black_box(&predicate), None, &plain, 1000));
         });
     }
     // A string filter over flat strings, and over a dictionary each batch
     // shares, as a chunk's do: its eight entries are tested once.
-    let ipad = pipitdb_bench::ipad_predicate();
+    let (ipad, literals) = pipitdb_bench::ipad_predicate();
     let dictionary = pipitdb_bench::string_dictionary();
     for (name, column) in [("string_flat", &strings), ("string_dictionary", &dictionary)] {
         group.bench_function(name, |b| {
-            b.iter(|| pipitdb_bench::run_predicate(black_box(&ipad), column, 1000));
+            b.iter(|| {
+                pipitdb_bench::run_predicate(black_box(&ipad), Some(&literals), column, 1000)
+            });
         });
     }
     group.finish();

@@ -156,7 +156,7 @@ pub extern "C" fn spill_round_trip(value: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn run_column(value: i64) -> i64 {
     let query = QueryAllocators::new(&Heap);
-    let mut context = Context::for_query(&query);
+    let mut context = Context::for_query(&query, None);
     let Ok(mut values) = context.values_buffer(8) else { return 0 };
     values.as_mut_slice::<i64>()[0] = value;
     let Ok(column) = ColumnView::new(&mut context, DataType::Int64, values, None) else {
@@ -309,7 +309,9 @@ pub unsafe extern "C" fn query_rows(
     let Ok(planned) = plan_nodes(&Heap, &plan) else { return u32::MAX };
     let Ok(physical) = lower(&Heap, &plan, &planned) else { return u32::MAX };
     let allocators = QueryAllocators::new(&Heap);
-    let Ok(mut execution) = physical.pipeline().start(&allocators) else { return u32::MAX };
+    let Ok(mut execution) = physical.pipeline().start(&allocators, plan.literals()) else {
+        return u32::MAX;
+    };
     let mut batch = RowBatch::new();
     let mut rows = 0;
     loop {

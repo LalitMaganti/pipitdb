@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(names, ["b", "a"]);
 
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
@@ -530,7 +530,7 @@ mod tests {
 
         let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
@@ -640,7 +640,7 @@ mod tests {
 
         let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);
@@ -869,7 +869,7 @@ mod tests {
 
         let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         let (mut kept, mut rows) = (StdVec::new(), 0);
         while execution.next(&mut batch).unwrap() {
@@ -1087,7 +1087,7 @@ mod tests {
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
         let physical = lower_planned(&plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.pipeline().start(&query, plan.literals()).unwrap();
         let mut batch = RowBatch::new();
         let mut row = StdVec::new();
         if execution.next(&mut batch).unwrap() {
