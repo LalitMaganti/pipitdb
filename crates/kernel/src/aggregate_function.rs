@@ -4,13 +4,12 @@
 
 use crate::aggregate::Function;
 use crate::allocator::{AllocError, Allocator};
+use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Validity};
 use crate::context::Context;
 use crate::error::Error;
-use crate::group_table::GROUPS_MAX;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::slow_vec::SlowVec;
 
 /// What an aggregate reads of one batch: a value a row, contiguous, and
 /// which rows hold one.
@@ -71,35 +70,48 @@ impl AggregateInputLoader {
     }
 }
 
-/// Where each group's state for one aggregate is: group g's words start at
-/// `g * stride` of `words`. For a function that tracks seen, byte g of
-/// `seen` is 1 once group g has added a value, or `seen` is `None` if every
-/// group has: see `SeenBytes`.
+/// Where each group's state for one aggregate is: group g's record is in
+/// block `g >> BLOCK_SHIFT`, `stride` words a record, and the state starts
+/// `offset` words in. For a function that tracks seen, group g's byte in the
+/// blocks `seen` starts is 1 once it has added a value, or `seen` is `None`
+/// if every group has: see `SeenBytes`.
 pub(crate) struct GroupStates<'a> {
-    pub(crate) words: &'a mut [i64],
+    pub(crate) blocks: &'a [*mut i64],
     pub(crate) stride: usize,
-    pub(crate) seen: Option<&'a mut [u8]>,
+    pub(crate) offset: usize,
+    pub(crate) seen: Option<&'a [*mut u8]>,
 }
 
 impl GroupStates<'_> {
+    /// Where `group`'s state starts. Callers pass only groups that exist.
+    #[inline]
+    fn state(&self, group: u32) -> *mut i64 {
+        // SAFETY: the group exists, so its record does, with its state in it.
+        unsafe { address(self.blocks, self.stride, group as usize).add(self.offset) }
+    }
+
     /// The first word of `group`'s state.
     fn word(&self, group: u32) -> i64 {
-        *at!(self.words, group as usize * self.stride)
+        // SAFETY: as `state` promises.
+        unsafe { *self.state(group) }
     }
 
     fn word_mut(&mut self, group: u32) -> &mut i64 {
-        at_mut!(self.words, group as usize * self.stride)
+        // SAFETY: as `state` promises.
+        unsafe { &mut *self.state(group) }
     }
 
     /// Whether `group` has seen a value.
     fn seen(&self, group: u32) -> bool {
-        self.seen.as_ref().is_none_or(|seen| *at!(seen, group as usize) != 0)
+        // SAFETY: the group exists, so its byte does.
+        self.seen.is_none_or(|seen| unsafe { *address(seen, 1, group as usize) } != 0)
     }
 
     /// Marks `group` seen if `valid`.
     fn mark(&mut self, group: u32, valid: bool) {
-        if let Some(seen) = &mut self.seen {
-            *at_mut!(seen, group as usize) |= u8::from(valid);
+        if let Some(seen) = self.seen {
+            // SAFETY: the group exists, so its byte does.
+            unsafe { *address(seen, 1, group as usize) |= u8::from(valid) };
         }
     }
 }
@@ -111,7 +123,7 @@ impl GroupStates<'_> {
 /// each other.
 pub(crate) struct SeenBytes {
     /// A byte a group, once tracking.
-    bytes: SlowVec<u8>,
+    bytes: Blocks<u8>,
     /// Whether an input row has been null.
     tracking: bool,
     /// How many groups there were when last asked.
@@ -120,35 +132,33 @@ pub(crate) struct SeenBytes {
 
 impl SeenBytes {
     pub(crate) fn new(allocator: &dyn Allocator) -> Result<SeenBytes, AllocError> {
-        Ok(SeenBytes { bytes: SlowVec::new(allocator, GROUPS_MAX)?, tracking: false, groups: 0 })
+        Ok(SeenBytes { bytes: Blocks::new(allocator, 1)?, tracking: false, groups: 0 })
     }
 
     /// What to pass as `GroupStates::seen` for a batch with `groups` groups
     /// in all, whose input holds nulls if `nulls`.
     pub(crate) fn get(
         &mut self,
+        allocator: &dyn Allocator,
         groups: usize,
         nulls: bool,
-    ) -> Result<Option<&mut [u8]>, AllocError> {
+    ) -> Result<Option<&[*mut u8]>, AllocError> {
         if !self.tracking && !nulls {
             self.groups = groups;
             return Ok(None);
         }
+        // New groups' bytes start zeroed.
+        self.bytes.reserve(allocator, groups)?;
         if !self.tracking {
             // Every group so far added only values.
             self.tracking = true;
-            let ones = [1; 64];
-            let mut left = self.groups;
-            while left > 0 {
-                let n = left.min(ones.len());
-                self.bytes.extend_from_slice(at!(ones, ..n))?;
-                left -= n;
+            for group in 0..self.groups {
+                // SAFETY: room for the group was reserved above.
+                unsafe { *self.bytes.record_ptr(group) = 1 };
             }
         }
-        let new = groups - self.bytes.len();
-        self.bytes.extend_zeroed(new)?;
         self.groups = groups;
-        Ok(Some(&mut self.bytes))
+        Ok(Some(self.bytes.starts()))
     }
 }
 
@@ -244,19 +254,11 @@ fn scatter(
     mut add: impl FnMut(&mut [i64], i64, bool),
 ) {
     let rows = input.rows;
-    let GroupStates { words: states, stride, mut seen } = states;
+    let mut states = states;
+    let seen = states.seen.take();
     let values = if input.values.is_empty() { None } else { Some(input.values) };
     check!(groups.len() >= rows && values.is_none_or(|values| values.len() >= rows));
     check!(input.valid.is_none_or(|valid| valid.len() >= rows.div_ceil(64)));
-    if cfg!(debug_assertions) {
-        let groups = at!(groups, ..rows).iter();
-        let room = |group: usize| {
-            group * stride + words <= states.len()
-                && seen.as_ref().is_none_or(|seen| group < seen.len())
-        };
-        check!(groups.copied().all(|group| room(group as usize)));
-    }
-    let base = states.as_mut_ptr();
     for row in 0..rows {
         // SAFETY: the bounds are checked above, and each number is a group's,
         // whose state is in `states`, and whose byte is in `seen`.
@@ -264,11 +266,11 @@ fn scatter(
             let valid = input
                 .valid
                 .is_none_or(|valid| *valid.get_unchecked(row / 64) >> (row % 64) & 1 != 0);
-            let group = *groups.get_unchecked(row) as usize;
+            let group = *groups.get_unchecked(row);
             let value = values.map_or(0, |values| *values.get_unchecked(row));
-            add(core::slice::from_raw_parts_mut(base.add(group * stride), words), value, valid);
-            if let Some(seen) = &mut seen {
-                *seen.get_unchecked_mut(group) |= u8::from(valid);
+            add(core::slice::from_raw_parts_mut(states.state(group), words), value, valid);
+            if let Some(seen) = seen {
+                *address(seen, 1, group as usize) |= u8::from(valid);
             }
         }
     }
@@ -324,14 +326,9 @@ impl AggregateFunction for CountStar {
     }
 
     fn update(&self, _: &AggregateInput, groups: &[u32], states: GroupStates, _: &mut bool) {
-        let GroupStates { words, stride, .. } = states;
-        if cfg!(debug_assertions) {
-            check!(groups.iter().all(|&group| group as usize * stride < words.len()));
-        }
-        let words = words.as_mut_ptr();
         for &group in groups {
-            // SAFETY: each number is a group's, whose state is in `words`.
-            unsafe { *words.add(group as usize * stride) += 1 };
+            // SAFETY: each number is a group's, whose state exists.
+            unsafe { *states.state(group) += 1 };
         }
     }
 
@@ -524,8 +521,8 @@ fn set_int128(state: &mut [i64], sum: i128) {
 impl Avg {
     /// Group `group`'s state.
     fn state<'s>(states: &'s GroupStates, group: u32) -> &'s [i64] {
-        let start = group as usize * states.stride;
-        at!(states.words, start..=start + AVG_COUNT)
+        // SAFETY: the group exists, and an `Avg` state is `AVG_COUNT + 1` words.
+        unsafe { core::slice::from_raw_parts(states.state(group), AVG_COUNT + 1) }
     }
 }
 
@@ -550,8 +547,8 @@ impl AggregateFunction for Avg {
     }
 
     fn update_group(&self, input: &AggregateInput, group: u32, states: GroupStates, _: &mut bool) {
-        let start = group as usize * states.stride;
-        let state = at_mut!(states.words, start..=start + AVG_COUNT);
+        // SAFETY: the group exists, and an `Avg` state is `AVG_COUNT + 1` words.
+        let state = unsafe { core::slice::from_raw_parts_mut(states.state(group), AVG_COUNT + 1) };
         set_int128(state, int128(state) + batch_sum(input));
         *at_mut!(state, AVG_COUNT) += i64::try_from(input.count_valid()).unwrap_or(0);
     }

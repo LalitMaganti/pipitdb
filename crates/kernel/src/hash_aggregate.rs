@@ -66,31 +66,31 @@ impl HashAggregate {
         HashAggregate { spec, state_words }
     }
 
-    /// The states of every group, from the first, and how many words apart
-    /// groups' states are.
+    /// Where each block of groups' records starts, how many words apart
+    /// records are, and where their states start: `total`'s, a block of one,
+    /// without keys.
     fn state_base<'s>(
         &self,
         groups: &'s mut GroupTable,
-        total: &'s mut [i64],
-    ) -> (&'s mut [i64], usize) {
+        total: &'s [*mut i64],
+    ) -> (&'s [*mut i64], usize, usize) {
         if self.spec.key_columns.is_empty() {
-            return (total, self.state_words);
+            return (total, self.state_words, 0);
         }
         let stride = groups.row_stride();
-        (groups.payloads(), stride)
+        let (blocks, start) = groups.payloads();
+        (blocks, stride, start)
     }
 
     /// The states of the aggregate whose words start at `offset` of each
     /// group's, with `seen`.
     fn states<'s>(
-        base: &'s mut [i64],
-        stride: usize,
+        base: (&'s [*mut i64], usize, usize),
         offset: usize,
-        seen: Option<&'s mut [u8]>,
+        seen: Option<&'s [*mut u8]>,
     ) -> GroupStates<'s> {
-        // No groups, no words.
-        let words = base.get_mut(offset..).unwrap_or_default();
-        GroupStates { words, stride, seen }
+        let (blocks, stride, start) = base;
+        GroupStates { blocks, stride, offset: start + offset, seen }
     }
 
     fn group_count(&self, state: &State) -> usize {
@@ -255,7 +255,8 @@ impl Breaker for HashAggregate {
         }
         let group_count = self.group_count(state);
         let State { groups, total, seen, distinct, .. } = state;
-        let (base, stride) = self.state_base(groups, total);
+        let total = [total.as_mut_ptr()];
+        let base = self.state_base(groups, &total);
         let mut overflow = false;
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
@@ -266,11 +267,11 @@ impl Breaker for HashAggregate {
                 loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
             }
             let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(group_count, loaded.valid.is_some())?
+                at_mut!(seen, a).get(context.allocator(), group_count, loaded.valid.is_some())?
             } else {
                 None
             };
-            let states = Self::states(base, stride, offset, seen);
+            let states = Self::states(base, offset, seen);
             offset += function.state_words();
             let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
             if let Some(set) = at_mut!(distinct, a) {
@@ -321,18 +322,19 @@ impl Breaker for HashAggregate {
             *number = group as u32;
         }
         let State { groups: table, total, seen, consumed, .. } = state;
-        let (base, stride) = self.state_base(table, total);
+        let total = [total.as_mut_ptr()];
+        let base = self.state_base(table, &total);
         let mut offset = 0;
         for (a, call) in self.spec.aggregates.iter().enumerate() {
             let function = make_aggregate_function(call.function);
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
             let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(groups, !*consumed)?
+                at_mut!(seen, a).get(context.allocator(), groups, !*consumed)?
             } else {
                 None
             };
-            let states = Self::states(base, stride, offset, seen);
+            let states = Self::states(base, offset, seen);
             offset += function.state_words();
             let output_type = call.function.output_type();
             let column = finalize_to_buffer(context, function, output_type, states, numbers)?;
