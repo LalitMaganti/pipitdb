@@ -411,17 +411,17 @@ pub(crate) fn sort_row_layout(
     if in_words {
         fixed = Some(SlowVec::fixed_from(allocator, rows.get(0).iter().copied())?);
     }
-    let mut words = Array::zeroed(allocator, count as usize)?;
-    for from in (0..count).step_by(BATCH_ROWS_MAX as usize) {
-        let to = count.min(from + BATCH_ROWS_MAX);
-        let out = at_mut!(words, from as usize..to as usize).iter_mut();
-        for (out, r) in out.zip(from..to) {
-            *out = packing.word(row_layout.get(r), first, r);
+    let batch = BATCH_ROWS_MAX as usize;
+    let mut words = Array::from_chunks(allocator, count as usize, batch, |start, out| {
+        #[expect(clippy::cast_possible_truncation, reason = "below `count`")]
+        let (from, to) = (start as u32, (start + out.len()) as u32);
+        for (out, r) in out.iter_mut().zip(from..to) {
+            out.write(packing.word(row_layout.get(r), first, r));
         }
         if in_words {
             row_layout.let_go_below(to, true);
         }
-    }
+    })?;
     if in_words {
         row_layout.free();
     }
