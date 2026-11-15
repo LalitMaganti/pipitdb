@@ -63,6 +63,9 @@ pub(crate) struct GroupTable {
     /// Where a record's keys start: after its null word, if a key can be
     /// null, else first.
     first: usize,
+    /// Bit `k` set if key `k` isn't a string and can be null. Others' null
+    /// bits are never kept, even if their batches carry them.
+    nullable: u64,
     /// How many keys there are.
     keys: usize,
     /// Bit `k` set if key `k` is a string, stored as its id, which is 0 if
@@ -105,13 +108,16 @@ impl GroupTable {
     ) -> Result<GroupTable, AllocError> {
         check!(keys <= KEYS_MAX);
         // A null string is a key of its own, so only other keys need the word.
-        let first = usize::from(nullable_keys & !string_keys != 0);
+        let all = if keys == KEYS_MAX { u64::MAX } else { (1 << keys) - 1 };
+        let nullable = nullable_keys & !string_keys & all;
+        let first = usize::from(nullable != 0);
         let stride = first + keys + payload_words;
         Ok(GroupTable {
             slots: SlowVec::new(allocator, 1)?,
             records: Blocks::new(allocator, stride)?,
             stride,
             first,
+            nullable,
             keys,
             string_keys,
             dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
@@ -166,7 +172,8 @@ impl GroupTable {
                 let interned = at_mut!(self.dictionaries, k);
                 load_string_ids(context, interned, column, select, count, copy, None)?;
             } else {
-                load_key_words(context, column, select, count, k, copy, &mut nulls)?;
+                let nulls = if self.nullable >> k & 1 != 0 { Some(&mut nulls) } else { None };
+                load_key_words(context, column, select, count, k, copy, nulls)?;
             }
         }
         let mut keys: [&[i64]; KEYS_MAX] = [&[]; KEYS_MAX];
@@ -586,7 +593,8 @@ fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error
 /// Loads `count` rows that `select` keeps of key column `column`, all if
 /// it's empty, as words: copied to `copy` unless every row is kept and none
 /// is null, and 0 where null. Sets bit `k` of each null row's word in
-/// `nulls`, made when the first column with nulls is.
+/// `nulls`, made when the first column with nulls is, unless it's `None`, for
+/// a key that can't be null: then its validity, if any, isn't read.
 fn load_key_words(
     context: &mut Context,
     column: &ColumnView,
@@ -594,10 +602,11 @@ fn load_key_words(
     count: usize,
     k: usize,
     copy: &mut Option<Buffer>,
-    nulls: &mut Option<Buffer>,
+    nulls: Option<&mut Option<Buffer>>,
 ) -> Result<(), Error> {
     let values = column.int64s();
-    let Some(validity) = column.validity() else {
+    // A key that can't be null is read without its validity, if it has one.
+    let (Some(validity), Some(nulls)) = (column.validity(), nulls) else {
         gathered(context, select, values, copy)?;
         return Ok(());
     };
