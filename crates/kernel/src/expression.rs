@@ -482,12 +482,16 @@ impl Typer<'_> {
 /// The type `expr` computes, given each column's type, as compiling checks
 /// it.
 /// Whether `expr` can compute a null, given whether each column it reads
-/// can hold one: it can if one can, or if it divides, by zero perhaps, or
-/// has a `NULL`.
+/// can hold one: it can if one can, or if it divides by what may be zero,
+/// anything but a constant that isn't, or has a `NULL`.
 pub fn expr_can_be_null(expr: &Expr, nullable_of: &dyn Fn(ColumnId) -> bool) -> bool {
+    let nonzero = |node: &ExprStep| {
+        node.op == ExprOp::Constant && (node.int_value != 0 || node.double_value != 0.0)
+    };
     expr.nodes.iter().any(|node| match node.op {
         ExprOp::Column => nullable_of(node.a),
-        ExprOp::Div | ExprOp::Mod | ExprOp::Null => true,
+        ExprOp::Div | ExprOp::Mod => expr.nodes.get(node.b as usize).is_none_or(|b| !nonzero(b)),
+        ExprOp::Null => true,
         _ => false,
     })
 }

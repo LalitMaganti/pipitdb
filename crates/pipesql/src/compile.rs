@@ -345,13 +345,14 @@ mod tests {
     #[test]
     fn knows_which_columns_can_be_null() {
         let catalog = catalog();
-        let query = b"FROM t |> EXTEND a + 1 AS x, a / 2 AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
+        let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
         let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
         let nullable = |name: &str| {
             let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
             column.unwrap().nullable
         };
-        // The table has no nulls; dividing may make one, and a sum of none is one.
+        // The table has no nulls; dividing by a column may make one, and a
+        // sum of none is one, but dividing by a constant that isn't zero can't.
         assert!(!nullable("a") && !nullable("x") && !nullable("c"));
         assert!(nullable("y") && nullable("total"));
     }
