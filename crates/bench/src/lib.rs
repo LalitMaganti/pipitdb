@@ -11,7 +11,7 @@ use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
-use pipit_kernel::pipeline::Pipeline;
+use pipit_kernel::pipeline::{Execution, Pipeline};
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
@@ -269,7 +269,19 @@ impl Operator for PassOperator {
 /// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
     let query = QueryAllocators::new(&Heap);
-    let Ok(mut execution) = pipeline.start(&query, None) else { return 0 };
+    let Ok(execution) = pipeline.start(&query, None) else { return 0 };
+    count(execution)
+}
+
+/// Runs `plan`, returning the rows out.
+pub fn run_plan(plan: &PhysicalPlan) -> u64 {
+    let query = QueryAllocators::new(&Heap);
+    let Ok(execution) = plan.start(&query) else { return 0 };
+    count(execution)
+}
+
+/// The rows `execution` puts out.
+fn count(mut execution: Execution<'_>) -> u64 {
     let mut batch = RowBatch::new();
     let mut rows = 0;
     while execution.next(&mut batch) == Ok(true) {
@@ -284,13 +296,13 @@ pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'
     let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
     optimize(&Heap, &mut plan).ok()?;
     let planned = plan_nodes(&Heap, &plan).ok()?;
-    lower(&Heap, &plan, &planned).ok()
+    lower(&Heap, &mut plan, &planned).ok()
 }
 
 /// Plans and runs `query` over `catalog`, as an embedder would each query,
 /// returning the rows out.
 pub fn plan_and_run(catalog: &'static dyn Catalog, query: &str) -> u64 {
-    plan(catalog, query).map_or(0, |plan| run(plan.pipeline()))
+    plan(catalog, query).map_or(0, |plan| run_plan(&plan))
 }
 
 /// The table `t`.
