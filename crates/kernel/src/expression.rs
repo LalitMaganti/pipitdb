@@ -233,12 +233,22 @@ fn run(
             }
             ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
-            ExprOp::Coalesce => choose(context, step, registers)?,
+            ExprOp::Coalesce => {
+                let (x, y) = (register(registers, step.a), register(registers, step.b));
+                pick(context, 1, &|_| (None, x), y)?
+            }
             ExprOp::When => {
                 *at_mut!(registers, i) = None;
                 continue;
             }
-            ExprOp::Case => case(context, step, &program.steps, registers)?,
+            ExprOp::Case => {
+                let whens = at!(program.steps, step.a as usize..(step.a + step.b) as usize);
+                let branch = |k: usize| {
+                    let when = at!(whens, k);
+                    (Some(register(registers, when.a)), register(registers, when.b))
+                };
+                pick(context, whens.len(), &branch, register(registers, step.c))?
+            }
         };
         *at_mut!(registers, i) = Some(value);
     }
@@ -437,150 +447,127 @@ fn null_test(
     ColumnView::new(context, DataType::Int64, values, None)
 }
 
-/// `step`, a `Coalesce`: each row's value from its first register, unless
-/// that's null, else from its second.
-#[inline(never)]
-fn choose(
-    context: &mut Context,
-    step: &ExprStep,
-    registers: &[Option<ColumnView>],
-) -> Result<ColumnView, AllocError> {
-    let (x, y) = (register(registers, step.a), register(registers, step.b));
-    if x.validity().is_none() {
-        return Ok(x.clone());
-    }
-    let rows = x.row_count() as usize;
-    let mut take = context.values_buffer(rows * 8)?;
-    present(x.validity(), false, take.as_mut_slice());
-    if take.as_slice::<i64>().iter().all(|&t| t == 0) && y.validity().is_none() {
-        return Ok(y.clone());
-    }
-    let take = take.as_slice::<i64>();
-    let validity = chosen_validity(context, x, y, take)?;
-    if x.data_type() != DataType::String {
-        let mut values = context.values_buffer(rows * 8)?;
-        blend(x.values().words(), y.values().words(), take, values.as_mut_slice());
-        return ColumnView::new(context, x.data_type(), values, validity);
-    }
-    let mut which = context.values_buffer(rows * 8)?;
-    for (o, &take) in which.as_mut_slice::<i64>().iter_mut().zip(take) {
-        *o = 1 - take;
-    }
-    choose_strings(context, &[x, y], which.as_slice(), validity)
-}
+/// The branch `k` of a choice: its condition, or `None` to take the rows
+/// where its value isn't null, and its value.
+type Branch<'r> = dyn Fn(usize) -> (Option<&'r ColumnView>, &'r ColumnView) + 'r;
 
-/// `step`, a `Case`: each row's value from the first of its branches whose
-/// condition is true, else from its `ELSE`. Going through the branches in
-/// order, a mask of 0s and 1s picks the rows each takes, and numbers are
-/// blended through it, so the loops vectorize; strings keep which branch each
-/// row took, then copy the chosen ones' bytes once. Validity is worked out a
-/// word at a time.
+/// Each row's value from the first of `branches` branches that takes it,
+/// else from `otherwise`: a `Case`'s or a `Coalesce`'s. Going through them in
+/// order, a mask of 0s and 1s picks the rows each takes, and values are
+/// blended through it, so the loops vectorize; strings keep which branch
+/// each row took, then copy the chosen ones' bytes once. Validity is worked
+/// out a word at a time.
 #[inline(never)]
-fn case(
+fn pick<'r>(
     context: &mut Context,
-    step: &ExprStep,
-    steps: &[ExprStep],
-    registers: &[Option<ColumnView>],
+    branches: usize,
+    branch: &Branch<'r>,
+    otherwise: &'r ColumnView,
 ) -> Result<ColumnView, AllocError> {
-    let otherwise = register(registers, step.c);
-    let branches = at!(steps, step.a as usize..(step.a + step.b) as usize);
     let rows = otherwise.row_count() as usize;
     let strings = otherwise.data_type() == DataType::String;
-    let nullable = otherwise.validity().is_some()
-        || branches.iter().any(|when| register(registers, when.b).validity().is_some());
-    // 1 for each row no branch has taken yet, once a branch has run.
+    let nullable =
+        otherwise.validity().is_some() || (0..branches).any(|k| branch(k).1.validity().is_some());
+    // 1 for each row no branch has taken yet, once the first has run.
     let mut undecided = context.values_buffer(rows * 8)?;
     // 1 where the branch takes the row.
     let mut take = context.values_buffer(rows * 8)?;
-    // Each row's value, or for strings the branch it took, the `ELSE` last.
+    // Each row's value, or for strings the branch it took, the `ELSE` last,
+    // once a branch has taken a row.
     let mut out = context.values_buffer(rows * 8)?;
+    if strings {
+        #[expect(clippy::cast_possible_wrap, reason = "a step's branches")]
+        out.as_mut_slice::<i64>().fill(branches as i64);
+    }
     // Each row's presence, a bit each.
     let mut present_out = [0_u64; BATCH_ROWS_MAX as usize / 64];
     let present_out = at_mut!(present_out, ..rows.div_ceil(64));
     for (i, bits) in present_out.iter_mut().enumerate() {
         *bits = word(otherwise.validity(), i * 64, (rows - i * 64).min(64));
     }
-    let mut started = false;
-    for (k, when) in branches.iter().enumerate() {
-        let (condition, value) = (register(registers, when.a), register(registers, when.b));
-        let last = k + 1 == branches.len();
+    // A column every row takes as it is, if one is.
+    let mut whole = Some(otherwise);
+    for k in 0..branches {
+        let (condition, value) = branch(k);
         let take = take.as_mut_slice::<i64>();
-        present(condition.validity(), false, take);
-        let undecided = undecided.as_mut_slice::<i64>();
-        let mut taken = 0;
-        for ((t, u), &c) in take.iter_mut().zip(undecided.iter_mut()).zip(condition.int64s()) {
-            *t &= i64::from(c != 0) & if k == 0 { 1 } else { *u };
-            if !last {
-                *u = if k == 0 { 1 - *t } else { *u & !*t };
-            }
-            taken += *t;
-        }
+        present(condition.unwrap_or(value).validity(), false, take);
+        let condition = condition.map(ColumnView::int64s);
+        let undecided = (branches > 1).then(|| undecided.as_mut_slice());
+        let taken = decide(condition, k == 0, take, undecided);
         #[expect(clippy::cast_possible_wrap, reason = "a batch's rows")]
         if k == 0 && taken == rows as i64 {
-            return Ok(value.clone());
+            whole = Some(value);
+            break;
         }
         if taken == 0 {
             continue;
         }
-        let out = out.as_mut_slice::<i64>();
+        #[expect(clippy::cast_possible_wrap, reason = "a step's branches")]
         if strings {
-            #[expect(clippy::cast_possible_wrap, reason = "a step's branches")]
-            let (which, rest) = (k as i64, branches.len() as i64);
-            for (o, &t) in out.iter_mut().zip(take.iter()) {
-                let before = if started { *o } else { rest };
-                *o = before ^ (which ^ before) & -t;
-            }
-        } else if started {
-            blend_in(value.values().words(), take, out);
+            blend_in(&[k as i64], take, out.as_mut_slice());
+        } else if whole.is_some() {
+            // The first branch to take a row: `ELSE` for the rest.
+            blend(value.values().words(), otherwise.values().words(), take, out.as_mut_slice());
         } else {
-            blend(value.values().words(), otherwise.values().words(), take, out);
+            blend_in(value.values().words(), take, out.as_mut_slice());
         }
-        started = true;
+        whole = None;
         if nullable {
             take_presence(value, take, present_out);
         }
     }
-    if !started {
-        return Ok(otherwise.clone());
+    if let Some(whole) = whole {
+        return Ok(whole.clone());
     }
     let validity = if nullable { Some(pack_words(context, rows, present_out)?) } else { None };
     if !strings {
         return ColumnView::new(context, otherwise.data_type(), out, validity);
     }
-    let mut columns = SlowVec::fixed(context.allocator(), branches.len() + 1)?;
-    for when in branches {
-        columns.push(register(registers, when.b))?;
-    }
-    columns.push(otherwise)?;
-    choose_strings(context, &columns, out.as_slice(), validity)
+    let column = |k: usize| if k < branches { branch(k).1 } else { otherwise };
+    choose_strings(context, &column, out.as_slice(), validity)
 }
 
-/// Sets each bit of `present`, a row's presence, to `value`'s where `take` is
-/// 1, keeping it elsewhere.
-fn take_presence(value: &ColumnView, take: &[i64], present: &mut [u64]) {
-    for ((i, bits), take) in present.iter_mut().enumerate().zip(take.chunks(64)) {
-        let from = take.iter().enumerate().fold(0, |b, (k, &t)| b | t.cast_unsigned() << k);
-        *bits = from & word(value.validity(), i * 64, take.len()) | !from & *bits;
-    }
-}
-
-/// Sets `o` to `x` where `take` is 1, keeping it elsewhere.
+/// Narrows `take`, 1 for each row a branch's condition, or value, is present,
+/// to the rows `undecided`, or every row if `first`, and, if given,
+/// `condition` isn't zero at, and takes them out of `undecided`, which the
+/// first sets. A choice of one branch has no `undecided`. Returns how many it
+/// takes.
 #[inline(never)]
-fn blend_in(x: &[i64], take: &[i64], o: &mut [i64]) {
-    check!(x.len() >= o.len() && take.len() == o.len());
-    for ((o, &x), &take) in o.iter_mut().zip(x).zip(take) {
-        *o ^= (x ^ *o) & -take;
+fn decide(
+    condition: Option<&[i64]>,
+    first: bool,
+    take: &mut [i64],
+    undecided: Option<&mut [i64]>,
+) -> i64 {
+    check!(condition.is_none_or(|c| c.len() >= take.len()));
+    let holds = |row: usize| condition.map_or(1, |c| i64::from(*at!(c, row) != 0));
+    let mut taken = 0;
+    let Some(undecided) = undecided else {
+        for (row, t) in take.iter_mut().enumerate() {
+            *t &= holds(row);
+            taken += *t;
+        }
+        return taken;
+    };
+    check!(undecided.len() == take.len());
+    // All of a word's bits on the first, so `undecided`'s aren't read.
+    let all = -i64::from(first);
+    for (row, (t, u)) in take.iter_mut().zip(undecided).enumerate() {
+        *t &= (*u | all) & holds(row);
+        *u = (*u | all) & !*t;
+        taken += *t;
     }
+    taken
 }
 
-/// A validity of `rows` rows from `words`, a bit each.
-fn pack_words(context: &mut Context, rows: usize, words: &[u64]) -> Result<Buffer, AllocError> {
-    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
-    for (bytes, word) in buffer.as_mut_slice::<u8>().chunks_mut(8).zip(words) {
-        let word = word.to_le_bytes();
-        bytes.copy_from_slice(at!(word, ..bytes.len()));
+/// `x` where `take` is 1, else `y`, each a word: Int64s, or Float64s' bits.
+#[inline(never)]
+fn blend(x: &[i64], y: &[i64], take: &[i64], o: &mut [i64]) {
+    check!(x.len() >= o.len() && y.len() >= o.len() && take.len() == o.len());
+    for (((o, &x), &y), &take) in o.iter_mut().zip(x).zip(y).zip(take) {
+        // All ones where `take` is 1, so this picks without a branch.
+        *o = y ^ (x ^ y) & -take;
     }
-    Ok(buffer)
 }
 
 /// Writes 1 for each of `o`'s rows `validity` has present, else 0, or the
@@ -596,54 +583,55 @@ fn present(validity: Option<Validity>, null: bool, o: &mut [i64]) {
     }
 }
 
-/// `x` where `take` is 1, else `y`, each a word: Int64s, or Float64s' bits.
+/// Sets `o` to `x` where `take` is 1, keeping it elsewhere. `x` of one value
+/// is that value at every row.
 #[inline(never)]
-fn blend(x: &[i64], y: &[i64], take: &[i64], o: &mut [i64]) {
-    check!(x.len() >= o.len() && y.len() >= o.len() && take.len() == o.len());
-    for (((o, &x), &y), &take) in o.iter_mut().zip(x).zip(y).zip(take) {
-        // All ones where `take` is 1, so this picks without a branch.
-        *o = y ^ (x ^ y) & -take;
+fn blend_in(x: &[i64], take: &[i64], o: &mut [i64]) {
+    check!(take.len() == o.len());
+    if let [x] = *x {
+        for (o, &take) in o.iter_mut().zip(take) {
+            *o ^= (x ^ *o) & -take;
+        }
+        return;
+    }
+    check!(x.len() >= o.len());
+    for ((o, &x), &take) in o.iter_mut().zip(x).zip(take) {
+        *o ^= (x ^ *o) & -take;
     }
 }
 
-/// Which rows of a choice between `x` and `y` aren't null, row `r` `x`'s
-/// where `take` is 1: `None` if every row of both is present.
-fn chosen_validity(
-    context: &mut Context,
-    x: &ColumnView,
-    y: &ColumnView,
-    take: &[i64],
-) -> Result<Option<Buffer>, AllocError> {
-    if x.validity().is_none() && y.validity().is_none() {
-        return Ok(None);
+/// Sets each bit of `present`, a row's presence, to `value`'s where `take` is
+/// 1, keeping it elsewhere.
+fn take_presence(value: &ColumnView, take: &[i64], present: &mut [u64]) {
+    for ((i, bits), take) in present.iter_mut().enumerate().zip(take.chunks(64)) {
+        let from = take.iter().enumerate().fold(0, |b, (k, &t)| b | t.cast_unsigned() << k);
+        *bits = from & word(value.validity(), i * 64, take.len()) | !from & *bits;
     }
-    let rows = x.row_count() as usize;
+}
+
+/// A validity of `rows` rows from `words`, a bit each.
+fn pack_words(context: &mut Context, rows: usize, words: &[u64]) -> Result<Buffer, AllocError> {
     let mut buffer = context.small_buffer(rows.div_ceil(8))?;
-    for ((i, bytes), take) in
-        buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate().zip(take.chunks(64))
-    {
-        let (at, count) = (i * 64, take.len());
-        let from_x = take.iter().enumerate().fold(0, |bits, (k, &t)| bits | t.cast_unsigned() << k);
-        let word = from_x & word(x.validity(), at, count) | !from_x & word(y.validity(), at, count);
+    for (bytes, word) in buffer.as_mut_slice::<u8>().chunks_mut(8).zip(words) {
         let word = word.to_le_bytes();
         bytes.copy_from_slice(at!(word, ..bytes.len()));
     }
-    Ok(Some(buffer))
+    Ok(buffer)
 }
 
-/// The strings of a choice among `columns`, row `r` from column `which[r]`:
-/// the chosen ones' bytes, copied into one buffer. A null's view may not be
-/// of its bytes, so it's left empty.
-fn choose_strings(
+/// The strings of a choice, row `r` from `column(which[r])`: the chosen
+/// ones' bytes, copied into one buffer. A null's view may not be of its
+/// bytes, so it's left empty.
+fn choose_strings<'r>(
     context: &mut Context,
-    columns: &[&ColumnView],
+    column: &dyn Fn(usize) -> &'r ColumnView,
     which: &[i64],
     validity: Option<Buffer>,
 ) -> Result<ColumnView, AllocError> {
     let rows = which.len();
     let chosen = |row: usize| {
         let Ok(k) = usize::try_from(*at!(which, row)) else { failed!() };
-        let column = *at!(columns, k);
+        let column = column(k);
         #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
         let null = column.is_null(row as u32);
         if null { &[][..] } else { column.string_values().get(row) }
@@ -746,6 +734,7 @@ fn validity(
 
 /// Which of the `count` rows from `at`, a multiple of 64, aren't null, as
 /// the bits of a word.
+#[inline(never)]
 fn word(validity: Option<Validity>, at: usize, count: usize) -> u64 {
     let Some(validity) = validity else { return u64::MAX };
     let (bits, shift) = validity.bits();
