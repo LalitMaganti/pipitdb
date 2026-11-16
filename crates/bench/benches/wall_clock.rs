@@ -43,11 +43,11 @@ fn small(c: &mut Criterion) {
         b.iter(|| pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)));
     });
     group.bench_function("point_planned", |b| {
-        b.iter(|| pipitdb_bench::run(black_box(plan.pipeline())));
+        b.iter(|| pipitdb_bench::run_plan(black_box(&plan)));
     });
     let order = pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b");
     group.bench_function("order", |b| {
-        b.iter(|| pipitdb_bench::run(black_box(order.pipeline())));
+        b.iter(|| pipitdb_bench::run_plan(black_box(&order)));
     });
     group.finish();
 }
@@ -97,7 +97,7 @@ fn slices(c: &mut Criterion) {
     ];
     for (name, query) in queries {
         let Some(plan) = pipitdb_bench::real::slice_query(slices, query) else { continue };
-        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run(black_box(plan.pipeline()))));
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
     }
     group.finish();
 }
@@ -146,7 +146,7 @@ fn perfetto_filter(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1 << 20));
     for (i, (name, _)) in pipitdb_bench::PERFETTO_FILTERS.iter().enumerate() {
         let plan = pipitdb_bench::perfetto_filter_plan(i);
-        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run(black_box(plan.pipeline()))));
+        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
     }
     group.finish();
 }

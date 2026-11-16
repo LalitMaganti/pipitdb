@@ -307,9 +307,9 @@ pub unsafe extern "C" fn query_rows(
         return u32::MAX;
     }
     let Ok(planned) = plan_nodes(&Heap, &plan) else { return u32::MAX };
-    let Ok(physical) = lower(&Heap, &plan, &planned) else { return u32::MAX };
+    let Ok(physical) = lower(&Heap, &mut plan, &planned) else { return u32::MAX };
     let allocators = QueryAllocators::new(&Heap);
-    let Ok(mut execution) = physical.pipeline().start(&allocators, plan.literals()) else {
+    let Ok(mut execution) = physical.start(&allocators) else {
         return u32::MAX;
     };
     let mut batch = RowBatch::new();
