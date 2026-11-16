@@ -31,6 +31,7 @@ pub fn compile_expr(
             ExprError::Kinds => ErrorCode::ExpectedOneKind,
             ExprError::Types => ErrorCode::ExpectedOneType,
             ExprError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
+            ExprError::Strings => ErrorCode::ExpectedString,
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, span)
@@ -104,6 +105,10 @@ fn compile(
             push(compiler, nodes, constant)?;
         }
         Tag::Unary if node.operator() == Operator::Negate => negate(compiler, node, depth, nodes)?,
+        Tag::Unary if matches!(node.operator(), Operator::IsNull | Operator::IsNotNull) => {
+            null_test(compiler, node, depth, nodes)?;
+        }
+        Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -134,6 +139,42 @@ fn compile(
         }
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
     }
+    Ok(())
+}
+
+/// Appends the nodes of `x IS NULL` or `x IS NOT NULL`, the node `node`,
+/// `depth` deep.
+fn null_test(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let op = if node.operator() == Operator::IsNull { ExprOp::IsNull } else { ExprOp::IsNotNull };
+    compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let a = nodes.len() as u32 - 1;
+    push_node(nodes, expr_node(op, a, 0, 0), node, compiler)?;
+    Ok(())
+}
+
+/// Appends the nodes of `x LIKE 'pattern'`, the node `node`, `depth` deep.
+/// The pattern must be a string literal, as Perfetto's `GLOB`'s must.
+fn like(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let pattern = compiler.node(node.first_child() + 1);
+    if pattern.tag() != Tag::String {
+        return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(pattern)));
+    }
+    compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let a = nodes.len() as u32 - 1;
+    let pattern = string(compiler, pattern)?;
+    push_node(nodes, expr_node(ExprOp::Like, a, pattern.raw_id(), 0), node, compiler)?;
     Ok(())
 }
 

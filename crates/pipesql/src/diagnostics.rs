@@ -88,7 +88,8 @@ fn describe(found: &str, error: &Error) -> Message {
         | ErrorCode::ExpectedName
         | ErrorCode::ExpectedInteger
         | ErrorCode::ExpectedOneKind
-        | ErrorCode::ExpectedOneType => expression(error.code),
+        | ErrorCode::ExpectedOneType
+        | ErrorCode::ExpectedString => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -123,6 +124,7 @@ fn expression(code: ErrorCode) -> (String, String) {
             "a comparison needs values of one kind".into(),
             "this compares a number with a string".into(),
         ),
+        ErrorCode::ExpectedString => ("`LIKE` needs a string".into(), "this reads a number".into()),
         ErrorCode::ExpectedOneType => (
             "a comparison needs values of one type".into(),
             "multiply the integer by 1.0 to compare it as a double".into(),

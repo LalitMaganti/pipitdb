@@ -70,6 +70,8 @@ pub enum ErrorCode {
     /// A comparison of an integer with a double, unless the integer is a
     /// literal.
     ExpectedOneType = 31,
+    /// `LIKE` of a number.
+    ExpectedString = 32,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
