@@ -5,7 +5,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep};
+use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
@@ -195,14 +195,15 @@ pub fn compute_pipeline(
     let result = if comparison { DataType::Int64 } else { data_type };
     let (first, second) =
         (step(ExprOp::Column, data_type, 0, 0), step(ExprOp::Column, data_type, 1, 0));
-    let steps = if op == ExprOp::Case {
-        // `CASE WHEN first THEN second ELSE first END`.
+    let steps = if matches!(op, ExprOp::Case | ExprOp::When) {
+        // `iif(first, second, first)`, or for `When`, `coalesce(first,
+        // second)`: a `CASE` of one branch.
+        let (condition, value, otherwise) =
+            if op == ExprOp::Case { (0, 1, 0) } else { (PRESENT, 0, 1) };
         let mut case = step(ExprOp::Case, data_type, 2, 1);
-        case.c = 0;
-        SlowVec::fixed_from(
-            &Heap,
-            [first, second, step(ExprOp::When, data_type, 0, 1), case].into_iter(),
-        )
+        case.c = otherwise;
+        let when = step(ExprOp::When, data_type, condition, value);
+        SlowVec::fixed_from(&Heap, [first, second, when, case].into_iter())
     } else {
         SlowVec::fixed_from(&Heap, [first, second, step(op, result, 0, 1)].into_iter())
     };
@@ -240,7 +241,7 @@ pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 16] = [
     ("is_not_null", ExprOp::IsNotNull, DataType::Int64, true),
     // `iif`, as `CASE`, reads the first column as its condition, then chooses
     // the second or the first.
-    ("coalesce_int", ExprOp::Coalesce, DataType::Int64, true),
+    ("coalesce_int", ExprOp::When, DataType::Int64, true),
     ("iif_int", ExprOp::Case, DataType::Int64, false),
     ("iif_int_nullable", ExprOp::Case, DataType::Int64, true),
 ];
