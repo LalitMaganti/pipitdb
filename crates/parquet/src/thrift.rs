@@ -138,8 +138,33 @@ impl<'a> Cursor<'a> {
         Some(())
     }
 
+    /// Skips a value of type `kind`. Scalars are skipped here, without the
+    /// call to `skip_nested` that most of a footer's skipped values would
+    /// otherwise each cost.
+    #[inline(never)]
     pub fn skip(&mut self, kind: u8) -> Option<()> {
-        self.skip_nested(kind, 0)
+        match self.skip_scalar(kind) {
+            Some(skipped) => skipped,
+            None => self.skip_nested(kind, 0),
+        }
+    }
+
+    /// Skips a scalar of type `kind`: `None` if it isn't one.
+    #[inline(always)]
+    #[expect(clippy::inline_always, reason = "#[inline] isn't, with 10% more instructions")]
+    #[expect(clippy::option_option, reason = "damaged, or not a scalar")]
+    fn skip_scalar(&mut self, kind: u8) -> Option<Option<()>> {
+        Some(match kind {
+            // Booleans in fields carry their value in their type.
+            1 | 2 => Some(()),
+            3 => self.byte().map(drop),
+            4..=6 => self.varint().map(drop),
+            7 => self.pos.checked_add(8).filter(|&end| end <= self.bytes.len()).map(|end| {
+                self.pos = end;
+            }),
+            BINARY => self.binary().map(drop),
+            _ => return None,
+        })
     }
 
     fn skip_nested(&mut self, kind: u8, depth: u32) -> Option<()> {
@@ -147,24 +172,14 @@ impl<'a> Cursor<'a> {
             return None;
         }
         match kind {
-            // Booleans in fields carry their value in their type.
-            1 | 2 => {}
-            3 => {
-                self.byte()?;
-            }
-            4..=6 => {
-                self.varint()?;
-            }
-            7 => self.pos = self.pos.checked_add(8).filter(|&end| end <= self.bytes.len())?,
-            BINARY => {
-                self.binary()?;
-            }
             LIST | 10 => {
                 let (element, len) = self.list()?;
                 for _ in 0..len {
                     // Booleans in lists are a byte each.
                     if element == 1 || element == 2 {
                         self.byte()?;
+                    } else if let Some(skipped) = self.skip_scalar(element) {
+                        skipped?;
                     } else {
                         self.skip_nested(element, depth + 1)?;
                     }
@@ -173,7 +188,10 @@ impl<'a> Cursor<'a> {
             STRUCT => {
                 let mut last = 0;
                 while let Some((_, kind)) = self.field(&mut last)? {
-                    self.skip_nested(kind, depth + 1)?;
+                    match self.skip_scalar(kind) {
+                        Some(skipped) => skipped?,
+                        None => self.skip_nested(kind, depth + 1)?,
+                    }
                 }
             }
             _ => return None,
