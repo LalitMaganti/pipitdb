@@ -9,7 +9,7 @@ use pipit_kernel::names::{Name, Names};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::Error;
-use crate::thrift::{Cursor, Value};
+use crate::thrift::{Cursor, STRUCT, Value};
 
 /// How values are stored, as Parquet names them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -288,32 +288,47 @@ fn column_chunk(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
 /// A `ColumnMetaData`, at `c`, of `column`.
 fn column_meta(c: &mut Cursor<'_>, column: Column) -> Option<Chunk> {
     // Its codec, values, size, the offsets of its data and dictionary pages,
-    // and its statistics.
-    let mut meta = [Value::Missing; 6];
-    c.fields(&[4, 5, 7, 9, 11, 12], &mut meta)?;
-    let unsigned = |value: Value<'_>| u64::try_from(value.int()?).ok();
+    // and its statistics, read where they are.
+    let (mut last, mut meta) = (0, [None; 5]);
+    let (mut min, mut max, mut nulls, mut exact) = (None, None, None, false);
+    let unsigned = |value: Option<i64>| u64::try_from(value?).ok();
+    while let Some((id, kind)) = c.field(&mut last)? {
+        let slot = match (id, kind) {
+            (4, 3..=6) => 0,
+            (5, 3..=6) => 1,
+            (7, 3..=6) => 2,
+            (9, 3..=6) => 3,
+            (11, 3..=6) => 4,
+            (12, STRUCT) => {
+                // `Statistics`: the current max and min are fields 5 and 6,
+                // ordered as the column's values are. 1 and 2 are older and
+                // always ordered as signed, so are only right for signed
+                // integers. 3 counts nulls. 7 and 8 say whether max and min
+                // are exact: writers don't truncate integers, so they are
+                // unless they say not.
+                let mut stats = [Value::Missing; 7];
+                c.fields(&[5, 6, 1, 2, 3, 7, 8], &mut stats)?;
+                nulls = unsigned(stats[4].int());
+                exact = stats[5].int() != Some(0) && stats[6].int() != Some(0);
+                let integer = |value: Value<'_>| integer(value.bytes()?, column);
+                let signed = column.logical == Logical::Plain;
+                max = integer(stats[0]).or_else(|| integer(stats[2]).filter(|_| signed));
+                min = integer(stats[1]).or_else(|| integer(stats[3]).filter(|_| signed));
+                continue;
+            }
+            _ => {
+                c.skip(kind)?;
+                continue;
+            }
+        };
+        *meta.get_mut(slot)? = Some(c.int()?);
+    }
     let data = unsigned(meta[3])?;
     let start = unsigned(meta[4]).map_or(data, |dictionary| dictionary.min(data));
-    let (mut min, mut max, mut nulls, mut exact) = (None, None, None, false);
-    if let Some(at) = meta[5].at() {
-        // `Statistics`: the current max and min are fields 5 and 6, ordered
-        // as the column's values are. 1 and 2 are older and always ordered
-        // as signed, so are only right for signed integers. 3 counts nulls.
-        // 7 and 8 say whether max and min are exact: writers don't truncate
-        // integers, so they are unless they say not.
-        let mut stats = [Value::Missing; 7];
-        c.at(at).fields(&[5, 6, 1, 2, 3, 7, 8], &mut stats)?;
-        nulls = unsigned(stats[4]);
-        exact = stats[5].int() != Some(0) && stats[6].int() != Some(0);
-        let integer = |value: Value<'_>| integer(value.bytes()?, column);
-        let signed = column.logical == Logical::Plain;
-        max = integer(stats[0]).or_else(|| integer(stats[2]).filter(|_| signed));
-        min = integer(stats[1]).or_else(|| integer(stats[3]).filter(|_| signed));
-    }
     Some(Chunk {
         start,
         len: unsigned(meta[2])?,
-        codec: u8::try_from(meta[0].int().unwrap_or(0)).ok()?,
+        codec: u8::try_from(meta[0].unwrap_or(0)).ok()?,
         values: unsigned(meta[1]).unwrap_or(0),
         min,
         max,
