@@ -113,6 +113,7 @@ fn compile(
         }
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
         Tag::Call => call(compiler, node, depth, nodes)?,
+        Tag::Case => case(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -188,6 +189,57 @@ fn call(
     let mut rest = *at!(values, count as usize - 1);
     for &value in at!(values, ..count as usize - 1).iter().rev() {
         rest = push_node(nodes, expr_node(ExprOp::Coalesce, value, rest, 0), node, compiler)?;
+    }
+    Ok(())
+}
+
+/// Appends the nodes of the `CASE` `node`, `depth` deep, as `iif`s:
+/// `CASE WHEN c THEN x ELSE y END` is `iif(c, x, y)`, more `WHEN`s nest in
+/// the `ELSE`, no `ELSE` is `NULL`, and `CASE s WHEN v` tests `s = v`, with
+/// `s` computed once.
+fn case(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let count = node.child_count();
+    let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
+    let last = |nodes: &SlowVec<ExprStep>| {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let last = nodes.len() as u32 - 1;
+        last
+    };
+    let subject = child(compiler, 0);
+    let subject = if subject.is_empty() {
+        None
+    } else {
+        compile(compiler, subject, depth + 1, nodes)?;
+        Some(last(nodes))
+    };
+    // Each `WHEN`'s condition and value.
+    let mut branches = SlowVec::fixed(compiler.allocator(), (count as usize - 2) / 2)?;
+    for i in (1..count - 1).step_by(2) {
+        compile(compiler, child(compiler, i), depth + 1, nodes)?;
+        let mut condition = last(nodes);
+        if let Some(subject) = subject {
+            condition =
+                push_node(nodes, expr_node(ExprOp::Eq, subject, condition, 0), node, compiler)?;
+        }
+        compile(compiler, child(compiler, i + 1), depth + 1, nodes)?;
+        branches.push((condition, last(nodes)))?;
+    }
+    let otherwise = child(compiler, count - 1);
+    let mut rest = if otherwise.is_empty() {
+        push_node(nodes, expr_node(ExprOp::Null, 0, 0, 0), node, compiler)?
+    } else {
+        compile(compiler, otherwise, depth + 1, nodes)?;
+        last(nodes)
+    };
+    for &(condition, value) in branches.iter().rev() {
+        let mut chosen = expr_node(ExprOp::Iif, condition, value, 0);
+        chosen.c = rest;
+        rest = push_node(nodes, chosen, node, compiler)?;
     }
     Ok(())
 }
