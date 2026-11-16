@@ -93,15 +93,40 @@ fn starts_with(text: &[u8], segment: &[u8]) -> bool {
         && text.iter().zip(segment).all(|(&byte, &want)| want == b'_' || byte == want)
 }
 
-/// Where `segment` first starts in `text`, its `_`s matching any byte: at
-/// each place its first byte is, as `string_view::find` looks, unless that's
-/// a `_`.
+/// Where `segment` first starts in `text`, its `_`s matching any byte. A
+/// segment of more than one byte, with neither its first nor its last a `_`,
+/// is looked for where both its first and last bytes are, 32 places at a
+/// time, so a common first byte alone doesn't stop the search at each.
 fn find(text: &[u8], segment: &[u8]) -> Option<usize> {
     let starts = text.len().checked_sub(segment.len())?;
     let Some(&first) = segment.first().filter(|&&first| first != b'_') else {
         return (0..=starts).find(|&at| starts_with(at!(text, at..), segment));
     };
     let mut at = 0;
+    if let [_, .., last] = *segment
+        && last != b'_'
+    {
+        let gap = segment.len() - 1;
+        // Where a block's last byte, `gap` on, is still in `text`.
+        let blocks_end = text.len().saturating_sub(gap + 31);
+        while at < blocks_end {
+            // SAFETY: `at + gap + 32` is at most `text.len()`, so both
+            // blocks are in it.
+            let (firsts, lasts) = unsafe {
+                let block = |at: usize| &*text.as_ptr().add(at).cast::<[u8; 32]>();
+                (block(at), block(at + gap))
+            };
+            let mut found = block::pairs(firsts, lasts, first, last);
+            while found != 0 {
+                let candidate = at + found.trailing_zeros() as usize;
+                if starts_with(at!(text, candidate..), segment) {
+                    return Some(candidate);
+                }
+                found &= found - 1;
+            }
+            at += 32;
+        }
+    }
     while at <= starts {
         at += find_byte(at!(text, at..=starts), first)?;
         if starts_with(at!(text, at..), segment) {
@@ -157,6 +182,35 @@ mod block {
         }
     }
 
+    /// Which of 32 places hold `first`, and `last` the same distance on,
+    /// in `firsts` and `lasts`: a bit each.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[inline]
+    pub(super) fn pairs(firsts: &[u8; 32], lasts: &[u8; 32], first: u8, last: u8) -> u32 {
+        use core::arch::x86_64::{
+            __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+            _mm256_set1_epi8,
+        };
+        // SAFETY: the build has AVX2, and the loads read the blocks' 32 bytes.
+        unsafe {
+            let equal = |block: &[u8; 32], byte: u8| {
+                #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
+                let bytes = _mm256_loadu_si256(block.as_ptr().cast::<__m256i>());
+                _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(byte.cast_signed()))
+            };
+            let both = _mm256_and_si256(equal(firsts, first), equal(lasts, last));
+            _mm256_movemask_epi8(both).cast_unsigned()
+        }
+    }
+
+    /// Anywhere else: a fold the compiler can vectorize.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    #[inline]
+    pub(super) fn pairs(firsts: &[u8; 32], lasts: &[u8; 32], first: u8, last: u8) -> u32 {
+        let places = firsts.iter().zip(lasts).enumerate();
+        places.fold(0, |found, (i, (&a, &b))| found | u32::from(a == first && b == last) << i)
+    }
+
     /// Anywhere else: a fold the compiler can vectorize, as it can't a loop
     /// that stops at a match. On wasm, explicit vectors made the build
     /// bigger, with no benchmark there to show a gain.
@@ -202,6 +256,13 @@ mod tests {
             ("googoogle", "%google", true),
             ("________________________________________google", "%google%", true),
             ("________________________________________googl", "%google%", false),
+            // Found by its first and last bytes, 32 places at a time: across
+            // blocks, among false starts, with `_`s, and in the bytes after.
+            ("gegegegegegegegegegegegegegegegegegegegegegegegegegegegegegoogle", "%google%", true),
+            ("gegegegegegegegegegegegegegegegegegegegegegegegegegegegegegoogl", "%google%", false),
+            ("______________________________google____________________________", "%google%", true),
+            ("_______________________________________________________goxgle__", "%go_gle%", true),
+            ("_______________________________________________________googlx__", "%googl_%", true),
         ];
         for &(text, pattern, expected) in cases {
             assert_eq!(
