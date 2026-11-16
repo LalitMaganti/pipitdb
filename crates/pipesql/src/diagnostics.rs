@@ -78,7 +78,8 @@ fn describe(found: &str, error: &Error) -> Message {
         | ErrorCode::ArgumentCount
         | ErrorCode::ChoicesOfOneType
         | ErrorCode::NumberCondition
-        | ErrorCode::ArithmeticOnSomeRows => expression(error.code),
+        | ErrorCode::ArithmeticOnSomeRows
+        | ErrorCode::ArgumentType => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -163,6 +164,9 @@ fn expression(code: ErrorCode) -> (String, String) {
             "a comparison needs values of one type".into(),
             "multiply the integer by 1.0 to compare it as a double".into(),
         ),
+        ErrorCode::ArgumentType => {
+            ("a function's argument is of a type it doesn't take".into(), "this call".into())
+        }
         _ => pipit_kernel::failed!(),
     }
 }

@@ -28,6 +28,7 @@ pub struct Compiler<'q, 'c> {
     source: &'q [u8],
     ast: &'q Ast,
     catalog: &'c dyn Catalog,
+    registry: &'q Registry,
     allocator: &'q dyn Allocator,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
@@ -57,6 +58,11 @@ impl<'q, 'c> Compiler<'q, 'c> {
 
     pub fn catalog(&self) -> &'c dyn Catalog {
         self.catalog
+    }
+
+    /// The stages and functions queries can use.
+    pub fn registry(&self) -> &'q Registry {
+        self.registry
     }
 
     /// What to make plan nodes with.
@@ -147,6 +153,7 @@ pub fn compile<'c>(
         source,
         ast: &ast,
         catalog,
+        registry,
         plan: LogicalPlan::new(allocator)?,
         scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
         allocator,
@@ -181,10 +188,44 @@ mod tests {
     use pipit_operators::table::Table;
 
     use super::*;
+    use pipit_kernel::expression::validity_of;
+    use pipit_kernel::function::{DynFunction, Function};
+
     use crate::error::ErrorCode;
+    use crate::registry::FunctionRule;
     use crate::stages::{AGGREGATION, RELATIONAL};
 
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
+    #[cfg(not(feature = "string-functions"))]
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[HALF]);
+    #[cfg(feature = "string-functions")]
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION])
+        .with_functions(&[HALF, crate::string_functions::STRING_FUNCTIONS]);
+
+    /// `half(x)`, as a crate would add a function.
+    const HALF: &[FunctionRule] = &[FunctionRule {
+        name: "half",
+        arguments: &[DataType::Float64],
+        result: DataType::Float64,
+        bind: |compiler, _| Ok(DynFunction::new(compiler.allocator(), Half)?),
+    }];
+
+    struct Half;
+
+    impl Function for Half {
+        fn run(
+            &self,
+            context: &mut Context,
+            arguments: &[&ColumnView],
+        ) -> Result<ColumnView, pipit_kernel::error::Error> {
+            let validity = validity_of(context, arguments)?;
+            let x = arguments[0].float64s();
+            let mut values = context.values_buffer(x.len() * 8)?;
+            for (o, &x) in values.as_mut_slice::<f64>().iter_mut().zip(x) {
+                *o = x / 2.0;
+            }
+            Ok(ColumnView::new(context, DataType::Float64, values, validity)?)
+        }
+    }
 
     /// Table `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5, `s`
     /// is `it's` and the empty string. And `dup`, of `a` and `A`.
@@ -477,6 +518,22 @@ mod tests {
     }
 
     #[test]
+    fn calls_functions_from_the_registry() {
+        assert_eq!(kept("FROM t |> SELECT half(f) AS x"), [0.25, 1.25]);
+        assert_eq!(kept("FROM t |> SELECT half(a) AS x"), [0.5, 1.0]);
+        let null = "FROM t |> EXTEND half(NULL) AS x |> WHERE x IS NULL |> SELECT a";
+        assert_eq!(kept(null), [1.0, 2.0]);
+    }
+
+    #[cfg(feature = "string-functions")]
+    #[test]
+    fn measures_strings() {
+        assert_eq!(kept("FROM t |> SELECT length(s) AS n"), [4.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT LENGTH('h\u{e9}llo') AS n"), [5.0, 5.0]);
+        assert_eq!(kept("FROM t |> SELECT octet_length('h\u{e9}llo') AS n"), [6.0, 6.0]);
+    }
+
+    #[test]
     fn orders_rows() {
         assert_eq!(kept("FROM t |> ORDER BY a DESC |> SELECT b"), [20.0, 10.0]);
         assert_eq!(kept("FROM t |> ORDER BY f |> SELECT s"), [4.0, 0.0]);
@@ -500,7 +557,9 @@ mod tests {
         assert_eq!(error("FROM t |> SELECT iif(s, 1, 0) AS y"), (ErrorCode::NumberCondition, 17));
         let overflows = "FROM t |> SELECT iif(a > 1, b * 2, 0) AS y";
         assert_eq!(error(overflows), (ErrorCode::ArithmeticOnSomeRows, 17));
-        assert_eq!(error("FROM t |> SELECT upper(s) AS y"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT upper(s) AS y"), (ErrorCode::UnknownFunction, 17));
+        assert_eq!(error("FROM t |> SELECT half(s) AS y"), (ErrorCode::ArgumentType, 17));
+        assert_eq!(error("FROM t |> SELECT half(a, b) AS y"), (ErrorCode::ArgumentCount, 17));
         assert_eq!(error("FROM t |> SELECT s LIKE s AS y"), (ErrorCode::Unsupported, 24));
         assert_eq!(error("FROM t |> SELECT f > a AS x"), (ErrorCode::ExpectedOneType, 17));
         let inexact = "FROM t |> SELECT f = 9007199254740993 AS x";

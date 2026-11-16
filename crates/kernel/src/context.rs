@@ -3,6 +3,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
+use crate::function::DynFunction;
 use crate::query_allocators::QueryAllocators;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -25,6 +26,8 @@ pub struct Context<'a> {
     string_pool: Option<StringPool>,
     /// The strings the statement's conditions compare with, if it has any.
     literals: Option<&'a StringPool>,
+    /// The functions the statement's expressions call, by id.
+    functions: &'a [DynFunction],
     /// The first key of the last row a `TopK` keeps, once it has published
     /// one, so its scan can skip rows that sort after it.
     cutoff: Option<i64>,
@@ -43,6 +46,7 @@ impl<'a> Context<'a> {
             selections: None,
             string_pool: None,
             literals: None,
+            functions: &[],
             cutoff: None,
         }
     }
@@ -61,6 +65,7 @@ impl<'a> Context<'a> {
             selections: None,
             string_pool: None,
             literals: statement.and_then(Statement::literals),
+            functions: statement.map_or(&[], Statement::functions),
             cutoff: None,
         }
     }
@@ -68,6 +73,11 @@ impl<'a> Context<'a> {
     /// The strings the statement's conditions compare with, if it has any.
     pub fn literals(&self) -> Option<&'a StringPool> {
         self.literals
+    }
+
+    /// The function the statement's expressions call as `id`.
+    pub fn function(&self, id: u32) -> &'a DynFunction {
+        at!(self.functions, id as usize)
     }
 
     /// What the run's memory comes from, for states to allocate with.

@@ -81,6 +81,8 @@ pub enum ErrorCode {
     /// Integer arithmetic in an argument of `coalesce` or `iif` which only
     /// some rows use, which could overflow on the others.
     ArithmeticOnSomeRows = 36,
+    /// An argument of a type its function doesn't take.
+    ArgumentType = 37,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -130,7 +132,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-    pub const LAST: ErrorCode = ErrorCode::ExpectedInteger;
+    pub const LAST: ErrorCode = ErrorCode::ArgumentType;
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

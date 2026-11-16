@@ -20,3 +20,5 @@ pub mod parser;
 pub mod registry;
 mod settings;
 pub mod stages;
+#[cfg(feature = "string-functions")]
+pub mod string_functions;

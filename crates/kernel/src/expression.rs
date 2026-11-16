@@ -7,6 +7,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Column, DeriveContext, OutputProperties};
@@ -67,6 +68,12 @@ pub enum ExprOp {
     /// whose condition isn't null or zero, else `c`. Every step runs for
     /// every row, so what only some rows use mustn't be able to fail.
     Case,
+    /// An argument of the `Call` after it: its value `a`, of the type the
+    /// function takes. Computes nothing itself.
+    Argument,
+    /// The statement's function `c`, called with the `b` `Argument`s from
+    /// step `a`.
+    Call,
 }
 
 /// A `When`'s condition for the rows where its value isn't null.
@@ -84,7 +91,7 @@ pub struct ExprStep {
     pub a: u32,
     /// The second register it reads.
     pub b: u32,
-    /// The third register it reads, for `Case`.
+    /// The third register it reads, for `Case`, or a `Call`'s function.
     pub c: u32,
     /// A `Constant`'s value, if it's an Int64.
     pub int_value: i64,
@@ -235,7 +242,7 @@ fn run(
             }
             ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
-            ExprOp::When => {
+            ExprOp::When | ExprOp::Argument => {
                 *at_mut!(registers, i) = None;
                 continue;
             }
@@ -248,6 +255,7 @@ fn run(
                 };
                 pick(context, whens.len(), &branch, register(registers, step.c))?
             }
+            ExprOp::Call => call(context, program, step, registers, rows)?,
         };
         *at_mut!(registers, i) = Some(value);
     }
@@ -256,6 +264,47 @@ fn run(
     else {
         failed!()
     };
+    Ok(result)
+}
+
+/// Which rows of `columns`, of one batch, are null in none of them, or
+/// `None` if none can be: a function's result's, null where an argument is.
+pub fn validity_of(
+    context: &mut Context,
+    columns: &[&ColumnView],
+) -> Result<Option<Buffer>, AllocError> {
+    let Some(first) = columns.first() else { failed!() };
+    if columns.iter().all(|column| column.validity().is_none()) {
+        return Ok(None);
+    }
+    let rows = first.row_count() as usize;
+    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    for (i, bytes) in buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate() {
+        let (at, count) = (i * 64, (rows - i * 64).min(64));
+        let word = columns.iter().fold(!0, |w, column| w & word(column.validity(), at, count));
+        let word = word.to_le_bytes();
+        bytes.copy_from_slice(at!(word, ..bytes.len()));
+    }
+    Ok(Some(buffer))
+}
+
+/// Calls `step`'s function with its arguments' registers.
+#[inline(never)]
+fn call(
+    context: &mut Context,
+    program: &ExprProgram,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+    rows: u32,
+) -> Result<ColumnView, Error> {
+    let count = step.b as usize;
+    check!(0 < count && count <= ARGUMENTS_MAX);
+    let first = step.a as usize;
+    let arguments: [&ColumnView; ARGUMENTS_MAX] = core::array::from_fn(|k| {
+        register(registers, at!(program.steps, first + k.min(count - 1)).a)
+    });
+    let result = context.function(step.c).run(context, at!(arguments, ..count))?;
+    check!(result.data_type() == step.data_type && result.row_count() == rows);
     Ok(result)
 }
 
@@ -706,8 +755,10 @@ pub const EXPR_NODES_MAX: usize = 1 << 8;
 ///
 /// It has the shape of an `ExprProgram`: nodes in post-order, each reading
 /// only nodes before it, the last being the result. A `Column` node's `a` is
-/// a `ColumnId` rather than a batch position, and only a `Constant` node's
-/// `data_type` means anything: the rest are typed when the plan is lowered. A
+/// a `ColumnId` rather than a batch position, and only a `Constant`'s
+/// `data_type` means anything, and an `Argument`'s or a `Call`'s, which are
+/// the types its function was bound with: the rest are typed when the plan
+/// is lowered. A
 /// string `Constant`'s `a` is its id in the statement's literals.
 ///
 /// Only expressions whose meaning is the same as SQLite's are accepted.
@@ -740,6 +791,8 @@ pub enum ExprError {
     Condition,
     /// Arguments of `coalesce`, or values of `CASE`, of one type.
     Choices,
+    /// An argument of the type its function takes.
+    Arguments,
     /// An allocation failed.
     OutOfMemory,
 }
@@ -823,6 +876,7 @@ impl Typer<'_> {
             ExprOp::Constant => Ok((Some(node.data_type), self.add(*node)?)),
             // Its `Case` types a `When`.
             ExprOp::Null | ExprOp::When => Ok((None, 0)),
+            ExprOp::Argument | ExprOp::Call => self.type_call(node),
             ExprOp::ToDouble => failed!(),
             ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
                 let (a_type, b_type) = (at!(self.nodes, a).0, at!(self.nodes, b).0);
@@ -878,13 +932,14 @@ impl Typer<'_> {
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 fails(node.a) || fails(node.b)
             }
-            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull => fails(node.a),
+            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Argument => fails(node.a),
             // Only its first condition is computed for every row: a `PRESENT`
             // one tests its value.
             ExprOp::Case => {
                 let first = at!(nodes, node.a as usize);
                 fails(if first.a == PRESENT { first.b } else { first.a })
             }
+            ExprOp::Call => (node.a..node.a + node.b).any(fails),
             ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble | ExprOp::When => {
                 false
             }
@@ -934,6 +989,30 @@ impl Typer<'_> {
         let mut case = step(ExprOp::Case, data_type, first.unwrap_or(0), node.b);
         case.c = otherwise;
         Ok((Some(data_type), self.add(case)?))
+    }
+
+    /// Types `node`, an `Argument`, which must be of the type its function
+    /// takes, or an integer for a double, or `NULL`; or a `Call` of the
+    /// `Argument`s from node `a`, which it adds the steps of together.
+    fn type_call(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+        let (a, b) = (node.a as usize, node.b as usize);
+        if node.op == ExprOp::Argument {
+            let takes = |data_type| data_type == node.data_type;
+            match at!(self.nodes, a).0 {
+                Some(DataType::Int64) if takes(DataType::Float64) => {}
+                Some(data_type) if !takes(data_type) => return Err(ExprError::Arguments),
+                _ => {}
+            }
+            return Ok((Some(node.data_type), self.materialize(node.a, node.data_type)?));
+        }
+        let mut first = None;
+        for k in a..a + b {
+            let (Some(data_type), register, _) = *at!(self.nodes, k) else { failed!() };
+            first.get_or_insert(self.add(step(ExprOp::Argument, data_type, register, 0))?);
+        }
+        let mut call = step(ExprOp::Call, node.data_type, first.unwrap_or(0), node.b);
+        call.c = node.c;
+        Ok((Some(node.data_type), self.add(call)?))
     }
 
     /// The register holding node `i` as an Int64 condition: a double is true
@@ -1087,7 +1166,8 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
         | ExprError::Strings
         | ExprError::SomeRows
         | ExprError::Condition
-        | ExprError::Choices => LowerError::WrongType(column),
+        | ExprError::Choices
+        | ExprError::Arguments => LowerError::WrongType(column),
     }
 }
 
