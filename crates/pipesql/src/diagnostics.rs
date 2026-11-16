@@ -29,30 +29,15 @@ pub fn render(source: &str, name: &str, error: &Error) -> String {
 
 /// The title and the label under the source for `error`.
 fn describe(found: &str, error: &Error) -> Message {
-    let kind = u8::try_from(error.detail).ok().and_then(TokenKind::from_u8);
-    let expected = kind.map_or("?", token);
     let (title, label): (String, String) = match error.code {
-        ErrorCode::QueryTooLarge => {
-            ("the query is too large to parse".into(), "parsing stopped here".into())
-        }
-        ErrorCode::UnexpectedCharacter => {
-            (format!("unexpected character {found}"), "not part of any token".into())
-        }
-        ErrorCode::UnterminatedString => {
-            ("unterminated string".into(), "this string has no closing `'`".into())
-        }
-        ErrorCode::TokenTooLong => ("token too long".into(), "tokens are limited to 16 MiB".into()),
-        ErrorCode::ExpectedExpression => {
-            (format!("expected an expression, found {found}"), "expected an expression".into())
-        }
-        ErrorCode::UnexpectedToken => (format!("unexpected {found}"), "unexpected".into()),
-        ErrorCode::ExpectedToken => {
-            (format!("expected {expected}, found {found}"), format!("expected {expected}"))
-        }
-        ErrorCode::NestingTooDeep => (
-            "expression nests too deeply, or has too many arguments".into(),
-            format!("nesting is limited to {} levels", crate::parser::NESTING_MAX),
-        ),
+        ErrorCode::QueryTooLarge
+        | ErrorCode::UnexpectedCharacter
+        | ErrorCode::UnterminatedString
+        | ErrorCode::TokenTooLong
+        | ErrorCode::ExpectedExpression
+        | ErrorCode::UnexpectedToken
+        | ErrorCode::ExpectedToken
+        | ErrorCode::NestingTooDeep => syntax(found, error),
         ErrorCode::OutOfMemory => ("out of memory".into(), "while parsing this query".into()),
         ErrorCode::UnknownStage => (format!("unknown stage {found}"), "not a stage".into()),
         ErrorCode::ExpectedSource => (
@@ -104,6 +89,36 @@ fn describe(found: &str, error: &Error) -> Message {
         ErrorCode::Unsupported => unsupported(found, error.detail),
     };
     Message { title, label }
+}
+
+/// The title and label for an error in the query's tokens or nesting, `error`.
+fn syntax(found: &str, error: &Error) -> (String, String) {
+    let kind = u8::try_from(error.detail).ok().and_then(TokenKind::from_u8);
+    let expected = kind.map_or("?", token);
+    match error.code {
+        ErrorCode::QueryTooLarge => {
+            ("the query is too large to parse".into(), "parsing stopped here".into())
+        }
+        ErrorCode::UnexpectedCharacter => {
+            (format!("unexpected character {found}"), "not part of any token".into())
+        }
+        ErrorCode::UnterminatedString => {
+            ("unterminated string".into(), "this string has no closing `'`".into())
+        }
+        ErrorCode::TokenTooLong => ("token too long".into(), "tokens are limited to 16 MiB".into()),
+        ErrorCode::ExpectedExpression => {
+            (format!("expected an expression, found {found}"), "expected an expression".into())
+        }
+        ErrorCode::UnexpectedToken => (format!("unexpected {found}"), "unexpected".into()),
+        ErrorCode::ExpectedToken => {
+            (format!("expected {expected}, found {found}"), format!("expected {expected}"))
+        }
+        ErrorCode::NestingTooDeep => (
+            "expression nests too deeply, or has too many arguments".into(),
+            format!("nesting is limited to {} levels", crate::parser::NESTING_MAX),
+        ),
+        _ => pipit_kernel::failed!(),
+    }
 }
 
 /// The title and label for an error about a computed column, `code`.
