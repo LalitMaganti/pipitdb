@@ -427,9 +427,10 @@ impl<'c> LogicalPlan<'c> {
         literals.intern_string(allocator, Some(literal))
     }
 
-    /// The strings its conditions compare with, for its runs to read.
-    pub fn literals(&self) -> Option<&StringPool> {
-        self.literals.as_ref()
+    /// The strings its conditions compare with, which lowering gives the
+    /// physical plan.
+    pub(crate) fn take_literals(&mut self) -> Option<StringPool> {
+        self.literals.take()
     }
 
     /// A new column, with a copy of `name`.
