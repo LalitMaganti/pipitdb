@@ -17,8 +17,8 @@ use crate::error::Error;
 use crate::query_allocators::QueryAllocators;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
+use crate::statement::Statement;
 use crate::step::{DynSource, Progress, Step};
-use crate::string_pool::StringPool;
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -37,16 +37,16 @@ impl<'a> Pipeline<'a> {
     /// metadata allocator, which steps' states also allocate from; batches
     /// allocate from its other allocators. A run takes `QueryAllocators`,
     /// not any allocator, so its column buffers always come from fixed
-    /// allocators. `literals` are its statement's, which its steps read.
+    /// allocators. Its steps read its `statement`, if it has one.
     pub fn start<'r>(
         &'r self,
         query: &'r QueryAllocators<'_>,
-        literals: Option<&'r StringPool>,
+        statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
         let size_bytes = self.layout(|_, _| {})?.0.size();
         // SAFETY: `Execution::new` writes every byte it reads.
         let memory = unsafe { Buffer::allocate_uninit(query.metadata, size_bytes)? };
-        Execution::new(self, query, literals, memory)
+        Execution::new(self, query, statement, memory)
     }
 
     /// A `Segment` per segment, a `Slot` per step, then the source's state,
@@ -170,13 +170,13 @@ impl<'p> Execution<'p> {
     fn new(
         pipeline: &'p Pipeline<'p>,
         query: &'p QueryAllocators<'_>,
-        literals: Option<&'p StringPool>,
+        statement: Option<&'p Statement>,
         mut buffer: Buffer,
     ) -> Result<Execution<'p>, Error> {
         let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
             failed!();
         };
-        let mut context = Context::for_query(query, literals);
+        let mut context = Context::for_query(query, statement);
         let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
             failed!();
         };
