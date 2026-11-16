@@ -22,6 +22,7 @@ pub mod error;
 pub mod expression;
 pub mod filter;
 pub mod flat_hash_map;
+pub mod function;
 mod group_table;
 mod hash_aggregate;
 pub mod like;

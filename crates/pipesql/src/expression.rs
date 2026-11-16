@@ -5,6 +5,7 @@ use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
     EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PRESENT, check_expr_type,
 };
+use pipit_kernel::function::ARGUMENTS_MAX;
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
@@ -12,6 +13,7 @@ use crate::compile::Compiler;
 use crate::condition::string;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
+use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
 /// it computes.
@@ -35,6 +37,7 @@ pub fn compile_expr(
             ExprError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
             ExprError::Condition => ErrorCode::NumberCondition,
             ExprError::Choices => ErrorCode::ChoicesOfOneType,
+            ExprError::Arguments => ErrorCode::ArgumentType,
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, span)
@@ -151,6 +154,7 @@ fn compile(
 /// `iif(c, x, y)` is `CASE WHEN c THEN x ELSE y END`, and `coalesce(a, b,
 /// c)` is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
 /// END`, which `PRESENT` branches test. `ifnull` is `coalesce` of two.
+/// Any other function is the registry's.
 fn call(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
@@ -161,7 +165,7 @@ fn call(
     let text = compiler.text(name.span()).as_bytes();
     let (iif, ifnull) = (same_word(text, b"iif"), same_word(text, b"ifnull"));
     if !iif && !ifnull && !same_word(text, b"coalesce") {
-        return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)));
+        return (compiler.registry().call)(compiler, node, depth, nodes);
     }
     let count = node.child_count() - 1;
     let expected = if iif {
@@ -192,6 +196,68 @@ fn call(
     let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches, 0);
     case.c = *at!(values, count as usize - 1);
     push_node(nodes, case, node, compiler)?;
+    Ok(())
+}
+
+/// How a registry compiles a call of a function it may have: as
+/// `call_function` does, or as `no_function` does when it has none.
+pub(crate) type CallFunction =
+    fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>;
+
+/// Fails the call `node`, as a registry without functions can't compile it.
+pub(crate) fn no_function(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    _: usize,
+    _: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)))
+}
+
+/// Appends the nodes of the call `node`, `depth` deep, of the registry's
+/// function, bound to the statement: its arguments', an `Argument` for each,
+/// then the `Call`.
+pub(crate) fn call_function(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let name = compiler.node(node.first_child()).span();
+    let text = compiler.text(name).as_bytes();
+    let Some(rule) = compiler.registry().function(text) else {
+        // An aggregate can't be called here.
+        if aggregate(text).is_some() {
+            return Err(Error::unsupported(Unsupported::SelectExpression, name));
+        }
+        return Err(Error::new(ErrorCode::UnknownFunction, name));
+    };
+    let count = node.child_count() - 1;
+    if count as usize != rule.arguments.len() {
+        return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
+    }
+    let mut values = [0; ARGUMENTS_MAX];
+    for (i, value) in (1..=count).zip(&mut values) {
+        compile(compiler, compiler.node(node.first_child() + i), depth + 1, nodes)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let last = nodes.len() as u32 - 1;
+        *value = last;
+    }
+    let function = (rule.bind)(compiler, node)?;
+    let allocator = compiler.allocator();
+    let Some(id) = compiler.plan.add_function(allocator, function)? else {
+        return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
+    };
+    let mut first = None;
+    for (&value, &data_type) in values.iter().zip(rule.arguments) {
+        let mut argument = expr_node(ExprOp::Argument, value, 0, 0);
+        argument.data_type = data_type;
+        first.get_or_insert(push_node(nodes, argument, node, compiler)?);
+    }
+    let mut call = expr_node(ExprOp::Call, first.unwrap_or(0), count, 0);
+    call.data_type = rule.result;
+    call.c = id;
+    push_node(nodes, call, node, compiler)?;
     Ok(())
 }
 

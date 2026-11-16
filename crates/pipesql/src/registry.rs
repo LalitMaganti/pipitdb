@@ -4,9 +4,13 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
+use pipit_kernel::column::DataType;
+use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
+
 use crate::ast::Node;
 use crate::compile::Compiler;
 use crate::error::Error;
+use crate::expression::{CallFunction, call_function, no_function};
 use crate::keywords::{KeywordTable, same_word};
 use crate::settings::build_setting;
 
@@ -63,10 +67,30 @@ pub struct Rule {
     pub compile: fn(&mut Compiler<'_, '_>, Node) -> Result<(), Error>,
 }
 
-/// Rules, found by keyword. A rule's id is `set << 8 | index in set`.
+/// A function queries can call, which a crate adds by registering it.
+#[derive(Clone, Copy)]
+pub struct FunctionRule {
+    /// What queries call it, matched ignoring case.
+    pub name: &'static str,
+    /// The types of its arguments: a `NULL` is one of any, and an integer
+    /// widens to a double.
+    pub arguments: &'static [DataType],
+    pub result: DataType,
+    /// Binds it to the statement being compiled for the `Call` node passed,
+    /// whose children after the name are its arguments: what needs only
+    /// doing once, such as compiling a pattern, is done here.
+    pub bind: fn(&mut Compiler<'_, '_>, Node) -> Result<DynFunction, Error>,
+}
+
+/// Rules, found by keyword, and functions, found by name. A rule's id is
+/// `set << 8 | index in set`.
 pub struct Registry {
     sets: &'static [&'static [Rule]],
     keywords: KeywordTable<STAGE_SLOTS>,
+    functions: &'static [&'static [FunctionRule]],
+    /// Compiles a call of a function, which only a registry with functions
+    /// can: so one without doesn't pay for the code.
+    pub(crate) call: CallFunction,
 }
 
 impl Registry {
@@ -88,7 +112,30 @@ impl Registry {
             }
             set += 1;
         }
-        Registry { sets, keywords }
+        Registry { sets, keywords, functions: &[], call: no_function }
+    }
+
+    /// It, with the functions of `functions` too.
+    pub const fn with_functions(self, functions: &'static [&'static [FunctionRule]]) -> Registry {
+        let mut set = 0;
+        while set < functions.len() {
+            let mut index = 0;
+            while index < functions[set].len() {
+                let count = functions[set][index].arguments.len();
+                assert!(0 < count && count <= ARGUMENTS_MAX, "a function takes 1 to 8 arguments");
+                index += 1;
+            }
+            set += 1;
+        }
+        Registry { functions, call: call_function, ..self }
+    }
+
+    /// The function called `name`, ignoring case.
+    pub fn function(&self, name: &[u8]) -> Option<&'static FunctionRule> {
+        self.functions
+            .iter()
+            .flat_map(|set| set.iter())
+            .find(|f| same_word(f.name.as_bytes(), name))
     }
 
     /// The id of the rule whose keyword is `word`, ignoring case.

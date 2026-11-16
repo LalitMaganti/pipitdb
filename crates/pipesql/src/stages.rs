@@ -104,6 +104,11 @@ const FUNCTIONS: [(&str, Function); 5] = [
     ("avg", Function::Avg),
 ];
 
+/// The aggregate function called `name`, ignoring case, and its name.
+pub(crate) fn aggregate(name: &[u8]) -> Option<(&'static str, Function)> {
+    FUNCTIONS.iter().find(|(f, _)| same_word(f.as_bytes(), name)).copied()
+}
+
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let relation = compiler.compile_relation(compiler.node(stage.first_child()))?;
@@ -388,9 +393,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         }
         let name = compiler.node(item.first_child()).span();
         let text = compiler.text(name);
-        let Some(&(function_name, function)) =
-            FUNCTIONS.iter().find(|(f, _)| same_word(f.as_bytes(), text.as_bytes()))
-        else {
+        let Some((function_name, function)) = aggregate(text.as_bytes()) else {
             return Err(Error::new(ErrorCode::UnknownFunction, name));
         };
         let mut argument = compiler.node(item.first_child() + 1);

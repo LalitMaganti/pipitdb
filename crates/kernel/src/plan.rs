@@ -12,6 +12,7 @@ use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
+use crate::function::DynFunction;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
@@ -421,6 +422,17 @@ impl<'c> LogicalPlan<'c> {
         literal: &[u8],
     ) -> Result<Id, AllocError> {
         self.statement.add_literal(allocator, literal)
+    }
+
+    /// Binds `function` to it, allocating from `allocator`, which must
+    /// outlive the plan, and returns its id, or `None` if it has the most it
+    /// can.
+    pub fn add_function(
+        &mut self,
+        allocator: &dyn Allocator,
+        function: DynFunction,
+    ) -> Result<Option<u32>, AllocError> {
+        self.statement.add_function(allocator, function)
     }
 
     /// What its runs read, which lowering gives the physical plan.

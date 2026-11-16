@@ -20,6 +20,8 @@ pipitdb-operators = { path = "../operators" }
 [features]
 # Error messages, and `pipit-explain` to print them.
 diagnostics = ["dep:pipitdb-diagnostics"]
+# `length` and `octet_length`, in `string_functions`.
+string-functions = []
 
 [[bin]]
 name = "pipit-explain"
