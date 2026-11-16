@@ -27,7 +27,7 @@ impl<'c> Op<'c> for LimitOp {
     /// Its input's, less some rows. The sort just before, if any, only needs
     /// to output the rows read here, if a `TopK` can count them.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = *c.input(0);
+        let mut out = c.input_copy(0)?;
         let read = self.count.checked_add(self.offset).and_then(|read| u32::try_from(read).ok());
         if let (Some(sort), Some(read)) = (out.open_sort, read) {
             c.limit_sort(sort, read);

@@ -1193,12 +1193,12 @@ impl<'c> Op<'c> for ComputeOp {
     /// Its input's, with each item's column after them.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let input = c.input(0);
-        let mut out = *input;
+        let mut out = c.input_copy(0)?;
         for item in self.items.iter() {
             let data_type = check_expr_type(&item.expr, &|column| input.type_of(column))
                 .map_err(|error| lower_error(error, item.output))?;
             let nullable = expr_can_be_null(&item.expr, &|column| input.nullable_of(column));
-            out.push_column(Column { id: item.output, data_type, nullable })?;
+            out.push_column(c.allocator(), Column { id: item.output, data_type, nullable })?;
         }
         Ok(out)
     }

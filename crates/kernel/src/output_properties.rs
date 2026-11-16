@@ -6,8 +6,7 @@
 use crate::allocator::{AllocError, Allocator};
 use crate::column::DataType;
 use crate::lower::LowerError;
-use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
-use crate::row_batch::BATCH_COLUMNS_MAX;
+use crate::plan::{ColumnId, LogicalPlan, PLAN_COLUMNS_MAX, PlanNodeId, SortKey};
 use crate::slow_vec::SlowVec;
 
 /// A layout known to hold for rows: grouped by the columns of its first
@@ -114,12 +113,9 @@ fn is_permutation(a: &[ColumnId], b: &[ColumnId]) -> bool {
 /// What is known about the batches a node outputs: their columns and types,
 /// and how the rows are arranged. Planning compares it with what each node
 /// needs.
-#[derive(Clone, Copy)]
 pub struct OutputProperties {
-    /// The columns of a batch, in order: the first `column_count` of these.
-    columns: [Column; BATCH_COLUMNS_MAX as usize],
-    /// How many of `columns` there are.
-    column_count: u32,
+    /// The columns of a batch, in order: made with the first.
+    columns: Option<SlowVec<Column>>,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
     /// Set while a sort can still be undone.
@@ -133,46 +129,69 @@ pub struct OutputProperties {
 impl OutputProperties {
     /// No columns, and nothing known.
     pub const NONE: OutputProperties = OutputProperties {
-        // Unused, and all zero, so copies are cheap.
-        columns: [Column { id: 0, data_type: DataType::Int64, nullable: false };
-            BATCH_COLUMNS_MAX as usize],
-        column_count: 0,
+        columns: None,
         arrangements: Arrangements::NONE,
         open_sort: None,
         scan: None,
     };
 
-    /// Adds `column` at the next position in batches, which fail to hold
-    /// more than `BATCH_COLUMNS_MAX`.
-    pub fn push_column(&mut self, column: Column) -> Result<(), LowerError> {
-        let Some(slot) = self.columns.get_mut(self.column_count as usize) else {
-            return Err(LowerError::TooManyColumns);
+    /// A copy, its columns allocated from `allocator`.
+    pub fn clone_in(&self, allocator: &dyn Allocator) -> Result<OutputProperties, AllocError> {
+        let columns = match &self.columns {
+            Some(columns) => {
+                let mut copy = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+                copy.extend_from_slice(columns)?;
+                Some(copy)
+            }
+            None => None,
         };
-        *slot = column;
-        self.column_count += 1;
-        Ok(())
+        Ok(OutputProperties { columns, ..*self })
+    }
+
+    /// Adds `column` at the next position in batches, allocating from
+    /// `allocator`. Batches hold at most as many columns as a plan has.
+    pub fn push_column(
+        &mut self,
+        allocator: &dyn Allocator,
+        column: Column,
+    ) -> Result<(), LowerError> {
+        let columns = match &mut self.columns {
+            Some(columns) => columns,
+            None => self.columns.insert(SlowVec::new(allocator, PLAN_COLUMNS_MAX)?),
+        };
+        if columns.len() == PLAN_COLUMNS_MAX {
+            return Err(LowerError::TooManyColumns);
+        }
+        Ok(columns.push(column)?)
     }
 
     fn columns(&self) -> &[Column] {
-        at!(self.columns, ..self.column_count as usize)
+        self.columns.as_deref().unwrap_or_default()
+    }
+
+    /// How many columns its batches have.
+    pub fn column_count(&self) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
+        let count = self.columns().len() as u32;
+        count
     }
 
     /// The position of `column` in a batch, if it has one.
     pub fn position_of(&self, column: ColumnId) -> Option<u32> {
-        #[expect(clippy::cast_possible_truncation, reason = "at most `BATCH_COLUMNS_MAX`")]
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
         self.columns().iter().position(|c| c.id == column).map(|position| position as u32)
     }
 
     /// The type of `column`, which the batches must have.
     pub fn type_of(&self, column: ColumnId) -> DataType {
         let Some(position) = self.position_of(column) else { failed!() };
-        at!(self.columns, position as usize).data_type
+        at!(self.columns(), position as usize).data_type
     }
 
     /// Whether `column` can hold a null.
     pub fn nullable_of(&self, column: ColumnId) -> bool {
         let Some(position) = self.position_of(column) else { failed!() };
-        at!(self.columns, position as usize).nullable
+        at!(self.columns(), position as usize).nullable
     }
 
     /// Whether the rows are grouped by `keys`, and each group sorted by
@@ -250,47 +269,18 @@ pub struct Arranged<'a> {
     pub sorted_by: &'a [SortKey],
 }
 
-/// Columns to hold types: the first `len` of these. Each is a column of the
-/// input, needed as one type, so there are at most as many as a batch has
-/// columns.
-#[derive(Clone, Copy)]
-pub struct Types {
-    list: [Type; BATCH_COLUMNS_MAX as usize],
-    len: usize,
-}
-
-impl Types {
-    pub const NONE: Types = Types {
-        list: [Type { column: 0, data_type: DataType::Int64 }; BATCH_COLUMNS_MAX as usize],
-        len: 0,
-    };
-
-    /// Adds that `column` must hold `data_type`, unless that's known.
-    pub fn push(&mut self, column: ColumnId, data_type: DataType) {
-        let need = Type { column, data_type };
-        if self.known().iter().any(|known| known.column == column && known.data_type == data_type) {
-            return;
-        }
-        *at_mut!(self.list, self.len) = need;
-        self.len += 1;
-    }
-
-    fn known(&self) -> &[Type] {
-        at!(self.list, ..self.len)
-    }
-}
-
 /// What a node needs of the rows of one of its inputs. All of it is
 /// optional, and it is met in the order of these fields.
 #[derive(Clone, Copy)]
 pub struct InputNeeds<'a> {
     pub arranged: Option<Arranged<'a>>,
-    pub types_then: Types,
+    /// Columns of the input that must hold a type, each once.
+    pub types_then: &'a [Type],
 }
 
 impl InputNeeds<'_> {
     /// Nothing.
-    pub const NONE: InputNeeds<'static> = InputNeeds { arranged: None, types_then: Types::NONE };
+    pub const NONE: InputNeeds<'static> = InputNeeds { arranged: None, types_then: &[] };
 }
 
 /// What it takes for an input to meet a node's needs, each step run in order
@@ -339,17 +329,28 @@ pub struct DeriveContext<'p, 'c> {
     plan: &'p LogicalPlan<'c>,
     planned: &'p mut Planned,
     self_: PlanNodeId,
+    allocator: &'p dyn Allocator,
 }
 
-impl DeriveContext<'_, '_> {
+impl<'p> DeriveContext<'p, '_> {
     /// The id of the node being derived.
     pub fn node(&self) -> PlanNodeId {
         self.self_
     }
 
+    /// What outputs' columns are allocated from.
+    pub fn allocator(&self) -> &'p dyn Allocator {
+        self.allocator
+    }
+
     /// What is known of input `i` once its needs are met.
     pub fn input(&self, i: u32) -> &OutputProperties {
         &at!(at!(self.planned, self.self_ as usize).inputs, i as usize).rows
+    }
+
+    /// A copy of `input(i)`, for an output that starts as its input.
+    pub fn input_copy(&self, i: u32) -> Result<OutputProperties, AllocError> {
+        self.input(i).clone_in(self.allocator)
     }
 
     /// `id` as a column of the output: as it is in an input which has it,
@@ -397,7 +398,7 @@ impl InputPlanner<'_> {
         if let Some(arranged) = needs.arranged {
             self.arrange(planned, arranged.grouped_by, arranged.sorted_by)?;
         }
-        self.types(needs.types_then.known())
+        self.types(needs.types_then)
     }
 
     fn types(&self, types: &[Type]) -> Result<(), LowerError> {
@@ -489,7 +490,7 @@ fn plan_node_inputs(
     let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
     for &child in node.children.iter() {
         check!(child < id);
-        let rows = at!(planned, child as usize).output;
+        let rows = at!(planned, child as usize).output.clone_in(allocator)?;
         inputs.push(PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows })?;
     }
     for (i, out) in (0..).zip(inputs.iter_mut()) {
@@ -497,7 +498,7 @@ fn plan_node_inputs(
         input.meet(planned, &node.op.needs(i))?;
     }
     planned.push(PlannedNode { inputs, output: OutputProperties::NONE, cutoff: None })?;
-    let mut derive = DeriveContext { plan, planned, self_: id };
+    let mut derive = DeriveContext { plan, planned, self_: id, allocator };
     let output = node.op.derive(&mut derive)?;
     at_mut!(planned, id as usize).output = output;
     Ok(())
@@ -530,14 +531,5 @@ mod tests {
         // Two keys on one column group by it once, not by two columns.
         rows.arrangements.push(&[], &[key(0), key(0)]);
         assert!(!rows.is_arranged(&[0, 1], &[]));
-    }
-
-    #[test]
-    fn needs_each_type_of_a_column_once() {
-        let mut types = Types::NONE;
-        for _ in 0..2 * BATCH_COLUMNS_MAX {
-            types.push(0, DataType::Int64);
-        }
-        assert_eq!(types.known().len(), 1);
     }
 }

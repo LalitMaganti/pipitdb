@@ -29,7 +29,7 @@ impl<'c> Op<'c> for OrderByOp {
     }
 
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        Ok(*c.input(0))
+        Ok(c.input_copy(0)?)
     }
 
     fn lower(

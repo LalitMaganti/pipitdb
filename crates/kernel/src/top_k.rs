@@ -79,7 +79,7 @@ impl Breaker for TopK {
             return Ok(());
         }
         if kept.cutoff.is_some() {
-            let passed = self.before_cutoff(kept, input)?;
+            let passed = self.before_cutoff(context, kept, input)?;
             kept.rows.append_laid_out(context, &passed, &self.keys, &kept.keys)?;
         } else {
             kept.rows.append(context, input, &self.keys)?;
@@ -114,6 +114,7 @@ impl TopK {
     /// having arrived later.
     fn before_cutoff<'b>(
         &self,
+        context: &Context,
         kept: &mut Kept,
         input: &RowBatch<'b>,
     ) -> Result<RowBatch<'b>, Error> {
@@ -127,6 +128,7 @@ impl TopK {
         let mut passing = 0;
         let mut i = 0;
         let mut passed = RowBatch::new();
+        passed.reserve(context.allocator(), input.column_count())?;
         passed.copy_from(input);
         passed.selection_mut().retain(|row| {
             let laid_out = at!(keys, i * stride..(i + 1) * stride);

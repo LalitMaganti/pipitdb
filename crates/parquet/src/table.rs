@@ -10,7 +10,8 @@ use pipit_kernel::filter::{
     Comparison::{GreaterEqual, LessEqual},
     Value,
 };
-use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::plan::PLAN_COLUMNS_MAX;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Scannable, Summary};
 use pipit_kernel::selection::{Kept, Selection};
 use pipit_kernel::slow_vec::SlowVec;
@@ -353,7 +354,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     }
 
     fn new_loader(&self, context: &mut Context) -> Result<Loader<'a>, Error> {
-        Ok(Loader { readers: SlowVec::fixed(context.allocator(), BATCH_COLUMNS_MAX as usize)? })
+        Ok(Loader { readers: SlowVec::new(context.allocator(), PLAN_COLUMNS_MAX)? })
     }
 
     /// Reads the rows of `lazy` `selection` keeps, keeping a reader for each
@@ -410,7 +411,6 @@ impl<'a> Scannable for ParquetTable<'a> {
         context: &mut Context,
         columns: &'s [(u32, Forms)],
     ) -> Result<ScanState<'s>, Error> {
-        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
         let rows = Rows::new(context.allocator(), columns.len())?;
         Ok(ScanState { columns, file: 0, group: 0, rows })

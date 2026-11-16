@@ -166,10 +166,10 @@ impl<'c> Op<'c> for AggregateOp {
         }
         let mut out = OutputProperties::NONE;
         for &key in self.keys.iter() {
-            out.push_column(c.column_of(key))?;
+            out.push_column(c.allocator(), c.column_of(key))?;
         }
         for aggregate in self.aggregates.iter() {
-            out.push_column(c.column_of(aggregate.binding.id))?;
+            out.push_column(c.allocator(), c.column_of(aggregate.binding.id))?;
         }
         if self.answer.is_none() {
             let sorted = c.input(0).sorted_by(&self.keys);

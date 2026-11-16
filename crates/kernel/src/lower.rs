@@ -21,7 +21,7 @@ use crate::top_k::top_k;
 pub enum LowerError {
     /// An allocation failed.
     OutOfMemory,
-    /// A batch would need more than `BATCH_COLUMNS_MAX` columns.
+    /// A batch would need more than `PLAN_COLUMNS_MAX` columns.
     TooManyColumns,
     /// An op reads a column of a type it doesn't take.
     WrongType(ColumnId),
@@ -197,7 +197,15 @@ pub fn lower<'c>(
         columns.push(OutputColumn { name, position: lowering.query_position(column.id) })?;
     }
     let Some(source) = lowering.source else { failed!() };
-    let pipeline = Pipeline::new(source, lowering.steps);
+    // Every batch is made room for the widest rows any node knows of.
+    let mut width = 0;
+    for node in planned.iter() {
+        width = width.max(node.output.column_count());
+        for input in node.inputs.iter() {
+            width = width.max(input.rows.column_count());
+        }
+    }
+    let pipeline = Pipeline::new(source, lowering.steps).with_width(width);
     Ok(PhysicalPlan { pipeline, names, columns, statement: plan.take_statement() })
 }
 
@@ -347,7 +355,7 @@ mod tests {
 
     impl<'c> Op<'c> for Knows<'_> {
         fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-            let out = *c.input(0);
+            let out = c.input_copy(0)?;
             for &(keys, sorted_by) in self.asks {
                 let sorted_by: StdVec<SortKey> = sorted_by
                     .iter()
@@ -700,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn fails_to_lower_batches_too_wide() {
+    fn lowers_batches_wider_than_they_hold_inline() {
         let table = DynScannable::new(&Heap, Wide(70)).unwrap();
         let plan = |output: usize| {
             let mut plan = LogicalPlan::new(&Heap).unwrap();
@@ -716,11 +724,7 @@ mod tests {
             plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
             plan
         };
-        assert_eq!(lower_planned(&mut plan(70)).err(), Some(LowerError::TooManyColumns));
-        // Pruned to the two in the output, it fits.
-        let mut narrow = plan(2);
-        crate::optimize::optimize(&Heap, &mut narrow).unwrap();
-        assert!(lower_planned(&mut narrow).is_ok());
+        assert!(lower_planned(&mut plan(70)).is_ok());
     }
 
     /// Three batches of four rows of `a`, `b` and `c`: row `r` of batch `n`

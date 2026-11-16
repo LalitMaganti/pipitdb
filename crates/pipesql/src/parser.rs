@@ -16,8 +16,9 @@ use pipit_kernel::slow_vec::SlowVec;
 /// argument counts as a level.
 pub const NESTING_MAX: usize = 64;
 
-/// How many stages a query, or items a list, can have.
-pub const LIST_MAX: usize = 64;
+/// How many stages a query, or items a list, can have: as many as a plan
+/// has columns.
+pub const LIST_MAX: usize = pipit_kernel::plan::PLAN_COLUMNS_MAX;
 
 /// How many values an `IN` list can have.
 pub const IN_LIST_MAX: usize = 1 << 16;
@@ -595,17 +596,15 @@ fn leaf(token: Token) -> Result<Node, Error> {
 impl Parser<'_> {
     /// Parses a query, returning its root, which is not in the tree yet.
     pub(crate) fn query(&mut self, registry: &Registry) -> Result<Node, Error> {
-        let mut stages = [Node::empty(); LIST_MAX];
-        let mut count = 0;
+        let mut stages = SlowVec::new(self.allocator, LIST_MAX)?;
         loop {
-            if count == LIST_MAX {
+            if stages.len() == LIST_MAX {
                 return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
             }
-            let point = if count == 0 { Point::Source } else { Point::Stage };
-            *at_mut!(stages, count) = self.stage(registry, point)?;
-            count += 1;
+            let point = if stages.is_empty() { Point::Source } else { Point::Stage };
+            stages.push(self.stage(registry, point)?)?;
             if self.current().kind != TokenKind::Pipe {
-                return Ok(self.list(Tag::Query, at!(stages, ..count)));
+                return Ok(self.list(Tag::Query, &stages));
             }
             self.advance()?;
         }
@@ -688,16 +687,14 @@ impl Parser<'_> {
 
     /// One or more `shared`, separated by commas.
     fn list_of(&mut self, shared: Shared) -> Result<Node, Error> {
-        let mut items = [Node::empty(); LIST_MAX];
-        let mut count = 0;
+        let mut items = SlowVec::new(self.allocator, LIST_MAX)?;
         loop {
-            if count == LIST_MAX {
+            if items.len() == LIST_MAX {
                 return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
             }
-            *at_mut!(items, count) = self.shared(shared)?;
-            count += 1;
+            items.push(self.shared(shared)?)?;
             if self.current().kind != TokenKind::Comma {
-                return Ok(self.list(Tag::List, at!(items, ..count)));
+                return Ok(self.list(Tag::List, &items));
             }
             self.advance()?;
         }
