@@ -17,7 +17,7 @@ use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
-use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
+use crate::row_batch::RowBatch;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynSource, DynTransform, ErasedBatch, NewState};
@@ -322,7 +322,6 @@ impl<'a> DynScannable<'a> {
         cutoff: Option<Cutoff>,
     ) -> Result<DynSource<'_>, AllocError> {
         let columns = SlowVec::fixed_from(allocator, columns)?;
-        check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         let column_count = self.column_count();
         // Each set holds flat, which every scannable can write, so checked
         // here, once, not for every column of every batch.
