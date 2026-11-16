@@ -59,16 +59,18 @@ pub enum ExprOp {
     IsNull,
     /// Whether `a` isn't null, as 0 or 1, never null.
     IsNotNull,
-    /// `a` unless it's null, else `b`.
-    Coalesce,
-    /// A branch of the `Case` after it: its condition `a` and value `b`.
-    /// Computes nothing itself.
+    /// A branch of the `Case` after it: its condition `a`, or `PRESENT` to
+    /// take the rows where its value isn't null, as `coalesce`'s do, and its
+    /// value `b`. Computes nothing itself.
     When,
     /// For each row, the value of the first of the `b` `When`s from step `a`
     /// whose condition isn't null or zero, else `c`. Every step runs for
     /// every row, so what only some rows use mustn't be able to fail.
     Case,
 }
+
+/// A `When`'s condition for the rows where its value isn't null.
+pub const PRESENT: u32 = u32::MAX;
 
 /// One step of an `ExprProgram`. Step `i` computes register `i` from the
 /// batch or from earlier registers.
@@ -233,10 +235,6 @@ fn run(
             }
             ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
-            ExprOp::Coalesce => {
-                let (x, y) = (register(registers, step.a), register(registers, step.b));
-                pick(context, 1, &|_| (None, x), y)?
-            }
             ExprOp::When => {
                 *at_mut!(registers, i) = None;
                 continue;
@@ -245,7 +243,8 @@ fn run(
                 let whens = at!(program.steps, step.a as usize..(step.a + step.b) as usize);
                 let branch = |k: usize| {
                     let when = at!(whens, k);
-                    (Some(register(registers, when.a)), register(registers, when.b))
+                    let condition = (when.a != PRESENT).then(|| register(registers, when.a));
+                    (condition, register(registers, when.b))
                 };
                 pick(context, whens.len(), &branch, register(registers, step.c))?
             }
@@ -452,11 +451,11 @@ fn null_test(
 type Branch<'r> = dyn Fn(usize) -> (Option<&'r ColumnView>, &'r ColumnView) + 'r;
 
 /// Each row's value from the first of `branches` branches that takes it,
-/// else from `otherwise`: a `Case`'s or a `Coalesce`'s. Going through them in
-/// order, a mask of 0s and 1s picks the rows each takes, and values are
-/// blended through it, so the loops vectorize; strings keep which branch
-/// each row took, then copy the chosen ones' bytes once. Validity is worked
-/// out a word at a time.
+/// else from `otherwise`: a `Case`'s. Going through them
+/// from the last, each overwrites the rows it takes, through a mask of 0s
+/// and 1s so the loops vectorize, and the first wins; strings keep which
+/// branch each row took, then copy the chosen ones' bytes once. Validity is
+/// worked out a word at a time.
 #[inline(never)]
 fn pick<'r>(
     context: &mut Context,
@@ -468,16 +467,13 @@ fn pick<'r>(
     let strings = otherwise.data_type() == DataType::String;
     let nullable =
         otherwise.validity().is_some() || (0..branches).any(|k| branch(k).1.validity().is_some());
-    // 1 for each row no branch has taken yet, once the first has run.
-    let mut undecided = context.values_buffer(rows * 8)?;
-    // 1 where the branch takes the row.
-    let mut take = context.values_buffer(rows * 8)?;
-    // Each row's value, or for strings the branch it took, the `ELSE` last,
-    // once a branch has taken a row.
+    // Each row's value, or for strings the branch it took, the `ELSE` last.
     let mut out = context.values_buffer(rows * 8)?;
     if strings {
         #[expect(clippy::cast_possible_wrap, reason = "a step's branches")]
         out.as_mut_slice::<i64>().fill(branches as i64);
+    } else {
+        out.as_mut_slice::<i64>().copy_from_slice(at!(otherwise.values().words(), ..rows));
     }
     // Each row's presence, a bit each.
     let mut present_out = [0_u64; BATCH_ROWS_MAX as usize / 64];
@@ -485,39 +481,25 @@ fn pick<'r>(
     for (i, bits) in present_out.iter_mut().enumerate() {
         *bits = word(otherwise.validity(), i * 64, (rows - i * 64).min(64));
     }
-    // A column every row takes as it is, if one is.
-    let mut whole = Some(otherwise);
-    for k in 0..branches {
+    for k in (0..branches).rev() {
         let (condition, value) = branch(k);
-        let take = take.as_mut_slice::<i64>();
-        present(condition.unwrap_or(value).validity(), false, take);
-        let condition = condition.map(ColumnView::int64s);
-        let undecided = (branches > 1).then(|| undecided.as_mut_slice());
-        let taken = decide(condition, k == 0, take, undecided);
-        #[expect(clippy::cast_possible_wrap, reason = "a batch's rows")]
-        if k == 0 && taken == rows as i64 {
-            whole = Some(value);
-            break;
-        }
-        if taken == 0 {
-            continue;
-        }
+        let tested = condition.unwrap_or(value).validity();
         #[expect(clippy::cast_possible_wrap, reason = "a step's branches")]
-        if strings {
-            blend_in(&[k as i64], take, out.as_mut_slice());
-        } else if whole.is_some() {
-            // The first branch to take a row: `ELSE` for the rest.
-            blend(value.values().words(), otherwise.values().words(), take, out.as_mut_slice());
-        } else {
-            blend_in(value.values().words(), take, out.as_mut_slice());
+        let x = if strings { &[k as i64][..] } else { value.values().words() };
+        // 64 rows at a time: the bits of the rows it takes, then its values
+        // and presence where they're set.
+        for ((i, o), bits) in
+            out.as_mut_slice::<i64>().chunks_mut(64).enumerate().zip(&mut *present_out)
+        {
+            let (at, count) = (i * 64, o.len());
+            let mut take = word(tested, at, count);
+            if let Some(condition) = condition {
+                let values = at!(condition.int64s(), at..at + count);
+                take &= values.iter().enumerate().fold(0, |b, (j, &c)| b | u64::from(c != 0) << j);
+            }
+            blend_bits(x, at, take, o);
+            *bits = take & word(value.validity(), at, count) | !take & *bits;
         }
-        whole = None;
-        if nullable {
-            take_presence(value, take, present_out);
-        }
-    }
-    if let Some(whole) = whole {
-        return Ok(whole.clone());
     }
     let validity = if nullable { Some(pack_words(context, rows, present_out)?) } else { None };
     if !strings {
@@ -525,49 +507,6 @@ fn pick<'r>(
     }
     let column = |k: usize| if k < branches { branch(k).1 } else { otherwise };
     choose_strings(context, &column, out.as_slice(), validity)
-}
-
-/// Narrows `take`, 1 for each row a branch's condition, or value, is present,
-/// to the rows `undecided`, or every row if `first`, and, if given,
-/// `condition` isn't zero at, and takes them out of `undecided`, which the
-/// first sets. A choice of one branch has no `undecided`. Returns how many it
-/// takes.
-#[inline(never)]
-fn decide(
-    condition: Option<&[i64]>,
-    first: bool,
-    take: &mut [i64],
-    undecided: Option<&mut [i64]>,
-) -> i64 {
-    check!(condition.is_none_or(|c| c.len() >= take.len()));
-    let holds = |row: usize| condition.map_or(1, |c| i64::from(*at!(c, row) != 0));
-    let mut taken = 0;
-    let Some(undecided) = undecided else {
-        for (row, t) in take.iter_mut().enumerate() {
-            *t &= holds(row);
-            taken += *t;
-        }
-        return taken;
-    };
-    check!(undecided.len() == take.len());
-    // All of a word's bits on the first, so `undecided`'s aren't read.
-    let all = -i64::from(first);
-    for (row, (t, u)) in take.iter_mut().zip(undecided).enumerate() {
-        *t &= (*u | all) & holds(row);
-        *u = (*u | all) & !*t;
-        taken += *t;
-    }
-    taken
-}
-
-/// `x` where `take` is 1, else `y`, each a word: Int64s, or Float64s' bits.
-#[inline(never)]
-fn blend(x: &[i64], y: &[i64], take: &[i64], o: &mut [i64]) {
-    check!(x.len() >= o.len() && y.len() >= o.len() && take.len() == o.len());
-    for (((o, &x), &y), &take) in o.iter_mut().zip(x).zip(y).zip(take) {
-        // All ones where `take` is 1, so this picks without a branch.
-        *o = y ^ (x ^ y) & -take;
-    }
 }
 
 /// Writes 1 for each of `o`'s rows `validity` has present, else 0, or the
@@ -583,29 +522,21 @@ fn present(validity: Option<Validity>, null: bool, o: &mut [i64]) {
     }
 }
 
-/// Sets `o` to `x` where `take` is 1, keeping it elsewhere. `x` of one value
-/// is that value at every row.
+/// Sets each of `o`'s rows, from row `at` of `x`, to `x`'s where its bit of
+/// `take` is set, keeping it elsewhere. `x` of one value is that value at
+/// every row.
 #[inline(never)]
-fn blend_in(x: &[i64], take: &[i64], o: &mut [i64]) {
-    check!(take.len() == o.len());
+fn blend_bits(x: &[i64], at: usize, take: u64, o: &mut [i64]) {
+    let mask = |j: usize| -((take >> j & 1).cast_signed());
     if let [x] = *x {
-        for (o, &take) in o.iter_mut().zip(take) {
-            *o ^= (x ^ *o) & -take;
+        for (j, o) in o.iter_mut().enumerate() {
+            *o ^= (x ^ *o) & mask(j);
         }
         return;
     }
-    check!(x.len() >= o.len());
-    for ((o, &x), &take) in o.iter_mut().zip(x).zip(take) {
-        *o ^= (x ^ *o) & -take;
-    }
-}
-
-/// Sets each bit of `present`, a row's presence, to `value`'s where `take` is
-/// 1, keeping it elsewhere.
-fn take_presence(value: &ColumnView, take: &[i64], present: &mut [u64]) {
-    for ((i, bits), take) in present.iter_mut().enumerate().zip(take.chunks(64)) {
-        let from = take.iter().enumerate().fold(0, |b, (k, &t)| b | t.cast_unsigned() << k);
-        *bits = from & word(value.validity(), i * 64, take.len()) | !from & *bits;
+    let x = at!(x, at..at + o.len());
+    for (j, (o, &x)) in o.iter_mut().zip(x).enumerate() {
+        *o ^= (x ^ *o) & mask(j);
     }
 }
 
@@ -927,7 +858,6 @@ impl Typer<'_> {
                     Some(_) => Err(ExprError::Strings),
                 }
             }
-            ExprOp::Coalesce => self.type_choice(node),
             ExprOp::Case => self.type_case(nodes, node),
             ExprOp::IsNull | ExprOp::IsNotNull => {
                 let a_type = at!(self.nodes, node.a as usize).0;
@@ -948,36 +878,24 @@ impl Typer<'_> {
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 fails(node.a) || fails(node.b)
             }
-            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Coalesce => fails(node.a),
-            // Only its first condition is computed for the rows it decides.
-            ExprOp::Case => fails(at!(nodes, node.a as usize).a),
+            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull => fails(node.a),
+            // Only its first condition is computed for every row: a `PRESENT`
+            // one tests its value.
+            ExprOp::Case => {
+                let first = at!(nodes, node.a as usize);
+                fails(if first.a == PRESENT { first.b } else { first.a })
+            }
             ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble | ExprOp::When => {
                 false
             }
         }
     }
 
-    /// Types `node`, a `Coalesce`, choosing between two nodes of one type,
-    /// `NULL` going with either. Every step runs for every row, so the second,
-    /// which only some rows choose, mustn't be able to fail.
-    fn type_choice(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
-        let (x_type, _, _) = *at!(self.nodes, node.a as usize);
-        let (y_type, _, y_fails) = *at!(self.nodes, node.b as usize);
-        if y_fails {
-            return Err(ExprError::SomeRows);
-        }
-        let data_type = one_type([x_type, y_type].into_iter())?;
-        let Some(data_type) = data_type else { return Ok((None, 0)) };
-        let mut chosen = step(ExprOp::Coalesce, data_type, 0, 0);
-        chosen.a = self.materialize(node.a, data_type)?;
-        chosen.b = self.materialize(node.b, data_type)?;
-        Ok((Some(data_type), self.add(chosen)?))
-    }
-
     /// Types `node`, a `Case` of the `When`s from node `a`, one of `nodes`:
     /// its values and `ELSE` of one type, `NULL` going with any, and its
     /// conditions numbers. Every step runs for every row, so only its first
-    /// condition, which every row is tested by, can fail.
+    /// condition, which every row is tested by, can fail: a `PRESENT` one
+    /// tests its value, as `coalesce`'s first argument.
     fn type_case(
         &mut self,
         nodes: &[ExprStep],
@@ -987,10 +905,11 @@ impl Typer<'_> {
         check!(!whens.is_empty() && whens.iter().all(|when| when.op == ExprOp::When));
         let at = |i: u32| *at!(self.nodes, i as usize);
         for (k, when) in whens.iter().enumerate() {
-            if (k > 0 && at(when.a).2) || at(when.b).2 {
+            let tested = if when.a == PRESENT { when.b } else { when.a };
+            if (k > 0 && at(tested).2) || (tested != when.b && at(when.b).2) {
                 return Err(ExprError::SomeRows);
             }
-            if at(when.a).0 == Some(DataType::String) {
+            if when.a != PRESENT && at(when.a).0 == Some(DataType::String) {
                 return Err(ExprError::Condition);
             }
         }
@@ -1003,7 +922,8 @@ impl Typer<'_> {
         // the `Case` reads them.
         let mut branches = [(0, 0); EXPR_NODES_MAX];
         for (k, when) in whens.iter().enumerate() {
-            *at_mut!(branches, k) = (self.condition(when.a)?, self.materialize(when.b, data_type)?);
+            let condition = if when.a == PRESENT { PRESENT } else { self.condition(when.a)? };
+            *at_mut!(branches, k) = (condition, self.materialize(when.b, data_type)?);
         }
         let otherwise = self.materialize(node.c, data_type)?;
         let mut first = None;
@@ -1446,13 +1366,16 @@ mod tests {
         }
     }
 
-    /// `coalesce` fills nulls from its second argument, and `CASE` takes each
-    /// row from its first branch whose condition is true, else its `ELSE`.
+    /// `coalesce`, a `PRESENT` branch, fills nulls from its second argument,
+    /// and `CASE` takes each row from its first branch whose condition is
+    /// true, else its `ELSE`.
     #[test]
     fn choices() {
         let mut c = Builder(StdVec::new());
         let (n, u) = (c.push(ExprOp::Column, INT, 0, 0), c.push(ExprOp::Column, INT, 1, 0));
-        c.push(ExprOp::Coalesce, INT, n, u);
+        let when = c.push(ExprOp::When, INT, PRESENT, n);
+        let at = c.push(ExprOp::Case, INT, when, 1);
+        c.0[at as usize].c = u;
         let cells = run(c, batch(&[column(&N), column(&U)]));
         assert_eq!(cells, [Some(10), Some(20), Some(3), Some(40), Some(50)]);
 

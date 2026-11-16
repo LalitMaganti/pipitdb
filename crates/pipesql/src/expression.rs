@@ -3,7 +3,7 @@
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type,
+    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PRESENT, check_expr_type,
 };
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -146,10 +146,10 @@ fn compile(
     Ok(())
 }
 
-/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`, as
-/// `CASE WHEN c THEN x ELSE y END`,
-/// `coalesce(a, b, ...)`, as `coalesce(a, coalesce(b, ...))`, or `ifnull(a,
-/// b)`, which is `coalesce` of two.
+/// Appends the nodes of the call `node`, `depth` deep, as a `CASE`:
+/// `iif(c, x, y)` is `CASE WHEN c THEN x ELSE y END`, and `coalesce(a, b,
+/// c)` is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
+/// END`, which `PRESENT` branches test. `ifnull` is `coalesce` of two.
 fn call(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
@@ -180,19 +180,17 @@ fn call(
         #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
         values.push(nodes.len() as u32 - 1)?;
     }
-    if iif {
-        // `CASE WHEN c THEN x ELSE y END`.
-        let when = expr_node(ExprOp::When, *at!(values, 0), *at!(values, 1), 0);
-        let when = push_node(nodes, when, node, compiler)?;
-        let mut case = expr_node(ExprOp::Case, when, 1, 0);
-        case.c = *at!(values, 2);
-        push_node(nodes, case, node, compiler)?;
-        return Ok(());
+    let branches = if iif { 1 } else { count - 1 };
+    let mut first = None;
+    for k in 0..branches as usize {
+        let (condition, value) =
+            if iif { (*at!(values, 0), *at!(values, 1)) } else { (PRESENT, *at!(values, k)) };
+        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        first.get_or_insert(when);
     }
-    let mut rest = *at!(values, count as usize - 1);
-    for &value in at!(values, ..count as usize - 1).iter().rev() {
-        rest = push_node(nodes, expr_node(ExprOp::Coalesce, value, rest, 0), node, compiler)?;
-    }
+    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches, 0);
+    case.c = *at!(values, count as usize - 1);
+    push_node(nodes, case, node, compiler)?;
     Ok(())
 }
 
