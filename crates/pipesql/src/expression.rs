@@ -147,7 +147,8 @@ fn compile(
     Ok(())
 }
 
-/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`,
+/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`, as
+/// `CASE WHEN c THEN x ELSE y END`,
 /// `coalesce(a, b, ...)`, as `coalesce(a, coalesce(b, ...))`, or `ifnull(a,
 /// b)`, which is `coalesce` of two.
 fn call(
@@ -181,9 +182,12 @@ fn call(
         values.push(nodes.len() as u32 - 1)?;
     }
     if iif {
-        let mut chosen = expr_node(ExprOp::Iif, *at!(values, 0), *at!(values, 1), 0);
-        chosen.c = *at!(values, 2);
-        push_node(nodes, chosen, node, compiler)?;
+        // `CASE WHEN c THEN x ELSE y END`.
+        let when = expr_node(ExprOp::When, *at!(values, 0), *at!(values, 1), 0);
+        let when = push_node(nodes, when, node, compiler)?;
+        let mut case = expr_node(ExprOp::Case, when, 1, 0);
+        case.c = *at!(values, 2);
+        push_node(nodes, case, node, compiler)?;
         return Ok(());
     }
     let mut rest = *at!(values, count as usize - 1);
@@ -193,10 +197,9 @@ fn call(
     Ok(())
 }
 
-/// Appends the nodes of the `CASE` `node`, `depth` deep, as `iif`s:
-/// `CASE WHEN c THEN x ELSE y END` is `iif(c, x, y)`, more `WHEN`s nest in
-/// the `ELSE`, no `ELSE` is `NULL`, and `CASE s WHEN v` tests `s = v`, with
-/// `s` computed once.
+/// Appends the nodes of the `CASE` `node`, `depth` deep: each branch's
+/// condition and value, then a `When` for each, then the `Case`. No `ELSE`
+/// is `NULL`, and `CASE s WHEN v` tests `s = v`, with `s` computed once.
 fn case(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
@@ -223,24 +226,28 @@ fn case(
         compile(compiler, child(compiler, i), depth + 1, nodes)?;
         let mut condition = last(nodes);
         if let Some(subject) = subject {
-            condition =
-                push_node(nodes, expr_node(ExprOp::Eq, subject, condition, 0), node, compiler)?;
+            let equal = expr_node(ExprOp::Eq, subject, condition, 0);
+            condition = push_node(nodes, equal, node, compiler)?;
         }
         compile(compiler, child(compiler, i + 1), depth + 1, nodes)?;
         branches.push((condition, last(nodes)))?;
     }
     let otherwise = child(compiler, count - 1);
-    let mut rest = if otherwise.is_empty() {
+    let otherwise = if otherwise.is_empty() {
         push_node(nodes, expr_node(ExprOp::Null, 0, 0, 0), node, compiler)?
     } else {
         compile(compiler, otherwise, depth + 1, nodes)?;
         last(nodes)
     };
-    for &(condition, value) in branches.iter().rev() {
-        let mut chosen = expr_node(ExprOp::Iif, condition, value, 0);
-        chosen.c = rest;
-        rest = push_node(nodes, chosen, node, compiler)?;
+    let mut first = None;
+    for &(condition, value) in branches.iter() {
+        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        first.get_or_insert(when);
     }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
+    case.c = otherwise;
+    push_node(nodes, case, node, compiler)?;
     Ok(())
 }
 
