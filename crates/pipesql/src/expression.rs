@@ -146,7 +146,8 @@ fn compile(
     Ok(())
 }
 
-/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`,
+/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`, as
+/// `CASE WHEN c THEN x ELSE y END`,
 /// `coalesce(a, b, ...)`, as `coalesce(a, coalesce(b, ...))`, or `ifnull(a,
 /// b)`, which is `coalesce` of two.
 fn call(
@@ -180,9 +181,12 @@ fn call(
         values.push(nodes.len() as u32 - 1)?;
     }
     if iif {
-        let mut chosen = expr_node(ExprOp::Iif, *at!(values, 0), *at!(values, 1), 0);
-        chosen.c = *at!(values, 2);
-        push_node(nodes, chosen, node, compiler)?;
+        // `CASE WHEN c THEN x ELSE y END`.
+        let when = expr_node(ExprOp::When, *at!(values, 0), *at!(values, 1), 0);
+        let when = push_node(nodes, when, node, compiler)?;
+        let mut case = expr_node(ExprOp::Case, when, 1, 0);
+        case.c = *at!(values, 2);
+        push_node(nodes, case, node, compiler)?;
         return Ok(());
     }
     let mut rest = *at!(values, count as usize - 1);
