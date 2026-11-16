@@ -112,7 +112,7 @@ pub(crate) fn aggregate(name: &[u8]) -> Option<(&'static str, Function)> {
 /// `FROM t`: scans the table `t`, whose columns are then in scope.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let relation = compiler.compile_relation(compiler.node(stage.first_child()))?;
-    compiler.scope = relation.columns;
+    compiler.set_scope(relation.columns)?;
     Ok(())
 }
 
@@ -147,7 +147,7 @@ fn compile_extend(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
 fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result<(), Error> {
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
     if extend {
-        scope.extend_from_slice(&compiler.scope)?;
+        scope.extend_from_slice(compiler.scope())?;
     }
     let list = compiler.node(stage.first_child());
     let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
@@ -160,7 +160,7 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
         scope.push(value_of(compiler, value, name, &mut computed)?)?;
     }
     add_compute(compiler, computed)?;
-    compiler.scope = scope;
+    compiler.set_scope(scope)?;
     Ok(())
 }
 
@@ -187,7 +187,7 @@ fn named(
 fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
-    scope.extend_from_slice(&compiler.scope)?;
+    scope.extend_from_slice(compiler.scope())?;
     for i in 0..list.child_count() {
         let name = listed_once(compiler, list, i, 0)?;
         let text = compiler.text(name.span()).as_bytes();
@@ -203,7 +203,7 @@ fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
         let first = compiler.node(list.first_child());
         return Err(Error::new(ErrorCode::NoColumnsLeft, first.span()));
     }
-    compiler.scope = scope;
+    compiler.set_scope(scope)?;
     Ok(())
 }
 
@@ -229,14 +229,11 @@ fn change_in_place(
 ) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
-    scope.extend_from_slice(&compiler.scope)?;
+    scope.extend_from_slice(compiler.scope())?;
     let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
     let target = u32::from(!renames);
     for i in 0..list.child_count() {
-        let found = compiler.find_column(listed_once(compiler, list, i, target)?)?;
-        let Some(at) = compiler.scope.iter().position(|column| column.name == found.name) else {
-            pipit_kernel::failed!()
-        };
+        let (at, found) = compiler.find_in_scope(listed_once(compiler, list, i, target)?)?;
         let item = compiler.node(list.first_child() + i);
         let column = at_mut!(scope, at);
         if renames {
@@ -248,7 +245,7 @@ fn change_in_place(
         }
     }
     add_compute(compiler, computed)?;
-    compiler.scope = scope;
+    compiler.set_scope(scope)?;
     Ok(())
 }
 
@@ -428,7 +425,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates, answer: None })?;
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(aggregate, children)?;
-    compiler.scope = scope;
+    compiler.set_scope(scope)?;
     Ok(())
 }
 
