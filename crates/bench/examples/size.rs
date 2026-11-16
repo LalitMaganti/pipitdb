@@ -184,8 +184,15 @@ pub extern "C" fn compute_sum(count: u32, op: u8, value: i64, doubles: bool) -> 
     let (data_type, row) = if doubles { (DataType::Float64, 1) } else { (DataType::Int64, 0) };
     #[expect(clippy::cast_precision_loss, reason = "any value will do")]
     let double_value = value as f64;
-    let step =
-        |op, data_type, a| ExprStep { op, data_type, a, b: 2, int_value: value, double_value };
+    let step = |op, data_type, a| ExprStep {
+        op,
+        data_type,
+        a,
+        b: 2,
+        c: 0,
+        int_value: value,
+        double_value,
+    };
     let steps = [
         step(Column, DataType::Int64, 0),
         step(ToDouble, DataType::Float64, 0),

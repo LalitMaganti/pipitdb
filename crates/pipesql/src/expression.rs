@@ -32,6 +32,9 @@ pub fn compile_expr(
             ExprError::Types => ErrorCode::ExpectedOneType,
             ExprError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
             ExprError::Strings => ErrorCode::ExpectedString,
+            ExprError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
+            ExprError::Condition => ErrorCode::NumberCondition,
+            ExprError::Choices => ErrorCode::ChoicesOfOneType,
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, span)
@@ -46,7 +49,7 @@ pub fn is_null(compiler: &Compiler<'_, '_>, node: Node) -> bool {
 
 /// A node of `op` reading nodes `a` and `b`, or of value `int_value`.
 fn expr_node(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
-    ExprStep { op, data_type: DataType::Int64, a, b, int_value, double_value: 0.0 }
+    ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value, double_value: 0.0 }
 }
 
 /// Appends `node`, and returns its index.
@@ -109,6 +112,7 @@ fn compile(
             null_test(compiler, node, depth, nodes)?;
         }
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
+        Tag::Call => call(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -138,6 +142,52 @@ fn compile(
             push(compiler, nodes, expr_node(op, a, b, 0))?;
         }
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
+    }
+    Ok(())
+}
+
+/// Appends the nodes of the call `node`, `depth` deep: `iif(c, x, y)`,
+/// `coalesce(a, b, ...)`, as `coalesce(a, coalesce(b, ...))`, or `ifnull(a,
+/// b)`, which is `coalesce` of two.
+fn call(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let name = compiler.node(node.first_child());
+    let text = compiler.text(name.span()).as_bytes();
+    let (iif, ifnull) = (same_word(text, b"iif"), same_word(text, b"ifnull"));
+    if !iif && !ifnull && !same_word(text, b"coalesce") {
+        return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)));
+    }
+    let count = node.child_count() - 1;
+    let expected = if iif {
+        count == 3
+    } else if ifnull {
+        count == 2
+    } else {
+        count >= 2
+    };
+    if !expected {
+        return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
+    }
+    // Each argument's result: the last of the nodes computing it.
+    let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
+    for i in 0..count {
+        compile(compiler, compiler.node(node.first_child() + 1 + i), depth + 1, nodes)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        values.push(nodes.len() as u32 - 1)?;
+    }
+    if iif {
+        let mut chosen = expr_node(ExprOp::Iif, *at!(values, 0), *at!(values, 1), 0);
+        chosen.c = *at!(values, 2);
+        push_node(nodes, chosen, node, compiler)?;
+        return Ok(());
+    }
+    let mut rest = *at!(values, count as usize - 1);
+    for &value in at!(values, ..count as usize - 1).iter().rev() {
+        rest = push_node(nodes, expr_node(ExprOp::Coalesce, value, rest, 0), node, compiler)?;
     }
     Ok(())
 }

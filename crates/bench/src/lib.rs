@@ -178,8 +178,15 @@ pub fn compute_pipeline(
         column(|row| (row * 7919 % 1000) as i64, 0.5, 0),
         column(|row| (row % 97 + 1) as i64, 0.25, 5),
     ];
-    let step =
-        |op, data_type, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
+    let step = |op, data_type, a, b| ExprStep {
+        op,
+        data_type,
+        a,
+        b,
+        c: 0,
+        int_value: 0,
+        double_value: 0.0,
+    };
     // A comparison is an Int64, whatever it compares.
     let comparison = matches!(
         op,
@@ -209,7 +216,7 @@ pub fn perfetto_expression(index: usize, batches: u32) -> Pipeline<'static> {
 
 /// Perfetto's `expression_benchmark.cc`'s cases: names, ops, types and
 /// whether there are nulls.
-pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 13] = [
+pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 16] = [
     ("int_add", ExprOp::Add, DataType::Int64, false),
     ("int_mul", ExprOp::Mul, DataType::Int64, false),
     ("int_div", ExprOp::Div, DataType::Int64, false),
@@ -223,6 +230,11 @@ pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 13] = [
     ("double_lt", ExprOp::Lt, DataType::Float64, false),
     ("is_null", ExprOp::IsNull, DataType::Int64, true),
     ("is_not_null", ExprOp::IsNotNull, DataType::Int64, true),
+    // `iif` reads the first column as its condition, then chooses the second
+    // or the first.
+    ("coalesce_int", ExprOp::Coalesce, DataType::Int64, true),
+    ("iif_int", ExprOp::Iif, DataType::Int64, false),
+    ("iif_int_nullable", ExprOp::Iif, DataType::Int64, true),
 ];
 
 /// Does nothing, to measure what a transform costs the pipeline.

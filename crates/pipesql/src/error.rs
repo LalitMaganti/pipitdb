@@ -72,6 +72,15 @@ pub enum ErrorCode {
     ExpectedOneType = 31,
     /// `LIKE` of a number.
     ExpectedString = 32,
+    /// A call has more or fewer arguments than its function takes.
+    ArgumentCount = 33,
+    /// Arguments of `coalesce` or `iif` of different types.
+    ChoicesOfOneType = 34,
+    /// A string as `iif`'s condition.
+    NumberCondition = 35,
+    /// Integer arithmetic in an argument of `coalesce` or `iif` which only
+    /// some rows use, which could overflow on the others.
+    ArithmeticOnSomeRows = 36,
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.

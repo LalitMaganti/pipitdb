@@ -59,6 +59,11 @@ pub enum ExprOp {
     IsNull,
     /// Whether `a` isn't null, as 0 or 1, never null.
     IsNotNull,
+    /// `a` unless it's null, else `b`.
+    Coalesce,
+    /// `b` where `a` isn't null or zero, else `c`. `b` and `c` are computed
+    /// for every row, so mustn't be able to fail.
+    Iif,
 }
 
 /// One step of an `ExprProgram`. Step `i` computes register `i` from the
@@ -73,6 +78,8 @@ pub struct ExprStep {
     pub a: u32,
     /// The second register it reads.
     pub b: u32,
+    /// The third register it reads, for `Iif`.
+    pub c: u32,
     /// A `Constant`'s value, if it's an Int64.
     pub int_value: i64,
     /// A `Constant`'s value, if it's a Float64.
@@ -222,6 +229,7 @@ fn run(
             }
             ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
+            ExprOp::Coalesce | ExprOp::Iif => choose(context, step, registers)?,
         };
         *at_mut!(registers, i) = Some(value);
     }
@@ -416,14 +424,138 @@ fn null_test(
     let a = register(registers, step.a);
     let rows = a.row_count() as usize;
     let mut values = context.values_buffer(rows * 8)?;
-    let flip = u64::from(step.op == ExprOp::IsNull);
-    for (i, o) in values.as_mut_slice::<i64>().chunks_mut(64).enumerate() {
-        let present = word(a.validity(), i * 64, o.len());
+    present(a.validity(), step.op == ExprOp::IsNull, values.as_mut_slice());
+    ColumnView::new(context, DataType::Int64, values, None)
+}
+
+/// `step`, a `Coalesce` or an `Iif`: each row's value from one of two
+/// registers, chosen by the first's nulls or by a condition, through a mask
+/// of 0s and 1s, so the loops vectorize.
+#[inline(never)]
+fn choose(
+    context: &mut Context,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let (x, y) = match step.op {
+        ExprOp::Iif => (register(registers, step.b), register(registers, step.c)),
+        _ => (register(registers, step.a), register(registers, step.b)),
+    };
+    let rows = x.row_count() as usize;
+    if step.op == ExprOp::Coalesce && x.validity().is_none() {
+        return Ok(x.clone());
+    }
+    // 1 where a row takes `x`, else 0.
+    let mut take = context.values_buffer(rows * 8)?;
+    let mask = take.as_mut_slice::<i64>();
+    let tested = if step.op == ExprOp::Iif { register(registers, step.a) } else { x };
+    present(tested.validity(), false, mask);
+    let mut taken = 0;
+    if step.op == ExprOp::Iif {
+        for (o, &value) in mask.iter_mut().zip(tested.int64s()) {
+            *o &= i64::from(value != 0);
+            taken += *o;
+        }
+    } else {
+        taken = mask.iter().sum();
+    }
+    #[expect(clippy::cast_possible_wrap, reason = "a batch's rows")]
+    if taken == rows as i64 {
+        return Ok(x.clone());
+    }
+    if taken == 0 && (step.op == ExprOp::Iif || y.validity().is_none()) {
+        return Ok(y.clone());
+    }
+    let mask = take.as_slice::<i64>();
+    let validity = chosen_validity(context, x, y, mask)?;
+    if x.data_type() != DataType::String {
+        let mut values = context.values_buffer(rows * 8)?;
+        blend(x.values().words(), y.values().words(), mask, values.as_mut_slice());
+        return ColumnView::new(context, x.data_type(), values, validity);
+    }
+    choose_strings(context, x, y, mask, validity)
+}
+
+/// Writes 1 for each of `o`'s rows `validity` has present, else 0, or the
+/// opposite if `null`.
+#[inline(never)]
+fn present(validity: Option<Validity>, null: bool, o: &mut [i64]) {
+    let flip = u64::from(null);
+    for (i, o) in o.chunks_mut(64).enumerate() {
+        let bits = word(validity, i * 64, o.len());
         for (k, o) in o.iter_mut().enumerate() {
-            *o = (present >> k & 1 ^ flip).cast_signed();
+            *o = (bits >> k & 1 ^ flip).cast_signed();
         }
     }
-    ColumnView::new(context, DataType::Int64, values, None)
+}
+
+/// `x` where `take` is 1, else `y`, each a word: Int64s, or Float64s' bits.
+#[inline(never)]
+fn blend(x: &[i64], y: &[i64], take: &[i64], o: &mut [i64]) {
+    check!(x.len() >= o.len() && y.len() >= o.len() && take.len() == o.len());
+    for (((o, &x), &y), &take) in o.iter_mut().zip(x).zip(y).zip(take) {
+        // All ones where `take` is 1, so this picks without a branch.
+        *o = y ^ (x ^ y) & -take;
+    }
+}
+
+/// Which rows of a choice between `x` and `y` aren't null, row `r` `x`'s
+/// where `take` is 1: `None` if every row of both is present.
+fn chosen_validity(
+    context: &mut Context,
+    x: &ColumnView,
+    y: &ColumnView,
+    take: &[i64],
+) -> Result<Option<Buffer>, AllocError> {
+    if x.validity().is_none() && y.validity().is_none() {
+        return Ok(None);
+    }
+    let rows = x.row_count() as usize;
+    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    for ((i, bytes), take) in
+        buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate().zip(take.chunks(64))
+    {
+        let (at, count) = (i * 64, take.len());
+        let from_x = take.iter().enumerate().fold(0, |bits, (k, &t)| bits | t.cast_unsigned() << k);
+        let word = from_x & word(x.validity(), at, count) | !from_x & word(y.validity(), at, count);
+        let word = word.to_le_bytes();
+        bytes.copy_from_slice(at!(word, ..bytes.len()));
+    }
+    Ok(Some(buffer))
+}
+
+/// The strings of a choice between `x` and `y`, row `r` `x`'s where `take`
+/// is 1: the chosen ones' bytes, copied into one buffer. A null's view may
+/// not be of its bytes, so it's left empty.
+fn choose_strings(
+    context: &mut Context,
+    x: &ColumnView,
+    y: &ColumnView,
+    take: &[i64],
+    validity: Option<Buffer>,
+) -> Result<ColumnView, AllocError> {
+    let rows = x.row_count() as usize;
+    let chosen = |row: usize| {
+        let (column, strings) =
+            if *at!(take, row) != 0 { (x, x.string_values()) } else { (y, y.string_values()) };
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+        let null = column.is_null(row as u32);
+        if null { &[][..] } else { strings.get(row) }
+    };
+    let len: usize = (0..rows).map(|row| chosen(row).len()).sum();
+    let mut bytes = context.bytes_buffer(len)?;
+    let mut views = context.values_buffer(rows * 8)?;
+    let mut end = 0;
+    let out = bytes.as_mut_slice::<u8>();
+    for (row, view) in views.as_mut_slice::<u32>().as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        let string = chosen(row);
+        at_mut!(out, end..end + string.len()).copy_from_slice(string);
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's strings fit `u32`")]
+        let (start, len) = (end as u32, string.len() as u32);
+        *view = [start, len];
+        end += string.len();
+    }
+    ColumnView::strings(context, views, bytes, validity)
 }
 
 /// An overflowing operation's result, and whether it fit.
@@ -575,6 +707,13 @@ pub enum ExprError {
     Inexact,
     /// A string, not a number, on the left of `LIKE`.
     Strings,
+    /// Integer arithmetic in an argument of `coalesce` or `iif` which only
+    /// some rows use, which could overflow on the others.
+    SomeRows,
+    /// A number, not a string, as `iif`'s condition.
+    Condition,
+    /// Arguments of `coalesce` or `iif` of one type.
+    Choices,
     /// An allocation failed.
     OutOfMemory,
 }
@@ -587,7 +726,7 @@ impl From<AllocError> for ExprError {
 
 /// A step of no value, reading registers `a` and `b`.
 const fn step(op: ExprOp, data_type: DataType, a: u32, b: u32) -> ExprStep {
-    ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 }
+    ExprStep { op, data_type, a, b, c: 0, int_value: 0, double_value: 0.0 }
 }
 
 /// Types an expression's nodes in order and, given the rows it reads,
@@ -598,9 +737,10 @@ struct Typer<'t> {
     type_of: &'t dyn Fn(ColumnId) -> DataType,
     /// The rows the program reads, and its steps so far, if building one.
     build: Option<(&'t OutputProperties, &'t mut SlowVec<ExprStep>)>,
-    /// By node, its type, and the register holding it. A bare NULL has no
-    /// type of its own: it takes the type of whatever it meets.
-    nodes: [(Option<DataType>, u32); EXPR_NODES_MAX],
+    /// By node, its type, the register holding it, and whether computing it
+    /// can fail. A bare NULL has no type of its own: it takes the type of
+    /// whatever it meets.
+    nodes: [(Option<DataType>, u32, bool); EXPR_NODES_MAX],
 }
 
 impl Typer<'_> {
@@ -609,7 +749,9 @@ impl Typer<'_> {
     fn run(&mut self, expr: &Expr) -> Result<Option<DataType>, ExprError> {
         check!(!expr.nodes.is_empty() && expr.nodes.len() <= EXPR_NODES_MAX);
         for (i, node) in expr.nodes.iter().enumerate() {
-            *at_mut!(self.nodes, i) = self.type_node(&expr.nodes, node)?;
+            let (data_type, register) = self.type_node(&expr.nodes, node)?;
+            let fails = self.can_fail(node, data_type);
+            *at_mut!(self.nodes, i) = (data_type, register, fails);
         }
         Ok(at!(self.nodes, expr.nodes.len() - 1).0)
     }
@@ -617,7 +759,7 @@ impl Typer<'_> {
     /// The register holding node `i` as `data_type`: a null of that type for
     /// a bare NULL, an integer widened for a double.
     fn materialize(&mut self, i: u32, data_type: DataType) -> Result<u32, ExprError> {
-        let (node_type, register) = *at!(self.nodes, i as usize);
+        let (node_type, register, _) = *at!(self.nodes, i as usize);
         match node_type {
             None => self.add(step(ExprOp::Null, data_type, 0, 0)),
             Some(DataType::Int64) if data_type == DataType::Float64 => {
@@ -678,7 +820,7 @@ impl Typer<'_> {
                 self.type_comparison(nodes, node)
             }
             ExprOp::Like => {
-                let (a_type, a) = *at!(self.nodes, node.a as usize);
+                let (a_type, a, _) = *at!(self.nodes, node.a as usize);
                 match a_type {
                     // `NULL LIKE p` is NULL.
                     None => Ok((None, 0)),
@@ -689,12 +831,74 @@ impl Typer<'_> {
                     Some(_) => Err(ExprError::Strings),
                 }
             }
+            ExprOp::Coalesce | ExprOp::Iif => self.type_choice(node),
             ExprOp::IsNull | ExprOp::IsNotNull => {
                 let a_type = at!(self.nodes, node.a as usize).0;
                 let a = self.materialize(node.a, a_type.unwrap_or(DataType::Int64))?;
                 Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, 0))?))
             }
         }
+    }
+
+    /// Whether computing `node`, of type `data_type`, can fail: only integer
+    /// arithmetic can, or what reads it.
+    fn can_fail(&self, node: &ExprStep, data_type: Option<DataType>) -> bool {
+        let fails = |i: u32| at!(self.nodes, i as usize).2;
+        match node.op {
+            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
+                data_type == Some(DataType::Int64) || fails(node.a) || fails(node.b)
+            }
+            ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
+                fails(node.a) || fails(node.b)
+            }
+            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Coalesce | ExprOp::Iif => {
+                fails(node.a)
+            }
+            ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble => false,
+        }
+    }
+
+    /// Types `node`, a `Coalesce` or an `Iif`, choosing between two nodes of
+    /// one type, `NULL` going with either. Every step runs for every row, so
+    /// one only some rows choose mustn't be able to fail.
+    fn type_choice(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+        let iif = node.op == ExprOp::Iif;
+        let (x, y) = if iif { (node.b, node.c) } else { (node.a, node.b) };
+        let (x_type, _, x_fails) = *at!(self.nodes, x as usize);
+        let (y_type, _, y_fails) = *at!(self.nodes, y as usize);
+        if (iif && x_fails) || y_fails {
+            return Err(ExprError::SomeRows);
+        }
+        if iif && at!(self.nodes, node.a as usize).0 == Some(DataType::String) {
+            return Err(ExprError::Condition);
+        }
+        if let (Some(x_type), Some(y_type)) = (x_type, y_type)
+            && x_type != y_type
+        {
+            return Err(ExprError::Choices);
+        }
+        let Some(data_type) = x_type.or(y_type) else { return Ok((None, 0)) };
+        let mut chosen = step(node.op, data_type, 0, 0);
+        if iif {
+            chosen.a = self.condition(node.a)?;
+            chosen.b = self.materialize(x, data_type)?;
+            chosen.c = self.materialize(y, data_type)?;
+        } else {
+            chosen.a = self.materialize(x, data_type)?;
+            chosen.b = self.materialize(y, data_type)?;
+        }
+        Ok((Some(data_type), self.add(chosen)?))
+    }
+
+    /// The register holding node `i` as an Int64 condition: a double is true
+    /// unless it's zero.
+    fn condition(&mut self, i: u32) -> Result<u32, ExprError> {
+        let (data_type, register, _) = *at!(self.nodes, i as usize);
+        if data_type != Some(DataType::Float64) {
+            return self.materialize(i, DataType::Int64);
+        }
+        let zero = self.add(step(ExprOp::Constant, DataType::Float64, 0, 0))?;
+        self.add(step(ExprOp::Ne, DataType::Int64, register, zero))
     }
 
     /// Types the comparison `node`, one of `nodes`, which is an Int64.
@@ -765,7 +969,7 @@ pub fn check_expr_type(
     expr: &Expr,
     type_of: &dyn Fn(ColumnId) -> DataType,
 ) -> Result<DataType, ExprError> {
-    let mut typer = Typer { type_of, build: None, nodes: [(None, 0); EXPR_NODES_MAX] };
+    let mut typer = Typer { type_of, build: None, nodes: [(None, 0, false); EXPR_NODES_MAX] };
     // A result which is only ever NULL is a column of Int64 nulls.
     Ok(typer.run(expr)?.unwrap_or(DataType::Int64))
 }
@@ -786,7 +990,7 @@ pub fn type_expr(
     // Each node takes at most three steps, and a NULL result one more.
     let mut steps = SlowVec::new(allocator, 4 * EXPR_NODES_MAX)?;
     let type_of = |column| rows.type_of(column);
-    let nodes = [(None, 0); EXPR_NODES_MAX];
+    let nodes = [(None, 0, false); EXPR_NODES_MAX];
     let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes };
     let result = typer.run(expr)?.unwrap_or(DataType::Int64);
     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
@@ -821,7 +1025,10 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
         | ExprError::Kinds
         | ExprError::Types
         | ExprError::Inexact
-        | ExprError::Strings => LowerError::WrongType(column),
+        | ExprError::Strings
+        | ExprError::SomeRows
+        | ExprError::Condition
+        | ExprError::Choices => LowerError::WrongType(column),
     }
 }
 
@@ -915,7 +1122,7 @@ mod tests {
 
     impl Builder {
         fn push(&mut self, op: ExprOp, data_type: DataType, a: u32, b: u32) -> u32 {
-            let step = ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
+            let step = ExprStep { op, data_type, a, b, c: 0, int_value: 0, double_value: 0.0 };
             self.0.push(step);
             u32::try_from(self.0.len() - 1).unwrap()
         }
@@ -1098,6 +1305,24 @@ mod tests {
             let expected = [Some(first), Some(second), None, Some(fourth), Some(fifth)];
             assert_eq!(run(b, batch(&[column(&N)])), expected, "{op:?}");
         }
+    }
+
+    /// `coalesce` fills nulls from its second argument, and `iif` takes rows
+    /// from its second where its condition is true, else from its third.
+    #[test]
+    fn choices() {
+        let mut c = Builder(StdVec::new());
+        let (n, u) = (c.push(ExprOp::Column, INT, 0, 0), c.push(ExprOp::Column, INT, 1, 0));
+        c.push(ExprOp::Coalesce, INT, n, u);
+        let cells = run(c, batch(&[column(&N), column(&U)]));
+        assert_eq!(cells, [Some(10), Some(20), Some(3), Some(40), Some(50)]);
+
+        let mut i = Builder(StdVec::new());
+        let (n, u) = (i.push(ExprOp::Column, INT, 0, 0), i.push(ExprOp::Column, INT, 1, 0));
+        let at = i.push(ExprOp::Iif, INT, u, n);
+        i.0[at as usize].c = u;
+        let cells = run(i, batch(&[column(&N), column(&U)]));
+        assert_eq!(cells, [Some(10), Some(0), None, Some(0), Some(50)]);
     }
 
     /// Whether each row is null, or isn't, as 0 or 1, never null.
