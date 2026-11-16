@@ -7,6 +7,7 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 use crate::row_batch::BATCH_ROWS_MAX;
+use crate::selection::Selection;
 
 /// A set of the forms a column may come in: what a plan lets a producer
 /// make a column in, and what a consumer takes it in. Every producer can
@@ -160,6 +161,17 @@ impl GatherSource {
             words: words.cast(),
             validity: validity.and_then(NonNull::new).map(NonNull::cast),
             bytes: NonNull::from(bytes),
+        }
+    }
+
+    /// A lazy view's, whose words aren't read: its rows are loaded instead.
+    pub(crate) fn lazy(view: &ColumnView) -> GatherSource {
+        check!(view.is_lazy());
+        GatherSource {
+            view: view.clone(),
+            words: NonNull::dangling(),
+            validity: None,
+            bytes: NonNull::from(&[][..]),
         }
     }
 
@@ -352,6 +364,63 @@ impl ColumnView {
             bounds: Cell::new(UNKNOWN),
         };
         ColumnView::with_header(context, header, row_count)
+    }
+
+    /// A copy of a flat view that a `GatherSource` can be made of, its words
+    /// and any bits each a batch's worth from their first. A string column's
+    /// bytes are shared, unless `kept` is given: then it holds only the bytes
+    /// of the rows `kept` keeps, so it doesn't keep what all its rows view
+    /// alive.
+    pub(crate) fn padded(
+        &self,
+        context: &mut Context,
+        kept: Option<&Selection>,
+    ) -> Result<ColumnView, AllocError> {
+        let header = self.header();
+        check!(header.kind == Kind::Flat);
+        let (rows, full) = (self.row_count as usize, BATCH_ROWS_MAX as usize);
+        let start = (header.value_start + self.start) as usize;
+        let mut values = context.values_buffer(full * 8)?;
+        let words = at!(header.values.as_slice::<i64>(), start..start + rows);
+        at_mut!(values.as_mut_slice::<i64>(), ..rows).copy_from_slice(words);
+        let mut validity = None;
+        if header.validity.is_some() {
+            let mut bits = context.small_buffer(full / 8)?;
+            let out = bits.as_mut_slice::<u8>();
+            out.fill(0);
+            for row in 0..rows {
+                #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+                let valid = !self.is_null(row as u32);
+                *at_mut!(out, row / 8) |= u8::from(valid) << (row % 8);
+            }
+            validity = Some(bits);
+        }
+        let padded = match (&header.bytes, kept) {
+            (Some(_), Some(kept)) => {
+                let strings = self.values().strings();
+                let get = |i| {
+                    let row = kept.kept().row(i);
+                    if self.is_null(row) { &[][..] } else { strings.get(row as usize) }
+                };
+                let total = (0..kept.len()).map(|i| get(i).len()).sum();
+                let mut bytes = context.bytes_buffer(total)?;
+                let (out, mut start) = (bytes.as_mut_slice::<u8>(), 0);
+                let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
+                views.fill([0, 0]);
+                for i in 0..kept.len() {
+                    let string = get(i);
+                    at_mut!(out, start..start + string.len()).copy_from_slice(string);
+                    #[expect(clippy::cast_possible_truncation, reason = "a batch's strings")]
+                    let view = [start as u32, string.len() as u32];
+                    *at_mut!(views, kept.kept().row(i) as usize) = view;
+                    start += string.len();
+                }
+                ColumnView::strings(context, values, bytes, validity)?
+            }
+            (Some(bytes), None) => ColumnView::strings(context, values, bytes.clone(), validity)?,
+            (None, _) => ColumnView::new(context, header.data_type, values, validity)?,
+        };
+        Ok(padded.slice(0, self.row_count))
     }
 
     /// Whether the view's values aren't read yet. Nothing but loading them

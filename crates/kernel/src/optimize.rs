@@ -279,6 +279,9 @@ pub fn choose_forms(
             let worth = above_parent || load == Load::Never;
             let allowed = if worth { accepted | Forms::LAZY } else { accepted };
             let made = at_mut!(plan.nodes, maker).op.allow(column, allowed);
+            if made.contains(Forms::LAZY) && load != Load::Never {
+                tell_lazy(plan, &parents, maker, load);
+            }
             if made.contains(Forms::LAZY) && !accepted.contains(Forms::LAZY) && load != Load::Never
             {
                 lazy.push((maker, load, column, accepted))?;
@@ -324,6 +327,25 @@ pub fn choose_forms(
         }
     }
     Ok(())
+}
+
+/// Tells each op from `maker`'s parent up to the first to read a column it
+/// made lazy, at `load`, what made it, as some hold it or take it lazy.
+fn tell_lazy(
+    plan: &mut LogicalPlan<'_>,
+    parents: &[Option<(PlanNodeId, usize)>],
+    maker: usize,
+    load: Load,
+) {
+    let Some(scannable) = at!(plan.nodes, maker).op.scannable() else { return };
+    let mut at = *at!(parents, maker);
+    while let Some((parent, _)) = at {
+        at_mut!(plan.nodes, parent as usize).op.holds_lazy(scannable);
+        if matches!(load, Load::Below(below, _) if below == parent) {
+            return;
+        }
+        at = *at!(parents, parent as usize);
+    }
 }
 
 /// Adds `node` to `plan` as node `id`, moving the nodes from `id` on up one.

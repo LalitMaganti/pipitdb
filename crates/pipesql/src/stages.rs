@@ -324,7 +324,7 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         let column = compiler.find_column(column)?.id;
         keys.push(SortKey { column, descending: key.descending() })?;
     }
-    let order_by = DynOp::new(allocator, OrderByOp { keys })?;
+    let order_by = DynOp::new(allocator, OrderByOp::new(keys))?;
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(order_by, children)?;
     Ok(())

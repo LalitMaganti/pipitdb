@@ -4,12 +4,14 @@
 
 use crate::allocator::AllocError;
 use crate::allocator::Allocator;
+use crate::column::Forms;
 use crate::error::Error;
 use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
 use crate::query_allocators::QueryAllocators;
+use crate::scannable::DynScannable;
 use crate::slow_vec::SlowVec;
 use crate::sort::sort;
 use crate::statement::Statement;
@@ -109,26 +111,50 @@ impl<'p, 'c> Lowering<'p, 'c> {
     /// Lowers input `input` of `node`, the node being lowered, then the
     /// steps planning chose to meet its needs.
     pub fn lower_input(&mut self, node: &PlanNode<'c>, input: u32) -> Result<(), LowerError> {
+        self.lower_input_holding(node, input, None)
+    }
+
+    /// As `lower_input`, where the steps planned for the input, a sort, hold
+    /// lazy columns `lazy` made, if given, and load them.
+    pub fn lower_input_holding(
+        &mut self,
+        node: &PlanNode<'c>,
+        input: u32,
+        lazy: Option<&'c DynScannable<'c>>,
+    ) -> Result<(), LowerError> {
         let id = self.plan.id_of(node);
         self.lower_node(*at!(node.children, input as usize))?;
         let planned = at!(at!(self.planned, id as usize).inputs, input as usize);
         self.rows = &planned.rows;
         for step in planned.steps.iter() {
-            self.apply(step)?;
+            self.apply(step, lazy)?;
         }
         Ok(())
     }
 
-    fn apply(&mut self, step: &InputStep) -> Result<(), LowerError> {
+    fn apply(
+        &mut self,
+        step: &InputStep,
+        lazy: Option<&'c DynScannable<'c>>,
+    ) -> Result<(), LowerError> {
         let InputStep::Sort { keys, keep, publish, .. } = step;
         let keys = keys.iter().map(|key| crate::sort::SortKey {
             column: self.query_position(key.column),
             descending: key.descending,
         });
         let keys = SlowVec::fixed_from(self.allocator, keys)?;
-        let operator = match *keep {
-            Some(count) => top_k(self.allocator, keys, count, *publish)?,
-            None => sort(self.allocator, keys)?,
+        let operator = if let Some(count) = *keep {
+            top_k(self.allocator, keys, count, *publish, lazy)?
+        } else {
+            // A sort outputs every row, so it's given them loaded.
+            if let Some(lazy) = lazy {
+                let width = self.rows.column_count();
+                let positions = SlowVec::fixed_from(self.allocator, 0..width)?;
+                let forms = SlowVec::fixed_from(self.allocator, (0..width).map(|_| Forms::FLAT))?;
+                let materialize = lazy.materialize(self.allocator, positions, forms)?;
+                self.add_operator(Step::Transform(materialize))?;
+            }
+            sort(self.allocator, keys)?
         };
         self.add_operator(Step::Operator(operator))
     }
@@ -468,7 +494,7 @@ mod tests {
         let sort_keys =
             keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
         let order_by =
-            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
+            crate::order_by::OrderByOp::new(SlowVec::fixed_from(&Heap, sort_keys).unwrap());
         let order_by = DynOp::new(&Heap, order_by).unwrap();
         let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
         let ordered = plan.add_node(order_by, children).unwrap();
@@ -522,7 +548,7 @@ mod tests {
         for (column, descending) in [(1, false), (0, true)] {
             let key = SortKey { column: ids[column].id, descending };
             let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
-            let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap();
+            let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp::new(keys)).unwrap();
             let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
             node = plan.add_node(order_by, children).unwrap();
         }
@@ -734,9 +760,12 @@ mod tests {
     /// columns of each scan's conditions in `conditions`. If `applies`, it
     /// says it applies conditions, but reads one row of 999s, which meets
     /// none.
+    /// Each load `Counted` made: the column, the batch and the rows.
+    type Loads = StdVec<(u8, u8, StdVec<u16>)>;
+
     struct Counted<'a> {
         lazy: bool,
-        loads: &'a RefCell<StdVec<(u8, u8, StdVec<u16>)>>,
+        loads: &'a RefCell<Loads>,
         conditions: &'a RefCell<StdVec<SkippedBy>>,
     }
 
@@ -925,6 +954,66 @@ mod tests {
         assert_eq!(*loads.borrow(), [b[0].clone(), c[0].clone(), b[1].clone(), c[1].clone()]);
     }
 
+    /// The rows of `Counted`'s `c` and `b` sorted by `b` descending, the
+    /// first `limit` if given, and the loads made.
+    fn sorted_by_b(limit: Option<u64>) -> (StdVec<StdVec<i64>>, Loads) {
+        let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
+        let table = Counted { lazy: true, loads: &loads, conditions: &conditions };
+        let table = DynScannable::new(&Heap, table).unwrap();
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let mut columns = SlowVec::fixed(&Heap, 3).unwrap();
+        let mut bindings = StdVec::new();
+        for (column, name) in [(0, "a"), (1, "b"), (2, "c")] {
+            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
+            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            bindings.push(binding);
+        }
+        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let key = SortKey { column: bindings[1].id, descending: true };
+        let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
+        let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp::new(keys)).unwrap();
+        node = plan
+            .add_node(order_by, SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap())
+            .unwrap();
+        if let Some(count) = limit {
+            let limit = DynOp::new(&Heap, crate::limit::LimitOp { count, offset: 0 }).unwrap();
+            plan.add_node(limit, SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap()).unwrap();
+        }
+        assert!(plan.output.push(bindings[2]).is_ok() && plan.output.push(bindings[1]).is_ok());
+        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = physical.start(&query).unwrap();
+        let (mut batch, mut kept) = (RowBatch::new(), StdVec::new());
+        while execution.next(&mut batch).unwrap() {
+            for i in 0..batch.selection().len() {
+                let row = batch.selection().kept().row(i) as usize;
+                let columns = physical.columns().iter().map(|c| batch.column(c.position));
+                kept.push(columns.map(|column| column.int64s()[row]).collect());
+            }
+        }
+        drop(execution);
+        let loaded = loads.borrow().clone();
+        (kept, loaded)
+    }
+
+    #[test]
+    fn sorts_hold_lazy_columns_and_top_k_loads_only_its_rows() {
+        // A `TopK` loads `c` only for the two rows it outputs, both of batch 2.
+        let (kept, loads) = sorted_by_b(Some(2));
+        assert_eq!(kept, [[223, 123], [222, 122]]);
+        assert_eq!(loads, [(2, 2, vec![2, 3])]);
+        // A sort outputs every row, so loads each batch as it arrives.
+        let (kept, loads) = sorted_by_b(None);
+        assert_eq!(kept.len(), 12);
+        assert_eq!((kept[0].clone(), kept[11].clone()), (vec![223, 123], vec![200, 100]));
+        assert_eq!(
+            loads.iter().map(|(c, b, _)| (*c, *b)).collect::<StdVec<_>>(),
+            [(2, 0), (2, 1), (2, 2)]
+        );
+    }
+
     #[test]
     fn never_loads_columns_nothing_reads() {
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
@@ -998,7 +1087,7 @@ mod tests {
                 Stage::OrderBy => {
                     let key = SortKey { column: ids[1], descending: true };
                     let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
-                    DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap()
+                    DynOp::new(&Heap, crate::order_by::OrderByOp::new(keys)).unwrap()
                 }
                 Stage::Limit(count) => {
                     DynOp::new(&Heap, crate::limit::LimitOp { count, offset: 0 }).unwrap()
