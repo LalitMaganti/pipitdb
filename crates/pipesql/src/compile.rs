@@ -492,7 +492,7 @@ mod tests {
             (ErrorCode::ExpectedWord, 36)
         );
         assert_eq!(error("FROM t |> SELECT CASE END AS x"), (ErrorCode::ExpectedExpression, 22));
-        assert_eq!(error("FROM t |> SELECT CASE a THEN 1 END AS x"), (ErrorCode::ExpectedWord, 31));
+        assert_eq!(error("FROM t |> SELECT CASE a THEN 1 END AS x"), (ErrorCode::ExpectedWord, 24));
         assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
         assert_eq!(error("FROM t |> SELECT a LIKE 'x' AS y"), (ErrorCode::ExpectedString, 17));
         assert_eq!(error("FROM t |> SELECT iif(a, 1) AS y"), (ErrorCode::ArgumentCount, 17));

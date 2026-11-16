@@ -426,17 +426,29 @@ impl Parser<'_> {
                 } else {
                     Keyword::None
                 };
-                match keyword {
-                    Keyword::When | Keyword::Then | Keyword::Else => {
-                        stack.push(Pending::CasePart(operand, keyword), 0, token)?;
-                        Ok(Ended::Next)
+                // What may end this part, by what ended the one before: the
+                // subject, a condition, a value, or what `ELSE` gives.
+                let before = match frame.pending {
+                    Pending::CasePart(_, keyword) => keyword,
+                    _ => Keyword::Case,
+                };
+                let allowed = match before {
+                    Keyword::Case => keyword == Keyword::When,
+                    Keyword::When => keyword == Keyword::Then,
+                    Keyword::Then => {
+                        matches!(keyword, Keyword::When | Keyword::Else | Keyword::End)
                     }
-                    Keyword::End => {
-                        let (case, power) = self.case(stack, operand, token)?;
-                        Ok(Ended::Closed(case, power))
-                    }
-                    _ => Err(Error::new(ErrorCode::ExpectedWord, token.span)),
+                    _ => keyword == Keyword::End,
+                };
+                if !allowed {
+                    return Err(Error::new(ErrorCode::ExpectedWord, token.span));
                 }
+                if keyword != Keyword::End {
+                    stack.push(Pending::CasePart(operand, keyword), 0, token)?;
+                    return Ok(Ended::Next);
+                }
+                let (case, power) = self.case(stack, operand, before);
+                Ok(Ended::Closed(case, power))
             }
             Pending::Call(_) | Pending::Argument(_) => {
                 let token = self.advance()?;
@@ -454,55 +466,29 @@ impl Parser<'_> {
         }
     }
 
-    /// Pops a `CASE` and its parts off `stack`, `last` being its last, ended
-    /// by `END`, the token `end`, and writes them to the tree: its subject,
-    /// each condition and value, and its `ELSE`'s value, an empty node for
-    /// one it hasn't. Returns the `CASE` and the binding power to go back to.
-    fn case(&mut self, stack: &mut Stack, last: Node, end: Token) -> Result<(Node, u8), Error> {
+    /// Pops a `CASE` and its parts off `stack`, checked to be in order as
+    /// they ended, `last` its last, after a part ended by `before`, and
+    /// writes them to the tree: its subject, each condition and value, and
+    /// its `ELSE`'s value, an empty node for one it hasn't. Returns the `CASE`
+    /// and the binding power to go back to.
+    fn case(&mut self, stack: &mut Stack, last: Node, before: Keyword) -> (Node, u8) {
         let mut case = stack.depth - 1;
         while let Pending::CasePart(..) = at!(stack.frames, case).pending {
             case -= 1;
         }
-        let mut parts = [(Node::empty(), Keyword::None); NESTING_MAX];
-        let mut count = 0;
-        for frame in at!(stack.frames, case + 1..stack.depth) {
-            if let Pending::CasePart(node, keyword) = frame.pending {
-                *at_mut!(parts, count) = (node, keyword);
-                count += 1;
-            }
-        }
-        *at_mut!(parts, count) = (last, Keyword::End);
-        count += 1;
-        let parts = at!(parts, ..count);
-        // A subject, then each condition, ended by `THEN`, and value, ended by
-        // the next `WHEN`, `ELSE` or `END`, then what `ELSE` gives.
-        let malformed = Error::new(ErrorCode::ExpectedWord, end.span);
-        let (&(subject, Keyword::When), mut rest) = parts.split_first().ok_or(malformed)? else {
-            return Err(malformed);
-        };
         let first_child = self.node_count();
-        self.write(&[subject]);
-        let mut otherwise = Node::empty();
-        loop {
-            let [(condition, Keyword::Then), (value, ended), tail @ ..] = rest else {
-                return Err(malformed);
-            };
-            self.write(&[*condition, *value]);
-            rest = tail;
-            match (*ended, rest) {
-                (Keyword::When, _) => {}
-                (Keyword::End, []) => break,
-                (Keyword::Else, [(value, Keyword::End)]) => {
-                    otherwise = *value;
-                    break;
-                }
-                _ => return Err(malformed),
+        for frame in at!(stack.frames, case + 1..stack.depth) {
+            if let Pending::CasePart(node, _) = frame.pending {
+                self.write(&[node]);
             }
         }
-        self.write(&[otherwise]);
+        self.write(&[last]);
+        if before != Keyword::Else {
+            self.write(&[Node::empty()]);
+        }
         stack.depth = case;
         let node = Node::list(Tag::Case, self.node_count() - first_child, first_child);
-        Ok((node, at!(stack.frames, case).min_power))
+        (node, at!(stack.frames, case).min_power)
     }
 
     /// Whether the current token is the keyword `keyword`.
