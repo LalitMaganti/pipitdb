@@ -1,0 +1,30 @@
+[package]
+name = "pipitdb-regex"
+description = "Regular expression functions for pipitdb's expressions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "pipit_regex"
+
+[dependencies]
+pipitdb-kernel = { path = "../kernel" }
+pipitdb-pipesql = { path = "../pipesql" }
+regex = { version = "1.13", optional = true }
+regex-lite = { version = "0.1.9", optional = true }
+
+[dev-dependencies]
+pipitdb-operators = { path = "../operators" }
+
+[features]
+default = ["lite"]
+# The engine: `regex-lite`, which is small, or `regex`, which is fast and
+# wins if both are on.
+lite = ["dep:regex-lite"]
+full = ["dep:regex"]
+
+[lints]
+workspace = true

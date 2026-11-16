@@ -20,6 +20,7 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 gungraun = "0.20"
 pipitdb-file = { path = "../file" }
 pipitdb-parquet-full = { path = "../parquet-full", features = ["snappy-cpp"] }
+pipitdb-regex = { path = "../regex", default-features = false, features = ["full"] }
 
 [features]
 default = ["check-lines", "string-functions"]
