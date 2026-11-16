@@ -417,6 +417,23 @@ fn validity(
         return Ok(None);
     }
     let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    let aligned = |validity: Option<Validity>| validity.is_none_or(|v| v.bits().1 == 0);
+    if divisor.is_none() && aligned(a) && aligned(b) {
+        // Nearly always: only a scan's later batches start mid-byte. The
+        // bits past the last row are never read.
+        let len = rows.div_ceil(8);
+        let out = buffer.as_mut_slice::<u8>();
+        match (a.map(|a| at!(a.bits().0, ..len)), b.map(|b| at!(b.bits().0, ..len))) {
+            (Some(x), Some(y)) => {
+                for ((o, &x), &y) in out.iter_mut().zip(x).zip(y) {
+                    *o = x & y;
+                }
+            }
+            (Some(only), None) | (None, Some(only)) => out.copy_from_slice(only),
+            (None, None) => failed!(),
+        }
+        return Ok(Some(buffer));
+    }
     for (i, bytes) in buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate() {
         let (at, count) = (i * 64, (rows - i * 64).min(64));
         let word = word(a, at, count) & word(b, at, count) & nonzero(divisor, at, count);
@@ -873,6 +890,16 @@ mod tests {
         b.push(ExprOp::Add, INT, doubled, u);
         let cells = run(b, batch(&[column(&N), column(&U)]));
         assert_eq!(cells, [Some(21), Some(40), None, Some(80), Some(105)]);
+    }
+
+    /// Both sides' nulls, each starting on a byte, as most batches' do.
+    #[test]
+    fn nulls_on_both_sides() {
+        let mut b = Builder(StdVec::new());
+        let (n, m) = (b.push(ExprOp::Column, INT, 0, 0), b.push(ExprOp::Column, INT, 1, 0));
+        b.push(ExprOp::Add, INT, n, m);
+        let m = column(&[None, Some(1), Some(2), Some(3), None]);
+        assert_eq!(run(b, batch(&[column(&N), m])), [None, Some(21), None, Some(43), None]);
     }
 
     #[test]
