@@ -728,7 +728,7 @@ mod tests {
             let kept = core::cell::Cell::new(0);
             let steps = [
                 Step::Transform(DynTransform::new(&Heap, Rows(&kept)).unwrap()),
-                Step::Operator(pipit_kernel::top_k::top_k(&Heap, keys, 3, publish).unwrap()),
+                Step::Operator(pipit_kernel::top_k::top_k(&Heap, keys, 3, publish, None).unwrap()),
             ];
             let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).unwrap();
             let pipeline = Pipeline::new(source, steps);

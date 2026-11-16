@@ -136,6 +136,19 @@ pub trait Op<'c> {
     /// The op that loads `columns`, which this makes lazy, each in one of
     /// the forms given with it, to put above it. Only called for columns
     /// `allow` said it would make lazy.
+    /// What reads the columns this makes, if it's a scan: what loads those
+    /// it makes lazy. By default, none.
+    fn scannable(&self) -> Option<&'c DynScannable<'c>> {
+        None
+    }
+
+    /// Tells this that lazy columns `scannable` made pass through it unread,
+    /// to be loaded above it. By default it needn't know: only an op that
+    /// holds rows, as `ORDER BY`'s sort does, loads them itself.
+    fn holds_lazy(&mut self, scannable: &'c DynScannable<'c>) {
+        let _ = scannable;
+    }
+
     fn materialize(
         &self,
         allocator: &dyn Allocator,
@@ -218,6 +231,8 @@ struct OpFunctions<'c> {
     give_condition: GiveCondition,
     takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
     take_condition: TakeCondition,
+    scannable: unsafe fn(NonNull<()>) -> Option<&'c DynScannable<'c>>,
+    holds_lazy: unsafe fn(NonNull<()>, &'c DynScannable<'c>),
     materialize: Materialize<'c>,
     summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
     answer: Answer<'c>,
@@ -259,6 +274,10 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         take_condition: |op, allocator, column, condition| unsafe {
             value_mut_of::<T>(op).take_condition(allocator, column, condition)
         },
+        // SAFETY: as for `reads`.
+        scannable: |op| unsafe { value_of::<T>(op).scannable() },
+        // SAFETY: as for `prune`.
+        holds_lazy: |op, scannable| unsafe { value_mut_of::<T>(op).holds_lazy(scannable) },
         // SAFETY: as for `reads`.
         materialize: |op, allocator, columns| unsafe {
             value_of::<T>(op).materialize(allocator, columns)
@@ -333,6 +352,17 @@ impl<'c> DynOp<'c> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
         unsafe { (self.functions.take_condition)(self.op.as_ptr(), allocator, column, condition) }
+    }
+
+    pub(crate) fn scannable(&self) -> Option<&'c DynScannable<'c>> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.scannable)(self.op.as_ptr()) }
+    }
+
+    pub(crate) fn holds_lazy(&mut self, scannable: &'c DynScannable<'c>) {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.holds_lazy)(self.op.as_ptr(), scannable) }
     }
 
     pub(crate) fn materialize(
@@ -573,6 +603,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
             None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
         };
         conditions.push(condition).map_err(|_| AllocError)
+    }
+
+    fn scannable(&self) -> Option<&'c DynScannable<'c>> {
+        Some(self.scannable)
     }
 
     fn materialize(

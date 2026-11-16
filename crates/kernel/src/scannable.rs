@@ -11,7 +11,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
-use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::column::{Bounds, ColumnView, DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
@@ -361,6 +361,18 @@ impl<'a> DynScannable<'a> {
         Ok(source)
     }
 
+    /// A loader of the lazy columns this writes, for a step that holds them
+    /// and loads only the rows it keeps, as a `TopK` does.
+    pub fn loader(&'a self, context: &mut Context) -> Result<LazyLoader<'a>, Error> {
+        let size = self.loader_layout.size().max(1);
+        // SAFETY: the loader is made in it before it's read.
+        let mut memory = unsafe { Buffer::allocate_uninit(context.allocator(), size)? };
+        // SAFETY: the function matches the scannable's type, and the memory
+        // has room for its loader, aligned as `new` checked.
+        unsafe { (self.new_loader)(self.scannable.as_ptr(), context, memory.as_mut_non_null())? };
+        Ok(LazyLoader { scannable: self, memory })
+    }
+
     /// A transform that loads the lazy columns at `positions` in batches,
     /// which this wrote, for the rows each batch keeps, each in one of its
     /// `forms`.
@@ -396,6 +408,57 @@ struct Scan {
     /// Which of its columns, in order, each with the forms it may be
     /// written in.
     columns: SlowVec<(u32, Forms)>,
+}
+
+/// A `DynScannable`'s loader, made by `DynScannable::loader`.
+pub struct LazyLoader<'a> {
+    scannable: &'a DynScannable<'a>,
+    /// Holds the loader.
+    memory: Buffer,
+}
+
+impl LazyLoader<'_> {
+    /// The rows `selection` keeps of `lazy`, one of the scannable's lazy
+    /// columns, flat.
+    pub fn load(
+        &mut self,
+        context: &mut Context,
+        lazy: &ColumnView,
+        selection: &Selection,
+    ) -> Result<ColumnView, Error> {
+        let (scannable, loader) = (self.scannable, self.memory.as_mut_non_null());
+        // SAFETY: the function matches the scannable's type, and the memory
+        // holds its loader.
+        unsafe {
+            (scannable.load)(
+                scannable.scannable.as_ptr(),
+                context,
+                loader,
+                lazy,
+                selection,
+                Forms::FLAT,
+            )
+        }
+    }
+}
+
+/// Loads the rows `selection` keeps of `lazy` with `loader`, which a step
+/// given lazy columns has.
+pub(crate) fn load_lazy(
+    loader: &mut Option<LazyLoader<'_>>,
+    context: &mut Context,
+    lazy: &ColumnView,
+    selection: &Selection,
+) -> Result<ColumnView, Error> {
+    let Some(loader) = loader else { failed!() };
+    loader.load(context, lazy, selection)
+}
+
+impl Drop for LazyLoader<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the memory holds the scannable's loader, dropped once.
+        unsafe { (self.scannable.drop_loader)(self.memory.as_mut_non_null()) }
+    }
 }
 
 /// A transform that loads lazy columns a `DynScannable` wrote.

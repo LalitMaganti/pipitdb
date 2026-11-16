@@ -8,7 +8,7 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::plan::PLAN_COLUMNS_MAX;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use crate::selection::Kept;
+use crate::selection::{Kept, Selection};
 use crate::slow_vec::SlowVec;
 use core::ops::Range;
 
@@ -76,6 +76,8 @@ pub(crate) struct RowStore {
     /// By column dropped, a batch's worth of words never read, held in its
     /// place.
     placeholders: SlowVec<ColumnView>,
+    /// Whether a batch held has a lazy column.
+    lazy: bool,
     /// By column, a bit for whether `scatter` copied it.
     scattered: u64,
     /// The columns `scatter` copied, in output order: by column copied, a
@@ -96,6 +98,7 @@ impl RowStore {
             nullable: 0,
             dropped: 0,
             placeholders: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            lazy: false,
             scattered: 0,
             copies: SlowVec::new(allocator, 1 << 24)?,
         })
@@ -109,20 +112,24 @@ impl RowStore {
         len
     }
 
-    /// Holds the rows `batch` keeps. Every batch must have the same columns.
+    /// Holds the rows `batch` keeps. Every batch must have the same columns,
+    /// each flat or lazy: a batch with a lazy column is held whole, as its
+    /// rows can't be packed until they're loaded, which `gather` does.
     pub(crate) fn append(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
         let count = batch.selection().len();
         if count == 0 {
             return Ok(());
         }
-        check!((0..batch.column_count()).all(|c| matches!(batch.column(c).form(), Form::Flat)));
+        let held = |column: &ColumnView| column.is_lazy() || matches!(column.form(), Form::Flat);
+        check!((0..batch.column_count()).all(|c| held(batch.column(c))));
+        let lazy = (0..batch.column_count()).any(|c| batch.column(c).is_lazy());
         if self.len().checked_add(count).is_none_or(|len| len > 1 << 31) {
             return Err(Error::OutOfMemory);
         }
-        if shares(batch) {
+        if lazy || shares(batch) {
             // Rows packed before come first.
             self.flush(context)?;
-            return self.hold(batch);
+            return self.hold(context, batch);
         }
         let columns = (0..batch.column_count()).map(|c| batch.column(c));
         let kept = batch.selection().kept();
@@ -178,17 +185,32 @@ impl RowStore {
     }
 
     /// Holds `batch` as it is, sharing its buffers.
-    fn hold(&mut self, batch: &RowBatch) -> Result<(), Error> {
+    fn hold(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
         let held = self.batches;
         if held as usize == BATCHES_MAX {
             return Err(Error::OutOfMemory);
         }
         self.width = batch.column_count();
+        // A batch held for its lazy columns which keeps few rows holds only
+        // their strings, as packing would.
+        let lazy = (0..batch.column_count()).any(|c| batch.column(c).is_lazy());
+        self.lazy |= lazy;
+        let few = lazy && batch.selection().len() * 2 < BATCH_ROWS_MAX;
+        let few = few.then(|| batch.selection());
         for c in 0..batch.column_count() {
             let column = batch.column(c);
             let placeholder = self.dropped(c as usize).map(|k| at!(self.placeholders, k));
-            self.held.push(GatherSource::of(placeholder.unwrap_or(column)))?;
-            self.nullable |= u64::from(column.has_nulls()) << c.min(63);
+            let source = match placeholder.unwrap_or(column) {
+                lazy if lazy.is_lazy() => GatherSource::lazy(lazy),
+                strings if few.is_some() && strings.data_type().has_bytes() => {
+                    GatherSource::of(&strings.padded(context, few)?)
+                }
+                fits if GatherSource::fits(fits) => GatherSource::of(fits),
+                // Only a batch held for its lazy columns needn't fit.
+                short => GatherSource::of(&short.padded(context, None)?),
+            };
+            self.held.push(source)?;
+            self.nullable |= u64::from(!column.is_lazy() && column.has_nulls()) << c.min(63);
         }
         let kept = batch.selection().kept();
         let whole = self.dense.is_multiple_of(BATCH_ROWS_MAX) && matches!(kept, Kept::Prefix);
@@ -218,7 +240,7 @@ impl RowStore {
         }
         while self.packing.pop().is_some() {}
         self.packed = 0;
-        self.hold(&batch)
+        self.hold(context, &batch)
     }
 
     /// The string of the held row `row` in column `column`, a string column,
@@ -243,6 +265,7 @@ impl RowStore {
         rows: &[u32],
         at: u32,
         mut given: impl FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
+        load: &mut Load<'_>,
     ) -> Result<u32, Error> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         let count = rows.len().min(BATCH_ROWS_MAX as usize) as u32;
@@ -270,6 +293,10 @@ impl RowStore {
                 let column = match scattered(c as usize) {
                     Some(column) => column,
                     None if self.dropped(c as usize).is_some() => given(context, c)?,
+                    None if held.view().is_lazy() => {
+                        let width = self.width as usize;
+                        gather_loaded(context, (&self.held, width, c as usize), places, load)?
+                    }
                     None => held.view().slice(start, count),
                 };
                 let Ok(()) = out.push_column(column) else { failed!() };
@@ -284,6 +311,9 @@ impl RowStore {
                 Some(column) => column,
                 #[expect(clippy::cast_possible_truncation, reason = "a column")]
                 None if self.dropped(c).is_some() => given(context, c as u32)?,
+                None if self.lazy_in(c, places) => {
+                    gather_loaded(context, (&self.held, width, c), places, load)?
+                }
                 None => {
                     let nullable = self.nullable >> c.min(63) & 1 != 0;
                     let data_type = at!(held, c).view().data_type();
@@ -293,6 +323,13 @@ impl RowStore {
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
+    }
+
+    /// Whether column `column` is lazy in a batch one of `places` is in.
+    fn lazy_in(&self, column: usize, places: &[u32]) -> bool {
+        let width = self.width as usize;
+        let held = |place: u32| at!(self.held, (place >> ROW_BITS) as usize * width + column);
+        places.iter().any(|&place| held(place).view().is_lazy())
     }
 
     /// Column `column`'s `count` values from `at` in the order `scatter` was
@@ -328,6 +365,8 @@ impl RowStore {
     ) -> Result<(), Error> {
         self.flush(context)?;
         let (width, rows) = (self.width as usize, words.len());
+        // A sort loads lazy columns before holding them, so none has words.
+        check!(!self.lazy);
         let allocator = context.allocator();
         // A bit for each column to copy, and each column's type.
         let (mut copy, mut types) = (0_u64, [DataType::Int64; 63]);
@@ -636,6 +675,58 @@ fn view(start: usize, len: usize) -> Result<[u32; 2], Error> {
 /// A flat column of `data_type` holding, for each of `places`, that row of
 /// its batch's column in `held`: the store's columns, how many each batch
 /// has, and which column. `nullable` is whether any has nulls.
+/// Loads the rows a selection keeps of a lazy column, flat.
+pub(crate) type Load<'l> =
+    dyn FnMut(&mut Context, &ColumnView, &Selection) -> Result<ColumnView, Error> + 'l;
+
+/// Column `column` of the rows at `places`, in order, where batches they're
+/// in hold it lazy: each of those loads, with `load`, only the rows needed
+/// of it, which are then gathered as any are.
+#[inline(never)]
+fn gather_loaded(
+    context: &mut Context,
+    (held, width, column): (&[GatherSource], usize, usize),
+    places: &[u32],
+    load: &mut Load<'_>,
+) -> Result<ColumnView, Error> {
+    // Each batch the places are in, and its column, loaded if lazy; then
+    // the places renumbered by those.
+    let (mut batches, mut sources) = (
+        SlowVec::new(context.allocator(), BATCH_ROWS_MAX as usize)?,
+        SlowVec::new(context.allocator(), BATCH_ROWS_MAX as usize)?,
+    );
+    for &place in places {
+        let batch = place >> ROW_BITS;
+        if batches.contains(&batch) {
+            continue;
+        }
+        let view = at!(held, batch as usize * width + column).view();
+        let source = if view.is_lazy() {
+            let mut needed = [0_u64; BATCH_ROWS_MAX as usize / 64];
+            for &other in places.iter().filter(|&&other| other >> ROW_BITS == batch) {
+                let row = (other & ROW_MASK) as usize;
+                *at_mut!(needed, row / 64) |= 1 << (row % 64);
+            }
+            let mut selection = Selection::all(view.row_count());
+            selection.retain(|row| *at!(needed, usize::from(row) / 64) >> (row % 64) & 1 != 0);
+            let loaded = load(context, view, &selection)?;
+            GatherSource::of(&loaded.padded(context, None)?)
+        } else {
+            GatherSource::of(view)
+        };
+        batches.push(batch)?;
+        sources.push(source)?;
+    }
+    let mut renumbered = SlowVec::fixed(context.allocator(), places.len())?;
+    for &place in places {
+        let Some(at) = batches.iter().position(|&b| b == place >> ROW_BITS) else { failed!() };
+        #[expect(clippy::cast_possible_truncation, reason = "at most a batch's places")]
+        renumbered.push((at as u32) << ROW_BITS | place & ROW_MASK)?;
+    }
+    let data_type = at!(sources, 0).view().data_type();
+    gather(context, data_type, (&sources, 1, 0), &renumbered, true)
+}
+
 fn gather(
     context: &mut Context,
     data_type: DataType,
@@ -805,7 +896,16 @@ mod tests {
         let mut got = Vec::new();
         for chunk in all.chunks(BATCH_ROWS_MAX as usize) {
             assert_eq!(
-                store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap() as usize,
+                store
+                    .gather(
+                        &mut context,
+                        &mut out,
+                        chunk,
+                        0,
+                        |_, _| failed!(),
+                        &mut |_, _, _| failed!()
+                    )
+                    .unwrap() as usize,
                 chunk.len()
             );
             if chunk[0] == 0 {
@@ -819,7 +919,16 @@ mod tests {
         let backwards: Vec<u32> = (0..store.len()).rev().step_by(3).collect();
         let mut got = Vec::new();
         for chunk in backwards.chunks(BATCH_ROWS_MAX as usize) {
-            store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap();
+            store
+                .gather(
+                    &mut context,
+                    &mut out,
+                    chunk,
+                    0,
+                    |_, _| failed!(),
+                    &mut |_, _, _| failed!(),
+                )
+                .unwrap();
             got.extend(read(&out));
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
@@ -838,7 +947,9 @@ mod tests {
         let last = BATCH_ROWS_MAX * 2 - 1;
         let rows = [last, 3, BATCH_ROWS_MAX, 0];
         let mut out = RowBatch::new();
-        store.gather(&mut context, &mut out, &rows, 0, |_, _| failed!()).unwrap();
+        store
+            .gather(&mut context, &mut out, &rows, 0, |_, _| failed!(), &mut |_, _, _| failed!())
+            .unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let null = (None, b"v0".to_vec());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
@@ -885,7 +996,16 @@ mod tests {
         for (chunk, at) in
             rows.chunks(BATCH_ROWS_MAX as usize).zip((0..).step_by(BATCH_ROWS_MAX as usize))
         {
-            store.gather(&mut context, &mut out, chunk, at, |_, _| failed!()).unwrap();
+            store
+                .gather(
+                    &mut context,
+                    &mut out,
+                    chunk,
+                    at,
+                    |_, _| failed!(),
+                    &mut |_, _, _| failed!(),
+                )
+                .unwrap();
             for (r, &row) in chunk.iter().enumerate() {
                 assert_eq!(out.column(0).int64s()[r], value(row));
                 assert_eq!(out.column(2).int64s()[r], value(row) * 10 + 1);

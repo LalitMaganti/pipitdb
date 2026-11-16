@@ -14,6 +14,7 @@ use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
+use crate::row_store::Load;
 use crate::row_store::RowStore;
 use crate::slow_vec::SlowVec;
 
@@ -239,6 +240,7 @@ impl SortedRows {
         context: &mut Context,
         out: &mut RowBatch,
         at: u32,
+        load: &mut Load<'_>,
     ) -> Result<u32, Error> {
         let end = self.order_len.min(at.saturating_add(BATCH_ROWS_MAX));
         let start = at.min(end);
@@ -294,7 +296,7 @@ impl SortedRows {
             }
             Ok(ColumnView::new(context, data_type, values, nulls.then_some(validity))?)
         };
-        self.rows.gather(context, out, rows, at, given)
+        self.rows.gather(context, out, rows, at, given, load)
     }
 
     /// Copies the columns `RowStore::scatter` can into the order, once
