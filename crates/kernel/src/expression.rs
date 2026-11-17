@@ -15,13 +15,15 @@ use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynTransform, Step, Transform};
+use crate::string_pool::Id;
 
 /// What a step of an `ExprProgram` computes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExprOp {
     /// Reads batch column `a`.
     Column,
-    /// A constant: `int_value` or `double_value` by type.
+    /// A constant: `int_value` or `double_value` by type, or for a string,
+    /// the string whose id in the statement's literals is `a`.
     Constant,
     /// A null of its type.
     Null,
@@ -128,18 +130,34 @@ fn constant(context: &mut Context, step: &ExprStep) -> Result<Option<ColumnView>
         return Ok(None);
     }
     let rows = BATCH_ROWS_MAX as usize;
-    let mut values = context.values_buffer(rows * 8)?;
-    if step.data_type == DataType::Float64 {
-        values.as_mut_slice::<f64>().fill(step.double_value);
-    } else {
-        check!(step.data_type == DataType::Int64);
-        values.as_mut_slice::<i64>().fill(step.int_value);
-    }
     let mut validity = None;
     if step.op == ExprOp::Null {
         let mut none = context.small_buffer(rows / 8)?;
         none.as_mut_slice::<u8>().fill(0);
         validity = Some(none);
+    }
+    let mut values = context.values_buffer(rows * 8)?;
+    if step.data_type == DataType::String {
+        // Every row's view is of one copy of its bytes: none for a null.
+        let text = match step.op {
+            ExprOp::Constant => {
+                let literal = context.literals().and_then(|literals| literals.get(Id::raw(step.a)));
+                let Some(literal) = literal else { failed!() };
+                literal
+            }
+            _ => &[],
+        };
+        let mut bytes = context.bytes_buffer(text.len())?;
+        bytes.as_mut_slice::<u8>().copy_from_slice(text);
+        let Ok(len) = u32::try_from(text.len()) else { failed!() };
+        values.as_mut_slice::<u32>().as_chunks_mut::<2>().0.fill([0, len]);
+        return Ok(Some(ColumnView::strings(context, values, bytes, validity)?));
+    }
+    if step.data_type == DataType::Float64 {
+        values.as_mut_slice::<f64>().fill(step.double_value);
+    } else {
+        check!(step.data_type == DataType::Int64);
+        values.as_mut_slice::<i64>().fill(step.int_value);
     }
     Ok(Some(ColumnView::new(context, step.data_type, values, validity)?))
 }
@@ -359,12 +377,13 @@ fn nonzero(divisor: Option<(&[i64], bool)>, at: usize, count: usize) -> u64 {
 pub const EXPR_NODES_MAX: usize = 1 << 8;
 
 /// A scalar expression over the columns of a row, as a plan holds it: column
-/// references, numbers, NULL and arithmetic.
+/// references, literals, NULL and arithmetic.
 ///
 /// It has the shape of an `ExprProgram`: nodes in post-order, each reading
 /// only nodes before it, the last being the result. A `Column` node's `a` is
 /// a `ColumnId` rather than a batch position, and only a `Constant` node's
-/// `data_type` means anything: the rest are typed when the plan is lowered.
+/// `data_type` means anything: the rest are typed when the plan is lowered. A
+/// string `Constant`'s `a` is its id in the statement's literals.
 ///
 /// Only expressions whose meaning is the same as SQLite's are accepted.
 /// Arithmetic on strings is an error, and an integer overflow fails the query
@@ -798,6 +817,30 @@ mod tests {
         let expected: StdVec<Option<i64>> =
             (3..23).map(|i| (i % 3 != 0 && (i + 1) % 3 != 0).then_some(-1)).collect();
         assert_eq!(run(b, batch(&[n, m])), expected);
+    }
+
+    /// A string constant is every row's, read from the statement's literals,
+    /// and a string null none.
+    #[test]
+    fn string_constants() {
+        let mut literals = crate::string_pool::StringPool::new(&Heap).unwrap();
+        let hi = literals.intern_string(&Heap, Some(b"hi")).unwrap();
+        let string = DataType::String;
+        let query = crate::query_allocators::QueryAllocators::new(&Heap);
+        let mut context = Context::for_query(&query, Some(&literals));
+        for (op, expected) in [(ExprOp::Constant, Some(&b"hi"[..])), (ExprOp::Null, None)] {
+            let mut b = Builder(StdVec::new());
+            b.push(op, string, hi.raw_id(), 0);
+            let compute = compute([b.program()].into_iter());
+            let mut state = compute.new_state(&mut context).unwrap();
+            let mut batch = batch(&[column(&N)]);
+            compute.process(&mut context, &mut state, &mut batch).unwrap();
+            let column = batch.column(1);
+            for row in 0..5 {
+                let cell = (!column.is_null(row)).then(|| column.string_values().get(row as usize));
+                assert_eq!(cell, expected);
+            }
+        }
     }
 
     /// Each program reads the batch as it came, and adds its column.
