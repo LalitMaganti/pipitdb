@@ -83,12 +83,9 @@ pub enum ErrorCode {
     ArithmeticOnSomeRows = 36,
     /// An argument of a type its function doesn't take.
     ArgumentType = 37,
-<<<<<<< HEAD
     /// An argument a function can't take, such as a pattern that isn't a
     /// string literal, or isn't valid.
     InvalidArgument = 38,
-=======
->>>>>>> origin/main
 }
 
 /// What an `Unsupported` error is about. Only ever added to, as codes are.
@@ -138,11 +135,7 @@ const _: () = assert!(size_of::<Option<ErrorCode>>() == size_of::<ErrorCode>());
 
 impl ErrorCode {
     /// The highest code. Update it when adding one.
-<<<<<<< HEAD
     pub const LAST: ErrorCode = ErrorCode::InvalidArgument;
-=======
-    pub const LAST: ErrorCode = ErrorCode::ArgumentType;
->>>>>>> origin/main
 
     pub fn from_u16(value: u16) -> Option<ErrorCode> {
         if !(1..=ErrorCode::LAST as u16).contains(&value) {

@@ -36,10 +36,7 @@ static REGISTRY: Registry =
         .with_functions(&[
             pipit_pipesql::choices::CHOICES,
             pipit_pipesql::string_functions::STRING_FUNCTIONS,
-<<<<<<< HEAD
             pipit_regex::REGEX_FUNCTIONS,
-=======
->>>>>>> origin/main
         ]);
 
 /// ClickBench's queries: each one's name, PipeSQL, if pipitdb can run it yet,

@@ -60,7 +60,6 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.catalog
     }
 
-<<<<<<< HEAD
     /// The bytes of `node`, if it's a string literal, which it adds to the
     /// statement's literals: as a function's binding reads a pattern.
     pub fn string_literal(&mut self, node: Node) -> Result<Option<&[u8]>, Error> {
@@ -71,8 +70,6 @@ impl<'q, 'c> Compiler<'q, 'c> {
         Ok(Some(self.plan.literal(id)))
     }
 
-=======
->>>>>>> origin/main
     /// The stages and functions queries can use.
     pub fn registry(&self) -> &'q Registry {
         self.registry
