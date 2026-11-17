@@ -5,7 +5,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep};
+use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::lower::{PhysicalPlan, lower};
@@ -178,20 +178,36 @@ pub fn compute_pipeline(
         column(|row| (row * 7919 % 1000) as i64, 0.5, 0),
         column(|row| (row % 97 + 1) as i64, 0.25, 5),
     ];
-    let step =
-        |op, data_type, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
+    let step = |op, data_type, a, b| ExprStep {
+        op,
+        data_type,
+        a,
+        b,
+        c: 0,
+        int_value: 0,
+        double_value: 0.0,
+    };
     // A comparison is an Int64, whatever it compares.
     let comparison = matches!(
         op,
         ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::IsNull | ExprOp::IsNotNull
     );
     let result = if comparison { DataType::Int64 } else { data_type };
-    let steps = [
-        step(ExprOp::Column, data_type, 0, 0),
-        step(ExprOp::Column, data_type, 1, 0),
-        step(op, result, 0, 1),
-    ];
-    let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).expect("allocates");
+    let (first, second) =
+        (step(ExprOp::Column, data_type, 0, 0), step(ExprOp::Column, data_type, 1, 0));
+    let steps = if matches!(op, ExprOp::Case | ExprOp::When) {
+        // `iif(first, second, first)`, or for `When`, `coalesce(first,
+        // second)`: a `CASE` of one branch.
+        let (condition, value, otherwise) =
+            if op == ExprOp::Case { (0, 1, 0) } else { (PRESENT, 0, 1) };
+        let mut case = step(ExprOp::Case, data_type, 2, 1);
+        case.c = otherwise;
+        let when = step(ExprOp::When, data_type, condition, value);
+        SlowVec::fixed_from(&Heap, [first, second, when, case].into_iter())
+    } else {
+        SlowVec::fixed_from(&Heap, [first, second, step(op, result, 0, 1)].into_iter())
+    };
+    let steps = steps.expect("allocates");
     let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps }].into_iter());
     let compute = Compute { programs: programs.expect("allocates") };
     let mut owned = SlowVec::fixed(&Heap, 1).expect("allocates");
@@ -209,7 +225,7 @@ pub fn perfetto_expression(index: usize, batches: u32) -> Pipeline<'static> {
 
 /// Perfetto's `expression_benchmark.cc`'s cases: names, ops, types and
 /// whether there are nulls.
-pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 13] = [
+pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 16] = [
     ("int_add", ExprOp::Add, DataType::Int64, false),
     ("int_mul", ExprOp::Mul, DataType::Int64, false),
     ("int_div", ExprOp::Div, DataType::Int64, false),
@@ -223,6 +239,11 @@ pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 13] = [
     ("double_lt", ExprOp::Lt, DataType::Float64, false),
     ("is_null", ExprOp::IsNull, DataType::Int64, true),
     ("is_not_null", ExprOp::IsNotNull, DataType::Int64, true),
+    // `iif`, as `CASE`, reads the first column as its condition, then chooses
+    // the second or the first.
+    ("coalesce_int", ExprOp::When, DataType::Int64, true),
+    ("iif_int", ExprOp::Case, DataType::Int64, false),
+    ("iif_int_nullable", ExprOp::Case, DataType::Int64, true),
 ];
 
 /// Does nothing, to measure what a transform costs the pipeline.

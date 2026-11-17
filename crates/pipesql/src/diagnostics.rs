@@ -74,7 +74,11 @@ fn describe(found: &str, error: &Error) -> Message {
         | ErrorCode::ExpectedInteger
         | ErrorCode::ExpectedOneKind
         | ErrorCode::ExpectedOneType
-        | ErrorCode::ExpectedString => expression(error.code),
+        | ErrorCode::ExpectedString
+        | ErrorCode::ArgumentCount
+        | ErrorCode::ChoicesOfOneType
+        | ErrorCode::NumberCondition
+        | ErrorCode::ArithmeticOnSomeRows => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -140,6 +144,21 @@ fn expression(code: ErrorCode) -> (String, String) {
             "this compares a number with a string".into(),
         ),
         ErrorCode::ExpectedString => ("`LIKE` needs a string".into(), "this reads a number".into()),
+        ErrorCode::ArgumentCount => (
+            "a function has the wrong number of arguments".into(),
+            "`iif` takes 3, `ifnull` 2, and `coalesce` at least 2".into(),
+        ),
+        ErrorCode::ChoicesOfOneType => (
+            "`coalesce` and `iif` need arguments of one type".into(),
+            "these are of different types".into(),
+        ),
+        ErrorCode::NumberCondition => {
+            ("`iif`'s condition needs a number".into(), "this is a string".into())
+        }
+        ErrorCode::ArithmeticOnSomeRows => (
+            "integer arithmetic only some rows use could overflow on the others".into(),
+            "compute this before `coalesce` or `iif`, or as a double".into(),
+        ),
         ErrorCode::ExpectedOneType => (
             "a comparison needs values of one type".into(),
             "multiply the integer by 1.0 to compare it as a double".into(),

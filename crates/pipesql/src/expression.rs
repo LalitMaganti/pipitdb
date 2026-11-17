@@ -3,7 +3,7 @@
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type,
+    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PRESENT, check_expr_type,
 };
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -32,6 +32,9 @@ pub fn compile_expr(
             ExprError::Types => ErrorCode::ExpectedOneType,
             ExprError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
             ExprError::Strings => ErrorCode::ExpectedString,
+            ExprError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
+            ExprError::Condition => ErrorCode::NumberCondition,
+            ExprError::Choices => ErrorCode::ChoicesOfOneType,
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, span)
@@ -46,7 +49,7 @@ pub fn is_null(compiler: &Compiler<'_, '_>, node: Node) -> bool {
 
 /// A node of `op` reading nodes `a` and `b`, or of value `int_value`.
 fn expr_node(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
-    ExprStep { op, data_type: DataType::Int64, a, b, int_value, double_value: 0.0 }
+    ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value, double_value: 0.0 }
 }
 
 /// Appends `node`, and returns its index.
@@ -109,6 +112,7 @@ fn compile(
             null_test(compiler, node, depth, nodes)?;
         }
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
+        Tag::Call => call(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -139,6 +143,54 @@ fn compile(
         }
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
     }
+    Ok(())
+}
+
+/// Appends the nodes of the call `node`, `depth` deep, as a `CASE`:
+/// `iif(c, x, y)` is `CASE WHEN c THEN x ELSE y END`, and `coalesce(a, b,
+/// c)` is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
+/// END`, which `PRESENT` branches test. `ifnull` is `coalesce` of two.
+fn call(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let name = compiler.node(node.first_child());
+    let text = compiler.text(name.span()).as_bytes();
+    let (iif, ifnull) = (same_word(text, b"iif"), same_word(text, b"ifnull"));
+    if !iif && !ifnull && !same_word(text, b"coalesce") {
+        return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)));
+    }
+    let count = node.child_count() - 1;
+    let expected = if iif {
+        count == 3
+    } else if ifnull {
+        count == 2
+    } else {
+        count >= 2
+    };
+    if !expected {
+        return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
+    }
+    // Each argument's result: the last of the nodes computing it.
+    let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
+    for i in 0..count {
+        compile(compiler, compiler.node(node.first_child() + 1 + i), depth + 1, nodes)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        values.push(nodes.len() as u32 - 1)?;
+    }
+    let branches = if iif { 1 } else { count - 1 };
+    let mut first = None;
+    for k in 0..branches as usize {
+        let (condition, value) =
+            if iif { (*at!(values, 0), *at!(values, 1)) } else { (PRESENT, *at!(values, k)) };
+        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        first.get_or_insert(when);
+    }
+    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches, 0);
+    case.c = *at!(values, count as usize - 1);
+    push_node(nodes, case, node, compiler)?;
     Ok(())
 }
 

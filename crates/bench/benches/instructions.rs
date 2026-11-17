@@ -80,6 +80,9 @@ fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
 #[bench::double_lt(pipitdb_bench::perfetto_expression(10, 16))]
 #[bench::is_null(pipitdb_bench::perfetto_expression(11, 16))]
 #[bench::is_not_null(pipitdb_bench::perfetto_expression(12, 16))]
+#[bench::coalesce_int(pipitdb_bench::perfetto_expression(13, 16))]
+#[bench::iif_int(pipitdb_bench::perfetto_expression(14, 16))]
+#[bench::iif_int_nullable(pipitdb_bench::perfetto_expression(15, 16))]
 fn perfetto_expression(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }

@@ -397,6 +397,19 @@ mod tests {
         assert_eq!(kept("FROM t |> EXTEND s LIKE '%s' AS m |> WHERE m = 1 |> SELECT a"), [1.0]);
         let null = "FROM t |> EXTEND NULL LIKE 'x' AS y |> WHERE y IS NULL |> SELECT a";
         assert_eq!(kept(null).len(), 2);
+        // `iif` and `coalesce`, of integers and strings, with conditions which
+        // are doubles or null.
+        assert_eq!(kept("FROM t |> SELECT iif(a > 1, b, a) AS x"), [1.0, 20.0]);
+        assert_eq!(kept("FROM t |> SELECT iif(a = 1, s, '') AS x"), [4.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT iif(a = 2, s, 'xyz') AS x"), [3.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT iif(f, 1, 0) AS x"), [1.0, 1.0]);
+        assert_eq!(kept("FROM n |> SELECT iif(x = 1, 1, 0) AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM n |> SELECT coalesce(x, 7) AS y"), [1.0, 7.0]);
+        assert_eq!(kept("FROM n |> SELECT coalesce(x, NULL, 3) AS y"), [1.0, 3.0]);
+        assert_eq!(kept("FROM n |> SELECT ifnull(x, 0) AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT coalesce(a * 2, 0) AS x"), [2.0, 4.0]);
+        let groups = "FROM t |> EXTEND iif(a > 1, 'big', 'small') AS k |> AGGREGATE count(*) AS c GROUP BY k |> SELECT c";
+        assert_eq!(kept(groups), [1.0, 1.0]);
         // String literals, as lengths here, which later stages read.
         assert_eq!(kept("FROM t |> SELECT 'it''s' AS x"), [4.0, 4.0]);
         assert_eq!(kept("FROM t |> SELECT '' AS x"), [0.0, 0.0]);
@@ -460,6 +473,22 @@ mod tests {
     }
 
     #[test]
+    fn reports_what_expressions_cant_compute() {
+        assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
+        assert_eq!(error("FROM t |> SELECT a LIKE 'x' AS y"), (ErrorCode::ExpectedString, 17));
+        assert_eq!(error("FROM t |> SELECT iif(a, 1) AS y"), (ErrorCode::ArgumentCount, 17));
+        assert_eq!(error("FROM t |> SELECT coalesce(a) AS y"), (ErrorCode::ArgumentCount, 17));
+        assert_eq!(error("FROM t |> SELECT iif(s, 1, 0) AS y"), (ErrorCode::NumberCondition, 17));
+        let overflows = "FROM t |> SELECT iif(a > 1, b * 2, 0) AS y";
+        assert_eq!(error(overflows), (ErrorCode::ArithmeticOnSomeRows, 17));
+        assert_eq!(error("FROM t |> SELECT upper(s) AS y"), (ErrorCode::Unsupported, 17));
+        assert_eq!(error("FROM t |> SELECT s LIKE s AS y"), (ErrorCode::Unsupported, 24));
+        assert_eq!(error("FROM t |> SELECT f > a AS x"), (ErrorCode::ExpectedOneType, 17));
+        let inexact = "FROM t |> SELECT f = 9007199254740993 AS x";
+        assert_eq!(error(inexact), (ErrorCode::Unsupported, 17));
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
@@ -483,12 +512,10 @@ mod tests {
         assert_eq!(error("FROM t |> EXTEND NULL - s AS x"), (ErrorCode::ExpectedNumber, 17));
         assert_eq!(error("FROM t |> EXTEND f % 2 AS x"), (ErrorCode::ExpectedInteger, 17));
         assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
-        assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
-        assert_eq!(error("FROM t |> SELECT a LIKE 'x' AS y"), (ErrorCode::ExpectedString, 17));
-        assert_eq!(error("FROM t |> SELECT s LIKE s AS y"), (ErrorCode::Unsupported, 24));
-        assert_eq!(error("FROM t |> SELECT f > a AS x"), (ErrorCode::ExpectedOneType, 17));
-        let inexact = "FROM t |> SELECT f = 9007199254740993 AS x";
-        assert_eq!(error(inexact), (ErrorCode::Unsupported, 17));
+        assert_eq!(
+            error("FROM t |> SELECT coalesce(a, s) AS y"),
+            (ErrorCode::ChoicesOfOneType, 17)
+        );
         assert_eq!(error("FROM t |> SELECT 'x' + 1 AS x"), (ErrorCode::ExpectedNumber, 17));
         assert_eq!(error("FROM t |> SELECT -'x' AS x"), (ErrorCode::ExpectedNumber, 18));
         assert_eq!(error("FROM t |> SELECT 1.5 AS x"), (ErrorCode::Unsupported, 17));
