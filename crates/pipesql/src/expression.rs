@@ -5,7 +5,7 @@ use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
     EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PRESENT, check_expr_type,
 };
-use pipit_kernel::function::ARGUMENTS_MAX;
+use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
@@ -13,6 +13,7 @@ use crate::compile::Compiler;
 use crate::condition::string;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
+use crate::registry::FunctionRule;
 use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
@@ -115,7 +116,7 @@ fn compile(
             null_test(compiler, node, depth, nodes)?;
         }
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
-        Tag::Call => call(compiler, node, depth, nodes)?,
+        Tag::Call => (compiler.registry().call)(compiler, node, depth, nodes)?,
         Tag::Case => case(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
@@ -150,55 +151,6 @@ fn compile(
     Ok(())
 }
 
-/// Appends the nodes of the call `node`, `depth` deep, as a `CASE`:
-/// `iif(c, x, y)` is `CASE WHEN c THEN x ELSE y END`, and `coalesce(a, b,
-/// c)` is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
-/// END`, which `PRESENT` branches test. `ifnull` is `coalesce` of two.
-/// Any other function is the registry's.
-fn call(
-    compiler: &mut Compiler<'_, '_>,
-    node: Node,
-    depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
-) -> Result<(), Error> {
-    let name = compiler.node(node.first_child());
-    let text = compiler.text(name.span()).as_bytes();
-    let (iif, ifnull) = (same_word(text, b"iif"), same_word(text, b"ifnull"));
-    if !iif && !ifnull && !same_word(text, b"coalesce") {
-        return (compiler.registry().call)(compiler, node, depth, nodes);
-    }
-    let count = node.child_count() - 1;
-    let expected = if iif {
-        count == 3
-    } else if ifnull {
-        count == 2
-    } else {
-        count >= 2
-    };
-    if !expected {
-        return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
-    }
-    // Each argument's result: the last of the nodes computing it.
-    let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
-    for i in 0..count {
-        compile(compiler, compiler.node(node.first_child() + 1 + i), depth + 1, nodes)?;
-        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-        values.push(nodes.len() as u32 - 1)?;
-    }
-    let branches = if iif { 1 } else { count - 1 };
-    let mut first = None;
-    for k in 0..branches as usize {
-        let (condition, value) =
-            if iif { (*at!(values, 0), *at!(values, 1)) } else { (PRESENT, *at!(values, k)) };
-        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
-        first.get_or_insert(when);
-    }
-    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches, 0);
-    case.c = *at!(values, count as usize - 1);
-    push_node(nodes, case, node, compiler)?;
-    Ok(())
-}
-
 /// How a registry compiles a call of a function it may have: as
 /// `call_function` does, or as `no_function` does when it has none.
 pub(crate) type CallFunction =
@@ -214,9 +166,8 @@ pub(crate) fn no_function(
     Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)))
 }
 
-/// Appends the nodes of the call `node`, `depth` deep, of the registry's
-/// function, bound to the statement: its arguments', an `Argument` for each,
-/// then the `Call`.
+/// Appends the nodes of the call `node`, `depth` deep, as the registry's
+/// rule for its function compiles them.
 pub(crate) fn call_function(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
@@ -232,32 +183,134 @@ pub(crate) fn call_function(
         }
         return Err(Error::new(ErrorCode::UnknownFunction, name));
     };
+    (rule.compile)(compiler, node, depth, nodes)
+}
+
+/// Appends the nodes of each argument of the call `node`, `depth` deep, if
+/// it has from `fewest` to `most`, and returns each one's result: the last
+/// of the nodes computing it.
+pub fn compile_arguments(
+    compiler: &mut Compiler<'_, '_>,
+    (node, depth): (Node, usize),
+    nodes: &mut SlowVec<ExprStep>,
+    fewest: u32,
+    most: u32,
+) -> Result<SlowVec<u32>, Error> {
     let count = node.child_count() - 1;
-    if count as usize != rule.arguments.len() {
+    if count < fewest || count > most {
         return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
     }
-    let mut values = [0; ARGUMENTS_MAX];
-    for (i, value) in (1..=count).zip(&mut values) {
+    let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
+    for i in 1..=count {
         compile(compiler, compiler.node(node.first_child() + i), depth + 1, nodes)?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-        let last = nodes.len() as u32 - 1;
-        *value = last;
+        values.push(nodes.len() as u32 - 1)?;
     }
-    let function = (rule.bind)(compiler, node)?;
+    Ok(values)
+}
+
+/// Binds a function to the statement being compiled for the call node
+/// passed, whose children after the name are its arguments: what needs only
+/// doing once, such as compiling a pattern, is done here.
+pub type Bind = fn(&mut Compiler<'_, '_>, Node) -> Result<DynFunction, Error>;
+
+/// Appends the nodes calling the function `bind` binds for the call `node`,
+/// `depth` deep, which takes `arguments`, of those types, and gives a
+/// `result`: its arguments', an `Argument` for each, then the `Call`. A
+/// `NULL` is an argument of any type, and an integer widens to a double.
+pub fn call_bound(
+    compiler: &mut Compiler<'_, '_>,
+    (node, depth): (Node, usize),
+    nodes: &mut SlowVec<ExprStep>,
+    (arguments, result): (&[DataType], DataType),
+    bind: Bind,
+) -> Result<(), Error> {
+    check!(!arguments.is_empty() && arguments.len() <= ARGUMENTS_MAX);
+    #[expect(clippy::cast_possible_truncation, reason = "at most `ARGUMENTS_MAX`")]
+    let count = arguments.len() as u32;
+    let values = compile_arguments(compiler, (node, depth), nodes, count, count)?;
+    let function = bind(compiler, node)?;
     let allocator = compiler.allocator();
     let Some(id) = compiler.plan.add_function(allocator, function)? else {
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
     };
     let mut first = None;
-    for (&value, &data_type) in values.iter().zip(rule.arguments) {
+    for (&value, &data_type) in values.iter().zip(arguments) {
         let mut argument = expr_node(ExprOp::Argument, value, 0, 0);
         argument.data_type = data_type;
         first.get_or_insert(push_node(nodes, argument, node, compiler)?);
     }
     let mut call = expr_node(ExprOp::Call, first.unwrap_or(0), count, 0);
-    call.data_type = rule.result;
+    call.data_type = result;
     call.c = id;
     push_node(nodes, call, node, compiler)?;
+    Ok(())
+}
+
+/// `iif`, `ifnull` and `coalesce`, which choose between their arguments, so
+/// compile to `CASE` as SQL's does: `iif(c, x, y)` is `CASE WHEN c THEN x
+/// ELSE y END`, and `coalesce(a, b, c)` is `CASE WHEN a IS NOT NULL THEN a
+/// WHEN b IS NOT NULL THEN b ELSE c END`, which `PRESENT` branches test.
+/// `ifnull` is `coalesce` of two.
+pub const CHOICES: &[FunctionRule] = &[
+    FunctionRule { name: "iif", compile: |c, node, depth, nodes| iif(c, (node, depth), nodes) },
+    FunctionRule {
+        name: "ifnull",
+        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, 2),
+    },
+    FunctionRule {
+        name: "coalesce",
+        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, u32::MAX),
+    },
+];
+
+/// Appends the nodes of the `iif` call `node`.
+fn iif(
+    compiler: &mut Compiler<'_, '_>,
+    (node, depth): (Node, usize),
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let values = compile_arguments(compiler, (node, depth), nodes, 3, 3)?;
+    let branch = [(*at!(values, 0), *at!(values, 1))];
+    push_case(compiler, node, nodes, &branch, *at!(values, 2))
+}
+
+/// Appends the nodes of the `coalesce` call `node`, of at most `most`
+/// arguments.
+fn coalesce(
+    compiler: &mut Compiler<'_, '_>,
+    (node, depth): (Node, usize),
+    nodes: &mut SlowVec<ExprStep>,
+    most: u32,
+) -> Result<(), Error> {
+    let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
+    // At least two, as `compile_arguments` checked.
+    let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
+    let mut branches = SlowVec::fixed(compiler.allocator(), tested.len())?;
+    for &value in tested {
+        branches.push((PRESENT, value))?;
+    }
+    push_case(compiler, node, nodes, &branches, *otherwise)
+}
+
+/// Appends a `When` for each of `branches`, a condition and a value, then a
+/// `Case` of them, with `otherwise` its `ELSE`.
+fn push_case(
+    compiler: &Compiler<'_, '_>,
+    node: Node,
+    nodes: &mut SlowVec<ExprStep>,
+    branches: &[(u32, u32)],
+    otherwise: u32,
+) -> Result<(), Error> {
+    let mut first = None;
+    for &(condition, value) in branches {
+        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        first.get_or_insert(when);
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
+    case.c = otherwise;
+    push_node(nodes, case, node, compiler)?;
     Ok(())
 }
 
@@ -303,16 +356,7 @@ fn case(
         compile(compiler, otherwise, depth + 1, nodes)?;
         last(nodes)
     };
-    let mut first = None;
-    for &(condition, value) in branches.iter() {
-        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
-        first.get_or_insert(when);
-    }
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
-    case.c = otherwise;
-    push_node(nodes, case, node, compiler)?;
-    Ok(())
+    push_case(compiler, node, nodes, &branches, otherwise)
 }
 
 /// Appends the nodes of `x IS NULL` or `x IS NOT NULL`, the node `node`,

@@ -4,8 +4,8 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
-use pipit_kernel::column::DataType;
-use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
+use pipit_kernel::expression::ExprStep;
+use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -72,14 +72,12 @@ pub struct Rule {
 pub struct FunctionRule {
     /// What queries call it, matched ignoring case.
     pub name: &'static str,
-    /// The types of its arguments: a `NULL` is one of any, and an integer
-    /// widens to a double.
-    pub arguments: &'static [DataType],
-    pub result: DataType,
-    /// Binds it to the statement being compiled for the `Call` node passed,
-    /// whose children after the name are its arguments: what needs only
-    /// doing once, such as compiling a pattern, is done here.
-    pub bind: fn(&mut Compiler<'_, '_>, Node) -> Result<DynFunction, Error>,
+    /// Appends the expression nodes computing the `Call` node passed,
+    /// `depth` deep, its result last: steps the kernel has, as `iif`'s
+    /// `CASE`, or a call of a function bound to the statement, which
+    /// `call_bound` appends.
+    pub compile:
+        fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>,
 }
 
 /// Rules, found by keyword, and functions, found by name. A rule's id is
@@ -117,16 +115,6 @@ impl Registry {
 
     /// It, with the functions of `functions` too.
     pub const fn with_functions(self, functions: &'static [&'static [FunctionRule]]) -> Registry {
-        let mut set = 0;
-        while set < functions.len() {
-            let mut index = 0;
-            while index < functions[set].len() {
-                let count = functions[set][index].arguments.len();
-                assert!(0 < count && count <= ARGUMENTS_MAX, "a function takes 1 to 8 arguments");
-                index += 1;
-            }
-            set += 1;
-        }
         Registry { functions, call: call_function, ..self }
     }
 
