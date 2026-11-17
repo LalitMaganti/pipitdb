@@ -3,7 +3,7 @@
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PRESENT, check_expr_type,
+    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::slow_vec::SlowVec;
@@ -13,7 +13,6 @@ use crate::compile::Compiler;
 use crate::condition::string;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
-use crate::registry::FunctionRule;
 use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
@@ -247,55 +246,10 @@ pub fn call_bound(
     Ok(())
 }
 
-/// `iif`, `ifnull` and `coalesce`, which choose between their arguments, so
-/// compile to `CASE` as SQL's does: `iif(c, x, y)` is `CASE WHEN c THEN x
-/// ELSE y END`, and `coalesce(a, b, c)` is `CASE WHEN a IS NOT NULL THEN a
-/// WHEN b IS NOT NULL THEN b ELSE c END`, which `PRESENT` branches test.
-/// `ifnull` is `coalesce` of two.
-pub const CHOICES: &[FunctionRule] = &[
-    FunctionRule { name: "iif", compile: |c, node, depth, nodes| iif(c, (node, depth), nodes) },
-    FunctionRule {
-        name: "ifnull",
-        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, 2),
-    },
-    FunctionRule {
-        name: "coalesce",
-        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, u32::MAX),
-    },
-];
-
-/// Appends the nodes of the `iif` call `node`.
-fn iif(
-    compiler: &mut Compiler<'_, '_>,
-    (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
-) -> Result<(), Error> {
-    let values = compile_arguments(compiler, (node, depth), nodes, 3, 3)?;
-    let branch = [(*at!(values, 0), *at!(values, 1))];
-    push_case(compiler, node, nodes, &branch, *at!(values, 2))
-}
-
-/// Appends the nodes of the `coalesce` call `node`, of at most `most`
-/// arguments.
-fn coalesce(
-    compiler: &mut Compiler<'_, '_>,
-    (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
-    most: u32,
-) -> Result<(), Error> {
-    let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
-    // At least two, as `compile_arguments` checked.
-    let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
-    let mut branches = SlowVec::fixed(compiler.allocator(), tested.len())?;
-    for &value in tested {
-        branches.push((PRESENT, value))?;
-    }
-    push_case(compiler, node, nodes, &branches, *otherwise)
-}
-
 /// Appends a `When` for each of `branches`, a condition and a value, then a
-/// `Case` of them, with `otherwise` its `ELSE`.
-fn push_case(
+/// `Case` of them, with `otherwise` its `ELSE`: SQL's `CASE`, and the
+/// functions that choose between their arguments.
+pub(crate) fn push_case(
     compiler: &Compiler<'_, '_>,
     node: Node,
     nodes: &mut SlowVec<ExprStep>,
