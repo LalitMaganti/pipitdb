@@ -67,6 +67,9 @@ pub fn compare(
     match value {
         Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
+            if let Form::Sequence(first) = column.form() {
+                return keep_sequence(first, range, selection, dropped);
+            }
             let cells = column.values().int64s();
             if eight::EIGHT_AT_A_TIME
                 && dropped.is_none()
@@ -143,8 +146,9 @@ pub fn is_in(
             return keep_all(selection, dropped);
         }
         Form::Constant => return drop_all(selection, dropped),
-        // Only string conditions take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // Only string conditions take dictionaries, and only comparisons
+        // sequences: see `FilterOp::accepts`.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
     // One loop for each case, which keeps rows: those dropped are found from
     // what's left.
@@ -294,8 +298,8 @@ fn keep_strings(
         }
         Form::Constant => return drop_all(selection, dropped),
         // Only string conditions take dictionaries, which they test by entry:
-        // see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // see `FilterOp::accepts`. Sequences are integers.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
     let valid = valid_rows(column);
     retain(selection, dropped, |row| valid(row) && holds(strings.get(usize::from(row))));
@@ -450,8 +454,31 @@ fn compare_form<T: Copy>(
             }
         }
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // `compare` takes sequences before reading values.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
+}
+
+/// Narrows `selection` to the rows of a sequence from `first` whose values
+/// are in `range`, writing the rows it drops to `dropped`, if given. Each
+/// row's value is its number from `first`, so no value is read, and when
+/// every row is kept and `range` doesn't wrap, those kept are one run of
+/// them, kept at once, as Perfetto keeps a range of ids.
+fn keep_sequence(
+    first: i64,
+    range: Range,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    let (lo, hi) = (i128::from(range.lo), i128::from(range.lo) + i128::from(range.span));
+    if dropped.is_none() && selection.is_prefix() && hi <= i128::from(i64::MAX) {
+        let rows = i128::from(selection.len());
+        let start = (lo - i128::from(first)).clamp(0, rows);
+        let end = (hi - i128::from(first) + 1).clamp(start, rows);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "rows")]
+        return selection.keep_range(start as u32, (end - start) as u32);
+    }
+    retain(selection, dropped, move |row| range.contains(first.wrapping_add(i64::from(row))));
 }
 
 /// Narrows `selection` to the null rows if `nulls`, or else to the others,
@@ -468,6 +495,9 @@ pub fn is_null(
         // One value for every row: kept or dropped together.
         Form::Constant if column.is_null(0) == nulls => return keep_all(selection, dropped),
         Form::Constant => return drop_all(selection, dropped),
+        // A sequence has no nulls.
+        Form::Sequence(_) if nulls => return drop_all(selection, dropped),
+        Form::Sequence(_) => return keep_all(selection, dropped),
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => failed!(),
     }
@@ -641,6 +671,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
+    use crate::column::Forms;
     use crate::context::Context;
     use crate::selection::Kept;
 
@@ -665,7 +696,8 @@ mod tests {
         let mut selection = Selection::all(10);
         filter(&mut selection);
         match selection.kept() {
-            Kept::Prefix => (0..10).collect(),
+            #[expect(clippy::cast_possible_truncation, reason = "at most 10")]
+            Kept::Prefix => (0..selection.len() as u16).collect(),
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }
@@ -681,6 +713,30 @@ mod tests {
         assert_eq!(rows(Comparison::LessEqual), [0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(rows(Comparison::Greater), [7, 8, 9]);
         assert_eq!(rows(Comparison::GreaterEqual), [6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn compares_sequences_by_their_rows() {
+        let context = &mut Context::new(&Heap);
+        let (flat, sequence) = (int64s(&[]), ColumnView::sequence(context, 0, 10).unwrap());
+        for comparison in [
+            Comparison::Equal,
+            Comparison::NotEqual,
+            Comparison::Less,
+            Comparison::LessEqual,
+            Comparison::Greater,
+            Comparison::GreaterEqual,
+        ] {
+            let rows = |column| kept(|s| compare(column, comparison, Value::Int64(6), s, None));
+            assert_eq!(rows(&sequence), rows(&flat));
+        }
+        // Row 0 of a slice from row 3 of one from 100 is 103.
+        let from = ColumnView::sequence(context, 100, 13).unwrap().slice(3, 10);
+        assert_eq!(kept(|s| compare(&from, Comparison::Less, Value::Int64(105), s, None)), [0, 1]);
+        assert!(kept(|s| is_null(&from, true, s, None)).is_empty());
+        let mut flat = from.clone();
+        flat.make_in(context, Forms::FLAT).unwrap();
+        assert_eq!(flat.int64s(), [103, 104, 105, 106, 107, 108, 109, 110, 111, 112]);
     }
 
     /// Whether a comparison holds, as Rust's operators say.

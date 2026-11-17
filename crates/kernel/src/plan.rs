@@ -682,12 +682,15 @@ impl<'c> Op<'c> for FilterOp {
         }
     }
 
-    /// Constants, which it tests once, and dictionaries of columns it only
-    /// compares with strings, whose entries it tests once each: see
-    /// `Op::accepts`.
+    /// Constants, which it tests once; dictionaries of columns it only
+    /// compares with strings, whose entries it tests once each; and
+    /// sequences of columns it only compares with integers, whose rows it
+    /// keeps by their numbers: see `Op::accepts`.
     fn accepts(&self, column: ColumnId) -> Forms {
         if self.predicate.compares_only_strings(column) {
             Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
+        } else if self.predicate.compares_only_integers(column) {
+            Forms::FLAT | Forms::CONSTANT | Forms::SEQUENCE
         } else {
             Forms::FLAT | Forms::CONSTANT
         }

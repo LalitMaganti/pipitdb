@@ -111,8 +111,12 @@ impl Scannable for Table {
 
     fn column_nullable(&self, column: u32) -> bool {
         let views = self.row_groups.iter().map(|group| at!(group.columns, column as usize));
-        // A view of any form holds a null if its values, or itself, can.
-        views.into_iter().any(|view| view.has_nulls() || view.values().validity().is_some())
+        // A view of any form holds a null if its values, or itself, can. A
+        // sequence has no values, and no nulls.
+        let nullable = |view: &ColumnView| {
+            !view.is_in(Forms::SEQUENCE) && (view.has_nulls() || view.values().validity().is_some())
+        };
+        views.into_iter().any(nullable)
     }
 
     fn forms(&self, column: u32) -> Forms {
