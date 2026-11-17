@@ -19,8 +19,9 @@ use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, 
 use crate::predicate::{Filter, Predicate};
 use crate::scannable::{DynScannable, Summary};
 use crate::slow_vec::SlowVec;
+use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
-use crate::string_pool::{Id, StringPool};
+use crate::string_pool::Id;
 
 /// The most columns a plan can have.
 pub const PLAN_COLUMNS_MAX: usize = 1 << 10;
@@ -396,9 +397,8 @@ pub struct LogicalPlan<'c> {
     pub root: PlanNodeId,
     /// The columns of the result, in order.
     pub output: SlowVec<NamedColumn>,
-    /// The strings its conditions compare with: made with the first, as
-    /// most statements have none. Its runs read them through their context.
-    literals: Option<StringPool>,
+    /// What its runs read through their context, such as its literals.
+    statement: Statement,
 }
 
 impl<'c> LogicalPlan<'c> {
@@ -409,7 +409,7 @@ impl<'c> LogicalPlan<'c> {
             nodes: SlowVec::new(allocator, PLAN_NODES_MAX)?,
             root: 0,
             output: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
-            literals: None,
+            statement: Statement::default(),
         })
     }
 
@@ -420,17 +420,12 @@ impl<'c> LogicalPlan<'c> {
         allocator: &dyn Allocator,
         literal: &[u8],
     ) -> Result<Id, AllocError> {
-        let literals = match &mut self.literals {
-            Some(literals) => literals,
-            None => self.literals.insert(StringPool::new(allocator)?),
-        };
-        literals.intern_string(allocator, Some(literal))
+        self.statement.add_literal(allocator, literal)
     }
 
-    /// The strings its conditions compare with, which lowering gives the
-    /// physical plan.
-    pub(crate) fn take_literals(&mut self) -> Option<StringPool> {
-        self.literals.take()
+    /// What its runs read, which lowering gives the physical plan.
+    pub(crate) fn take_statement(&mut self) -> Statement {
+        core::mem::take(&mut self.statement)
     }
 
     /// A new column, with a copy of `name`.

@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::query_allocators::QueryAllocators;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
+use crate::statement::Statement;
 use crate::string_pool::StringPool;
 
 /// The most scratch selections a run can have.
@@ -46,11 +47,11 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// A query's context, which allocates from `query`'s allocators, of a
-    /// statement whose literals are `literals`.
+    /// A query's context, which allocates from `query`'s allocators, of
+    /// `statement`.
     pub fn for_query(
         query: &'a QueryAllocators<'a>,
-        literals: Option<&'a StringPool>,
+        statement: Option<&'a Statement>,
     ) -> Context<'a> {
         Context {
             allocator: query.metadata,
@@ -59,7 +60,7 @@ impl<'a> Context<'a> {
             small: &query.small,
             selections: None,
             string_pool: None,
-            literals,
+            literals: statement.and_then(Statement::literals),
             cutoff: None,
         }
     }

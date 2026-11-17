@@ -1414,11 +1414,11 @@ mod tests {
     /// and a string null none.
     #[test]
     fn string_constants() {
-        let mut literals = crate::string_pool::StringPool::new(&Heap).unwrap();
-        let hi = literals.intern_string(&Heap, Some(b"hi")).unwrap();
+        let mut statement = crate::statement::Statement::default();
+        let hi = statement.add_literal(&Heap, b"hi").unwrap();
         let string = DataType::String;
         let query = crate::query_allocators::QueryAllocators::new(&Heap);
-        let mut context = Context::for_query(&query, Some(&literals));
+        let mut context = Context::for_query(&query, Some(&statement));
         for (op, expected) in [(ExprOp::Constant, Some(&b"hi"[..])), (ExprOp::Null, None)] {
             let mut b = Builder(StdVec::new());
             b.push(op, string, hi.raw_id(), 0);

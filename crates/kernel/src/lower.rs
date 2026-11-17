@@ -12,8 +12,8 @@ use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNode
 use crate::query_allocators::QueryAllocators;
 use crate::slow_vec::SlowVec;
 use crate::sort::sort;
+use crate::statement::Statement;
 use crate::step::{DynSource, Step};
-use crate::string_pool::StringPool;
 use crate::top_k::top_k;
 
 /// Why a plan couldn't be planned or lowered.
@@ -49,7 +49,7 @@ pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
     names: Names,
     columns: SlowVec<OutputColumn>,
-    literals: Option<StringPool>,
+    statement: Statement,
 }
 
 impl<'c> PhysicalPlan<'c> {
@@ -57,10 +57,9 @@ impl<'c> PhysicalPlan<'c> {
         &self.pipeline
     }
 
-    /// Starts a run, as `Pipeline::start` does, with the statement's
-    /// literals, which its steps read.
+    /// Starts a run, as `Pipeline::start` does, of its statement.
     pub fn start<'r>(&'r self, query: &'r QueryAllocators<'_>) -> Result<Execution<'r>, Error> {
-        self.pipeline.start(query, self.literals.as_ref())
+        self.pipeline.start(query, Some(&self.statement))
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
@@ -175,7 +174,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
 
 /// Builds the pipeline of `plan`, once `planned` by `plan_nodes`, from its
 /// root, with memory from `allocator`. The physical plan takes the plan's
-/// literals.
+/// statement.
 pub fn lower<'c>(
     allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'c>,
@@ -199,7 +198,7 @@ pub fn lower<'c>(
     }
     let Some(source) = lowering.source else { failed!() };
     let pipeline = Pipeline::new(source, lowering.steps);
-    Ok(PhysicalPlan { pipeline, names, columns, literals: plan.take_literals() })
+    Ok(PhysicalPlan { pipeline, names, columns, statement: plan.take_statement() })
 }
 
 #[cfg(test)]
