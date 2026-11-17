@@ -4,9 +4,13 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
+use pipit_kernel::expression::ExprStep;
+use pipit_kernel::slow_vec::SlowVec;
+
 use crate::ast::Node;
 use crate::compile::Compiler;
 use crate::error::Error;
+use crate::expression::{CallFunction, call_function, no_function};
 use crate::keywords::{KeywordTable, same_word};
 use crate::settings::build_setting;
 
@@ -63,10 +67,28 @@ pub struct Rule {
     pub compile: fn(&mut Compiler<'_, '_>, Node) -> Result<(), Error>,
 }
 
-/// Rules, found by keyword. A rule's id is `set << 8 | index in set`.
+/// A function queries can call, which a crate adds by registering it.
+#[derive(Clone, Copy)]
+pub struct FunctionRule {
+    /// What queries call it, matched ignoring case.
+    pub name: &'static str,
+    /// Appends the expression nodes computing the `Call` node passed,
+    /// `depth` deep, its result last: steps the kernel has, as `iif`'s
+    /// `CASE`, or a call of a function bound to the statement, which
+    /// `call_bound` appends.
+    pub compile:
+        fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>,
+}
+
+/// Rules, found by keyword, and functions, found by name. A rule's id is
+/// `set << 8 | index in set`.
 pub struct Registry {
     sets: &'static [&'static [Rule]],
     keywords: KeywordTable<STAGE_SLOTS>,
+    functions: &'static [&'static [FunctionRule]],
+    /// Compiles a call of a function, which only a registry with functions
+    /// can: so one without doesn't pay for the code.
+    pub(crate) call: CallFunction,
 }
 
 impl Registry {
@@ -88,7 +110,20 @@ impl Registry {
             }
             set += 1;
         }
-        Registry { sets, keywords }
+        Registry { sets, keywords, functions: &[], call: no_function }
+    }
+
+    /// It, with the functions of `functions` too.
+    pub const fn with_functions(self, functions: &'static [&'static [FunctionRule]]) -> Registry {
+        Registry { functions, call: call_function, ..self }
+    }
+
+    /// The function called `name`, ignoring case.
+    pub fn function(&self, name: &[u8]) -> Option<&'static FunctionRule> {
+        self.functions
+            .iter()
+            .flat_map(|set| set.iter())
+            .find(|f| same_word(f.name.as_bytes(), name))
     }
 
     /// The id of the rule whose keyword is `word`, ignoring case.

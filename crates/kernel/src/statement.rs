@@ -2,13 +2,20 @@
 //! the physical plan takes from the logical one.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::function::DynFunction;
+use crate::slow_vec::SlowVec;
 use crate::string_pool::{Id, StringPool};
+
+/// The most functions a statement binds.
+pub const FUNCTIONS_MAX: usize = 1 << 8;
 
 #[derive(Default)]
 pub struct Statement {
     /// The strings it compares with: made with the first, as most statements
     /// have none.
     literals: Option<StringPool>,
+    /// The functions its expressions call, by id: made with the first.
+    functions: Option<SlowVec<DynFunction>>,
 }
 
 impl Statement {
@@ -29,5 +36,29 @@ impl Statement {
     /// The strings it compares with, if it has any.
     pub fn literals(&self) -> Option<&StringPool> {
         self.literals.as_ref()
+    }
+
+    /// Adds `function`, allocating from `allocator`, which must outlive it,
+    /// and returns its id, or `None` if it has `FUNCTIONS_MAX`.
+    pub fn add_function(
+        &mut self,
+        allocator: &dyn Allocator,
+        function: DynFunction,
+    ) -> Result<Option<u32>, AllocError> {
+        let functions = match &mut self.functions {
+            Some(functions) => functions,
+            None => self.functions.insert(SlowVec::new(allocator, FUNCTIONS_MAX)?),
+        };
+        if functions.len() == FUNCTIONS_MAX {
+            return Ok(None);
+        }
+        functions.push(function)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `FUNCTIONS_MAX`")]
+        Ok(Some(functions.len() as u32 - 1))
+    }
+
+    /// The functions its expressions call, by id.
+    pub fn functions(&self) -> &[DynFunction] {
+        self.functions.as_deref().unwrap_or_default()
     }
 }

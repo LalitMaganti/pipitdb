@@ -22,10 +22,13 @@ pipitdb-file = { path = "../file" }
 pipitdb-parquet-full = { path = "../parquet-full", features = ["snappy-cpp"] }
 
 [features]
-default = ["check-lines"]
+default = ["check-lines", "string-functions"]
 # Failed checks say their line, as in every build of ours but the size
 # example, which measures what an embedder ships.
 check-lines = ["pipitdb-kernel/check-lines"]
+# The string functions, which ClickBench calls, and the size example
+# leaves out.
+string-functions = ["pipitdb-pipesql/string-functions"]
 # Builds the size example, which `cargo test` can't: it has no unwinding.
 size = []
 
