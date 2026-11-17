@@ -202,21 +202,28 @@ mod tests {
     use pipit_kernel::function::{DynFunction, Function};
 
     use crate::error::ErrorCode;
+    use crate::expression::{Bind, CHOICES, call_bound};
     use crate::registry::FunctionRule;
     use crate::stages::{AGGREGATION, RELATIONAL};
 
     #[cfg(not(feature = "string-functions"))]
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[HALF]);
+    static REGISTRY: Registry =
+        Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[CHOICES, HALF]);
     #[cfg(feature = "string-functions")]
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION])
-        .with_functions(&[HALF, crate::string_functions::STRING_FUNCTIONS]);
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[
+        CHOICES,
+        HALF,
+        crate::string_functions::STRING_FUNCTIONS,
+    ]);
 
     /// `half(x)`, as a crate would add a function.
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
-        arguments: &[DataType::Float64],
-        result: DataType::Float64,
-        bind: |compiler, _| Ok(DynFunction::new(compiler.allocator(), Half)?),
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Half)?);
+            let signature = (&[DataType::Float64][..], DataType::Float64);
+            call_bound(compiler, (node, depth), nodes, signature, bind)
+        },
     }];
 
     struct Half;
