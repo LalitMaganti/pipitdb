@@ -1,4 +1,4 @@
-//! `Buffer`: a refcounted, 64-byte aligned block of bytes.
+//! `Buffer`: a refcounted block of bytes, aligned to 64 bytes or more.
 
 use core::alloc::Layout;
 use core::cell::Cell;
@@ -39,6 +39,7 @@ pub struct Buffer {
 #[repr(C, align(64))]
 struct Header {
     references: Cell<u32>,
+    alignment: u32,
     size_bytes: usize,
     allocator: NonNull<dyn Allocator>,
 }
@@ -48,9 +49,10 @@ pub(crate) const HEADER_BYTES: usize = size_of::<Header>();
 impl Buffer {
     /// Allocates `size_bytes` zeroed bytes from `allocator`, which must
     /// outlive the buffer and its clones.
+    #[inline(never)]
     pub fn allocate(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
         // SAFETY: the bytes come zeroed.
-        unsafe { Buffer::allocate_with(allocator, size_bytes, true) }
+        unsafe { Buffer::allocate_with(allocator, size_bytes, true, BUFFER_ALIGNMENT_BYTES) }
     }
 
     /// Allocates `size_bytes` bytes without zeroing them.
@@ -59,15 +61,34 @@ impl Buffer {
     ///
     /// No byte may be read, through `as_slice` or otherwise, before it is
     /// written.
+    #[inline(never)]
     pub unsafe fn allocate_uninit(
         allocator: &dyn Allocator,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
         // SAFETY: upheld by the caller.
-        unsafe { Buffer::allocate_with(allocator, size_bytes, false) }
+        unsafe { Buffer::allocate_with(allocator, size_bytes, false, BUFFER_ALIGNMENT_BYTES) }
     }
 
-    /// Allocates `size_bytes` bytes, zeroed if `zeroed`.
+    /// As `allocate_uninit`, with the header and bytes together starting at
+    /// a multiple of `alignment`, a power of two of at least
+    /// `BUFFER_ALIGNMENT_BYTES`: so `alignment - HEADER_BYTES` bytes fill an
+    /// aligned block of `alignment`, such as a huge page.
+    ///
+    /// # Safety
+    ///
+    /// As for `allocate_uninit`.
+    pub unsafe fn allocate_uninit_aligned(
+        allocator: &dyn Allocator,
+        size_bytes: usize,
+        alignment: usize,
+    ) -> Result<Buffer, AllocError> {
+        // SAFETY: upheld by the caller.
+        unsafe { Buffer::allocate_with(allocator, size_bytes, false, alignment) }
+    }
+
+    /// Allocates `size_bytes` bytes, zeroed if `zeroed`, aligned as
+    /// `allocate_uninit_aligned`'s.
     ///
     /// # Safety
     ///
@@ -77,9 +98,12 @@ impl Buffer {
         allocator: &dyn Allocator,
         size_bytes: usize,
         zeroed: bool,
+        alignment: usize,
     ) -> Result<Buffer, AllocError> {
         const { assert!(align_of::<Header>() == BUFFER_ALIGNMENT_BYTES) };
-        let layout = layout(size_bytes)?;
+        check!(alignment >= BUFFER_ALIGNMENT_BYTES);
+        let Ok(alignment) = u32::try_from(alignment) else { failed!() };
+        let layout = layout(size_bytes, alignment)?;
         let header =
             if zeroed { allocator.allocate_zeroed(layout) } else { allocator.allocate(layout) }?
                 .cast::<Header>();
@@ -93,7 +117,7 @@ impl Buffer {
         };
         // SAFETY: the allocation fits a header followed by `size_bytes` bytes.
         let data = unsafe {
-            header.write(Header { references: Cell::new(1), size_bytes, allocator });
+            header.write(Header { references: Cell::new(1), alignment, size_bytes, allocator });
             header.cast::<u8>().add(HEADER_BYTES)
         };
         Ok(Buffer { data })
@@ -206,16 +230,17 @@ unsafe fn header<'a>(data: NonNull<u8>) -> &'a Header {
 unsafe fn deallocate(data: NonNull<u8>) {
     // SAFETY: upheld by the caller.
     let header = unsafe { header(data) };
-    let Ok(layout) = layout(header.size_bytes) else { failed!() };
+    let Ok(layout) = layout(header.size_bytes, header.alignment) else { failed!() };
     // SAFETY: the header and bytes were allocated together with this layout,
     // from this allocator, which outlives them.
     unsafe { header.allocator.as_ref().deallocate(data.sub(HEADER_BYTES), layout) };
 }
 
-/// A header and `size_bytes` bytes after it.
-fn layout(size_bytes: usize) -> Result<Layout, AllocError> {
+/// A header and `size_bytes` bytes after it, starting at a multiple of
+/// `alignment`.
+fn layout(size_bytes: usize, alignment: u32) -> Result<Layout, AllocError> {
     let total_bytes = HEADER_BYTES.checked_add(size_bytes).ok_or(AllocError)?;
-    Layout::from_size_align(total_bytes, BUFFER_ALIGNMENT_BYTES).map_err(|_| AllocError)
+    Layout::from_size_align(total_bytes, alignment as usize).map_err(|_| AllocError)
 }
 
 impl Clone for Buffer {
@@ -290,6 +315,21 @@ mod tests {
         let buffer = Buffer::allocate(&Heap, 100).unwrap();
         assert_eq!(buffer.as_slice::<u8>(), [0; 100]);
         assert!(buffer.as_slice::<u8>().as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
+    }
+
+    /// The header and bytes start at the alignment, and are freed with it.
+    #[test]
+    fn allocates_aligned() {
+        let live = Rc::new(Cell::new(0));
+        let counting = Counting(live.clone());
+        // SAFETY: the bytes aren't read.
+        let buffer =
+            unsafe { Buffer::allocate_uninit_aligned(&counting, 4096 - HEADER_BYTES, 4096) };
+        let buffer = buffer.unwrap();
+        let start = buffer.as_ptr::<u8>().addr() - HEADER_BYTES;
+        assert!(start.is_multiple_of(4096));
+        drop(buffer);
+        assert_eq!(live.get(), 0);
     }
 
     #[test]

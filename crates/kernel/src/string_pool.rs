@@ -2,24 +2,28 @@
 //! back in O(1), ported from Perfetto's.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, HEADER_BYTES};
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
 
-/// How many bits of an id say which block its string is in.
-const BLOCK_INDEX_BITS: u32 = 9;
-
 /// How many bits of an id say where in its block its string is.
-const BLOCK_OFFSET_BITS: u32 = 22;
+const BLOCK_OFFSET_BITS: u32 = 21;
+
+/// How many bits of an id say which block its string is in: the rest of 31.
+const BLOCK_INDEX_BITS: u32 = 31 - BLOCK_OFFSET_BITS;
 
 const LARGE_STRING_FLAG_MASK: u32 = 1 << 31;
 const BLOCK_OFFSET_MASK: u32 = (1 << BLOCK_OFFSET_BITS) - 1;
 const BLOCK_INDEX_MASK: u32 = !LARGE_STRING_FLAG_MASK & !BLOCK_OFFSET_MASK;
 
-/// 4 MB.
+/// A block's allocation, its buffer's header and its strings: 2 MB, aligned
+/// to it, so one huge page can hold it.
 const BLOCK_BYTES: usize = BLOCK_OFFSET_MASK as usize + 1;
+
+/// How many bytes of strings a block holds.
+const BLOCK_CAPACITY: usize = BLOCK_BYTES - HEADER_BYTES;
 
 const BLOCKS_MAX: usize = 1 << BLOCK_INDEX_BITS;
 
@@ -121,8 +125,8 @@ pub struct StringPool {
 /// Where a pool's strings are, apart from its index, so a string can be
 /// stored while its slot in the index is held.
 struct Store {
-    /// The blocks, of `BLOCK_BYTES` each, written up to `block_end` in the
-    /// last.
+    /// The blocks, of `BLOCK_CAPACITY` each, written up to `block_end` in
+    /// the last.
     blocks: SlowVec<Buffer>,
     /// How many bytes of the last block are written.
     block_end: usize,
@@ -338,7 +342,9 @@ impl Store {
     fn add_block(&mut self, allocator: &dyn Allocator) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
-        self.blocks.push(unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }?)?;
+        let block =
+            unsafe { Buffer::allocate_uninit_aligned(allocator, BLOCK_CAPACITY, BLOCK_BYTES) };
+        self.blocks.push(block?)?;
         self.block_end = 0;
         Ok(())
     }
@@ -347,7 +353,7 @@ impl Store {
         if str.len() >= LARGE_STRING_BYTES_MIN {
             return self.insert_large_string(allocator, str);
         }
-        if self.block_end + str.len() + METADATA_BYTES > BLOCK_BYTES {
+        if self.block_end + str.len() + METADATA_BYTES > BLOCK_CAPACITY {
             self.add_block(allocator)?;
         }
         Ok(Id::block_string(self.blocks.len() - 1, self.insert_in_current_block(str)))
