@@ -15,7 +15,7 @@ use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
 use crate::error::Error;
 use crate::query_allocators::QueryAllocators;
-use crate::row_batch::RowBatch;
+use crate::row_batch::{BATCH_COLUMNS_INLINE, RowBatch};
 use crate::slow_vec::SlowVec;
 use crate::statement::Statement;
 use crate::step::{DynSource, Progress, Step};
@@ -25,12 +25,21 @@ pub struct Pipeline<'a> {
     source: DynSource<'a>,
     steps: SlowVec<Step<'a>>,
     segment_count: usize,
+    /// The most columns any of its batches holds.
+    width: u32,
 }
 
 impl<'a> Pipeline<'a> {
+    /// A pipeline whose batches hold at most `BATCH_COLUMNS_INLINE` columns.
     pub fn new(source: DynSource<'a>, steps: SlowVec<Step<'a>>) -> Pipeline<'a> {
         let operators = steps.iter().filter(|step| matches!(step, Step::Operator(_))).count();
-        Pipeline { source, steps, segment_count: operators + 1 }
+        Pipeline { source, steps, segment_count: operators + 1, width: BATCH_COLUMNS_INLINE }
+    }
+
+    /// It, with batches that hold up to `width` columns, which each run
+    /// makes room for in them before they're filled.
+    pub fn with_width(self, width: u32) -> Pipeline<'a> {
+        Pipeline { width: width.max(BATCH_COLUMNS_INLINE), ..self }
     }
 
     /// Creates the state of a run, in one allocation from `query`'s
@@ -303,6 +312,10 @@ impl<'p> Run<'p> {
             // SAFETY: the next operator's slot, which nothing else borrows.
             unsafe { &mut (*self.slot(end)).input }
         };
+        // Only the first batch of a wide pipeline allocates.
+        if let Err(error) = batch.reserve(context.allocator(), self.pipeline.width) {
+            return self.fail(error.into());
+        }
         let (made, first) = if k == 0 {
             (self.read_source(context, batch), 0)
         } else {

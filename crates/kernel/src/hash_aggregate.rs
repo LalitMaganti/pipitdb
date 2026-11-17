@@ -15,7 +15,8 @@ use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::group_table::{GroupTable, KEYS_MAX};
 use crate::murmur_hash;
-use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
+use crate::plan::PLAN_COLUMNS_MAX;
+use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
 use crate::step::{Breaker, DynOperator};
@@ -55,6 +56,9 @@ struct State {
     distinct: SlowVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
+    /// A place for a flat copy of each column of the batches read, by
+    /// position, for `Flat`.
+    copies: SlowVec<Option<ColumnView>>,
 }
 
 impl HashAggregate {
@@ -174,17 +178,22 @@ fn first_values(
 struct Flat<'b, 'r> {
     /// The batch, whose columns that are flat are read as they are.
     batch: &'b RowBatch<'r>,
-    /// A flat copy of each column that isn't, by its position.
-    copies: [Option<ColumnView>; BATCH_COLUMNS_MAX as usize],
+    /// By position, a flat copy of each column read that isn't.
+    copies: &'b [Option<ColumnView>],
 }
 
-impl<'b, 'r> Flat<'b, 'r> {
-    fn new(
+impl Flat<'_, '_> {
+    /// Makes a flat copy in `copies`, which has a place for each, of each
+    /// column of `batch` at `read` that isn't.
+    fn copy(
         context: &mut Context,
-        batch: &'b RowBatch<'r>,
+        batch: &RowBatch,
         read: impl Iterator<Item = u32>,
-    ) -> Result<Flat<'b, 'r>, Error> {
-        let mut copies = [const { None }; BATCH_COLUMNS_MAX as usize];
+        copies: &mut [Option<ColumnView>],
+    ) -> Result<(), Error> {
+        for copy in copies.iter_mut() {
+            *copy = None;
+        }
         for position in read {
             let column = batch.column(position);
             let forms = if column.data_type() == DataType::String {
@@ -192,13 +201,14 @@ impl<'b, 'r> Flat<'b, 'r> {
             } else {
                 Forms::FLAT
             };
-            if !column.is_in(forms) && at!(copies, position as usize).is_none() {
-                let mut copy = column.clone();
-                copy.make_in(context, forms)?;
-                *at_mut!(copies, position as usize) = Some(copy);
+            let copy = at_mut!(copies, position as usize);
+            if !column.is_in(forms) && copy.is_none() {
+                let mut flat = column.clone();
+                flat.make_in(context, forms)?;
+                *copy = Some(flat);
             }
         }
-        Ok(Flat { batch, copies })
+        Ok(())
     }
 
     fn column(&self, position: u32) -> &ColumnView {
@@ -239,7 +249,8 @@ impl Breaker for HashAggregate {
             let set = if call.distinct { Some(FlatHashMap::for_len(allocator, 0)?) } else { None };
             distinct.push(set)?;
         }
-        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0 })
+        let copies = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0, copies })
     }
 
     fn consume(
@@ -252,7 +263,11 @@ impl Breaker for HashAggregate {
         if rows == 0 {
             return Ok(());
         }
-        let input = Flat::new(context, input, self.read())?;
+        while state.copies.len() < input.column_count() as usize {
+            state.copies.push(None)?;
+        }
+        Flat::copy(context, input, self.read(), &mut state.copies)?;
+        let input = Flat { batch: input, copies: &state.copies };
         // Find each row's group. Groups are numbered in the order first seen,
         // so a row starts a new group when its number equals the group count.
         // With no keys, every row is in the one group.

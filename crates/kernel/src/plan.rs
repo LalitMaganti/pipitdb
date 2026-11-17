@@ -597,7 +597,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(c.column_of(column.binding.id))?;
+            out.push_column(c.allocator(), c.column_of(column.binding.id))?;
         }
         out.scan = Some(c.node());
         let read = |&(column, descending): &(u32, bool)| {
@@ -655,7 +655,7 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
 
     /// Its input's: it loads columns where they are.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        Ok(*c.input(0))
+        Ok(c.input_copy(0)?)
     }
 
     fn lower(
@@ -711,7 +711,7 @@ impl<'c> Op<'c> for FilterOp {
 
     /// Its input's, less some rows.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let mut out = *c.input(0);
+        let mut out = c.input_copy(0)?;
         out.drop_rows();
         Ok(out)
     }

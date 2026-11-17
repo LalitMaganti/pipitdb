@@ -3,6 +3,7 @@
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
@@ -83,6 +84,18 @@ impl<T> SlowVec<T> {
     {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         let mut raw = RawVec::new(allocator, size_of::<T>(), len, len, true)?;
+        raw.len = len;
+        Ok(SlowVec { raw, values: PhantomData })
+    }
+
+    /// `len` places for values, none written, in a `SlowVec` that never
+    /// grows.
+    pub fn uninit(
+        allocator: &dyn Allocator,
+        len: usize,
+    ) -> Result<SlowVec<MaybeUninit<T>>, AllocError> {
+        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+        let mut raw = RawVec::new(allocator, size_of::<T>(), len, len, false)?;
         raw.len = len;
         Ok(SlowVec { raw, values: PhantomData })
     }

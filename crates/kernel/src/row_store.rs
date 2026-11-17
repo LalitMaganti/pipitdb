@@ -6,6 +6,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
 use crate::context::Context;
 use crate::error::Error;
+use crate::plan::PLAN_COLUMNS_MAX;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
@@ -90,11 +91,11 @@ impl RowStore {
             width: 0,
             dense: 0,
             places: SlowVec::new(allocator, 1 << 31)?,
-            packing: SlowVec::new(allocator, 1 << 6)?,
+            packing: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
             packed: 0,
             nullable: 0,
             dropped: 0,
-            placeholders: SlowVec::new(allocator, 1 << 6)?,
+            placeholders: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
             scattered: 0,
             copies: SlowVec::new(allocator, 1 << 24)?,
         })
@@ -209,6 +210,8 @@ impl RowStore {
             return Ok(());
         }
         let mut batch = RowBatch::new();
+        #[expect(clippy::cast_possible_truncation, reason = "a column of a batch each")]
+        batch.reserve(context.allocator(), self.packing.len() as u32)?;
         batch.reset(self.packed);
         for packing in self.packing.iter() {
             let Ok(()) = batch.push_column(packing.take(context)?) else { failed!() };
@@ -244,6 +247,7 @@ impl RowStore {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         let count = rows.len().min(BATCH_ROWS_MAX as usize) as u32;
         let rows = at!(rows, ..count as usize);
+        out.reserve(context.allocator(), self.width)?;
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;

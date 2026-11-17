@@ -8,6 +8,7 @@ use crate::array::Array;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
+use crate::plan::PLAN_COLUMNS_MAX;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_blocks::RowBlocks;
@@ -49,11 +50,11 @@ impl SortedRows {
     pub(crate) fn new(allocator: &dyn Allocator) -> Result<SortedRows, AllocError> {
         Ok(SortedRows {
             layout: None,
-            types: SlowVec::new(allocator, 1 << 6)?,
-            strings: SlowVec::new(allocator, 1 << 6)?,
+            types: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            strings: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
             keys: None,
             rows: RowStore::new(allocator)?,
-            decoded: SlowVec::new(allocator, 1 << 6)?,
+            decoded: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
             order: Sorted::Held { reverse: false, count: 0 },
             order_len: 0,
         })
