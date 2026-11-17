@@ -3,9 +3,11 @@
 //! descending.
 
 use crate::allocator::{AllocError, Allocator};
+use crate::column::ColumnView;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
+use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
@@ -57,7 +59,9 @@ impl Breaker for Sort {
         sorting: &mut Sorting,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        sorting.emitted += sorting.rows.gather(context, output, sorting.emitted)?;
+        // Its input's lazy columns are loaded before it holds them.
+        let load = &mut |_: &mut Context, _: &ColumnView, _: &Selection| failed!();
+        sorting.emitted += sorting.rows.gather(context, output, sorting.emitted, load)?;
         Ok(sorting.emitted < sorting.rows.order_len())
     }
 }
@@ -237,7 +241,7 @@ mod tests {
             for keys in [KEY_THEN_VALUE, &[(0, false)], &[(2, false)], &[(2, true), (0, false)]] {
                 let all = run(rows(), sort(&Heap, by(keys)).unwrap());
                 for count in [0, 1, 100, 3000, u32::MAX] {
-                    let top = run(rows(), top_k(&Heap, by(keys), count, false).unwrap());
+                    let top = run(rows(), top_k(&Heap, by(keys), count, false, None).unwrap());
                     assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
                 }
             }

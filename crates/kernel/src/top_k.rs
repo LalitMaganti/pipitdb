@@ -5,10 +5,13 @@
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
+use crate::column::ColumnView;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{RowLayout, decode};
+use crate::scannable::{DynScannable, LazyLoader, load_lazy};
+use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 use crate::sorted_rows::{SortKey, SortedRows, lay_out_keys};
 use crate::step::{Breaker, DynOperator};
@@ -22,28 +25,35 @@ use crate::step::{Breaker, DynOperator};
 /// appending them in order to rows held afresh. The last of those becomes
 /// the cutoff: from then on, rows which don't come before it are dropped as
 /// they arrive, so on most inputs pruning soon becomes rare.
+///
+/// Lazy columns `lazy` made are held as they are, and only the rows it
+/// keeps are loaded, as it outputs them or prunes to them.
 pub fn top_k<'a>(
     allocator: &dyn Allocator,
     keys: SlowVec<SortKey>,
     count: u32,
     publish: bool,
+    lazy: Option<&'a DynScannable<'a>>,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, TopK { keys, count, publish })
+    DynOperator::new(allocator, TopK { keys, count, publish, lazy })
 }
 
-struct TopK {
+struct TopK<'a> {
     keys: SlowVec<SortKey>,
     count: u32,
     publish: bool,
+    lazy: Option<&'a DynScannable<'a>>,
 }
 
 /// The rows held, the cutoff once there is one, the keys of a batch's rows
-/// laid out, and how many rows have been output.
-struct Kept {
+/// laid out, how many rows have been output, and what loads lazy columns,
+/// if the input has them.
+struct Kept<'a> {
     rows: SortedRows,
     cutoff: Option<Cutoff>,
     keys: SlowVec<u8>,
     emitted: u32,
+    loader: Option<LazyLoader<'a>>,
 }
 
 /// The last row kept: its keys laid out, and by key, where the strings of its
@@ -54,14 +64,15 @@ struct Cutoff {
     bytes: SlowVec<u8>,
 }
 
-impl Breaker for TopK {
-    type State = Kept;
+impl<'a> Breaker for TopK<'a> {
+    type State = Kept<'a>;
 
-    fn new_state(&self, context: &mut Context) -> Result<Kept, Error> {
+    fn new_state(&self, context: &mut Context) -> Result<Kept<'a>, Error> {
         let allocator = context.allocator();
         let rows = SortedRows::new(allocator)?;
         let keys = SlowVec::new(allocator, 1 << 31)?;
-        Ok(Kept { rows, cutoff: None, keys, emitted: 0 })
+        let loader = self.lazy.map(|lazy| lazy.loader(context)).transpose()?;
+        Ok(Kept { rows, cutoff: None, keys, emitted: 0, loader })
     }
 
     fn consume(
@@ -103,12 +114,16 @@ impl Breaker for TopK {
         kept: &mut Kept,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        kept.emitted += kept.rows.gather(context, output, kept.emitted)?;
-        Ok(kept.emitted < kept.rows.order_len())
+        let Kept { rows, emitted, loader, .. } = kept;
+        let load = &mut |context: &mut Context, lazy: &ColumnView, selection: &Selection| {
+            load_lazy(loader, context, lazy, selection)
+        };
+        *emitted += rows.gather(context, output, *emitted, load)?;
+        Ok(*emitted < rows.order_len())
     }
 }
 
-impl TopK {
+impl TopK<'_> {
     /// The rows of `input` which come before the cutoff, their keys laid out
     /// at the start of `kept.keys`. A row equal to the cutoff comes after it,
     /// having arrived later.
@@ -149,14 +164,17 @@ impl TopK {
     /// Keeps only the first `count` rows held, in order, and makes the last
     /// of them the cutoff.
     fn prune(&self, context: &mut Context, kept: &mut Kept) -> Result<(), Error> {
-        let rows = &mut kept.rows;
+        let (rows, loader) = (&mut kept.rows, &mut kept.loader);
         rows.sort(context)?;
         rows.truncate_order(self.count);
         let mut first = SortedRows::new(context.allocator())?;
         let mut batch = RowBatch::new();
         let mut at = 0;
+        let load = &mut |context: &mut Context, lazy: &ColumnView, selection: &Selection| {
+            load_lazy(loader, context, lazy, selection)
+        };
         while at < self.count {
-            at += rows.gather(context, &mut batch, at)?;
+            at += rows.gather(context, &mut batch, at, load)?;
             first.append(context, &batch, &self.keys)?;
         }
         first.flush(context)?;
