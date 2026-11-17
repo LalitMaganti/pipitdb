@@ -26,6 +26,10 @@ pub enum Tag {
     /// A function call: `child_count` children from `first_child`, the name and
     /// then the arguments.
     Call,
+    /// `CASE`: `child_count` children from `first_child`: its subject, then
+    /// each `WHEN`'s condition and `THEN`'s value, then its `ELSE`'s value.
+    /// A subject or `ELSE` it hasn't is an empty node.
+    Case,
     /// `child_count` items from `first_child`, as in `SELECT a, b`.
     List,
     /// An expression and a name for it, a `Name`, from `first_child`: `a AS
@@ -118,9 +122,15 @@ impl Node {
         Node { tag: tag as u8, data: [a, b, c], payload: span.start }
     }
 
-    /// A placeholder, for array slots not yet filled.
+    /// A placeholder, for array slots not yet filled, and what a `Case` has
+    /// for a subject or `ELSE` it hasn't: a name of no letters.
     pub(crate) const fn empty() -> Node {
         Node { tag: 0, data: [0; 3], payload: 0 }
+    }
+
+    /// Whether this is `empty()`'s.
+    pub fn is_empty(self) -> bool {
+        self.tag() == Tag::Name && self.span().len == 0
     }
 
     pub(crate) fn stage(rule: u16, first_child: u32) -> Node {
@@ -164,10 +174,10 @@ impl Node {
         self.payload
     }
 
-    /// For `Call`, `List` and `Query`. A `Stage` has one child per item of
-    /// its rule.
+    /// For `Call`, `Case`, `List` and `Query`. A `Stage` has one child per
+    /// item of its rule.
     pub fn child_count(self) -> u32 {
-        check!(matches!(self.tag(), Tag::Call | Tag::List | Tag::Query));
+        check!(matches!(self.tag(), Tag::Call | Tag::Case | Tag::List | Tag::Query));
         self.data_u24()
     }
 

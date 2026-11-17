@@ -174,7 +174,7 @@ const fn infix() -> [Option<(Operator, u8)>; TOKEN_KIND_COUNT] {
     infix
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Keyword {
     None,
     And,
@@ -182,6 +182,11 @@ enum Keyword {
     Not,
     Like,
     Distinct,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
 }
 
 #[derive(Clone, Copy)]
@@ -191,6 +196,20 @@ enum Pending {
     Parenthesis,
     Call(Node),
     Argument(Node),
+    /// A `CASE`, its parts on the frames above it.
+    Case,
+    /// A part of a `CASE`, and the keyword that ended it.
+    CasePart(Node, Keyword),
+}
+
+/// What a part of a call or `CASE` ending did.
+enum Ended {
+    /// Another part follows.
+    Next,
+    /// The call or `CASE` closed, and the binding power to go back to.
+    Closed(Node, u8),
+    /// It wasn't part of one.
+    No,
 }
 
 /// What a token in operand position does: gives an operand, or starts
@@ -237,14 +256,7 @@ impl Parser<'_> {
             let mut operand = match self.prefix(token)? {
                 Step::Operand(operand) => operand,
                 Step::Push(pending, power) => {
-                    // `DISTINCT` only starts a call's argument.
-                    let top = stack.depth.checked_sub(1).map(|top| at!(stack.frames, top).pending);
-                    if let Pending::Unary(Operator::Distinct) = pending
-                        && !matches!(top, Some(Pending::Call(_) | Pending::Argument(_)))
-                    {
-                        return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
-                    }
-                    stack.push(pending, min_power, token)?;
+                    self.push_pending(&mut stack, pending, min_power, token)?;
                     min_power = power;
                     continue;
                 }
@@ -270,18 +282,16 @@ impl Parser<'_> {
                     return Ok(operand);
                 }
                 let frame = *at!(stack.frames, stack.depth - 1);
-                if let Pending::Call(_) | Pending::Argument(_) = frame.pending {
-                    let token = self.advance()?;
-                    if token.kind == TokenKind::Comma {
-                        stack.push(Pending::Argument(operand), 0, token)?;
+                match self.end_part(&mut stack, frame, operand)? {
+                    Ended::Next => {
                         min_power = 0;
                         continue 'operand;
                     }
-                    if token.kind != TokenKind::RightParen {
-                        return Err(Error::expected(TokenKind::RightParen, token.span));
+                    Ended::Closed(closed, power) => {
+                        (operand, min_power) = (closed, power);
+                        continue;
                     }
-                    (operand, min_power) = self.call(&mut stack, operand);
-                    continue;
+                    Ended::No => {}
                 }
                 stack.depth -= 1;
                 min_power = frame.min_power;
@@ -294,7 +304,10 @@ impl Parser<'_> {
                         self.expect(TokenKind::RightParen)?;
                         operand
                     }
-                    Pending::Call(_) | Pending::Argument(_) => {
+                    Pending::Call(_)
+                    | Pending::Argument(_)
+                    | Pending::Case
+                    | Pending::CasePart(..) => {
                         pipit_kernel::failed!()
                     }
                 };
@@ -374,6 +387,116 @@ impl Parser<'_> {
         (node, at!(stack.frames, call).min_power)
     }
 
+    /// Pushes `pending`, from `token`, going back to `min_power` once it has
+    /// its operand.
+    fn push_pending(
+        &mut self,
+        stack: &mut Stack,
+        pending: Pending,
+        min_power: u8,
+        token: Token,
+    ) -> Result<(), Error> {
+        // `DISTINCT` only starts a call's argument.
+        let top = stack.depth.checked_sub(1).map(|top| at!(stack.frames, top).pending);
+        if let Pending::Unary(Operator::Distinct) = pending
+            && !matches!(top, Some(Pending::Call(_) | Pending::Argument(_)))
+        {
+            return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
+        }
+        stack.push(pending, min_power, token)?;
+        // A `CASE` without a subject starts with `WHEN`.
+        if let Pending::Case = pending
+            && self.at_keyword(Keyword::When)
+        {
+            let token = self.advance()?;
+            stack.push(Pending::CasePart(Node::empty(), Keyword::When), 0, token)?;
+        }
+        Ok(())
+    }
+
+    /// Ends `operand` as an argument of the call, or a part of the `CASE`,
+    /// that `frame`, the top of `stack`, is part of, at the token after it:
+    /// another follows, or the call or `CASE` closes.
+    fn end_part(&mut self, stack: &mut Stack, frame: Frame, operand: Node) -> Result<Ended, Error> {
+        match frame.pending {
+            Pending::Case | Pending::CasePart(..) => {
+                let token = self.advance()?;
+                let keyword = if token.kind == TokenKind::Identifier {
+                    self.keyword(token)
+                } else {
+                    Keyword::None
+                };
+                // What may end this part, by what ended the one before: the
+                // subject, a condition, a value, or what `ELSE` gives.
+                let before = match frame.pending {
+                    Pending::CasePart(_, keyword) => keyword,
+                    _ => Keyword::Case,
+                };
+                let allowed = match before {
+                    Keyword::Case => keyword == Keyword::When,
+                    Keyword::When => keyword == Keyword::Then,
+                    Keyword::Then => {
+                        matches!(keyword, Keyword::When | Keyword::Else | Keyword::End)
+                    }
+                    _ => keyword == Keyword::End,
+                };
+                if !allowed {
+                    return Err(Error::new(ErrorCode::ExpectedWord, token.span));
+                }
+                if keyword != Keyword::End {
+                    stack.push(Pending::CasePart(operand, keyword), 0, token)?;
+                    return Ok(Ended::Next);
+                }
+                let (case, power) = self.case(stack, operand, before);
+                Ok(Ended::Closed(case, power))
+            }
+            Pending::Call(_) | Pending::Argument(_) => {
+                let token = self.advance()?;
+                if token.kind == TokenKind::Comma {
+                    stack.push(Pending::Argument(operand), 0, token)?;
+                    return Ok(Ended::Next);
+                }
+                if token.kind != TokenKind::RightParen {
+                    return Err(Error::expected(TokenKind::RightParen, token.span));
+                }
+                let (call, power) = self.call(stack, operand);
+                Ok(Ended::Closed(call, power))
+            }
+            Pending::Unary(_) | Pending::Binary(..) | Pending::Parenthesis => Ok(Ended::No),
+        }
+    }
+
+    /// Pops a `CASE` and its parts off `stack`, checked to be in order as
+    /// they ended, `last` its last, after a part ended by `before`, and
+    /// writes them to the tree: its subject, each condition and value, and
+    /// its `ELSE`'s value, an empty node for one it hasn't. Returns the `CASE`
+    /// and the binding power to go back to.
+    fn case(&mut self, stack: &mut Stack, last: Node, before: Keyword) -> (Node, u8) {
+        let mut case = stack.depth - 1;
+        while let Pending::CasePart(..) = at!(stack.frames, case).pending {
+            case -= 1;
+        }
+        let first_child = self.node_count();
+        for frame in at!(stack.frames, case + 1..stack.depth) {
+            if let Pending::CasePart(node, _) = frame.pending {
+                self.write(&[node]);
+            }
+        }
+        self.write(&[last]);
+        if before != Keyword::Else {
+            self.write(&[Node::empty()]);
+        }
+        stack.depth = case;
+        let node = Node::list(Tag::Case, self.node_count() - first_child, first_child);
+        (node, at!(stack.frames, case).min_power)
+    }
+
+    /// Whether the current token is the keyword `keyword`.
+    fn at_keyword(&self, keyword: Keyword) -> bool {
+        let token = self.current();
+        token.kind == TokenKind::Identifier && self.keyword(token) == keyword
+    }
+
     /// What `token`, in operand position, does.
     fn prefix(&mut self, token: Token) -> Result<Step, Error> {
         Ok(match token.kind {
@@ -397,7 +520,14 @@ impl Parser<'_> {
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
                 // Over all that follows, as in `count(DISTINCT a)`.
                 Keyword::Distinct => Step::Push(Pending::Unary(Operator::Distinct), 0),
-                Keyword::And | Keyword::Or | Keyword::Like => {
+                Keyword::Case => Step::Push(Pending::Case, 0),
+                Keyword::And
+                | Keyword::Or
+                | Keyword::Like
+                | Keyword::When
+                | Keyword::Then
+                | Keyword::Else
+                | Keyword::End => {
                     return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
                 }
             },
@@ -413,19 +543,32 @@ impl Parser<'_> {
             Keyword::And => Some((Operator::And, AND)),
             Keyword::Or => Some((Operator::Or, OR)),
             Keyword::Like => Some((Operator::Like, COMPARISON)),
-            Keyword::Not | Keyword::Distinct | Keyword::None => None,
+            Keyword::Not
+            | Keyword::Distinct
+            | Keyword::None
+            | Keyword::Case
+            | Keyword::When
+            | Keyword::Then
+            | Keyword::Else
+            | Keyword::End => None,
         }
     }
 
     fn keyword(&self, token: Token) -> Keyword {
         check!(token.kind == TokenKind::Identifier);
         let text = self.text(token);
-        let keyword = match text.len() {
-            2 => (Keyword::Or, b"or".as_slice()),
-            3 if text[0].eq_ignore_ascii_case(&b'a') => (Keyword::And, b"and".as_slice()),
-            3 => (Keyword::Not, b"not".as_slice()),
-            4 => (Keyword::Like, b"like".as_slice()),
-            8 => (Keyword::Distinct, b"distinct".as_slice()),
+        let first = text.first().map_or(0, u8::to_ascii_lowercase);
+        let keyword = match (text.len(), first) {
+            (2, _) => (Keyword::Or, b"or".as_slice()),
+            (3, b'a') => (Keyword::And, b"and".as_slice()),
+            (3, b'e') => (Keyword::End, b"end".as_slice()),
+            (3, _) => (Keyword::Not, b"not".as_slice()),
+            (4, b'c') => (Keyword::Case, b"case".as_slice()),
+            (4, b'w') => (Keyword::When, b"when".as_slice()),
+            (4, b't') => (Keyword::Then, b"then".as_slice()),
+            (4, b'e') => (Keyword::Else, b"else".as_slice()),
+            (4, _) => (Keyword::Like, b"like".as_slice()),
+            (8, _) => (Keyword::Distinct, b"distinct".as_slice()),
             _ => return Keyword::None,
         };
         if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }
@@ -617,7 +760,7 @@ mod tests {
                 render(source, ast, node.first_child()),
                 render(source, ast, node.first_child() + 1)
             ),
-            Tag::Call | Tag::List => {
+            Tag::Call | Tag::Case | Tag::List => {
                 let children = (0..node.child_count())
                     .map(|i| render(source, ast, node.first_child() + i))
                     .collect::<alloc::vec::Vec<_>>();

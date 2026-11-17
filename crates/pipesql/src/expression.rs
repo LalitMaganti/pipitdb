@@ -113,6 +113,7 @@ fn compile(
         }
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
         Tag::Call => call(compiler, node, depth, nodes)?,
+        Tag::Case => case(compiler, node, depth, nodes)?,
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -190,6 +191,60 @@ fn call(
     }
     let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches, 0);
     case.c = *at!(values, count as usize - 1);
+    push_node(nodes, case, node, compiler)?;
+    Ok(())
+}
+
+/// Appends the nodes of the `CASE` `node`, `depth` deep: each branch's
+/// condition and value, then a `When` for each, then the `Case`. No `ELSE`
+/// is `NULL`, and `CASE s WHEN v` tests `s = v`, with `s` computed once.
+fn case(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    let count = node.child_count();
+    let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
+    let last = |nodes: &SlowVec<ExprStep>| {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let last = nodes.len() as u32 - 1;
+        last
+    };
+    let subject = child(compiler, 0);
+    let subject = if subject.is_empty() {
+        None
+    } else {
+        compile(compiler, subject, depth + 1, nodes)?;
+        Some(last(nodes))
+    };
+    // Each `WHEN`'s condition and value.
+    let mut branches = SlowVec::fixed(compiler.allocator(), (count as usize - 2) / 2)?;
+    for i in (1..count - 1).step_by(2) {
+        compile(compiler, child(compiler, i), depth + 1, nodes)?;
+        let mut condition = last(nodes);
+        if let Some(subject) = subject {
+            let equal = expr_node(ExprOp::Eq, subject, condition, 0);
+            condition = push_node(nodes, equal, node, compiler)?;
+        }
+        compile(compiler, child(compiler, i + 1), depth + 1, nodes)?;
+        branches.push((condition, last(nodes)))?;
+    }
+    let otherwise = child(compiler, count - 1);
+    let otherwise = if otherwise.is_empty() {
+        push_node(nodes, expr_node(ExprOp::Null, 0, 0, 0), node, compiler)?
+    } else {
+        compile(compiler, otherwise, depth + 1, nodes)?;
+        last(nodes)
+    };
+    let mut first = None;
+    for &(condition, value) in branches.iter() {
+        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        first.get_or_insert(when);
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
+    case.c = otherwise;
     push_node(nodes, case, node, compiler)?;
     Ok(())
 }

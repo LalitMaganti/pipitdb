@@ -465,6 +465,7 @@ mod tests {
             Tag::Query => ("Query".to_string(), node.child_count()),
             Tag::List => ("List".to_string(), node.child_count()),
             Tag::Call => ("Call".to_string(), node.child_count()),
+            Tag::Case => ("Case".to_string(), node.child_count()),
             Tag::Stage => {
                 let rule = REGISTRY.rule(node.rule());
                 (rule.keyword.to_uppercase(), u32::try_from(rule.items.len()).unwrap())

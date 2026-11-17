@@ -410,6 +410,19 @@ mod tests {
         assert_eq!(kept("FROM t |> SELECT coalesce(a * 2, 0) AS x"), [2.0, 4.0]);
         let groups = "FROM t |> EXTEND iif(a > 1, 'big', 'small') AS k |> AGGREGATE count(*) AS c GROUP BY k |> SELECT c";
         assert_eq!(kept(groups), [1.0, 1.0]);
+        // `CASE`, as `iif`s.
+        assert_eq!(kept("FROM t |> SELECT CASE WHEN a > 1 THEN b ELSE a END AS x"), [1.0, 20.0]);
+        let no_else =
+            "FROM t |> EXTEND CASE WHEN a > 1 THEN b END AS x |> WHERE x IS NULL |> SELECT a";
+        assert_eq!(kept(no_else), [1.0]);
+        let whens =
+            "FROM t |> SELECT CASE WHEN a = 1 THEN 'one' WHEN a = 2 THEN 'three' ELSE '' END AS x";
+        assert_eq!(kept(whens), [3.0, 5.0]);
+        let subject = "FROM t |> SELECT CASE a WHEN 1 THEN 10 WHEN 2 THEN 20 END AS x";
+        assert_eq!(kept(subject), [10.0, 20.0]);
+        let nested = "FROM t |> SELECT CASE WHEN a = 1 THEN CASE WHEN b = 10 THEN s ELSE 'x' END ELSE 'yy' END AS x";
+        assert_eq!(kept(nested), [4.0, 2.0]);
+        assert_eq!(kept("FROM t |> SELECT case when a > 1 then 1 else 0 end AS x"), [0.0, 1.0]);
         // String literals, as lengths here, which later stages read.
         assert_eq!(kept("FROM t |> SELECT 'it''s' AS x"), [4.0, 4.0]);
         assert_eq!(kept("FROM t |> SELECT '' AS x"), [0.0, 0.0]);
@@ -474,6 +487,12 @@ mod tests {
 
     #[test]
     fn reports_what_expressions_cant_compute() {
+        assert_eq!(
+            error("FROM t |> SELECT CASE WHEN a THEN 1 AS x"),
+            (ErrorCode::ExpectedWord, 36)
+        );
+        assert_eq!(error("FROM t |> SELECT CASE END AS x"), (ErrorCode::ExpectedExpression, 22));
+        assert_eq!(error("FROM t |> SELECT CASE a THEN 1 END AS x"), (ErrorCode::ExpectedWord, 24));
         assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
         assert_eq!(error("FROM t |> SELECT a LIKE 'x' AS y"), (ErrorCode::ExpectedString, 17));
         assert_eq!(error("FROM t |> SELECT iif(a, 1) AS y"), (ErrorCode::ArgumentCount, 17));
