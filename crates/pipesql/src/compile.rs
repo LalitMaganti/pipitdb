@@ -388,6 +388,15 @@ mod tests {
         assert_eq!(kept("FROM t |> SELECT s = '' AS x"), [0.0, 1.0]);
         assert_eq!(kept("FROM n |> EXTEND x = 1 AS y |> WHERE y IS NULL |> SELECT x").len(), 1);
         assert_eq!(kept("FROM t |> EXTEND a > 1 AS big |> WHERE big = 1 |> SELECT a"), [2.0]);
+        // Null tests, never null, and `LIKE`, null where its string is.
+        assert_eq!(kept("FROM n |> SELECT x IS NULL AS y"), [0.0, 1.0]);
+        assert_eq!(kept("FROM n |> SELECT x IS NOT NULL AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT s LIKE 'it%' AS x"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT s LIKE '%' AS x"), [1.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT s LIKE '%t''s%' AS x"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> EXTEND s LIKE '%s' AS m |> WHERE m = 1 |> SELECT a"), [1.0]);
+        let null = "FROM t |> EXTEND NULL LIKE 'x' AS y |> WHERE y IS NULL |> SELECT a";
+        assert_eq!(kept(null).len(), 2);
         // String literals, as lengths here, which later stages read.
         assert_eq!(kept("FROM t |> SELECT 'it''s' AS x"), [4.0, 4.0]);
         assert_eq!(kept("FROM t |> SELECT '' AS x"), [0.0, 0.0]);
@@ -475,6 +484,8 @@ mod tests {
         assert_eq!(error("FROM t |> EXTEND f % 2 AS x"), (ErrorCode::ExpectedInteger, 17));
         assert_eq!(error("FROM t |> SELECT count(a) AS x"), (ErrorCode::Unsupported, 17));
         assert_eq!(error("FROM t |> SELECT s = 1 AS x"), (ErrorCode::ExpectedOneKind, 17));
+        assert_eq!(error("FROM t |> SELECT a LIKE 'x' AS y"), (ErrorCode::ExpectedString, 17));
+        assert_eq!(error("FROM t |> SELECT s LIKE s AS y"), (ErrorCode::Unsupported, 24));
         assert_eq!(error("FROM t |> SELECT f > a AS x"), (ErrorCode::ExpectedOneType, 17));
         let inexact = "FROM t |> SELECT f = 9007199254740993 AS x";
         assert_eq!(error(inexact), (ErrorCode::Unsupported, 17));

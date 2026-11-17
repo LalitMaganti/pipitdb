@@ -181,7 +181,10 @@ pub fn compute_pipeline(
     let step =
         |op, data_type, a, b| ExprStep { op, data_type, a, b, int_value: 0, double_value: 0.0 };
     // A comparison is an Int64, whatever it compares.
-    let comparison = matches!(op, ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le);
+    let comparison = matches!(
+        op,
+        ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::IsNull | ExprOp::IsNotNull
+    );
     let result = if comparison { DataType::Int64 } else { data_type };
     let steps = [
         step(ExprOp::Column, data_type, 0, 0),
@@ -206,7 +209,7 @@ pub fn perfetto_expression(index: usize, batches: u32) -> Pipeline<'static> {
 
 /// Perfetto's `expression_benchmark.cc`'s cases: names, ops, types and
 /// whether there are nulls.
-pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 11] = [
+pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 13] = [
     ("int_add", ExprOp::Add, DataType::Int64, false),
     ("int_mul", ExprOp::Mul, DataType::Int64, false),
     ("int_div", ExprOp::Div, DataType::Int64, false),
@@ -218,6 +221,8 @@ pub const PERFETTO_EXPRESSIONS: [(&str, ExprOp, DataType, bool); 11] = [
     ("int_ne", ExprOp::Ne, DataType::Int64, false),
     ("int_lt_nullable", ExprOp::Lt, DataType::Int64, true),
     ("double_lt", ExprOp::Lt, DataType::Float64, false),
+    ("is_null", ExprOp::IsNull, DataType::Int64, true),
+    ("is_not_null", ExprOp::IsNotNull, DataType::Int64, true),
 ];
 
 /// Does nothing, to measure what a transform costs the pipeline.

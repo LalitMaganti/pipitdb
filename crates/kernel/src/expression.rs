@@ -52,6 +52,13 @@ pub enum ExprOp {
     Gt,
     /// `a >= b`.
     Ge,
+    /// Whether the string `a` matches the `LIKE` pattern whose id in the
+    /// statement's literals is `b`, as 0 or 1: null if `a` is.
+    Like,
+    /// Whether `a` is null, as 0 or 1, never null.
+    IsNull,
+    /// Whether `a` isn't null, as 0 or 1, never null.
+    IsNotNull,
 }
 
 /// One step of an `ExprProgram`. Step `i` computes register `i` from the
@@ -213,6 +220,8 @@ fn run(
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 compare(context, step, registers)?
             }
+            ExprOp::Like => like(context, step, registers)?,
+            ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
         };
         *at_mut!(registers, i) = Some(value);
     }
@@ -363,6 +372,60 @@ fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
     }
 }
 
+/// Whether each row's string matches `step`'s pattern, as 0 or 1, at the rows
+/// where it isn't null: others' views may not be of their bytes. A
+/// `%needle%` pattern is searched for once across the strings' bytes.
+#[inline(never)]
+fn like(
+    context: &mut Context,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let a = register(registers, step.a);
+    let pattern = context.literals().and_then(|literals| literals.get(Id::raw(step.b)));
+    let Some(pattern) = pattern else { failed!() };
+    let rows = a.row_count() as usize;
+    let validity = validity(context, a, None, None)?;
+    let mut values = context.values_buffer(rows * 8)?;
+    let strings = a.string_values();
+    let contains = crate::like::contained(pattern)
+        .map(|needle| crate::like::Contains::new(strings.bytes(), needle));
+    for (row, o) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+        if a.is_null(row as u32) {
+            *o = 0;
+            continue;
+        }
+        let cell = strings.get(row);
+        let matches = match &contains {
+            Some(contains) => contains.within(cell),
+            None => crate::like::like(cell, pattern),
+        };
+        *o = i64::from(matches);
+    }
+    ColumnView::new(context, DataType::Int64, values, validity)
+}
+
+/// Whether each row of `step`'s register is null, or isn't, as 0 or 1.
+#[inline(never)]
+fn null_test(
+    context: &mut Context,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let a = register(registers, step.a);
+    let rows = a.row_count() as usize;
+    let mut values = context.values_buffer(rows * 8)?;
+    let flip = u64::from(step.op == ExprOp::IsNull);
+    for (i, o) in values.as_mut_slice::<i64>().chunks_mut(64).enumerate() {
+        let present = word(a.validity(), i * 64, o.len());
+        for (k, o) in o.iter_mut().enumerate() {
+            *o = (present >> k & 1 ^ flip).cast_signed();
+        }
+    }
+    ColumnView::new(context, DataType::Int64, values, None)
+}
+
 /// An overflowing operation's result, and whether it fit.
 fn fits((value, overflowed): (i64, bool)) -> (i64, bool) {
     (value, !overflowed)
@@ -510,6 +573,8 @@ pub enum ExprError {
     Types,
     /// An integer literal compared with a double which can hold it exactly.
     Inexact,
+    /// A string, not a number, on the left of `LIKE`.
+    Strings,
     /// An allocation failed.
     OutOfMemory,
 }
@@ -612,6 +677,23 @@ impl Typer<'_> {
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 self.type_comparison(nodes, node)
             }
+            ExprOp::Like => {
+                let (a_type, a) = *at!(self.nodes, node.a as usize);
+                match a_type {
+                    // `NULL LIKE p` is NULL.
+                    None => Ok((None, 0)),
+                    Some(DataType::String) => {
+                        let like = step(ExprOp::Like, DataType::Int64, a, node.b);
+                        Ok((Some(DataType::Int64), self.add(like)?))
+                    }
+                    Some(_) => Err(ExprError::Strings),
+                }
+            }
+            ExprOp::IsNull | ExprOp::IsNotNull => {
+                let a_type = at!(self.nodes, node.a as usize).0;
+                let a = self.materialize(node.a, a_type.unwrap_or(DataType::Int64))?;
+                Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, 0))?))
+            }
         }
     }
 
@@ -664,6 +746,10 @@ impl Typer<'_> {
 /// can hold one: it can if one can, or if it divides by what may be zero,
 /// anything but a constant that isn't, or has a `NULL`.
 pub fn expr_can_be_null(expr: &Expr, nullable_of: &dyn Fn(ColumnId) -> bool) -> bool {
+    // A null test never is, whatever it tests.
+    if expr.nodes.last().is_some_and(|node| matches!(node.op, ExprOp::IsNull | ExprOp::IsNotNull)) {
+        return false;
+    }
     let nonzero = |node: &ExprStep| {
         node.op == ExprOp::Constant && (node.int_value != 0 || node.double_value != 0.0)
     };
@@ -734,7 +820,8 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
         | ExprError::Integers
         | ExprError::Kinds
         | ExprError::Types
-        | ExprError::Inexact => LowerError::WrongType(column),
+        | ExprError::Inexact
+        | ExprError::Strings => LowerError::WrongType(column),
     }
 }
 
@@ -1010,6 +1097,19 @@ mod tests {
             b.push(op, INT, n, twenty);
             let expected = [Some(first), Some(second), None, Some(fourth), Some(fifth)];
             assert_eq!(run(b, batch(&[column(&N)])), expected, "{op:?}");
+        }
+    }
+
+    /// Whether each row is null, or isn't, as 0 or 1, never null.
+    #[test]
+    fn null_tests() {
+        for (op, expected) in
+            [(ExprOp::IsNull, [0, 0, 1, 0, 0]), (ExprOp::IsNotNull, [1, 1, 0, 1, 1])]
+        {
+            let mut b = Builder(StdVec::new());
+            let n = b.push(ExprOp::Column, INT, 0, 0);
+            b.push(op, INT, n, 0);
+            assert_eq!(run(b, batch(&[column(&N)])), expected.map(Some), "{op:?}");
         }
     }
 
