@@ -15,22 +15,28 @@ use pipit_kernel::slow_vec::SlowVec;
 use pipit_pipesql::ast::Node;
 use pipit_pipesql::compile::Compiler;
 use pipit_pipesql::error::{Error as CompileError, ErrorCode};
+use pipit_pipesql::expression::{Bind, call_bound};
 use pipit_pipesql::registry::FunctionRule;
 
 pub const REGEX_FUNCTIONS: &[FunctionRule] = &[
     FunctionRule {
         name: "regexp_replace",
-        arguments: &[DataType::String; 3],
-        result: DataType::String,
-        bind: |compiler, node| bind(compiler, node, true),
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |compiler, node| bind(compiler, node, true);
+            call_bound(compiler, (node, depth), nodes, STRINGS, bind)
+        },
     },
     FunctionRule {
         name: "regexp_replace_simple",
-        arguments: &[DataType::String; 3],
-        result: DataType::String,
-        bind: |compiler, node| bind(compiler, node, false),
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |compiler, node| bind(compiler, node, false);
+            call_bound(compiler, (node, depth), nodes, STRINGS, bind)
+        },
     },
 ];
+
+/// Three strings, and a string result.
+const STRINGS: (&[DataType], DataType) = (&[DataType::String; 3], DataType::String);
 
 /// Every match of `pattern` in a string, replaced with `replacement`: in
 /// which, if `groups`, `\0` is the match, `\1` to `\9` its groups, and `\\`

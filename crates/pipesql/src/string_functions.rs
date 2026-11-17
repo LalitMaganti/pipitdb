@@ -6,22 +6,28 @@ use pipit_kernel::error::Error;
 use pipit_kernel::expression::validity_of;
 use pipit_kernel::function::{DynFunction, Function};
 
+use crate::expression::{Bind, call_bound};
 use crate::registry::FunctionRule;
 
 pub const STRING_FUNCTIONS: &[FunctionRule] = &[
     FunctionRule {
         name: "length",
-        arguments: &[DataType::String],
-        result: DataType::Int64,
-        bind: |compiler, _| Ok(DynFunction::new(compiler.allocator(), Length { bytes: false })?),
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Length { bytes: false })?);
+            call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
+        },
     },
     FunctionRule {
         name: "octet_length",
-        arguments: &[DataType::String],
-        result: DataType::Int64,
-        bind: |compiler, _| Ok(DynFunction::new(compiler.allocator(), Length { bytes: true })?),
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Length { bytes: true })?);
+            call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
+        },
     },
 ];
+
+/// A string's arguments and an integer result.
+const STRING_TO_INT: (&[DataType], DataType) = (&[DataType::String], DataType::Int64);
 
 /// A string's length: in bytes, or in characters before any NUL, as
 /// SQLite's `length` counts them.
