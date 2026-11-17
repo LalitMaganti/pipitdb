@@ -50,7 +50,7 @@ fn small(catalog: &'static dyn Catalog, query: &str) -> u64 {
 #[bench::point(pipitdb_bench::small_plan(100, POINT))]
 #[bench::order(pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b"))]
 fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
-    black_box(pipitdb_bench::run(black_box(plan.pipeline())))
+    black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
 
 library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
@@ -62,7 +62,7 @@ library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]
 #[bench::eq_nullable(pipitdb_bench::perfetto_filter_plan(2))]
 #[bench::eq_string(pipitdb_bench::perfetto_filter_plan(3))]
 fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
-    black_box(pipitdb_bench::run(black_box(plan.pipeline())))
+    black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
 
 // Perfetto's `expression_benchmark.cc`, over 16 batches.
@@ -113,7 +113,7 @@ fn filter(
 #[bench::not(pipitdb_bench::predicate("not"))]
 fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
     let column = pipitdb_bench::filter_column(false);
-    black_box(pipitdb_bench::run_predicate(black_box(&predicate), &column, 100))
+    black_box(pipitdb_bench::run_predicate(black_box(&predicate), None, &column, 100))
 }
 
 #[library_benchmark]
@@ -204,7 +204,7 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::q24t(hits_query("24t"))]
 #[bench::q25(hits_query("25"))]
 fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
-    plan.map_or(0, |plan| black_box(pipitdb_bench::run(black_box(plan.pipeline()))))
+    plan.map_or(0, |plan| black_box(pipitdb_bench::run_plan(black_box(&plan))))
 }
 
 library_benchmark_group!(name = clickbench_group, benchmarks = [clickbench]);

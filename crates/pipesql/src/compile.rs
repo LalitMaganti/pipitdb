@@ -244,10 +244,11 @@ mod tests {
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
+        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let planned = plan_nodes(&Heap, &plan).unwrap();
+        let physical = lower(&Heap, &mut plan, &planned).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
@@ -379,10 +380,11 @@ mod tests {
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
-        let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
-        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
+        let mut plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
+        let planned = plan_nodes(&Heap, &plan).unwrap();
+        let physical = lower(&Heap, &mut plan, &planned).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
     }
@@ -498,9 +500,10 @@ mod tests {
         let catalog = catalog();
         let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
         pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
-        let physical = lower(&Heap, &plan, &plan_nodes(&Heap, &plan).unwrap()).unwrap();
+        let planned = plan_nodes(&Heap, &plan).unwrap();
+        let physical = lower(&Heap, &mut plan, &planned).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let values = batch.column(physical.columns()[0].position).int64s().to_vec();

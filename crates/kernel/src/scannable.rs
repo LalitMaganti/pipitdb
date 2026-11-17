@@ -572,7 +572,7 @@ mod tests {
             SlowVec::new(&Heap, 1).unwrap(),
         );
         let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query).unwrap();
+        let mut execution = pipeline.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();
@@ -692,7 +692,7 @@ mod tests {
         let pipeline =
             Pipeline::new(source, SlowVec::fixed_from(&Heap, [keep, load].into_iter()).unwrap());
         let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query).unwrap();
+        let mut execution = pipeline.start(&query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut kept = StdVec::new();
         while execution.next(&mut batch).unwrap() {

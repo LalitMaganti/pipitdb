@@ -4,13 +4,16 @@
 
 use crate::allocator::AllocError;
 use crate::allocator::Allocator;
+use crate::error::Error;
 use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
+use crate::query_allocators::QueryAllocators;
 use crate::slow_vec::SlowVec;
 use crate::sort::sort;
 use crate::step::{DynSource, Step};
+use crate::string_pool::StringPool;
 use crate::top_k::top_k;
 
 /// Why a plan couldn't be planned or lowered.
@@ -46,11 +49,18 @@ pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
     names: Names,
     columns: SlowVec<OutputColumn>,
+    literals: Option<StringPool>,
 }
 
 impl<'c> PhysicalPlan<'c> {
     pub fn pipeline(&self) -> &Pipeline<'c> {
         &self.pipeline
+    }
+
+    /// Starts a run, as `Pipeline::start` does, with the statement's
+    /// literals, which its steps read.
+    pub fn start<'r>(&'r self, query: &'r QueryAllocators<'_>) -> Result<Execution<'r>, Error> {
+        self.pipeline.start(query, self.literals.as_ref())
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
@@ -164,14 +174,15 @@ impl<'p, 'c> Lowering<'p, 'c> {
 }
 
 /// Builds the pipeline of `plan`, once `planned` by `plan_nodes`, from its
-/// root, with memory from `allocator`.
+/// root, with memory from `allocator`. The physical plan takes the plan's
+/// literals.
 pub fn lower<'c>(
     allocator: &dyn Allocator,
-    plan: &LogicalPlan<'c>,
+    plan: &mut LogicalPlan<'c>,
     planned: &Planned,
 ) -> Result<PhysicalPlan<'c>, LowerError> {
     let mut lowering = Lowering {
-        plan,
+        plan: &*plan,
         planned,
         allocator,
         source: None,
@@ -187,7 +198,8 @@ pub fn lower<'c>(
         columns.push(OutputColumn { name, position: lowering.query_position(column.id) })?;
     }
     let Some(source) = lowering.source else { failed!() };
-    Ok(PhysicalPlan { pipeline: Pipeline::new(source, lowering.steps), names, columns })
+    let pipeline = Pipeline::new(source, lowering.steps);
+    Ok(PhysicalPlan { pipeline, names, columns, literals: plan.take_literals() })
 }
 
 #[cfg(test)]
@@ -217,8 +229,9 @@ mod tests {
     use crate::step::DynSource;
 
     /// Plans `plan`, then lowers it.
-    fn lower_planned<'c>(plan: &LogicalPlan<'c>) -> Result<PhysicalPlan<'c>, LowerError> {
-        lower(&Heap, plan, &plan_nodes(&Heap, plan)?)
+    fn lower_planned<'c>(plan: &mut LogicalPlan<'c>) -> Result<PhysicalPlan<'c>, LowerError> {
+        let planned = plan_nodes(&Heap, plan)?;
+        lower(&Heap, plan, &planned)
     }
 
     /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20,
@@ -306,12 +319,12 @@ mod tests {
         plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
 
-        let physical = lower_planned(&plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
         let names: StdVec<&str> = physical.columns().iter().map(|&c| physical.name(c)).collect();
         assert_eq!(names, ["b", "a"]);
 
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
@@ -382,7 +395,7 @@ mod tests {
         let op = DynOp::new(&Heap, op).unwrap();
         plan.add_node(op, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
         assert!(plan.output.push(bindings[read[0] as usize]).is_ok());
-        lower_planned(&plan).unwrap();
+        lower_planned(&mut plan).unwrap();
         drop(plan);
         (known.into_inner(), sorted_by_b.into_inner())
     }
@@ -458,7 +471,7 @@ mod tests {
                 .unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
-        lower_planned(&plan).unwrap().pipeline().describe()
+        lower_planned(&mut plan).unwrap().pipeline().describe()
     }
 
     #[test]
@@ -507,7 +520,7 @@ mod tests {
             node = plan.add_node(order_by, children).unwrap();
         }
         assert!(plan.output.push(ids[0]).is_ok());
-        assert_eq!(lower_planned(&plan).unwrap().pipeline().describe(), "Scan | Sort");
+        assert_eq!(lower_planned(&mut plan).unwrap().pipeline().describe(), "Scan | Sort");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -528,9 +541,9 @@ mod tests {
         }
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower_planned(&plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
@@ -638,9 +651,9 @@ mod tests {
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower_planned(&plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);
@@ -704,11 +717,11 @@ mod tests {
             plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
             plan
         };
-        assert_eq!(lower_planned(&plan(70)).err(), Some(LowerError::TooManyColumns));
+        assert_eq!(lower_planned(&mut plan(70)).err(), Some(LowerError::TooManyColumns));
         // Pruned to the two in the output, it fits.
         let mut narrow = plan(2);
         crate::optimize::optimize(&Heap, &mut narrow).unwrap();
-        assert!(lower_planned(&narrow).is_ok());
+        assert!(lower_planned(&mut narrow).is_ok());
     }
 
     /// Three batches of four rows of `a`, `b` and `c`: row `r` of batch `n`
@@ -867,9 +880,9 @@ mod tests {
         }
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
-        let physical = lower_planned(&plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         let (mut kept, mut rows) = (StdVec::new(), 0);
         while execution.next(&mut batch).unwrap() {
@@ -994,7 +1007,7 @@ mod tests {
         let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
         assert!(plan.output.push(a).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
-        lower_planned(&plan).unwrap();
+        lower_planned(&mut plan).unwrap();
         drop(plan);
         conditions.borrow().clone()
     }
@@ -1085,9 +1098,9 @@ mod tests {
         let aggregate = DynOp::new(&Heap, aggregate).unwrap();
         plan.add_node(aggregate, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
-        let physical = lower_planned(&plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
         let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.pipeline().start(&query).unwrap();
+        let mut execution = physical.start(&query).unwrap();
         let mut batch = RowBatch::new();
         let mut row = StdVec::new();
         if execution.next(&mut batch).unwrap() {

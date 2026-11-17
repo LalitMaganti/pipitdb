@@ -22,6 +22,8 @@ pub struct Context<'a> {
     selections: Option<SlowVec<Selection>>,
     /// Made when first used: most runs intern no strings.
     string_pool: Option<StringPool>,
+    /// The strings the statement's conditions compare with, if it has any.
+    literals: Option<&'a StringPool>,
     /// The first key of the last row a `TopK` keeps, once it has published
     /// one, so its scan can skip rows that sort after it.
     cutoff: Option<i64>,
@@ -39,12 +41,17 @@ impl<'a> Context<'a> {
             small,
             selections: None,
             string_pool: None,
+            literals: None,
             cutoff: None,
         }
     }
 
-    /// A query's context, which allocates from `query`'s allocators.
-    pub fn for_query(query: &'a QueryAllocators<'a>) -> Context<'a> {
+    /// A query's context, which allocates from `query`'s allocators, of a
+    /// statement whose literals are `literals`.
+    pub fn for_query(
+        query: &'a QueryAllocators<'a>,
+        literals: Option<&'a StringPool>,
+    ) -> Context<'a> {
         Context {
             allocator: query.metadata,
             values: &query.values,
@@ -52,8 +59,14 @@ impl<'a> Context<'a> {
             small: &query.small,
             selections: None,
             string_pool: None,
+            literals,
             cutoff: None,
         }
+    }
+
+    /// The strings the statement's conditions compare with, if it has any.
+    pub fn literals(&self) -> Option<&'a StringPool> {
+        self.literals
     }
 
     /// What the run's memory comes from, for states to allocate with.

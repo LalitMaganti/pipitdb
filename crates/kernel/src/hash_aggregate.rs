@@ -526,7 +526,7 @@ mod tests {
         assert!(steps.push(Step::Operator(hash_aggregate(&Heap, spec).unwrap())).is_ok());
         let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
         let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query)?;
+        let mut execution = pipeline.start(&query, None)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {

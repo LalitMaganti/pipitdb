@@ -113,7 +113,8 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let predicate = compile_condition(compiler, compiler.node(stage.first_child()))?;
+    let condition = compiler.node(stage.first_child());
+    let predicate = compile_condition(compiler, condition)?;
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
