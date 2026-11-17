@@ -424,6 +424,7 @@ impl<'c> LogicalPlan<'c> {
         self.statement.add_literal(allocator, literal)
     }
 
+<<<<<<< HEAD
     /// The literal whose id is `id`.
     pub fn literal(&self, id: Id) -> &[u8] {
         let literal = self.statement.literals().and_then(|literals| literals.get(id));
@@ -431,6 +432,8 @@ impl<'c> LogicalPlan<'c> {
         literal
     }
 
+=======
+>>>>>>> origin/main
     /// Binds `function` to it, allocating from `allocator`, which must
     /// outlive the plan, and returns its id, or `None` if it has the most it
     /// can.
