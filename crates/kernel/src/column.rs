@@ -25,6 +25,9 @@ impl Forms {
     pub const CONSTANT: Forms = Forms(4);
     /// Each row an index into a column of values.
     pub const DICTIONARY: Forms = Forms(8);
+    /// Each row's value its own number, from a first: an id column, stored
+    /// as nothing.
+    pub const SEQUENCE: Forms = Forms(16);
 
     /// Whether every form in `other` is in this.
     pub fn contains(self, other: Forms) -> bool {
@@ -228,6 +231,7 @@ enum Kind {
     Lazy = Forms::LAZY.0,
     Constant = Forms::CONSTANT.0,
     Dictionary = Forms::DICTIONARY.0,
+    Sequence = Forms::SEQUENCE.0,
 }
 
 /// Bounds no value is within, for when they aren't known.
@@ -242,6 +246,8 @@ pub enum Form<'a> {
     Constant,
     /// Row `i` is value `indices[i]`.
     Dictionary(&'a [u32]),
+    /// Row `i` is the integer `first + i`, with no values.
+    Sequence(i64),
 }
 
 /// The values a column's rows map to.
@@ -337,6 +343,34 @@ impl ColumnView {
         };
         // Each index is checked when it's read.
         let header = Header { kind: Kind::Dictionary, ..dictionary.shared(Some(indices)) };
+        ColumnView::with_header(context, header, row_count)
+    }
+
+    /// `row_count` integers from `first`, one more each row, such as ids:
+    /// with no values, so they cost nothing to read, and their bounds known.
+    pub fn sequence(
+        context: &mut Context,
+        first: i64,
+        row_count: u32,
+    ) -> Result<ColumnView, AllocError> {
+        let mut values = context.small_buffer(8)?;
+        *at_mut!(values.as_mut_slice::<i64>(), 0) = first;
+        let last = first.checked_add(i64::from(row_count) - 1);
+        let bounds = match last {
+            Some(last) if row_count > 0 => Bounds { min: first, max: last },
+            _ => UNKNOWN,
+        };
+        let header = Header {
+            data_type: DataType::Int64,
+            kind: Kind::Sequence,
+            values,
+            bytes: None,
+            validity: None,
+            indices: None,
+            value_start: 0,
+            len: row_count,
+            bounds: Cell::new(bounds),
+        };
         ColumnView::with_header(context, header, row_count)
     }
 
@@ -504,11 +538,16 @@ impl ColumnView {
                     start..start + self.row_count as usize
                 ))
             }
+            Kind::Sequence => {
+                let first = *at!(header.values.as_slice::<i64>(), 0);
+                Form::Sequence(first.wrapping_add(i64::from(self.start)))
+            }
             Kind::Lazy => failed!(),
         }
     }
 
-    /// The values rows map to: for a flat view, its rows' own.
+    /// The values rows map to: for a flat view, its rows' own. A sequence
+    /// has none.
     pub fn values(&self) -> Values<'_> {
         let header = self.header();
         match header.kind {
@@ -518,7 +557,7 @@ impl ColumnView {
             Kind::Constant | Kind::Dictionary => {
                 Values { header, start: header.value_start, len: header.len }
             }
-            Kind::Lazy => failed!(),
+            Kind::Lazy | Kind::Sequence => failed!(),
         }
     }
 
@@ -558,9 +597,18 @@ impl ColumnView {
     #[inline(never)]
     fn flatten(&self, context: &mut Context) -> Result<ColumnView, AllocError> {
         let form = self.form();
+        if let Form::Sequence(first) = form {
+            let mut out = context.values_buffer(self.row_count as usize * 8)?;
+            for (value, row) in out.as_mut_slice::<i64>().iter_mut().zip(0..) {
+                *value = first.wrapping_add(row);
+            }
+            let flat = ColumnView::new(context, DataType::Int64, out, None)?;
+            flat.header().bounds.set(self.header().bounds.get());
+            return Ok(flat);
+        }
         let index = |row: u32| match form {
             Form::Dictionary(indices) => *at!(indices, row as usize),
-            Form::Flat | Form::Constant => 0,
+            Form::Flat | Form::Constant | Form::Sequence(_) => 0,
         };
         let (rows, values) = (self.row_count as usize, self.values());
         let validity = match values.validity() {
@@ -645,6 +693,7 @@ impl ColumnView {
             Form::Flat => row,
             Form::Constant => 0,
             Form::Dictionary(indices) => *at!(indices, row as usize),
+            Form::Sequence(_) => return false,
         };
         self.values().is_null(value)
     }

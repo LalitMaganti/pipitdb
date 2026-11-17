@@ -312,7 +312,12 @@ mod tests {
 
     /// Table `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5, `s`
     /// is `it's` and the empty string. And `dup`, of `a` and `A`.
-    struct Tables(DynScannable<'static>, DynScannable<'static>, DynScannable<'static>);
+    struct Tables(
+        DynScannable<'static>,
+        DynScannable<'static>,
+        DynScannable<'static>,
+        DynScannable<'static>,
+    );
 
     impl Catalog for Tables {
         fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
@@ -320,6 +325,7 @@ mod tests {
                 "t" => Some(&self.0),
                 "dup" => Some(&self.1),
                 "n" => Some(&self.2),
+                "ids" => Some(&self.3),
                 _ => None,
             }
         }
@@ -361,7 +367,14 @@ mod tests {
         let x = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity));
         let nulls = Table::new(&Heap, &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
         let scannable = |table| DynScannable::new(&Heap, table).unwrap();
-        Tables(scannable(table), scannable(same), scannable(nulls))
+        // `id` is 10, 11 and 12, stored as a sequence, and `v` 1, 2 and 3.
+        let id = ColumnView::sequence(&mut Context::new(&Heap), 10, 3).unwrap();
+        let mut values = Buffer::allocate(&Heap, 24).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
+        let v = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+        let schema = [("id", DataType::Int64), ("v", DataType::Int64)];
+        let ids = Table::new(&Heap, &schema, &[&[id, v]]).unwrap();
+        Tables(scannable(table), scannable(same), scannable(nulls), scannable(ids))
     }
 
     /// Runs `query`, returning each result column's name and the values of
@@ -614,6 +627,15 @@ mod tests {
         assert_eq!(kept("FROM t |> SELECT length(s) AS n"), [4.0, 0.0]);
         assert_eq!(kept("FROM t |> SELECT LENGTH('h\u{e9}llo') AS n"), [5.0, 5.0]);
         assert_eq!(kept("FROM t |> SELECT octet_length('h\u{e9}llo') AS n"), [6.0, 6.0]);
+    }
+
+    #[test]
+    fn reads_id_columns_stored_as_sequences() {
+        // A filter takes the sequence; everything else, flat values.
+        assert_eq!(kept("FROM ids |> WHERE id > 10 |> SELECT v"), [2.0, 3.0]);
+        assert_eq!(kept("FROM ids |> WHERE id = 11 OR id IS NULL |> SELECT id"), [11.0]);
+        assert_eq!(kept("FROM ids |> SELECT id + 1 AS x"), [11.0, 12.0, 13.0]);
+        assert_eq!(kept("FROM ids |> AGGREGATE sum(id)"), [33.0]);
     }
 
     #[test]
