@@ -10,7 +10,7 @@ use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::array::Array;
-use crate::column::{ColumnView, DataType, Form, Values};
+use crate::column::{ColumnView, DataType, Form, Forms, Values};
 use crate::eight;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::murmur_hash;
@@ -67,8 +67,8 @@ pub fn compare(
     match value {
         Value::Int64(_) => {
             check!(column.data_type() == DataType::Int64);
-            if let Form::Sequence(first) = column.form() {
-                return keep_sequence(first, range, selection, dropped);
+            if column.is_in(Forms::SEQUENCE) {
+                return keep_sequence(column, range, selection, dropped);
             }
             let cells = column.values().int64s();
             if eight::EIGHT_AT_A_TIME
@@ -459,17 +459,19 @@ fn compare_form<T: Copy>(
     }
 }
 
-/// Narrows `selection` to the rows of a sequence from `first` whose values
-/// are in `range`, writing the rows it drops to `dropped`, if given. Each
+/// Narrows `selection` to the rows of `column`, a sequence from `first`,
+/// whose values are in `range`, writing the rows it drops to `dropped`, if given. Each
 /// row's value is its number from `first`, so no value is read, and when
 /// every row is kept and `range` doesn't wrap, those kept are one run of
 /// them, kept at once, as Perfetto keeps a range of ids.
+#[inline(never)]
 fn keep_sequence(
-    first: i64,
+    column: &ColumnView,
     range: Range,
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
 ) {
+    let Form::Sequence(first) = column.form() else { failed!() };
     let (lo, hi) = (i128::from(range.lo), i128::from(range.lo) + i128::from(range.span));
     if dropped.is_none() && selection.is_prefix() && hi <= i128::from(i64::MAX) {
         let rows = i128::from(selection.len());
