@@ -1,6 +1,5 @@
-//! Regular expressions in expressions: `regexp_replace`, and Perfetto's
-//! `regexp_replace_simple`. The engine is a feature: `lite`, the small
-//! `regex-lite`, or `full`, the fast `regex`.
+//! Regular expressions in expressions: `regexp_replace`. The engine is a
+//! feature: `lite`, the small `regex-lite`, or `full`, the fast `regex`.
 
 #[cfg(not(any(feature = "lite", feature = "full")))]
 compile_error!("pipitdb-regex needs an engine: the `lite` or `full` feature");
@@ -18,42 +17,30 @@ use pipit_pipesql::error::{Error as CompileError, ErrorCode};
 use pipit_pipesql::expression::{Bind, call_bound};
 use pipit_pipesql::registry::FunctionRule;
 
-pub const REGEX_FUNCTIONS: &[FunctionRule] = &[
-    FunctionRule {
-        name: "regexp_replace",
-        compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |compiler, node| bind(compiler, node, true);
-            call_bound(compiler, (node, depth), nodes, STRINGS, bind)
-        },
+pub const REGEX_FUNCTIONS: &[FunctionRule] = &[FunctionRule {
+    name: "regexp_replace",
+    compile: |compiler, node, depth, nodes| {
+        call_bound(compiler, (node, depth), nodes, STRINGS, bind as Bind)
     },
-    FunctionRule {
-        name: "regexp_replace_simple",
-        compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |compiler, node| bind(compiler, node, false);
-            call_bound(compiler, (node, depth), nodes, STRINGS, bind)
-        },
-    },
-];
+}];
 
 /// Three strings, and a string result.
 const STRINGS: (&[DataType], DataType) = (&[DataType::String; 3], DataType::String);
 
 /// Every match of `pattern` in a string, replaced with `replacement`: in
-/// which, if `groups`, `\0` is the match, `\1` to `\9` its groups, and `\\`
-/// a backslash, as in `ClickHouse`'s and `DuckDB`'s.
+/// which `\0` is the match, `\1` to `\9` its groups, and `\\` a backslash, as
+/// in `ClickHouse`'s and `DuckDB`'s.
 struct Replace {
     pattern: engine::Pattern,
     replacement: SlowVec<u8>,
+    /// Whether the replacement has a backslash: if not, it's as it is, and
+    /// the matches' groups, which cost more to find, needn't be.
     groups: bool,
 }
 
 /// Binds the call `node`, whose pattern and replacement must be string
 /// literals, compiling the pattern once.
-fn bind(
-    compiler: &mut Compiler<'_, '_>,
-    node: Node,
-    groups: bool,
-) -> Result<DynFunction, CompileError> {
+fn bind(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<DynFunction, CompileError> {
     let argument = |compiler: &Compiler<'_, '_>, i| compiler.node(node.first_child() + i);
     let invalid = |compiler: &Compiler<'_, '_>, i| {
         CompileError::new(ErrorCode::InvalidArgument, compiler.span(argument(compiler, i)))
@@ -66,6 +53,7 @@ fn bind(
     let Some(text) = compiler.string_literal(argument(compiler, 3))? else {
         return Err(invalid(compiler, 3));
     };
+    let groups = text.contains(&b'\\');
     let mut replacement = SlowVec::fixed(allocator, text.len())?;
     replacement.extend_from_slice(text)?;
     Ok(DynFunction::new(allocator, Replace { pattern, replacement, groups })?)
@@ -285,9 +273,9 @@ mod tests {
         assert_eq!(strings(host), some(["example.com", "plain", "a1b22"]));
         let every = r"FROM t |> SELECT regexp_replace(s, '[0-9]+', '<\0\\>') AS x";
         assert_eq!(strings(every), some(["https://www.example.com/a/b", "plain", r"a<1\>b<22\>"]));
-        // As Perfetto's: the replacement as it is.
-        let simple = r"FROM t |> SELECT regexp_replace_simple(s, '[0-9]', '\1') AS x";
-        assert_eq!(strings(simple), some(["https://www.example.com/a/b", "plain", r"a\1b\1\1"]));
+        // With no backslash, the replacement is as it is.
+        let plain = r"FROM t |> SELECT regexp_replace(s, '[0-9]', '#') AS x";
+        assert_eq!(strings(plain), some(["https://www.example.com/a/b", "plain", "a#b##"]));
         let null = "FROM t |> SELECT regexp_replace(NULL, 'a', 'b') AS x";
         assert_eq!(strings(null), [None, None, None]);
     }
