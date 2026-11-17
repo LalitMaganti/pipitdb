@@ -8,6 +8,7 @@ extern crate alloc;
 extern crate pipit_kernel;
 
 pub mod ast;
+pub mod choices;
 pub mod compile;
 mod condition;
 #[cfg(feature = "diagnostics")]
