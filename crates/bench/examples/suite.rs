@@ -33,7 +33,10 @@ use pipit_pipesql::registry::Registry;
 
 static REGISTRY: Registry =
     Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION])
-        .with_functions(&[pipit_pipesql::string_functions::STRING_FUNCTIONS]);
+        .with_functions(&[
+            pipit_pipesql::expression::CHOICES,
+            pipit_pipesql::string_functions::STRING_FUNCTIONS,
+        ]);
 
 /// ClickBench's queries: each one's name, PipeSQL, if pipitdb can run it yet,
 /// and SQL, a line each.
