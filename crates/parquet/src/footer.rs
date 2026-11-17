@@ -101,9 +101,11 @@ pub struct ParquetFile {
 const MAGIC: &[u8; 4] = b"PAR1";
 
 /// The most columns, row groups, and column chunks in all, a file can have.
-const COLUMNS_MAX: usize = 1 << 12;
+const COLUMNS_MAX: usize = 1 << 20;
 const GROUPS_MAX: usize = 1 << 20;
-const CHUNKS_MAX: usize = 1 << 24;
+const CHUNKS_MAX: usize = 1 << 26;
+/// The most bytes its columns' names take.
+const NAME_BYTES_MAX: usize = 1 << 24;
 
 impl ParquetFile {
     /// Reads `source`'s footer, with memory from `allocator`.
@@ -147,7 +149,7 @@ impl ParquetFile {
 /// can't be read.
 fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     let (Ok(mut names), Ok(mut columns), Ok(mut group_rows), Ok(mut chunks)) = (
-        Names::new(allocator, 1 << 16),
+        Names::new(allocator, NAME_BYTES_MAX),
         SlowVec::new(allocator, COLUMNS_MAX),
         SlowVec::new(allocator, GROUPS_MAX),
         SlowVec::new(allocator, CHUNKS_MAX),

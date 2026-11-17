@@ -2,8 +2,9 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
-use pipit_kernel::allocator::Allocator;
+use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::Forms;
+use pipit_kernel::names::Names;
 use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
 };
@@ -32,7 +33,68 @@ pub struct Compiler<'q, 'c> {
     allocator: &'q dyn Allocator,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
-    pub scope: SlowVec<NamedColumn>,
+    scope: SlowVec<NamedColumn>,
+    /// The scope's positions, by the hash of their names.
+    index: NameIndex,
+}
+
+/// Positions of columns, in slots by a hash of their names ignoring ASCII
+/// case, so a name is found without comparing it with every other.
+struct NameIndex {
+    /// Each slot's position plus one, or 0 if it's empty: a power of two of
+    /// them, more than twice as many as positions, so probes are short.
+    slots: SlowVec<u32>,
+    /// Whether two of the columns have one name.
+    repeats: bool,
+}
+
+impl NameIndex {
+    /// An index of `columns`, whose names are in `names`.
+    fn new(
+        allocator: &dyn Allocator,
+        names: &Names,
+        columns: &[NamedColumn],
+    ) -> Result<NameIndex, AllocError> {
+        let slots = SlowVec::zeroed(allocator, (2 * columns.len() + 1).next_power_of_two())?;
+        let mut index = NameIndex { slots, repeats: false };
+        for (position, column) in (1..).zip(columns) {
+            let name = names.get(column.name);
+            let same = |other: u32| {
+                same_word(names.get(at!(columns, other as usize).name).as_bytes(), name.as_bytes())
+            };
+            let (count, _, empty) = index.find(name, same);
+            index.repeats |= count > 0;
+            *at_mut!(index.slots, empty) = position;
+        }
+        Ok(index)
+    }
+
+    /// Of the positions `name` probes, how many `named` says it names, and
+    /// the first; and the empty slot the probe ends at, where it would go.
+    fn find(&self, name: &str, named: impl Fn(u32) -> bool) -> (u32, u32, usize) {
+        let mask = self.slots.len() - 1;
+        #[expect(clippy::cast_possible_truncation, reason = "the low bits pick the slot")]
+        let (mut slot, mut count, mut first) = (hash(name) as usize & mask, 0, 0);
+        loop {
+            let position = *at!(self.slots, slot);
+            if position == 0 {
+                return (count, first, slot);
+            }
+            if named(position - 1) {
+                first = if count == 0 { position - 1 } else { first };
+                count += 1;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
+/// FNV-1a of `name`, ignoring ASCII case.
+fn hash(name: &str) -> u64 {
+    let fold = |hash: u64, &byte: &u8| {
+        (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x100_0000_01b3)
+    };
+    name.as_bytes().iter().fold(0xcbf2_9ce4_8422_2325, fold)
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -80,31 +142,40 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.allocator
     }
 
-    /// Whether two of `columns` have one name, ignoring case: a relation's
-    /// columns must each have their own, as in Perfetto.
-    #[inline(never)]
-    fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
-        let name = |i: usize| self.plan.names.get(at!(columns, i).name);
-        (1..columns.len())
-            .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
+    /// The columns the stages so far make, by name.
+    pub fn scope(&self) -> &[NamedColumn] {
+        &self.scope
+    }
+
+    /// Makes `columns` the scope.
+    pub fn set_scope(&mut self, columns: SlowVec<NamedColumn>) -> Result<(), Error> {
+        self.index = NameIndex::new(self.allocator, &self.plan.names, &columns)?;
+        self.scope = columns;
+        Ok(())
     }
 
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
     /// case, as SQL does. Two columns may share a name, as after `SELECT a,
     /// a`, but then the name can't be used, as in Perfetto.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
+        Ok(self.find_in_scope(name)?.1)
+    }
+
+    /// As `find_column`, with the column's position in the scope.
+    pub fn find_in_scope(&self, name: Node) -> Result<(usize, NamedColumn), Error> {
         let text = self.text(name.span());
-        let named = |column: &&NamedColumn| {
+        let named = |position: u32| {
+            let column = at!(self.scope, position as usize);
             same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
         };
-        let mut found = self.scope.iter().filter(named);
-        let Some(&column) = found.next() else {
+        let (count, position, _) = self.index.find(text, named);
+        if count == 0 {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
-        };
-        if found.next().is_some() {
+        }
+        if count > 1 {
             return Err(Error::new(ErrorCode::AmbiguousColumn, name.span()));
         }
-        Ok(column)
+        Ok((position as usize, *at!(self.scope, position as usize)))
     }
 
     /// The relation `name`, a `Name` node, names: a table in the catalog,
@@ -125,7 +196,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
             columns.push(binding)?;
         }
-        if self.repeats_a_name(&columns) {
+        // A relation's columns must each have their own name, as in Perfetto.
+        if NameIndex::new(self.allocator, &self.plan.names, &columns)?.repeats {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
@@ -166,6 +238,7 @@ pub fn compile<'c>(
         registry,
         plan: LogicalPlan::new(allocator)?,
         scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+        index: NameIndex::new(allocator, &Names::fixed(allocator, 0)?, &[])?,
         allocator,
     };
     let query = ast.node(ast.root());

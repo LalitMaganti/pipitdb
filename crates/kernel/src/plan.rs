@@ -24,12 +24,13 @@ use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
 use crate::string_pool::Id;
 
-/// The most columns a plan can have.
-pub const PLAN_COLUMNS_MAX: usize = 1 << 10;
+/// The most columns a plan can have: far more than any table, as lists of
+/// them grow only as far as they're filled.
+pub const PLAN_COLUMNS_MAX: usize = 1 << 20;
 /// The most nodes a plan can have.
 pub const PLAN_NODES_MAX: usize = 1 << 6;
 /// The most bytes a plan's names take.
-pub const PLAN_NAME_BYTES_MAX: usize = 1 << 14;
+pub const PLAN_NAME_BYTES_MAX: usize = 1 << 24;
 
 /// Stable within a plan. Lowering gives each a position in batches.
 pub type ColumnId = u32;
