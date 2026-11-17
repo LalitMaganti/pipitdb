@@ -274,8 +274,9 @@ mod tests {
     use pipit_kernel::expression::validity_of;
     use pipit_kernel::function::{DynFunction, Function};
 
+    use crate::choices::CHOICES;
     use crate::error::ErrorCode;
-    use crate::expression::{Bind, CHOICES, call_bound};
+    use crate::expression::{Bind, call_bound};
     use crate::registry::FunctionRule;
     use crate::stages::{AGGREGATION, RELATIONAL};
 
