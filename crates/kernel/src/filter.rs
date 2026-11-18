@@ -65,42 +65,51 @@ pub fn compare(
         return drop_all(selection, dropped);
     };
     match value {
-        Value::Int64(_) => {
-            check!(column.data_type() == DataType::Int64);
-            if column.is_in(Forms::SEQUENCE) {
-                return keep_sequence(column, range, selection, dropped);
-            }
-            let cells = column.values().int64s();
-            if eight::EIGHT_AT_A_TIME
-                && dropped.is_none()
-                && matches!(column.form(), Form::Flat)
-                && selection.is_prefix()
-            {
-                let cells = at!(cells, ..selection.len() as usize);
-                let validity = column.validity();
-                let valid = validity.map(crate::column::Validity::bits);
-                // SAFETY: `keep_prefix` asks for eights below `len()`, which
-                // `cells` has a cell for each of.
-                let kept = |at| unsafe { eight::in_range(cells, at, range.lo, range.span) };
-                #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
-                let one = |row: usize| {
-                    // SAFETY: `row` is below `len()`, a row of `column`.
-                    let valid = validity
-                        .is_none_or(|validity| unsafe { validity.is_valid_unchecked(row as u32) });
-                    valid & range.contains(*at!(cells, row))
-                };
-                let Some((bits, shift)) = valid else {
-                    return selection.keep_prefix(kept, one);
-                };
-                return selection.keep_prefix(|at| kept(at) & eight_valid(bits, shift, at), one);
-            }
-            compare_form(column, cells, |cell| cell, range, selection, dropped);
-        }
+        Value::Int64(_) => keep_within(column, range, selection, dropped),
         Value::Float64(_) => {
             check!(column.data_type() == DataType::Float64);
             compare_form(column, column.values().float64s(), float_key, range, selection, dropped);
         }
     }
+}
+
+/// Narrows `selection` to the rows of `column`, an integer column, within
+/// `range`, writing the rows it drops to `dropped`, if given.
+pub(crate) fn keep_within(
+    column: &ColumnView,
+    range: Range,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check!(column.data_type() == DataType::Int64);
+    if column.is_in(Forms::SEQUENCE) {
+        return keep_sequence(column, range, selection, dropped);
+    }
+    let cells = column.values().int64s();
+    if eight::EIGHT_AT_A_TIME
+        && dropped.is_none()
+        && matches!(column.form(), Form::Flat)
+        && selection.is_prefix()
+    {
+        let cells = at!(cells, ..selection.len() as usize);
+        let validity = column.validity();
+        let valid = validity.map(crate::column::Validity::bits);
+        // SAFETY: `keep_prefix` asks for eights below `len()`, which
+        // `cells` has a cell for each of.
+        let kept = |at| unsafe { eight::in_range(cells, at, range.lo, range.span) };
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+        let one = |row: usize| {
+            // SAFETY: `row` is below `len()`, a row of `column`.
+            let valid =
+                validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(row as u32) });
+            valid & range.contains(*at!(cells, row))
+        };
+        let Some((bits, shift)) = valid else {
+            return selection.keep_prefix(kept, one);
+        };
+        return selection.keep_prefix(|at| kept(at) & eight_valid(bits, shift, at), one);
+    }
+    compare_form(column, cells, |cell| cell, range, selection, dropped);
 }
 
 /// The most values an `IN` list can have for each row to be compared with

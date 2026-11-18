@@ -247,12 +247,16 @@ impl RowStore {
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
-        // Found once for every column.
-        let mut places = [0_u32; BATCH_ROWS_MAX as usize];
-        for (found, &row) in places.iter_mut().zip(rows) {
-            *found = self.place(row);
-        }
-        let places = at!(places, ..count as usize);
+        // Found once for every column: a row held whole is its own place.
+        let mut found = [0_u32; BATCH_ROWS_MAX as usize];
+        let places = if self.places.is_empty() {
+            rows
+        } else {
+            for (found, &row) in found.iter_mut().zip(rows) {
+                *found = self.place(row);
+            }
+            at!(found, ..count as usize)
+        };
         let first_place = *at!(places, 0);
         let (held, start) = self.find(first_place);
         let scattered = |c: usize| self.copied(c, at, count);

@@ -8,10 +8,12 @@ use pipit_kernel::error::Error;
 use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::pipeline::{Execution, Pipeline};
+use pipit_kernel::plan::{DynOp, LogicalPlan, ScanColumn, ScanOp};
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
@@ -700,4 +702,81 @@ pub const PERFETTO_FILTERS: [(&str, &str); 4] = [
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
     plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
+}
+
+/// `slices` slices joined to their threads, of which there are `threads`,
+/// as Perfetto's `slice JOIN thread USING (utid)`: each slice's `dur` and its
+/// thread's `tid`. A thread's `id` is stored as a sequence, and 9 in 10
+/// slices' `utid`s, at random, are a thread's. If not `joined`, the slices'
+/// `dur` alone, to tell what the join costs. Kept for the rest of the run.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'static> {
+    let mut context = Context::new(&Heap);
+    let int64s = |values: &mut dyn Iterator<Item = i64>, rows: u32| {
+        let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
+        for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
+            *slot = value;
+        }
+        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).expect("allocates")
+    };
+    let groups = |rows: u32| {
+        (0..rows.div_ceil(BATCH_ROWS_MAX)).map(move |g| {
+            let first = g * BATCH_ROWS_MAX;
+            (first, (rows - first).min(BATCH_ROWS_MAX))
+        })
+    };
+    let mut thread_groups = Vec::new();
+    for (first, rows) in groups(threads) {
+        let id = ColumnView::sequence(&mut context, i64::from(first), rows).expect("allocates");
+        let tid = int64s(&mut (i64::from(first)..).map(|id| id + 1000), rows);
+        thread_groups.push([id, tid]);
+    }
+    // Uniform over ten ninths of the threads' ids, so 9 in 10 are one's.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let span = u64::from(threads) * 10 / 9;
+    let mut utid = move || {
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        i64::try_from((state >> 33) % span).unwrap_or(0)
+    };
+    let mut slice_groups = Vec::new();
+    for (first, rows) in groups(slices) {
+        let utids = int64s(&mut core::iter::repeat_with(&mut utid), rows);
+        slice_groups.push([utids, int64s(&mut (i64::from(first)..), rows)]);
+    }
+    let table = |schema: &[(&str, DataType)],
+                 groups: &[[ColumnView; 2]]|
+     -> &'static DynScannable<'static> {
+        let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+        let table = Table::new(&Heap, schema, &groups).expect("allocates");
+        Box::leak(Box::new(DynScannable::new(&Heap, table).expect("allocates")))
+    };
+    let thread = table(&[("id", DataType::Int64), ("tid", DataType::Int64)], &thread_groups);
+    let slice = table(&[("utid", DataType::Int64), ("dur", DataType::Int64)], &slice_groups);
+
+    let mut plan = LogicalPlan::new(&Heap).expect("allocates");
+    let scan_of = |plan: &mut LogicalPlan<'static>, table, names: [&str; 2]| {
+        let mut reads = SlowVec::fixed(&Heap, 2).expect("allocates");
+        let mut bound = [None; 2];
+        for (i, name) in (0..).zip(names) {
+            let binding = plan.add_column(name, DataType::Int64, false).expect("allocates");
+            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).expect("fixed");
+            bound[i as usize] = Some(binding);
+        }
+        let op = DynOp::new(&Heap, ScanOp::new(table, reads)).expect("allocates");
+        let node = plan.add_node(op, SlowVec::fixed(&Heap, 0).expect("allocates"));
+        (node.expect("allocates"), bound.map(|b| b.expect("bound")))
+    };
+    let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
+    plan.output.push(dur).expect("allocates");
+    if joined {
+        let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
+        let build_columns = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).expect("allocates");
+        let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns };
+        let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).expect("allocates");
+        plan.add_node(DynOp::new(&Heap, op).expect("allocates"), children).expect("allocates");
+        plan.output.push(tid).expect("allocates");
+    }
+    optimize(&Heap, &mut plan).expect("optimizes");
+    let planned = plan_nodes(&Heap, &plan).expect("plans");
+    lower(&Heap, &mut plan, &planned).expect("lowers")
 }

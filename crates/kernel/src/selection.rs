@@ -141,6 +141,8 @@ impl Selection {
     /// each row after the last eight. Each eight's kept rows are written
     /// together, at a cost that doesn't depend on how many are kept.
     #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
+    #[expect(clippy::inline_always, reason = "its loop compiles 12% better in its caller")]
+    #[inline(always)]
     pub fn keep_prefix(&mut self, eight: impl Fn(usize) -> u8, one: impl Fn(usize) -> bool) {
         check!(self.prefix);
         let len = self.len as usize;

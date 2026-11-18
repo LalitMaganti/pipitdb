@@ -12,9 +12,11 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
+use pipit_kernel::plan::{DynOp, LogicalPlan, ScanColumn, ScanOp};
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
@@ -328,6 +330,52 @@ pub unsafe extern "C" fn query_rows(
             Err(_) => return u32::MAX,
         }
     }
+}
+
+/// How many rows the Parquet file in `len` bytes from `data` outputs joined
+/// to itself, its first column a key on both sides, or `u32::MAX` if it
+/// fails.
+///
+/// # Safety
+///
+/// `data` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn join_rows(data: *const u8, len: usize) -> u32 {
+    // SAFETY: guaranteed by the caller.
+    let bytes: &[u8] = unsafe { core::slice::from_raw_parts(data, len) };
+    let Ok(table) = ParquetTable::open(&Heap, &Uncompressed, &[&bytes]) else { return u32::MAX };
+    let Ok(table) = DynScannable::new(&Heap, table) else { return u32::MAX };
+    let run = || -> Result<u32, Error> {
+        let mut plan = LogicalPlan::new(&Heap)?;
+        let mut columns = [None; 3];
+        let mut nodes = [0; 2];
+        for (side, reads) in [(0, 0..1), (1, 1..3)] {
+            let mut scan = SlowVec::fixed(&Heap, reads.len())?;
+            for (column, at) in (0..).zip(reads) {
+                let binding = plan.add_column("c", DataType::Int64, true)?;
+                scan.push(ScanColumn { column, binding, forms: Forms::FLAT })?;
+                columns[at] = Some(binding);
+            }
+            let op = DynOp::new(&Heap, ScanOp::new(&table, scan))?;
+            nodes[side] = plan.add_node(op, SlowVec::fixed(&Heap, 0)?)?;
+        }
+        let [Some(probe_key), Some(build_key), Some(built)] = columns else { return Ok(0) };
+        let build_columns = SlowVec::fixed_from(&Heap, [built.id].into_iter())?;
+        let join = JoinOp { probe_key: probe_key.id, build_key: build_key.id, build_columns };
+        plan.add_node(DynOp::new(&Heap, join)?, SlowVec::fixed_from(&Heap, nodes.into_iter())?)?;
+        plan.output.push(built)?;
+        optimize(&Heap, &mut plan)?;
+        let planned = plan_nodes(&Heap, &plan).map_err(|_| Error::Unsupported)?;
+        let physical = lower(&Heap, &mut plan, &planned).map_err(|_| Error::Unsupported)?;
+        let allocators = QueryAllocators::new(&Heap);
+        let mut execution = physical.start(&allocators)?;
+        let (mut batch, mut rows) = (RowBatch::new(), 0);
+        while execution.next(&mut batch)? {
+            rows += batch.selection().len();
+        }
+        Ok(rows)
+    };
+    run().unwrap_or(u32::MAX)
 }
 
 /// Pushes `0..count` to a `SlowVec`, and returns the last.
