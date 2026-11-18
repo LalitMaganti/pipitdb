@@ -5,6 +5,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::DataType;
+use crate::context::CUTOFFS_MAX;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
@@ -303,7 +304,7 @@ pub enum InputStep {
     Sort {
         keys: SlowVec<SortKey>,
         keep: Option<u32>,
-        publish: bool,
+        publish: Option<u32>,
         unsorted: Arrangements,
         scan: Option<PlanNodeId>,
     },
@@ -324,8 +325,8 @@ pub struct PlannedNode {
     /// What is known of the rows it outputs.
     pub output: OutputProperties,
     /// For a scan: the column, and whether descending, a `TopK` above sorts
-    /// by first and publishes a cutoff on.
-    pub cutoff: Option<SortKey>,
+    /// by first and publishes a cutoff on, and the slot it publishes in.
+    pub cutoff: Option<(SortKey, u32)>,
 }
 
 /// By node, what's decided about it.
@@ -370,6 +371,9 @@ impl DeriveContext<'_, '_> {
     /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
     /// scan to skip by.
     pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
+        // Each publishing `TopK` has a slot of its own, so one in another
+        // pipeline never cuts off this scan.
+        let slots = self.planned.iter().filter(|node| node.cutoff.is_some()).count();
         let node = at_mut!(self.planned, sort.node as usize);
         let InputStep::Sort { keys, keep, publish, scan, .. } =
             at_mut!(at_mut!(node.inputs, sort.input as usize).steps, sort.step);
@@ -379,8 +383,12 @@ impl DeriveContext<'_, '_> {
         if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
             return;
         }
-        *publish = true;
-        at_mut!(self.planned, scan as usize).cutoff = Some(first);
+        let Ok(slot) = u32::try_from(slots) else { return };
+        if slot >= CUTOFFS_MAX {
+            return;
+        }
+        *publish = Some(slot);
+        at_mut!(self.planned, scan as usize).cutoff = Some((first, slot));
     }
 }
 
@@ -452,7 +460,7 @@ impl InputPlanner<'_> {
         self.out.steps.push(InputStep::Sort {
             keys: keys_copy,
             keep: None,
-            publish: false,
+            publish: None,
             unsorted: rows.arrangements,
             scan: rows.scan.take(),
         })?;

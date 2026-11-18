@@ -13,6 +13,9 @@ use crate::string_pool::StringPool;
 /// The most scratch selections a run can have.
 pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
 
+/// The most cutoffs a run's `TopK`s can publish: more are not published.
+pub const CUTOFFS_MAX: u32 = 1 << 6;
+
 pub struct Context<'a> {
     /// What states and other metadata allocate from.
     allocator: &'a dyn Allocator,
@@ -28,9 +31,10 @@ pub struct Context<'a> {
     literals: Option<&'a StringPool>,
     /// The functions the statement's expressions call, by id.
     functions: &'a [DynFunction],
-    /// The first key of the last row a `TopK` keeps, once it has published
-    /// one, so its scan can skip rows that sort after it.
-    cutoff: Option<i64>,
+    /// By slot, the first key of the last row a `TopK` keeps, once it has
+    /// published one, so its scan can skip rows that sort after it. Made
+    /// when first reserved: most runs publish none.
+    cutoffs: Option<SlowVec<Option<i64>>>,
 }
 
 impl<'a> Context<'a> {
@@ -47,7 +51,7 @@ impl<'a> Context<'a> {
             string_pool: None,
             literals: None,
             functions: &[],
-            cutoff: None,
+            cutoffs: None,
         }
     }
 
@@ -66,7 +70,7 @@ impl<'a> Context<'a> {
             string_pool: None,
             literals: statement.and_then(Statement::literals),
             functions: statement.map_or(&[], Statement::functions),
-            cutoff: None,
+            cutoffs: None,
         }
     }
 
@@ -135,13 +139,30 @@ impl<'a> Context<'a> {
         self.selections.as_deref_mut().unwrap_or_default()
     }
 
-    /// The cutoff a `TopK` published, if any.
-    pub fn cutoff(&self) -> Option<i64> {
-        self.cutoff
+    /// Makes sure there is a cutoff in `slot`, below `CUTOFFS_MAX`, for a
+    /// `TopK` to publish in. `TopK`s call this when making their states, so
+    /// publishing doesn't allocate.
+    pub fn reserve_cutoff(&mut self, slot: u32) -> Result<(), AllocError> {
+        check!(slot < CUTOFFS_MAX);
+        let cutoffs = match &mut self.cutoffs {
+            Some(cutoffs) => cutoffs,
+            None => self.cutoffs.insert(SlowVec::new(self.allocator, CUTOFFS_MAX as usize)?),
+        };
+        while cutoffs.len() <= slot as usize {
+            cutoffs.push(None)?;
+        }
+        Ok(())
     }
 
-    pub fn set_cutoff(&mut self, cutoff: Option<i64>) {
-        self.cutoff = cutoff;
+    /// The cutoff a `TopK` published in `slot`, if any.
+    pub fn cutoff(&self, slot: u32) -> Option<i64> {
+        self.cutoffs.as_deref()?.get(slot as usize).copied().flatten()
+    }
+
+    /// Publishes `cutoff` in `slot`, which must be reserved.
+    pub fn set_cutoff(&mut self, slot: u32, cutoff: Option<i64>) {
+        let cutoffs = self.cutoffs.as_deref_mut().unwrap_or_default();
+        *at_mut!(cutoffs, slot as usize) = cutoff;
     }
 
     /// The run's string pool, so the ids of strings interned anywhere in it

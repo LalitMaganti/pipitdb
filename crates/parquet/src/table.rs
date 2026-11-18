@@ -119,8 +119,10 @@ impl<'a> Rows<'a> {
             batch.reset(rows);
             // The cutoff's column is read flat, even if it could be lazy, to
             // test its rows.
-            let tested = match (cutoff, context.cutoff()) {
-                (Some((c, cutoff)), Some(value)) => {
+            let published =
+                cutoff.and_then(|(c, cutoff)| Some((c, cutoff, context.cutoff(cutoff.slot)?)));
+            let tested = match published {
+                Some((c, cutoff, value)) => {
                     let values =
                         at_mut!(self.readers, c).read(context, rows as usize, Forms::FLAT)?;
                     // Nulls sort first ascending, so they're kept, which
@@ -717,11 +719,11 @@ mod tests {
         // to 2047, 2048 to 4095 and 4096 to 4999, and how many rows the scan
         // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
         // the third is skipped, and of the second file only 0, 1 and 2 kept.
-        let first = |publish: bool| {
+        let first = |publish: Option<u32>| {
             use pipit_kernel::step::{DynTransform, Step};
             let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
             let table = DynScannable::new(&Heap, table).unwrap();
-            let cutoff = publish.then_some(Cutoff { column: 0, descending: false });
+            let cutoff = publish.map(|slot| Cutoff { slot, column: 0, descending: false });
             let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
             let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
             let keys = SlowVec::fixed_from(&Heap, keys.into_iter()).unwrap();
@@ -743,8 +745,8 @@ mod tests {
             drop(execution);
             (ids, kept.get())
         };
-        assert_eq!(first(false), ([0, 0, 1].into(), 10000));
-        assert_eq!(first(true), ([0, 0, 1].into(), 4096 + 3));
+        assert_eq!(first(None), ([0, 0, 1].into(), 10000));
+        assert_eq!(first(Some(2)), ([0, 0, 1].into(), 4096 + 3));
     }
 
     #[test]
