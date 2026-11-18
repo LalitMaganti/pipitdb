@@ -107,7 +107,19 @@ pub(crate) fn keep_within(
         let Some((bits, shift)) = valid else {
             return selection.keep_prefix(kept, one);
         };
-        return selection.keep_prefix(|at| kept(at) & eight_valid(bits, shift, at), one);
+        // Every row has a bit, so each eight's bits are in the bitmap: in
+        // one byte unless they start partway through one.
+        check!(bits.len() * 8 >= cells.len() + shift as usize);
+        // Each half kept and not null.
+        let both = |(low, high): eight::Halves, valid: u8| (low & valid, high & valid >> 4);
+        if shift == 0 {
+            // SAFETY: as checked.
+            let valid = |at: usize| unsafe { *bits.get_unchecked(at / 8) };
+            return selection.keep_prefix(|at| both(kept(at), valid(at)), one);
+        }
+        // SAFETY: as checked.
+        let valid = |at| unsafe { eight_valid(bits, shift, at) };
+        return selection.keep_prefix(|at| both(kept(at), valid(at)), one);
     }
     compare_form(column, cells, |cell| cell, range, selection, dropped);
 }
@@ -561,14 +573,14 @@ impl Range {
 }
 
 /// Which of the eight rows from `at` aren't null, as the bits of a byte, from
-/// a bitmap whose first row is bit `shift` of its first byte.
-fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
-    let low = *at!(bits, at / 8);
-    if shift == 0 {
-        return low;
-    }
-    // Rows past the first byte's are in the next, which covers them.
-    let high = *at!(bits, at / 8 + 1);
+/// a bitmap whose first row is bit `shift`, above 0, of its first byte.
+///
+/// # Safety
+///
+/// `bits` must have a byte at `at / 8 + 1`.
+unsafe fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
+    // SAFETY: as the caller promises.
+    let (low, high) = unsafe { (*bits.get_unchecked(at / 8), *bits.get_unchecked(at / 8 + 1)) };
     #[expect(clippy::cast_possible_truncation, reason = "8 bits")]
     let eight = ((u16::from(low) | u16::from(high) << 8) >> shift) as u8;
     eight
