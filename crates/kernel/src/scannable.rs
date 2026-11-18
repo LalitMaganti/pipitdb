@@ -51,6 +51,11 @@ pub trait Scannable {
         true
     }
 
+    /// What `column` is known to be as a key. By default, nothing.
+    fn column_key(&self, _column: u32) -> Key {
+        Key::None
+    }
+
     /// A read of `columns`, in that order, from the first row, each with
     /// the forms it may be written in, some of those `forms` says it can
     /// write it in. What depends only on which columns are read
@@ -144,6 +149,20 @@ pub struct Summary {
     pub bounds: Option<Bounds>,
 }
 
+/// What a column is known to be as a key, from least to most, as Perfetto's
+/// dataframe columns say: each implies those before it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Key {
+    /// Nothing.
+    None,
+    /// No two rows have the same value, as Perfetto's `kNoDuplicates`.
+    Unique,
+    /// Each row's value is one more than the last's, as a table's id is, as
+    /// Perfetto's `Id` storage: a sequence, which costs nothing to find a
+    /// row of.
+    Id,
+}
+
 /// The tables a frontend can read, provided by the embedder.
 pub trait Catalog {
     /// What's registered as `name`, if anything.
@@ -184,6 +203,7 @@ pub struct DynScannable<'a> {
     column_name: unsafe fn(NonNull<()>, u32) -> *const str,
     column_type: unsafe fn(NonNull<()>, u32) -> DataType,
     column_nullable: unsafe fn(NonNull<()>, u32) -> bool,
+    column_key: unsafe fn(NonNull<()>, u32) -> Key,
     state_layout: Layout,
     open: ScannableOpen,
     drop_state: unsafe fn(NonNull<u8>),
@@ -222,6 +242,8 @@ impl<'a> DynScannable<'a> {
             column_nullable: |scannable, column| unsafe {
                 value_of::<T>(scannable).column_nullable(column)
             },
+            // SAFETY: as above.
+            column_key: |scannable, column| unsafe { value_of::<T>(scannable).column_key(column) },
             state_layout: Layout::new::<T::State<'a>>(),
             // SAFETY: as above. The state borrows the scan's columns, which
             // outlive it, as the scan's step drops its state first.
@@ -292,6 +314,11 @@ impl<'a> DynScannable<'a> {
     pub fn column_nullable(&self, column: u32) -> bool {
         // SAFETY: called with its own scannable.
         unsafe { (self.column_nullable)(self.scannable.as_ptr(), column) }
+    }
+
+    pub fn column_key(&self, column: u32) -> Key {
+        // SAFETY: called with its own scannable.
+        unsafe { (self.column_key)(self.scannable.as_ptr(), column) }
     }
 
     /// The forms `column` can be written in.
