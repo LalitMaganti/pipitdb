@@ -113,18 +113,20 @@ pub trait Op<'c> {
         Ok(Given::Stop)
     }
 
-    /// The input a condition from above on `column` can be applied to
-    /// instead, before this, giving the same rows: as a condition on a join
-    /// side's column can be applied to that side. By default, none.
+    /// Which input, if any, a condition from above on `column` can be
+    /// applied to instead, with the same result. For example, a condition on
+    /// a column one side of a join makes can be applied to that side. By
+    /// default, none.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         let _ = column;
         None
     }
 
-    /// If this only drops rows by a condition, as a filter does: splits off
-    /// the parts of it `below`, its one child, can take on an input instead
-    /// (see `moves_condition`), as filters to put there by input, keeping
-    /// the rest. By default, nothing moves.
+    /// For an op that drops rows by a condition, as a filter does: splits off
+    /// the parts of the condition that `below`, its child, can apply to one
+    /// of its inputs instead (see `moves_condition`), returning them as new
+    /// filters, one per input, and keeping the rest. By default, nothing is
+    /// split off.
     fn split_below(
         &mut self,
         allocator: &dyn Allocator,
@@ -197,15 +199,15 @@ pub trait Op<'c> {
     -> Result<(), LowerError>;
 }
 
-/// The filters an op's condition is split into, by the input of the op
-/// below each goes on, and whether none of it stays.
+/// The filters split off an op's condition, one for each input of the op
+/// below, and whether nothing of the condition is left.
 pub struct Moved<'c> {
     pub filters: [Option<DynOp<'c>>; 2],
     pub emptied: bool,
 }
 
 impl<'c> Moved<'c> {
-    /// Nothing moved.
+    /// Nothing split off.
     pub fn none() -> Moved<'c> {
         Moved { filters: [None, None], emptied: false }
     }
@@ -757,7 +759,8 @@ impl<'c> Op<'c> for FilterOp {
         }
     }
 
-    /// The conjuncts of its predicate `below` can take on an input instead.
+    /// Splits off the conjuncts of its predicate that `below` can apply to
+    /// an input instead.
     fn split_below(
         &mut self,
         allocator: &dyn Allocator,

@@ -229,10 +229,11 @@ impl Predicate {
         Ok(Some(Predicate::checked(nodes, self.values.clone())))
     }
 
-    /// Its top-level conjuncts split by where they can be applied instead:
-    /// those reading only columns `place` puts in one input, the same for
-    /// all, go to that input, at most 2, and the rest stay. Each part is its
-    /// conjuncts joined by `AND`, or `None` if it has none.
+    /// Splits its top-level conjuncts by where they can go. A conjunct whose
+    /// columns `place` puts all in the same input, 0 or 1, goes to that
+    /// input; any other stays. Returns the conjuncts that stay, then those
+    /// for input 0, then for input 1, each joined by `AND`, or `None` if
+    /// there are none.
     pub fn split(
         &self,
         allocator: &dyn Allocator,
@@ -240,7 +241,7 @@ impl Predicate {
     ) -> Result<[Option<Predicate>; 3], AllocError> {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
         let root = self.nodes.len() as u32 - 1;
-        // The stayers, then the movers to each input.
+        // In the order returned: those that stay, then those for each input.
         let mut parts = [const { None }; 3];
         for (part, input) in parts.iter_mut().zip([None, Some(0), Some(1)]) {
             let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
@@ -252,7 +253,8 @@ impl Predicate {
         Ok(parts)
     }
 
-    /// The input `place` puts every column node `node` reads in, if one.
+    /// The input `place` puts all the columns node `node` reads in, if
+    /// they're all in the same one.
     fn place_of(&self, node: u32, place: &impl Fn(u32) -> Option<u32>) -> Option<u32> {
         match *at!(self.nodes, node as usize) {
             Node::Leaf(leaf) => place(leaf.column()).filter(|&input| input < 2),
@@ -264,8 +266,9 @@ impl Predicate {
         }
     }
 
-    /// Copies node `node`'s conjuncts that `goes` says to `nodes`, each
-    /// joined to `root`, those so far, by `AND`: the new root.
+    /// Copies the conjuncts under node `node` that `goes` accepts into
+    /// `nodes`, joining each to `root`, those copied so far, by `AND`.
+    /// Returns the new root.
     fn copy_where(
         &self,
         node: u32,

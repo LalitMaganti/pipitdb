@@ -1047,8 +1047,9 @@ mod tests {
         // can be skipped below them too.
         let skipped = skipped_by(&[Filter, OrderBy, Limit(2)]);
         assert_eq!(skipped, [(vec![0], Some((1, true)))]);
-        // A filter over the sort moves below it, so the same. A limit below
-        // it keeps the first rows, whatever their keys.
+        // A filter written above the sort moves below it, so this plan is
+        // the same as the first. A limit below the sort keeps the first rows
+        // whatever their keys, so nothing can be skipped.
         assert_eq!(skipped_by(&[OrderBy, Filter, Limit(2)]), skipped);
         assert!(skipped_by(&[Limit(5), OrderBy, Limit(2)]).is_empty());
     }

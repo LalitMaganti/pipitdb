@@ -142,8 +142,8 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(true)
     }
 
-    /// Its input, for a key: a group is kept by a condition on its key only
-    /// if all its rows are.
+    /// A condition on a group key can be applied to the input rows instead:
+    /// a group passes it exactly when its rows do.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (self.answer.is_none() && self.keys.contains(&column)).then_some(0)
     }

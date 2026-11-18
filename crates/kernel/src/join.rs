@@ -55,9 +55,10 @@ impl<'c> Op<'c> for JoinOp {
         }
     }
 
-    /// The probe side, for a column it makes: a row is kept only if the
-    /// condition holds, whichever side tests it. Not yet the build side, as
-    /// a build side some of whose ids a filter drops isn't a sequence.
+    /// A condition on a probe-side column can be applied to the probe side.
+    /// Conditions on build-side columns stay above the join for now: a
+    /// filtered build side has gaps in its ids, which the join can't yet
+    /// handle.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (!self.is_build_column(column)).then_some(0)
     }

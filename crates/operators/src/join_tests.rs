@@ -160,9 +160,9 @@ fn joins_only_to_sequences_so_far() {
     assert_eq!(join(&slice, &gap, None), Err(Error::Unsupported));
 }
 
-/// `slice JOIN thread ON utid = id WHERE dur > durs AND tid > tids`'s `dur`
-/// and `tid`, by row, and how many children each node of the optimized
-/// plan has, from the root down each side.
+/// Runs `slice JOIN thread ON utid = id WHERE dur > durs AND tid > tids`,
+/// returning each row's `dur` and `tid`, and the optimized plan's shape:
+/// each node's number of children, from the root down, first side first.
 fn filtered_above(
     slice: &DynScannable<'_>,
     thread: &DynScannable<'_>,
@@ -219,9 +219,10 @@ fn moves_conditions_above_a_join_to_its_sides() {
     let thread = threads(&[(0, 2048), (2048, 952)], true);
     let slice = slices(&[Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048)]);
     let (rows, shape) = filtered_above(&slice, &thread, 0, 1005);
-    // `dur > 0` drops the first slice, `tid > 1005` the slice of thread 5.
+    // `dur > 0` drops slice 0, and `tid > 1005` the slice of thread 5.
     assert_eq!(rows, [(2, 3999), (5, 3048)]);
-    // `dur > 0` goes to the probe side, over its scan. `tid > 1005` stays
-    // above the join until a build side can have gaps in its ids.
+    // `dur > 0` moves below the join, onto the slice scan. `tid > 1005`
+    // stays above the join until the join can handle a build side with gaps
+    // in its ids.
     assert_eq!(shape, [1, 2, 1, 0, 0]);
 }

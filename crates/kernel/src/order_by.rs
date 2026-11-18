@@ -15,7 +15,8 @@ pub struct OrderByOp {
 }
 
 impl<'c> Op<'c> for OrderByOp {
-    /// Its input: it only reorders rows.
+    /// A condition can be applied before the sort: sorting doesn't change
+    /// which rows pass.
     fn moves_condition(&self, _: ColumnId) -> Option<u32> {
         Some(0)
     }

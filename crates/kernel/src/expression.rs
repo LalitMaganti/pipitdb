@@ -1172,7 +1172,8 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
 }
 
 impl<'c> Op<'c> for ComputeOp {
-    /// Its input, for a column it doesn't compute: it keeps every row.
+    /// A condition on a column it doesn't compute can be applied to its
+    /// input: it neither drops nor adds rows.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (!self.items.iter().any(|item| item.output == column)).then_some(0)
     }
