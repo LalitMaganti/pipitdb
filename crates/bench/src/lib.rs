@@ -8,8 +8,7 @@ use pipit_kernel::error::Error;
 use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
-use pipit_kernel::join::JoinKind::Inner;
-use pipit_kernel::join::JoinOp;
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
@@ -708,10 +707,11 @@ pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
 /// `slices` slices joined to their threads, of which there are `threads`,
 /// as Perfetto's `slice JOIN thread USING (utid)`: each slice's `dur` and its
 /// thread's `tid`. A thread's `id` is stored as a sequence, and 9 in 10
-/// slices' `utid`s, at random, are a thread's. If not `joined`, the slices'
-/// `dur` alone, to tell what the join costs. Kept for the rest of the run.
+/// slices' `utid`s, at random, are a thread's. The join is `kind`, or with
+/// none, the slices' `dur` alone, to tell what the join costs. Kept for the
+/// rest of the run.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'static> {
+pub fn join_plan(slices: u32, threads: u32, kind: Option<JoinKind>) -> PhysicalPlan<'static> {
     let mut context = Context::new(&Heap);
     let int64s = |values: &mut dyn Iterator<Item = i64>, rows: u32| {
         let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
@@ -769,11 +769,11 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
     };
     let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
     plan.output.push(dur).expect("allocates");
-    if joined {
+    if let Some(kind) = kind {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
         let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).expect("fixed");
         let op = JoinOp::new(
-            Inner,
+            kind,
             [utid.id, id.id],
             [columns([utid.id, dur.id]), columns([id.id, tid.id])],
         );

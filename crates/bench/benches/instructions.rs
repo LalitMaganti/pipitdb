@@ -1,6 +1,7 @@
 //! Instruction-count benchmarks, run under Valgrind by gungraun. CI fails a PR
 //! that makes any of them slower than its base by more than the set limit.
 
+use pipit_kernel::join::JoinKind;
 use std::hint::black_box;
 
 use gungraun::prelude::*;
@@ -103,8 +104,9 @@ fn pipeline(pipeline: Pipeline<'static>) -> u64 {
 
 // 64K slices joined to 4K threads by id, against scanning the slices alone.
 #[library_benchmark]
-#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, false))]
-#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, true))]
+#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, None))]
+#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, Some(JoinKind::Inner)))]
+#[bench::slice_thread_left(pipitdb_bench::join_plan(1 << 16, 1 << 12, Some(JoinKind::Left)))]
 fn join(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
