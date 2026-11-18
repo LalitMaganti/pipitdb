@@ -142,17 +142,17 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(true)
     }
 
-    /// A row per group: its keys, then its aggregates. Groups are output in
-    /// the order first seen, so if the input is sorted by the keys, the
-    /// output is too. Its keys must be `Int64` or strings, which are all the
-    /// hash aggregate groups by, and its aggregates' inputs of types their
-    /// functions read.
     /// Its input, for a key: a group is kept by a condition on its key only
     /// if all its rows are.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (self.answer.is_none() && self.keys.contains(&column)).then_some(0)
     }
 
+    /// A row per group: its keys, then its aggregates. Groups are output in
+    /// the order first seen, so if the input is sorted by the keys, the
+    /// output is too. Its keys must be `Int64` or strings, which are all the
+    /// hash aggregate groups by, and its aggregates' inputs of types their
+    /// functions read.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         for &key in self.keys.iter() {
             if !matches!(c.input(0).type_of(key), DataType::Int64 | DataType::String) {
