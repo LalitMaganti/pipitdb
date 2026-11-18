@@ -19,6 +19,7 @@ pub mod context;
 mod eight;
 mod erase;
 pub mod error;
+pub mod estimate;
 pub mod expression;
 pub mod filter;
 pub mod flat_hash_map;
