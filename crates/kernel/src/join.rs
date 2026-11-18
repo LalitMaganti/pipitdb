@@ -1,8 +1,8 @@
-//! `JoinOp`: an inner join of its two children on a key each, as Perfetto's
-//! joins on ids are. Each row of one child, the probe side, is joined to
-//! the row of the other, the build side, whose key equals its own, if there
-//! is one: N:1. Planning chooses which is which. The build side is read
-//! whole first, as a pipeline of its own.
+//! `JoinOp`: a join of its two children on a key each, as Perfetto's joins
+//! on ids are. Each row of one child, the probe side, is joined to the row
+//! of the other, the build side, whose key equals its own, if there is one:
+//! N:1. For an inner join planning chooses which is which. The build side is
+//! read whole first, as a pipeline of its own. `JoinKind` says what's output.
 //!
 //! So far a build key must be a sequence, such as a table's id: a key's
 //! row is then the key less the first, so nothing is looked up. Any other
@@ -23,11 +23,27 @@ use crate::row_store::RowStore;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynOperator, DynSource, Operator, Progress, Step};
 
+/// What a join outputs of its probe side's rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    /// Those whose key a build row has, joined to it.
+    Inner,
+    /// Those whose key a build row has, alone: `key IN (build keys)`.
+    Semi,
+    /// Those whose key no build row has, alone, with `NOT IN`'s nulls: a
+    /// null key is kept only if the build side is empty, and a null build
+    /// key would keep none.
+    Anti,
+}
+
 /// Outputs the probe side's columns, then the build side's.
 pub struct JoinOp {
+    /// What it outputs.
+    kind: JoinKind,
     /// Each child's column it joins on, an `Int64`.
     keys: [ColumnId; 2],
-    /// Each child's columns it outputs.
+    /// Each child's columns it outputs: the build side's, none, unless an
+    /// inner join.
     columns: [SlowVec<ColumnId>; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
@@ -35,9 +51,12 @@ pub struct JoinOp {
 }
 
 impl JoinOp {
-    /// Joins its children on `keys`, outputting `columns` of each.
-    pub fn new(keys: [ColumnId; 2], columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
-        JoinOp { keys, columns, build: 1 }
+    /// Joins its children on `keys`, outputting `columns` of each, as
+    /// `kind` says: for a semi or anti join, the first's, of which planning
+    /// keeps the second as the build side.
+    pub fn new(kind: JoinKind, keys: [ColumnId; 2], columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
+        check!(kind == JoinKind::Inner || at!(columns, 1).is_empty());
+        JoinOp { kind, keys, columns, build: 1 }
     }
 
     fn probe(&self) -> usize {
@@ -91,6 +110,10 @@ impl<'c> Op<'c> for JoinOp {
     /// is a sequence first, as it's held without being copied, then the
     /// smaller. With no such side, the second, which fails until 1:N joins.
     fn choose(&mut self, inputs: &[Estimate]) {
+        // Only an inner join's sides are the same either way round.
+        if self.kind != JoinKind::Inner {
+            return;
+        }
         let &[first, second] = inputs else { failed!() };
         // A better key, then fewer rows, with unknown as many as can be.
         let rank = |input: &Estimate, key| (input.key(key), u64::MAX - input.rows.estimated);
@@ -104,6 +127,9 @@ impl<'c> Op<'c> for JoinOp {
         // Not the build side's keys: one build row may be joined to many.
         let mut out = at!(inputs, self.probe()).after_filters();
         out.demote_ids();
+        if self.kind != JoinKind::Inner {
+            out.keep_some();
+        }
         Some(out)
     }
 
@@ -144,7 +170,7 @@ impl<'c> Op<'c> for JoinOp {
         let build_key = position(*at!(self.keys, self.build));
         lowering.lower_input(node, self.probe() as u32)?;
         let probe_key = lowering.query_position(*at!(self.keys, self.probe()));
-        let join = Join { build, probe_key, build_key, build_columns };
+        let join = Join { kind: self.kind, build, probe_key, build_key, build_columns };
         lowering.add_operator(Step::Operator(DynOperator::new(lowering.allocator(), join)?))
     }
 }
@@ -153,6 +179,8 @@ impl<'c> Op<'c> for JoinOp {
 /// its first input: an empty probe side never reads it. Each key's build
 /// row is the key less the build side's first.
 struct Join<'c> {
+    /// What it outputs.
+    kind: JoinKind,
     /// The build side.
     build: DynSource<'c>,
     /// Where the keys are in each side's batches.
@@ -229,17 +257,27 @@ impl Operator for Join<'_> {
         if !built.drained {
             self.drain(context, built)?;
         }
-        // No probe row can be joined.
+        output.copy_from(input);
+        // With no build row, an anti join keeps every row, as `x NOT IN ()`
+        // is true even of a null `x`, and the others none.
         if built.count == 0 {
+            if self.kind == JoinKind::Anti {
+                return Ok(Progress::NeedInput);
+            }
+            output.reset(0);
             return Ok(Progress::Done);
         }
         let key = input.column(self.probe_key);
         let (first, count) = (built.first, built.count);
         // The probe rows joined are those whose key is a build row's, as a
-        // filter on the key would keep them.
-        output.copy_from(input);
-        let joined = Range { lo: first, span: u64::from(count - 1) };
-        filter::keep_within(key, joined, output.selection_mut(), None);
+        // filter on the key would keep them; an anti join keeps the rest, of
+        // the keys that aren't null.
+        let last = first.wrapping_add(i64::from(count - 1));
+        let kept = match self.kind {
+            JoinKind::Inner | JoinKind::Semi => Range::between(first, last),
+            JoinKind::Anti => Range::between(last.wrapping_add(1), first.wrapping_sub(1)),
+        };
+        filter::keep_within(key, kept, output.selection_mut(), None);
         if output.selection().is_empty() || self.build_columns.is_empty() {
             return Ok(Progress::NeedInput);
         }
@@ -294,7 +332,7 @@ mod tests {
             estimate
         };
         let none = || SlowVec::fixed(&Heap, 0).unwrap();
-        let mut join = JoinOp::new([0, 1], [none(), none()]);
+        let mut join = JoinOp::new(JoinKind::Inner, [0, 1], [none(), none()]);
         join.choose(&[estimate(first, 0), estimate(second, 1)]);
         join.build
     }

@@ -12,6 +12,7 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::join::JoinKind::Inner;
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
@@ -362,7 +363,7 @@ pub unsafe extern "C" fn join_rows(data: *const u8, len: usize) -> u32 {
         let [Some(probe_key), Some(build_key), Some(built)] = columns else { return Ok(0) };
         let probe_columns = SlowVec::fixed_from(&Heap, [probe_key.id].into_iter())?;
         let build_columns = SlowVec::fixed_from(&Heap, [build_key.id, built.id].into_iter())?;
-        let join = JoinOp::new([probe_key.id, build_key.id], [probe_columns, build_columns]);
+        let join = JoinOp::new(Inner, [probe_key.id, build_key.id], [probe_columns, build_columns]);
         plan.add_node(DynOp::new(&Heap, join)?, SlowVec::fixed_from(&Heap, nodes.into_iter())?)?;
         plan.output.push(built)?;
         optimize(&Heap, &mut plan)?;

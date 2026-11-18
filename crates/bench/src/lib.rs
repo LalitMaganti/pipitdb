@@ -8,6 +8,7 @@ use pipit_kernel::error::Error;
 use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::join::JoinKind::Inner;
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
@@ -771,8 +772,11 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
     if joined {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
         let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).expect("fixed");
-        let op =
-            JoinOp::new([utid.id, id.id], [columns([utid.id, dur.id]), columns([id.id, tid.id])]);
+        let op = JoinOp::new(
+            Inner,
+            [utid.id, id.id],
+            [columns([utid.id, dur.id]), columns([id.id, tid.id])],
+        );
         let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).expect("allocates");
         plan.add_node(DynOp::new(&Heap, op).expect("allocates"), children).expect("allocates");
         plan.output.push(tid).expect("allocates");
