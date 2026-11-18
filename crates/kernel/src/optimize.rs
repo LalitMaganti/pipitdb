@@ -16,6 +16,9 @@ pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result
     answer_from_summaries(allocator, plan)?;
     place_filters(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
+    // Runs after pushdown, which can make scans skip rows, and before
+    // forms, which depend on what is chosen here.
+    choose_by_estimates(allocator, plan)?;
     choose_forms(allocator, plan)
 }
 
@@ -225,6 +228,28 @@ fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
     if plan.root == id {
         plan.root = child;
     }
+}
+
+/// Works out each node's estimate from its children's, from the scans up,
+/// and lets each op make the choices that depend on them, such as which
+/// side of a join to build.
+pub fn choose_by_estimates(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    let mut estimates = SlowVec::fixed(allocator, plan.nodes.len())?;
+    let mut inputs = SlowVec::new(allocator, PLAN_NODES_MAX)?;
+    let exprs = &plan.exprs;
+    for node in plan.nodes.iter_mut() {
+        inputs.retain(|_| false);
+        for &child in node.children.iter() {
+            // Children are added before their parents.
+            inputs.push(*at!(estimates, child as usize))?;
+        }
+        node.op.choose(&inputs);
+        estimates.push(node.op.estimate(exprs, &inputs))?;
+    }
+    Ok(())
 }
 
 /// Each node's parent, and which of its children it is; `None` for the
@@ -444,10 +469,11 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::column::DataType;
-    use crate::expression::Exprs;
+    use crate::estimate::Estimate;
+    use crate::expression::{Expr, ExprBuilder, ExprOp, Exprs};
     use crate::lower::{LowerError, Lowering};
     use crate::output_properties::{DeriveContext, OutputProperties};
-    use crate::plan::{DynOp, LogicalPlan, Op, PlanNode};
+    use crate::plan::{Conjuncts, DynOp, Given, LogicalPlan, Op, PlanNode};
 
     /// Makes column 0, and records the forms it's allowed in.
     struct Maker<'a>(&'a Cell<Forms>);
@@ -527,5 +553,96 @@ mod tests {
         assert!(allowed(sequences, false).contains(Forms::SEQUENCE));
         // The output is never a sequence.
         assert!(!allowed(sequences, true).contains(Forms::SEQUENCE));
+    }
+
+    /// Takes conditions on column 0, and records that it took one.
+    struct Taker<'a>(&'a Cell<bool>);
+
+    /// Gives the ops below it its condition, `IS NULL` on column 0.
+    struct Giver(Expr);
+
+    /// Records, when it chooses, whether `taken` was set by then.
+    struct Chooser<'a> {
+        taken: &'a Cell<bool>,
+        seen: &'a Cell<Option<bool>>,
+    }
+
+    impl<'c> Op<'c> for Taker<'_> {
+        fn takes_condition(&self, column: ColumnId) -> bool {
+            column == 0
+        }
+
+        fn take_condition(
+            &mut self,
+            _: &Exprs,
+            _: &dyn Allocator,
+            _: ColumnId,
+            _: Conjuncts,
+        ) -> Result<(), AllocError> {
+            self.0.set(true);
+            Ok(())
+        }
+
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
+        }
+    }
+
+    impl<'c> Op<'c> for Giver {
+        fn give_condition(
+            &mut self,
+            _: &Exprs,
+            allocator: &dyn Allocator,
+            _: ColumnId,
+        ) -> Result<Given, AllocError> {
+            Ok(Given::Passed(Some(SlowVec::fixed_from(allocator, [self.0].into_iter())?)))
+        }
+
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
+        }
+    }
+
+    impl<'c> Op<'c> for Chooser<'_> {
+        fn choose(&mut self, _: &[Estimate]) {
+            self.seen.set(Some(self.taken.get()));
+        }
+
+        fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
+            failed!()
+        }
+
+        fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
+            failed!()
+        }
+    }
+
+    #[test]
+    fn chooses_once_conditions_are_pushed_down() {
+        let (taken, seen) = (Cell::new(false), Cell::new(None));
+        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let column = plan.add_column("a", DataType::Int64, true).unwrap();
+        let mut null = ExprBuilder::new(&Heap).unwrap();
+        let a = null.column(0).unwrap();
+        null.node(ExprOp::IsNull, a, 0).unwrap();
+        let null = plan.exprs.add(null.nodes()).unwrap();
+        let mut node = plan.add_node(DynOp::new(&Heap, Taker(&taken)).unwrap(), &[]).unwrap();
+        for op in [
+            DynOp::new(&Heap, Giver(null)).unwrap(),
+            DynOp::new(&Heap, Chooser { taken: &taken, seen: &seen }).unwrap(),
+        ] {
+            node = plan.add_node(op, &[node]).unwrap();
+        }
+        assert!(plan.output.push(column).is_ok());
+        optimize(&Heap, &mut plan).unwrap();
+        assert_eq!(seen.get(), Some(true));
     }
 }

@@ -4,6 +4,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
+use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
@@ -11,6 +12,7 @@ use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
+use crate::scannable::Key;
 use crate::slow_vec::SlowVec;
 use crate::step::DynSource;
 use crate::step::Step;
@@ -147,6 +149,19 @@ impl<'c> Op<'c> for AggregateOp {
     /// a group passes it exactly when its rows do.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (self.answer.is_none() && self.keys.contains(&column)).then_some(0)
+    }
+
+    /// With no keys, it makes one row. With one key, it makes a row per
+    /// value of the key, so the key is unique in its output.
+    fn estimate(&self, _: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
+        let input = inputs.first().map_or(RowEstimate::UNKNOWN, |input| input.rows);
+        let mut out = Estimate::of(input);
+        match *self.keys {
+            [] => out.rows = RowEstimate::exactly(1),
+            [key] => out.add_key(key, Key::Unique),
+            _ => {}
+        }
+        Some(out)
     }
 
     /// A row per group: its keys, then its aggregates. Groups are output in
