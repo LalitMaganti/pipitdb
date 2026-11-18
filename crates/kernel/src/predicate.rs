@@ -10,6 +10,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::filter::{self, Comparison, Entries, Value};
 use crate::flat_hash_map::FlatHashMap;
 use crate::murmur_hash;
@@ -307,6 +308,30 @@ impl Predicate {
             Node::Leaf(leaf) => Some(leaf.column()),
             Node::And(..) | Node::Or(..) | Node::Not(_) => None,
         })
+    }
+
+    /// Applies to `estimate` what each of its conjuncts is expected to keep,
+    /// as Perfetto's dataframe planner does for its filters.
+    pub fn estimate(&self, estimate: &mut Estimate) {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
+        self.estimate_from(self.nodes.len() as u32 - 1, estimate);
+    }
+
+    fn estimate_from(&self, node: u32, estimate: &mut Estimate) {
+        match *at!(self.nodes, node as usize) {
+            Node::And(a, b) => {
+                self.estimate_from(a, estimate);
+                self.estimate_from(b, estimate);
+            }
+            Node::Leaf(
+                Leaf::Compare { column, comparison: Comparison::Equal, .. }
+                | Leaf::CompareString { column, comparison: Comparison::Equal, .. },
+            ) => estimate.keep_equal(column),
+            Node::Leaf(Leaf::In { column, len, .. } | Leaf::InStrings { column, len, .. }) => {
+                estimate.keep_in(column, u64::from(len));
+            }
+            Node::Leaf(_) | Node::Or(..) | Node::Not(_) => estimate.keep_some(),
+        }
     }
 
     /// A copy that reads column `renumber(c)` wherever this reads `c`, such

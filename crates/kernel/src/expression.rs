@@ -7,6 +7,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
@@ -1174,6 +1175,11 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
 impl<'c> Op<'c> for ComputeOp {
     /// Drops the items whose columns aren't needed, and itself with the
     /// last of them.
+    /// Its input's: it keeps every row, in order.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        Some(inputs.first().map_or(Estimate::UNKNOWN, |input| input.after_filters()))
+    }
+
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         self.items.retain(|item| needed.is_needed(item.output));
         if self.items.is_empty() {

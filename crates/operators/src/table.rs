@@ -2,11 +2,11 @@
 //! footer, which pipelines can scan.
 
 use pipit_kernel::allocator::{AllocError, Allocator};
-use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::scannable::Scannable;
+use pipit_kernel::scannable::{Key, Scannable};
 use pipit_kernel::slow_vec::SlowVec;
 
 use pipit_kernel::names::{Name, Names};
@@ -121,6 +121,22 @@ impl Scannable for Table {
 
     fn forms(&self, column: u32) -> Forms {
         at!(self.columns, column as usize).2
+    }
+
+    /// An id if every row group stores it as a sequence, each following on
+    /// from the last.
+    fn column_key(&self, column: u32) -> Key {
+        let mut next = None;
+        for group in self.row_groups.iter() {
+            let Form::Sequence(first) = at!(group.columns, column as usize).form() else {
+                return Key::None;
+            };
+            if next.is_some_and(|next| next != first) {
+                return Key::None;
+            }
+            next = first.checked_add(i64::from(group.row_count));
+        }
+        Key::Id
     }
 
     fn open<'s>(
@@ -262,6 +278,19 @@ mod tests {
     fn checks_columns_read_when_opened() {
         let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
         let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
+    }
+
+    #[test]
+    fn knows_ids_stored_as_one_sequence() {
+        let mut context = Context::new(&Heap);
+        let mut sequence = |first, rows| ColumnView::sequence(&mut context, first, rows).unwrap();
+        let schema = [("id", DataType::Int64)];
+        let key =
+            |groups: &[&[ColumnView]]| Table::new(&Heap, &schema, groups).unwrap().column_key(0);
+        let (first, next, gap) = (sequence(0, 4), sequence(4, 2), sequence(7, 2));
+        assert_eq!(key(&[core::slice::from_ref(&first), &[next]]), Key::Id);
+        assert_eq!(key(&[&[first], &[gap]]), Key::None);
+        assert_eq!(key(&[&[int64s(0..4)]]), Key::None);
     }
 
     #[test]
