@@ -386,6 +386,14 @@ pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'s
     Pipeline::new(DynSource::new(&Heap, Repeat::new(batches)).expect("allocates"), owned)
 }
 
+/// `batches` full batches read through a pipeline run as a source, as a
+/// join reads its build side.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn nested_pipeline(batches: u32) -> Pipeline<'static> {
+    let inner = pass_pipeline(batches, 0, false).into_source(&Heap).expect("allocates");
+    Pipeline::new(inner, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
+}
+
 /// `row_groups` full row groups, with four columns. Kept for the rest of the
 /// run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]

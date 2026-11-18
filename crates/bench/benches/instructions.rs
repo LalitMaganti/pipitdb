@@ -96,6 +96,7 @@ library_benchmark_group!(
 #[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
 #[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
 #[bench::operators(pipitdb_bench::pass_pipeline(1000, 4, true))]
+#[bench::nested(pipitdb_bench::nested_pipeline(1000))]
 fn pipeline(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
