@@ -75,6 +75,17 @@ fn scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// 1M slices joined to 64K threads by id, against scanning the slices alone.
+fn join(c: &mut Criterion) {
+    let mut group = c.benchmark_group("join");
+    group.throughput(Throughput::Elements(1 << 20));
+    for (name, joined) in [("scan", false), ("slice_thread", true)] {
+        let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
+    }
+    group.finish();
+}
+
 /// Queries over Perfetto's benchmark slices, compiled and lowered once, then
 /// run. Skipped without a Perfetto checkout.
 fn slices(c: &mut Criterion) {
@@ -184,6 +195,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter, perfetto_expression, string_pool
+    targets = lexer, parser, query, small, pipeline, scan, join, slices, filter, perfetto_filter, perfetto_expression, string_pool
 }
 criterion_main!(benches);

@@ -14,7 +14,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::boxed::{Box, ErasedBox};
-use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
@@ -297,6 +297,20 @@ impl<'a> DynSource<'a> {
         })
     }
 
+    /// A run of this source outside a pipeline, such as of a join's build
+    /// side, which the join drains: its state, in memory from `context`'s
+    /// allocator.
+    pub fn start<'s>(&'s self, context: &mut Context) -> Result<SourceRun<'s, 'a>, Error> {
+        let size_bytes = self.state_layout.size().max(1);
+        // SAFETY: `new_state` writes the state, and nothing reads the rest.
+        let mut memory = unsafe { Buffer::allocate_uninit(context.allocator(), size_bytes)? };
+        let Some(state) = NonNull::new(memory.as_mut_ptr::<u8>()) else { failed!() };
+        // SAFETY: the memory has the state's size, and alignment, which
+        // `new` checked is at most a buffer's.
+        unsafe { (self.new_state)(self.step.as_ptr(), context, state)? };
+        Ok(SourceRun { source: self, state, _memory: memory })
+    }
+
     /// # Safety
     ///
     /// `state` must hold a state made by `new_state`.
@@ -309,6 +323,30 @@ impl<'a> DynSource<'a> {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
         unsafe { (self.run)(self.step.as_ptr(), context, state, NonNull::from(batch).cast()) }
+    }
+}
+
+/// A run of a source outside a pipeline, from `DynSource::start`.
+pub struct SourceRun<'s, 'a> {
+    source: &'s DynSource<'a>,
+    state: NonNull<u8>,
+    /// Holds the state.
+    _memory: Buffer,
+}
+
+impl<'a> SourceRun<'_, 'a> {
+    /// Fills `batch` with the next batch, or returns false when none are
+    /// left.
+    pub fn next(&mut self, context: &mut Context, batch: &mut RowBatch<'a>) -> Result<bool, Error> {
+        // SAFETY: `start` made the state.
+        unsafe { self.source.next(context, self.state, batch) }
+    }
+}
+
+impl Drop for SourceRun<'_, '_> {
+    fn drop(&mut self) {
+        // SAFETY: `start` made the state, which is dropped once.
+        unsafe { (self.source.drop_state)(self.state) }
     }
 }
 

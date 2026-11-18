@@ -133,6 +133,28 @@ impl<'p, 'c> Lowering<'p, 'c> {
         self.add_operator(Step::Operator(operator))
     }
 
+    /// Lowers input `input` of `node`, the node being lowered, as a pipeline
+    /// of its own, as Perfetto's `AddSidePipeline` does: a source for an op
+    /// that reads that input whole, such as a join's build side. Returns it,
+    /// and what is known of its rows.
+    pub fn lower_side(
+        &mut self,
+        node: &PlanNode<'c>,
+        input: u32,
+    ) -> Result<(DynSource<'c>, &'p OutputProperties), LowerError> {
+        let side = SlowVec::new(self.allocator, LOWERED_STEPS_MAX)?;
+        let (source, steps, rows) =
+            (self.source.take(), core::mem::replace(&mut self.steps, side), self.rows);
+        let lowered = self.lower_input(node, input);
+        let side_steps = core::mem::replace(&mut self.steps, steps);
+        let (side_source, side_rows) = (core::mem::replace(&mut self.source, source), self.rows);
+        self.rows = rows;
+        lowered?;
+        let Some(side_source) = side_source else { failed!() };
+        let pipeline = Pipeline::new(side_source, side_steps);
+        Ok((pipeline.into_source(self.allocator)?, side_rows))
+    }
+
     /// How many of its first rows the open sort just below outputs, if it
     /// outputs only those.
     pub fn query_sort_keep(&self) -> Option<u32> {

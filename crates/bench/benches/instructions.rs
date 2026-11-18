@@ -101,6 +101,14 @@ fn pipeline(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
 
+// 64K slices joined to 4K threads by id, against scanning the slices alone.
+#[library_benchmark]
+#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, false))]
+#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, true))]
+fn join(plan: PhysicalPlan<'static>) -> u64 {
+    black_box(pipitdb_bench::run_plan(black_box(&plan)))
+}
+
 #[library_benchmark]
 #[bench::table(pipitdb_bench::scan_pipeline(pipitdb_bench::table(1000)))]
 fn scan(pipeline: Pipeline<'static>) -> u64 {
@@ -149,8 +157,16 @@ fn string_pool_get(
 
 library_benchmark_group!(
     name = pipeline_group,
-    benchmarks =
-        [pipeline, scan, filter, predicate, flat_hash_map, string_pool_intern, string_pool_get]
+    benchmarks = [
+        pipeline,
+        scan,
+        join,
+        filter,
+        predicate,
+        flat_hash_map,
+        string_pool_intern,
+        string_pool_get
+    ]
 );
 
 /// The table `hits`, over ClickBench's first file.
