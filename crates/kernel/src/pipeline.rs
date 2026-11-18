@@ -1,6 +1,9 @@
 //! `Pipeline`: a source and the steps its batches go through. `Execution`: one
 //! run of it.
 //!
+//! A pipeline is also a source, of the batches it outputs, as Perfetto's
+//! is: `into_source` makes one, whose runs are on their caller's `Context`.
+//!
 //! The steps are cut into segments at each operator. The first segment is the
 //! source and the transforms after it; each other is an operator and the
 //! transforms after it. A segment's transforms run in place on the batches its
@@ -10,15 +13,17 @@ use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use crate::allocator::AllocError;
+use crate::allocator::{AllocError, Allocator};
+use crate::boxed::Box;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
+use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::query_allocators::QueryAllocators;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 use crate::statement::Statement;
-use crate::step::{DynSource, Progress, Step};
+use crate::step::{DynSource, ErasedBatch, Progress, Step};
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -43,10 +48,28 @@ impl<'a> Pipeline<'a> {
         query: &'r QueryAllocators<'_>,
         statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
-        let size_bytes = self.layout(|_, _| {})?.0.size();
-        // SAFETY: `Execution::new` writes every byte it reads.
-        let memory = unsafe { Buffer::allocate_uninit(query.metadata, size_bytes)? };
-        Execution::new(self, query, statement, memory)
+        let mut context = Context::for_query(query, statement);
+        let run = Run::new(self, &mut context)?;
+        Ok(Execution { run, context })
+    }
+
+    /// This pipeline as a source of the batches it outputs. Each run of it
+    /// is on the `Context` of the run it's in, so shares its memory, string
+    /// pool and statement.
+    pub fn into_source(self, allocator: &dyn Allocator) -> Result<DynSource<'a>, AllocError> {
+        let pipeline = Box::new(allocator, self)?.erase();
+        let state = Layout::new::<Run<'static>>();
+        // SAFETY: each function takes this pipeline and a run of it.
+        Ok(unsafe {
+            DynSource::from_parts(
+                pipeline,
+                state,
+                new_run,
+                drop_state::<Run>,
+                next_of_run,
+                "Pipeline",
+            )
+        })
     }
 
     /// A `Segment` per segment, a `Slot` per step, then the source's state,
@@ -165,19 +188,58 @@ struct Run<'p> {
     _buffer: Buffer,
 }
 
+/// Makes a run of `pipeline`, a `Pipeline`, at `state`, as a source's state.
+///
+/// # Safety
+///
+/// As for `DynSource::from_parts`'s functions.
+unsafe fn new_run(
+    pipeline: NonNull<()>,
+    context: &mut Context,
+    state: NonNull<u8>,
+) -> Result<(), Error> {
+    // SAFETY: a source outlives its states, so `'static` stands in for how
+    // long the pipeline lives, which its run doesn't outlive.
+    let pipeline = unsafe { value_of::<Pipeline<'static>>(pipeline) };
+    let run = Run::new(pipeline, context)?;
+    // SAFETY: `state` has room for a run, as the source's layout says.
+    unsafe { write_state(state, run) };
+    Ok(())
+}
+
+/// Fills `batch` from the run at `state`, as a source's next batch.
+///
+/// # Safety
+///
+/// As for `DynSource::from_parts`'s functions.
+unsafe fn next_of_run(
+    _: NonNull<()>,
+    context: &mut Context,
+    state: NonNull<u8>,
+    batch: ErasedBatch,
+) -> Result<bool, Error> {
+    // SAFETY: `state` holds a run made by `new_run`, and `batch` is the
+    // caller's, erased as the run's is.
+    unsafe { state_of::<Run>(state).next(context, batch.cast().as_mut()) }
+}
+
 impl<'p> Execution<'p> {
-    /// Makes every state, or, if one fails, drops those made.
-    fn new(
-        pipeline: &'p Pipeline<'p>,
-        query: &'p QueryAllocators<'_>,
-        statement: Option<&'p Statement>,
-        mut buffer: Buffer,
-    ) -> Result<Execution<'p>, Error> {
-        let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
+    /// As `Run::next`.
+    pub fn next(&mut self, output: &mut RowBatch<'p>) -> Result<bool, Error> {
+        self.run.next(&mut self.context, output)
+    }
+}
+
+impl<'p> Run<'p> {
+    /// A run of `pipeline` on `context`, whose allocator its memory is from,
+    /// with every state made, or, if one fails, those made dropped.
+    fn new(pipeline: &'p Pipeline<'p>, context: &mut Context) -> Result<Run<'p>, Error> {
+        let Ok((layout, slots)) = pipeline.layout(|_, _| {}) else {
             failed!();
         };
-        let mut context = Context::for_query(query, statement);
-        let Ok((_, slots)) = pipeline.layout(|_, _| {}) else {
+        // SAFETY: what follows writes every byte it reads.
+        let mut buffer = unsafe { Buffer::allocate_uninit(context.allocator(), layout.size())? };
+        let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
             failed!();
         };
         let failed = Cell::new(None);
@@ -191,8 +253,8 @@ impl<'p> Execution<'p> {
                 return;
             }
             let made = match i {
-                None => pipeline.source.new_state(&mut context, memory.add(state)),
-                Some(i) => at!(pipeline.steps, i).new_state(&mut context, memory.add(state)),
+                None => pipeline.source.new_state(context, memory.add(state)),
+                Some(i) => at!(pipeline.steps, i).new_state(context, memory.add(state)),
             };
             if let Err(error) = made {
                 failed = Some(error);
@@ -230,27 +292,20 @@ impl<'p> Execution<'p> {
         segment.end = steps.len();
         // SAFETY: as above.
         unsafe { run.segment(k).write(segment) };
-        Ok(Execution { run, context })
+        Ok(run)
     }
 
     /// Fills `output` with the next batch, or returns false when there are
     /// none left. Fails if a step does, such as if it can't allocate what it
     /// needs; the run can't go on after that, so later calls fail too.
-    pub fn next(&mut self, output: &mut RowBatch<'p>) -> Result<bool, Error> {
-        if let Some(error) = self.run.failed.get() {
-            return Err(error);
-        }
-        self.run.next(&mut self.context, output)
-    }
-}
-
-impl<'p> Run<'p> {
-    /// As `Execution::next`.
     ///
     /// Starting from the last segment, it moves to the one before when a
     /// segment's operator needs input, and to the one after when a segment
     /// makes a batch or ends.
     fn next(&mut self, context: &mut Context, output: &mut RowBatch<'p>) -> Result<bool, Error> {
+        if let Some(error) = self.failed.get() {
+            return Err(error);
+        }
         let last = self.pipeline.segment_count - 1;
         let mut k = self.ready(last);
         loop {
@@ -287,14 +342,14 @@ impl<'p> Run<'p> {
     }
 
     fn waiting(&self, k: usize) -> bool {
-        // SAFETY: the segments were written by `Execution::new`.
+        // SAFETY: the segments were written by `Run::new`.
         unsafe { (*self.segment(k)).status == Status::Waiting }
     }
 
     /// Runs segment `k` once. Its batch goes to the next operator's input, or
     /// to `output` if it is the last segment.
     fn make(&self, context: &mut Context, k: usize, output: &mut RowBatch<'p>) -> Made {
-        // SAFETY: the segments were written by `Execution::new`.
+        // SAFETY: the segments were written by `Run::new`.
         let segment = unsafe { &mut *self.segment(k) };
         let end = segment.end;
         let batch = if end == self.pipeline.steps.len() {
@@ -316,7 +371,7 @@ impl<'p> Run<'p> {
             let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
                 failed!();
             };
-            // SAFETY: the transform's state was made by `Execution::new`.
+            // SAFETY: the transform's state was made by `Run::new`.
             if let Err(error) = unsafe { transform.process(context, self.state(Some(i)), batch) } {
                 return self.fail(error);
             }
@@ -332,7 +387,7 @@ impl<'p> Run<'p> {
 
     fn read_source(&self, context: &mut Context, batch: &mut RowBatch<'p>) -> Made {
         // Not reset here: the source resets it as it fills it.
-        // SAFETY: the source's state was made by `Execution::new`.
+        // SAFETY: the source's state was made by `Run::new`.
         match unsafe { self.pipeline.source.next(context, self.state(None), batch) } {
             Ok(true) => Made::Batch,
             Ok(false) => Self::end(batch),
@@ -369,7 +424,7 @@ impl<'p> Run<'p> {
         // SAFETY: the operator's slot, which nothing else borrows.
         let input = unsafe { &(*self.slot(op)).input };
         let state = self.state(Some(op));
-        // SAFETY: the operator's state was made by `Execution::new`.
+        // SAFETY: the operator's state was made by `Run::new`.
         let progress = unsafe {
             match segment.status {
                 Status::Done => return Self::end(output),
@@ -409,7 +464,7 @@ impl<'p> Run<'p> {
     fn state(&self, i: Option<usize>) -> NonNull<u8> {
         let offset = match i {
             None => self.source_state,
-            // SAFETY: each slot was written by `Execution::new`.
+            // SAFETY: each slot was written by `Run::new`.
             Some(i) => unsafe { (*self.slot(i)).state },
         };
         // SAFETY: offsets come from the run's layout.
@@ -423,7 +478,7 @@ impl Drop for Run<'_> {
         if self.made == 0 {
             return;
         }
-        // SAFETY: each was made by `Execution::new`, and is dropped once.
+        // SAFETY: each was made by `Run::new`, and is dropped once.
         unsafe {
             (pipeline.source.drop_state)(self.state(None));
             for (i, step) in pipeline.steps.iter().enumerate().take(self.made - 1) {
@@ -857,11 +912,23 @@ mod tests {
         source: impl Source + 'a,
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
+        with_source(DynSource::new(&Heap, source).unwrap(), steps)
+    }
+
+    /// `steps` after `inner`, run as a source.
+    fn nested<'a>(inner: Pipeline<'a>, steps: impl IntoIterator<Item = Step<'a>>) -> Pipeline<'a> {
+        with_source(inner.into_source(&Heap).unwrap(), steps)
+    }
+
+    fn with_source<'a>(
+        source: DynSource<'a>,
+        steps: impl IntoIterator<Item = Step<'a>>,
+    ) -> Pipeline<'a> {
         let mut owned = crate::slow_vec::SlowVec::new(&Heap, 8).unwrap();
         for step in steps {
             assert!(owned.push(step).is_ok());
         }
-        Pipeline::new(DynSource::new(&Heap, source).unwrap(), owned)
+        Pipeline::new(source, owned)
     }
 
     #[test]
@@ -992,6 +1059,74 @@ mod tests {
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
         // Rows aren't skipped: the run stays failed.
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
+    }
+
+    /// Interns `string` in the run's string pool, checking it's numbered
+    /// `number`.
+    struct Interns {
+        string: &'static [u8],
+        number: u32,
+    }
+
+    impl Transform for Interns {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn process(
+            &self,
+            context: &mut Context,
+            (): &mut (),
+            _: &mut RowBatch,
+        ) -> Result<(), Error> {
+            let allocator = context.allocator();
+            let (_, number) = context.string_pool()?.intern_numbered(allocator, self.string)?;
+            assert_eq!(number, self.number);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn runs_a_pipeline_as_a_source() {
+        // As its steps would run after its source, before the others.
+        let flat = pipeline(Numbers { batches: 2 }, [transform(Reverse), operator(Split)]);
+        let inner = pipeline(Numbers { batches: 2 }, [transform(Reverse)]);
+        let split = nested(inner, [operator(Split)]);
+        assert_eq!(split.describe(), "Pipeline | Split");
+        let query = QueryAllocators::new(&Heap);
+        let expected = batches(&mut flat.start(&query, None).unwrap());
+        assert_eq!(batches(&mut split.start(&query, None).unwrap()), expected);
+
+        // A breaker within it outputs once its input ends.
+        let backwards = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
+        let summed = nested(backwards, [operator(Sum)]);
+        assert_eq!(batches(&mut summed.start(&query, None).unwrap()), [[[15]]]);
+    }
+
+    #[test]
+    fn a_pipeline_as_a_source_runs_on_its_callers_context() {
+        let live = Rc::new(());
+        let position = Position { live: live.clone() };
+        let steps = [transform(position), transform(Interns { string: b"x", number: 0 })];
+        let inner = pipeline(Numbers { batches: 1 }, steps);
+        // The outer run's pool already has the inner run's string.
+        let outer = nested(inner, [transform(Interns { string: b"y", number: 1 })]);
+        let query = QueryAllocators::new(&Heap);
+        let mut execution = outer.start(&query, None).unwrap();
+        assert_eq!(batches(&mut execution).len(), 1);
+        // Ours, the inner pipeline's step, and its run's state, dropped
+        // with the outer run.
+        assert_eq!(Rc::strong_count(&live), 3);
+        drop(execution);
+        assert_eq!(Rc::strong_count(&live), 2);
+
+        // A failure within it ends the run it's in.
+        let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond)]);
+        let outer = nested(failing, [operator(Sum)]);
+        let mut execution = outer.start(&query, None).unwrap();
+        assert_eq!(execution.next(&mut RowBatch::new()), Err(Error::Corrupt));
     }
 
     #[test]
