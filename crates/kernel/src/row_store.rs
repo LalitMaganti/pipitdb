@@ -247,16 +247,9 @@ impl RowStore {
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
-        // Found once for every column: a row held whole is its own place.
+        // Found once for every column.
         let mut found = [0_u32; BATCH_ROWS_MAX as usize];
-        let places = if self.places.is_empty() {
-            rows
-        } else {
-            for (found, &row) in found.iter_mut().zip(rows) {
-                *found = self.place(row);
-            }
-            at!(found, ..count as usize)
-        };
+        let places = self.places(rows, &mut found);
         let first_place = *at!(places, 0);
         let (held, start) = self.find(first_place);
         let scattered = |c: usize| self.copied(c, at, count);
@@ -287,12 +280,58 @@ impl RowStore {
                 None => {
                     let nullable = self.nullable >> c.min(63) & 1 != 0;
                     let data_type = at!(held, c).view().data_type();
-                    gather(context, data_type, (&self.held, width, c), places, nullable)?
+                    gather(context, data_type, (&self.held, width, c), places, nullable, None)?
                 }
             };
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
+    }
+
+    /// As `gather`, for rows of which those whose bit is set in `nulls` are
+    /// null in every column instead, as a left join's rows without a match
+    /// are: every row is copied. No column may be dropped or scattered.
+    pub(crate) fn gather_or_null(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+        rows: &[u32],
+        nulls: &[u8],
+    ) -> Result<(), Error> {
+        check!(rows.len() <= BATCH_ROWS_MAX as usize && self.dropped == 0 && self.scattered == 0);
+        #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
+        out.reset(rows.len() as u32);
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.flush(context)?;
+        let mut found = [0_u32; BATCH_ROWS_MAX as usize];
+        let places = self.places(rows, &mut found);
+        let width = self.width as usize;
+        for c in 0..width {
+            let data_type = at!(self.held, c).view().data_type();
+            let source = (&self.held[..], width, c);
+            let nullable = self.nullable >> c.min(63) & 1 != 0;
+            let column = gather(context, data_type, source, places, nullable, Some(nulls))?;
+            let Ok(()) = out.push_column(column) else { failed!() };
+        }
+        Ok(())
+    }
+
+    /// Where each of `rows` is held, in `found` unless they're their own
+    /// places, as rows held whole are.
+    fn places<'a>(
+        &self,
+        rows: &'a [u32],
+        found: &'a mut [u32; BATCH_ROWS_MAX as usize],
+    ) -> &'a [u32] {
+        if self.places.is_empty() {
+            return rows;
+        }
+        for (found, &row) in found.iter_mut().zip(rows) {
+            *found = self.place(row);
+        }
+        at!(found, ..rows.len())
     }
 
     /// Column `column`'s `count` values from `at` in the order `scatter` was
@@ -641,8 +680,12 @@ fn gather(
     data_type: DataType,
     (held, width, column): (&[GatherSource], usize, usize),
     places: &[u32],
-    nullable: bool,
+    held_nullable: bool,
+    nulls: Option<&[u8]>,
 ) -> Result<ColumnView, Error> {
+    let nullable = held_nullable || nulls.is_some();
+    // Whether output row `r` is null whatever it's gathered from.
+    let null = |r: usize| nulls.is_some_and(|nulls| *at!(nulls, r / 8) >> (r % 8) & 1 != 0);
     let rows = places.len();
     // This column of every batch held is every `width`th from here.
     let held = at!(held, column..);
@@ -656,15 +699,25 @@ fn gather(
     if nullable {
         let mut buffer = context.small_buffer(rows.div_ceil(8))?;
         let bits = buffer.as_mut_slice::<u8>();
-        bits.fill(0);
-        let mut nulls = false;
-        for (r, &place) in places.iter().enumerate() {
-            let (source, row) = found(place);
-            let valid = source.is_valid(row);
-            *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
-            nulls |= !valid;
+        let mut any = false;
+        if held_nullable {
+            bits.fill(0);
+            for (r, &place) in places.iter().enumerate() {
+                let (source, row) = found(place);
+                let valid = source.is_valid(row);
+                *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
+                any |= !valid;
+            }
+        } else {
+            bits.fill(u8::MAX);
         }
-        validity = nulls.then_some(buffer);
+        // Rows made null, a byte at a time: their bits past the last row
+        // are clear, so add no nulls.
+        for (bits, &null) in bits.iter_mut().zip(nulls.unwrap_or_default()) {
+            *bits &= !null;
+            any |= null != 0;
+        }
+        validity = any.then_some(buffer);
     }
     // A string's word is its view.
     for (out, &place) in values.as_mut_slice::<i64>().iter_mut().zip(places) {
@@ -679,10 +732,10 @@ fn gather(
     let mut bytes = context.bytes_buffer(total)?;
     let out = bytes.as_mut_slice::<u8>();
     let mut start = 0;
-    for (out_view, &place) in views.iter_mut().zip(places) {
+    for (r, (out_view, &place)) in views.iter_mut().zip(places).enumerate() {
         let (source, _) = found(place);
         let [from, len] = *out_view;
-        let string = source.string(from, len);
+        let string = if null(r) { &[][..] } else { source.string(from, len) };
         at_mut!(out, start..start + string.len()).copy_from_slice(string);
         *out_view = view(start, string.len())?;
         start += string.len();
@@ -775,6 +828,24 @@ mod tests {
 
     /// Which of a batch's rows to keep.
     type Keep = fn(u16) -> bool;
+
+    #[test]
+    fn gathers_some_rows_as_nulls() {
+        let mut context = Context::new(&Heap);
+        let mut store = RowStore::new(&Heap).unwrap();
+        let batch = batch_without_nulls(&mut context, 0);
+        store.append(&mut context, &batch).unwrap();
+        let mut out = RowBatch::new();
+        // Rows 1 and 2 are null whatever they're gathered from.
+        store.gather_or_null(&mut context, &mut out, &[5, 1, 5, 3], &[0b0110]).unwrap();
+        let expected = [
+            (Some(5), b"v5".to_vec()),
+            (None, Vec::new()),
+            (None, Vec::new()),
+            (Some(3), b"v3".to_vec()),
+        ];
+        assert_eq!(read(&out), expected);
+    }
 
     #[test]
     fn hands_back_rows_shared_and_packed_in_any_order() {

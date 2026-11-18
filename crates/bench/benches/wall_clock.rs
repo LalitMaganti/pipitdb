@@ -1,5 +1,6 @@
 //! Wall-clock benchmarks. Run with `cargo bench -p pipitdb-bench --bench wall_clock`.
 
+use pipit_kernel::join::JoinKind::{Inner, Left};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -79,8 +80,9 @@ fn scan(c: &mut Criterion) {
 fn join(c: &mut Criterion) {
     let mut group = c.benchmark_group("join");
     group.throughput(Throughput::Elements(1 << 20));
-    for (name, joined) in [("scan", false), ("slice_thread", true)] {
-        let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
+    let kinds = [("scan", None), ("slice_thread", Some(Inner)), ("slice_thread_left", Some(Left))];
+    for (name, kind) in kinds {
+        let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, kind);
         group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
     }
     group.finish();

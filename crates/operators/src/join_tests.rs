@@ -208,3 +208,60 @@ fn keeps_rows_whose_ids_are_or_arent_in_a_table() {
     assert_eq!(filtered(&slice, &none, JoinKind::Semi), []);
     assert_eq!(filtered(&slice, &none, JoinKind::Anti), [0, 1, 2, 3, 4, 5]);
 }
+
+/// `slice LEFT JOIN thread ON utid = id`'s `dur` and `tid`, by row, of the
+/// rows whose `tid` is null, if `null_tids`.
+fn left(
+    slice: &DynScannable<'_>,
+    thread: &DynScannable<'_>,
+    null_tids: bool,
+) -> Vec<(i64, Option<i64>)> {
+    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let (probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
+    let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
+    let (utid, dur, id, tid) =
+        (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
+    let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).unwrap();
+    let both = [columns([utid.id, dur.id]), columns([id.id, tid.id])];
+    let op = JoinOp::new(JoinKind::Left, [utid.id, id.id], both);
+    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
+    let joined = plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
+    if null_tids {
+        let leaf = Node::Leaf(Leaf::IsNull { column: tid.id });
+        let predicate = Predicate::new(SlowVec::fixed_from(&Heap, [leaf].into_iter()).unwrap());
+        let children = SlowVec::fixed_from(&Heap, [joined].into_iter()).unwrap();
+        plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), children).unwrap();
+    }
+    plan.output.push(dur).unwrap();
+    plan.output.push(tid).unwrap();
+    optimize(&Heap, &mut plan).unwrap();
+    let planned = plan_nodes(&Heap, &plan).unwrap();
+    let physical = lower(&Heap, &mut plan, &planned).unwrap();
+    let query = QueryAllocators::new(&Heap);
+    let mut execution = physical.start(&query).unwrap();
+    let (mut batch, mut rows) = (RowBatch::new(), Vec::new());
+    let [dur, tid] = [0, 1].map(|i| physical.columns()[i].position);
+    while execution.next(&mut batch).unwrap() {
+        let selection = batch.selection();
+        for row in (0..selection.len()).map(|i| selection.kept().row(i)) {
+            let tid = batch.column(tid);
+            let tid = (!tid.is_null(row)).then(|| tid.int64s()[row as usize]);
+            rows.push((batch.column(dur).int64s()[row as usize], tid));
+        }
+    }
+    rows
+}
+
+#[test]
+fn joins_rows_to_their_ids_or_nulls() {
+    let thread = threads(&[(0, 2048), (2048, 952)], true);
+    let slice = slices(&[Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048)]);
+    let joined =
+        [(0, Some(1005)), (1, None), (2, Some(3999)), (3, None), (4, None), (5, Some(3048))];
+    assert_eq!(left(&slice, &thread, false), joined);
+    // A null from a missing match passes `IS NULL`, a match doesn't.
+    assert_eq!(left(&slice, &thread, true), [(1, None), (3, None), (4, None)]);
+    // With no thread, every slice, joined to nulls.
+    let none: Vec<_> = (0..6).map(|dur| (dur, None)).collect();
+    assert_eq!(left(&slice, &threads(&[], true), false), none);
+}

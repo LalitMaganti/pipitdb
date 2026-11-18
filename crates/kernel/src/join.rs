@@ -9,8 +9,9 @@
 //! fails as `Unsupported`.
 
 use crate::allocator::{AllocError, Allocator};
-use crate::column::{DataType, Form, Forms};
+use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
+use crate::eight;
 use crate::error::Error;
 use crate::estimate::Estimate;
 use crate::filter::{self, Range};
@@ -28,6 +29,8 @@ use crate::step::{DynOperator, DynSource, Operator, Progress, Step};
 pub enum JoinKind {
     /// Those whose key a build row has, joined to it.
     Inner,
+    /// Every one, joined to the build row with its key, or else to nulls.
+    Left,
     /// Those whose key a build row has, alone: `key IN (build keys)`.
     Semi,
     /// Those whose key no build row has, alone, with `NOT IN`'s nulls: a
@@ -42,8 +45,8 @@ pub struct JoinOp {
     kind: JoinKind,
     /// Each child's column it joins on, an `Int64`.
     keys: [ColumnId; 2],
-    /// Each child's columns it outputs: the build side's, none, unless an
-    /// inner join.
+    /// Each child's columns it outputs: the build side's, none, for a semi
+    /// or anti join.
     columns: [SlowVec<ColumnId>; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
@@ -52,10 +55,11 @@ pub struct JoinOp {
 
 impl JoinOp {
     /// Joins its children on `keys`, outputting `columns` of each, as
-    /// `kind` says: for a semi or anti join, the first's, of which planning
-    /// keeps the second as the build side.
+    /// `kind` says: for a semi or anti join, the first's. Only an inner
+    /// join may build the first.
     pub fn new(kind: JoinKind, keys: [ColumnId; 2], columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
-        check!(kind == JoinKind::Inner || at!(columns, 1).is_empty());
+        let outputs_second = matches!(kind, JoinKind::Inner | JoinKind::Left);
+        check!(outputs_second || at!(columns, 1).is_empty());
         JoinOp { kind, keys, columns, build: 1 }
     }
 
@@ -102,7 +106,14 @@ impl<'c> Op<'c> for JoinOp {
     /// Nothing of its own: it keeps the probe side's rows whose key a build
     /// row has, and a condition above on either side's columns only drops
     /// rows it would output.
-    fn give_condition(&mut self, _: &dyn Allocator, _: ColumnId) -> Result<Given, AllocError> {
+    ///
+    /// Not a left join's build columns: skipping build rows there would make
+    /// a row that has a match one that hasn't, with nulls that pass a test
+    /// such as `IS NULL`.
+    fn give_condition(&mut self, _: &dyn Allocator, column: ColumnId) -> Result<Given, AllocError> {
+        if self.kind == JoinKind::Left && self.is_build_column(column) {
+            return Ok(Given::Stop);
+        }
         Ok(Given::Passed(None))
     }
 
@@ -126,9 +137,14 @@ impl<'c> Op<'c> for JoinOp {
     fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
         // Not the build side's keys: one build row may be joined to many.
         let mut out = at!(inputs, self.probe()).after_filters();
-        out.demote_ids();
-        if self.kind != JoinKind::Inner {
-            out.keep_some();
+        match self.kind {
+            // A left join keeps every row, in order.
+            JoinKind::Left => {}
+            JoinKind::Inner => out.demote_ids(),
+            JoinKind::Semi | JoinKind::Anti => {
+                out.demote_ids();
+                out.keep_some();
+            }
         }
         Some(out)
     }
@@ -143,12 +159,16 @@ impl<'c> Op<'c> for JoinOp {
         }
         #[expect(clippy::cast_possible_truncation, reason = "0 or 1")]
         let mut out = *c.input(self.probe() as u32);
-        out.drop_rows();
+        if self.kind != JoinKind::Left {
+            out.drop_rows();
+        }
         // Its rows are kept by the build side's keys, not by the probe
         // scan's values alone.
         out.scan = None;
         for &column in at!(self.columns, self.build).iter() {
-            out.push_column(c.column_of(column))?;
+            let mut column = c.column_of(column);
+            column.nullable |= self.kind == JoinKind::Left;
+            out.push_column(column)?;
         }
         Ok(out)
     }
@@ -168,10 +188,13 @@ impl<'c> Op<'c> for JoinOp {
         let build_columns = at!(self.columns, self.build).iter().map(|&column| position(column));
         let build_columns = SlowVec::fixed_from(lowering.allocator(), build_columns)?;
         let build_key = position(*at!(self.keys, self.build));
+        let types = at!(self.columns, self.build).iter().map(|&column| rows.type_of(column));
+        let build_types = SlowVec::fixed_from(lowering.allocator(), types)?;
         lowering.lower_input(node, self.probe() as u32)?;
         let probe_key = lowering.query_position(*at!(self.keys, self.probe()));
-        let join = Join { kind: self.kind, build, probe_key, build_key, build_columns };
-        lowering.add_operator(Step::Operator(DynOperator::new(lowering.allocator(), join)?))
+        let (kind, allocator) = (self.kind, lowering.allocator());
+        let join = Join { kind, build, probe_key, build_key, build_columns, build_types };
+        lowering.add_operator(Step::Operator(DynOperator::new(allocator, join)?))
     }
 }
 
@@ -186,8 +209,10 @@ struct Join<'c> {
     /// Where the keys are in each side's batches.
     probe_key: u32,
     build_key: u32,
-    /// Where the build columns output are in the build side's batches.
+    /// Where the build columns output are in the build side's batches, and
+    /// their types.
     build_columns: SlowVec<u32>,
+    build_types: SlowVec<DataType>,
 }
 
 /// The build side's rows, once drained.
@@ -199,11 +224,37 @@ struct Built {
     /// The key of the first build row, and how many there are.
     first: i64,
     count: u32,
-    /// By row of the batch being joined, the build row it's joined to.
+    /// By row of the batch being joined, the build row it's joined to, and
+    /// for a left join, a bit for whether it has none.
     matched: SlowVec<u32>,
+    missed: SlowVec<u8>,
 }
 
 impl Join<'_> {
+    /// Adds a column of `rows` nulls of each build column's type to
+    /// `output`, for a left join with no build rows.
+    fn push_nulls(
+        &self,
+        context: &mut Context,
+        rows: u32,
+        output: &mut RowBatch,
+    ) -> Result<(), Error> {
+        for &data_type in self.build_types.iter() {
+            let mut values = context.values_buffer(rows as usize * 8)?;
+            values.as_mut_slice::<u64>().fill(0);
+            let mut validity = context.small_buffer((rows as usize).div_ceil(8))?;
+            validity.as_mut_slice::<u8>().fill(0);
+            let column = if data_type.has_bytes() {
+                let bytes = context.bytes_buffer(0)?;
+                ColumnView::strings(context, values, bytes, Some(validity))?
+            } else {
+                ColumnView::new(context, data_type, values, Some(validity))?
+            };
+            let Ok(()) = output.push_column(column) else { failed!() };
+        }
+        Ok(())
+    }
+
     /// Holds every row of the build side, whose keys must make one sequence.
     fn drain(&self, context: &mut Context, built: &mut Built) -> Result<(), Error> {
         built.drained = true;
@@ -236,58 +287,17 @@ impl Join<'_> {
     }
 }
 
-impl Operator for Join<'_> {
-    type State = Built;
-
-    fn new_state(&self, context: &mut Context) -> Result<Built, Error> {
-        let allocator = context.allocator();
-        let matched =
-            SlowVec::fixed_from(allocator, core::iter::repeat_n(0, BATCH_ROWS_MAX as usize))?;
-        let rows = RowStore::new(allocator)?;
-        Ok(Built { drained: false, rows, first: 0, count: 0, matched })
-    }
-
-    fn execute(
-        &self,
-        context: &mut Context,
-        built: &mut Built,
-        input: &RowBatch,
-        output: &mut RowBatch,
-    ) -> Result<Progress, Error> {
-        if !built.drained {
-            self.drain(context, built)?;
-        }
-        output.copy_from(input);
-        // With no build row, an anti join keeps every row, as `x NOT IN ()`
-        // is true even of a null `x`, and the others none.
-        if built.count == 0 {
-            if self.kind == JoinKind::Anti {
-                return Ok(Progress::NeedInput);
-            }
-            output.reset(0);
-            return Ok(Progress::Done);
-        }
-        let key = input.column(self.probe_key);
-        let (first, count) = (built.first, built.count);
-        // The probe rows joined are those whose key is a build row's, as a
-        // filter on the key would keep them; an anti join keeps the rest, of
-        // the keys that aren't null.
-        let last = first.wrapping_add(i64::from(count - 1));
-        let kept = match self.kind {
-            JoinKind::Inner | JoinKind::Semi => Range::between(first, last),
-            JoinKind::Anti => Range::between(last.wrapping_add(1), first.wrapping_sub(1)),
-        };
-        filter::keep_within(key, kept, output.selection_mut(), None);
-        if output.selection().is_empty() || self.build_columns.is_empty() {
-            return Ok(Progress::NeedInput);
-        }
-        // Each row's build row, and any for a row not joined, as every row
-        // is gathered: in a loop of its own, which needs no branch.
-        let matched = at_mut!(built.matched, ..input.row_count() as usize);
+impl Built {
+    /// Writes each of the first `rows` rows' build row, by `key`, to
+    /// `matched`, and any for a row not joined, as every row is gathered: in
+    /// a loop of its own, which needs no branch.
+    fn find(&mut self, key: &ColumnView, rows: usize) {
+        let (first, count) = (self.first, u64::from(self.count));
+        let matched = at_mut!(self.matched, ..rows);
         let build_row = |value: i64| {
             let row = value.wrapping_sub(first).cast_unsigned();
             #[expect(clippy::cast_possible_truncation, reason = "below `count` if kept")]
-            let row = if row < u64::from(count) { row as u32 } else { 0 };
+            let row = if row < count { row as u32 } else { 0 };
             row
         };
         match key.form() {
@@ -303,8 +313,108 @@ impl Operator for Join<'_> {
             }
             _ => failed!(),
         }
+    }
+
+    /// Writes a bit to `missed` for each of the first `rows` rows, set if
+    /// it has no build row: its key is outside the build side's, or null.
+    fn find_misses(&mut self, key: &ColumnView, rows: usize) {
+        let (first, count) = (self.first, u64::from(self.count));
+        let missed = at_mut!(self.missed, ..rows.div_ceil(8));
+        missed.fill(0);
+        let (start, values, validity) = match key.form() {
+            Form::Sequence(start) => (start, None, None),
+            _ => (0, Some(key.int64s()), key.validity()),
+        };
+        // Eight at a time where it can, as a filter tests them.
+        let mut done = 0;
+        if let (true, Some(values), None) = (eight::EIGHT_AT_A_TIME, values, validity) {
+            let span = count - 1;
+            for (at, missed) in (0..rows - rows % 8).step_by(8).zip(missed.iter_mut()) {
+                // SAFETY: the eight from `at` are rows of the batch, which
+                // are the key's.
+                let (low, high) = unsafe { eight::in_range(values, at, first, span) };
+                *missed = !(low | high << 4);
+            }
+            done = rows - rows % 8;
+        }
+        #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "a row")]
+        for row in done..rows {
+            let value = values.map_or(start.wrapping_add(row as i64), |v| *at!(v, row));
+            // SAFETY: `row` is one of the batch's, which are the key's.
+            let valid = validity.is_none_or(|v| unsafe { v.is_valid_unchecked(row as u32) });
+            let hit = valid && value.wrapping_sub(first).cast_unsigned() < count;
+            *at_mut!(missed, row / 8) |= u8::from(!hit) << (row % 8);
+        }
+    }
+}
+
+impl Operator for Join<'_> {
+    type State = Built;
+
+    fn new_state(&self, context: &mut Context) -> Result<Built, Error> {
+        let allocator = context.allocator();
+        let matched =
+            SlowVec::fixed_from(allocator, core::iter::repeat_n(0, BATCH_ROWS_MAX as usize))?;
+        let rows = RowStore::new(allocator)?;
+        let missed =
+            SlowVec::fixed_from(allocator, core::iter::repeat_n(0, BATCH_ROWS_MAX as usize / 8))?;
+        Ok(Built { drained: false, rows, first: 0, count: 0, matched, missed })
+    }
+
+    fn execute(
+        &self,
+        context: &mut Context,
+        built: &mut Built,
+        input: &RowBatch,
+        output: &mut RowBatch,
+    ) -> Result<Progress, Error> {
+        if !built.drained {
+            self.drain(context, built)?;
+        }
+        output.copy_from(input);
+        // With no build row, an anti join keeps every row, as `x NOT IN ()`
+        // is true even of a null `x`, a left join joins each to nulls, and
+        // the others keep none.
+        if built.count == 0 {
+            match self.kind {
+                JoinKind::Anti => {}
+                JoinKind::Left => self.push_nulls(context, input.row_count(), output)?,
+                JoinKind::Inner | JoinKind::Semi => {
+                    output.reset(0);
+                    return Ok(Progress::Done);
+                }
+            }
+            return Ok(Progress::NeedInput);
+        }
+        let key = input.column(self.probe_key);
+        let (first, count) = (built.first, built.count);
+        // The probe rows joined are those whose key is a build row's, as a
+        // filter on the key would keep them; an anti join keeps the rest, of
+        // the keys that aren't null, and a left join every one.
+        let last = first.wrapping_add(i64::from(count - 1));
+        let kept = match self.kind {
+            JoinKind::Inner | JoinKind::Semi => Some(Range::between(first, last)),
+            JoinKind::Anti => Some(Range::between(last.wrapping_add(1), first.wrapping_sub(1))),
+            JoinKind::Left => None,
+        };
+        if let Some(kept) = kept {
+            filter::keep_within(key, kept, output.selection_mut(), None);
+        }
+        if output.selection().is_empty() || self.build_columns.is_empty() {
+            return Ok(Progress::NeedInput);
+        }
+        let rows = input.row_count() as usize;
+        built.find(key, rows);
         let mut gathered = RowBatch::new();
-        built.rows.gather(context, &mut gathered, matched, 0, |_, _| failed!())?;
+        if self.kind == JoinKind::Left {
+            built.find_misses(key, rows);
+            let (matched, missed) =
+                (at!(built.matched, ..rows), at!(built.missed, ..rows.div_ceil(8)));
+            built.rows.gather_or_null(context, &mut gathered, matched, missed)?;
+        } else {
+            let matched = at!(built.matched, ..rows);
+            built.rows.gather(context, &mut gathered, matched, 0, |_, _| failed!())?;
+        }
         for c in 0..gathered.column_count() {
             let Ok(()) = output.push_column(gathered.column(c).clone()) else { failed!() };
         }
