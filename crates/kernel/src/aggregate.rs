@@ -4,12 +4,14 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
+use crate::estimate::{Estimate, RowEstimate};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
+use crate::scannable::Key;
 use crate::slow_vec::SlowVec;
 use crate::step::DynSource;
 use crate::step::Step;
@@ -147,6 +149,18 @@ impl<'c> Op<'c> for AggregateOp {
     /// output is too. Its keys must be `Int64` or strings, which are all the
     /// hash aggregate groups by, and its aggregates' inputs of types their
     /// functions read.
+    /// One row without keys, and with one key, a row for each of its values.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        let input = inputs.first().map_or(RowEstimate::UNKNOWN, |input| input.rows);
+        let mut out = Estimate::of(input);
+        match *self.keys {
+            [] => out.rows = RowEstimate::exactly(1),
+            [key] => out.add_key(key, Key::Unique),
+            _ => {}
+        }
+        Some(out)
+    }
+
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         for &key in self.keys.iter() {
             if !matches!(c.input(0).type_of(key), DataType::Int64 | DataType::String) {

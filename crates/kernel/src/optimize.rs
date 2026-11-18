@@ -13,6 +13,7 @@ use crate::slow_vec::SlowVec;
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
     answer_from_summaries(allocator, plan)?;
+    choose_by_estimates(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -141,6 +142,27 @@ pub fn answer_from_summaries(
         }
     }
     remove_unreachable_nodes(plan);
+    Ok(())
+}
+
+/// Has each op make the choices that depend on what's known of its inputs'
+/// rows, such as which side of a join to build, from the inputs up: each
+/// node's estimate is made from its children's.
+pub fn choose_by_estimates(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    let mut estimates = SlowVec::fixed(allocator, plan.nodes.len())?;
+    let mut inputs = SlowVec::new(allocator, PLAN_NODES_MAX)?;
+    for node in plan.nodes.iter_mut() {
+        inputs.retain(|_| false);
+        for &child in node.children.iter() {
+            // Children are added before their parents.
+            inputs.push(*at!(estimates, child as usize))?;
+        }
+        node.op.choose(&inputs);
+        estimates.push(node.op.estimate(&inputs))?;
+    }
     Ok(())
 }
 

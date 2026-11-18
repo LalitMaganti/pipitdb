@@ -12,13 +12,14 @@ use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
+use crate::estimate::{Estimate, RowEstimate};
 use crate::function::DynFunction;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate};
-use crate::scannable::{DynScannable, Summary};
+use crate::scannable::{DynScannable, Key, Summary};
 use crate::slow_vec::SlowVec;
 use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
@@ -160,6 +161,21 @@ pub trait Op<'c> {
         Ok(false)
     }
 
+    /// What is known of the rows this makes before any run, given what is of
+    /// its inputs', for planning to choose by, or `None` for the default: at
+    /// most as many rows as its first input, and that input's keys this
+    /// passes through, but none a sequence, as this may drop rows.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        let _ = inputs;
+        None
+    }
+
+    /// Makes the choices that depend on what is known of its inputs' rows,
+    /// such as which side of a join to build. By default, none.
+    fn choose(&mut self, inputs: &[Estimate]) {
+        let _ = inputs;
+    }
+
     /// What this needs of the rows of input `input`. By default, nothing.
     fn needs(&self, input: u32) -> InputNeeds<'_> {
         let _ = input;
@@ -220,6 +236,8 @@ struct OpFunctions<'c> {
     materialize: Materialize<'c>,
     summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
     answer: Answer<'c>,
+    estimate: unsafe fn(NonNull<()>, &[Estimate]) -> Option<Estimate>,
+    choose: unsafe fn(NonNull<()>, &[Estimate]),
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -266,6 +284,10 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
         // SAFETY: as for `prune`.
         answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
+        // SAFETY: as for `reads`.
+        estimate: |op, inputs| unsafe { value_of::<T>(op).estimate(inputs) },
+        // SAFETY: as for `prune`.
+        choose: |op, inputs| unsafe { value_mut_of::<T>(op).choose(inputs) },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -346,6 +368,28 @@ impl<'c> DynOp<'c> {
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.summary)(self.op.as_ptr(), column) }
+    }
+
+    /// As `Op::estimate`, with its default made.
+    pub(crate) fn estimate(&self, inputs: &[Estimate]) -> Estimate {
+        // SAFETY: the function matches the op's type.
+        if let Some(estimate) = unsafe { (self.functions.estimate)(self.op.as_ptr(), inputs) } {
+            return estimate;
+        }
+        let Some(input) = inputs.first() else { return Estimate::UNKNOWN };
+        let mut out = Estimate::of(input.rows);
+        for &(column, key) in input.known_keys() {
+            if self.passes_through(column) {
+                out.add_key(column, key.min(Key::Unique));
+            }
+        }
+        out
+    }
+
+    pub(crate) fn choose(&mut self, inputs: &[Estimate]) {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.choose)(self.op.as_ptr(), inputs) }
     }
 
     pub(crate) fn answer(
@@ -584,6 +628,17 @@ impl<'c> Op<'c> for ScanOp<'c> {
         self.scannable.summary(scanned)
     }
 
+    /// Its scannable's rows, and the keys among its columns.
+    fn estimate(&self, _: &[Estimate]) -> Option<Estimate> {
+        let summary = self.scannable.summary(None);
+        let rows = summary.and_then(|summary| u64::try_from(summary.rows).ok());
+        let mut out = Estimate::of(rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly));
+        for scanned in self.columns.iter() {
+            out.add_key(scanned.binding.id, self.scannable.column_key(scanned.column));
+        }
+        Some(out)
+    }
+
     /// Its columns, in order, and each order the scannable says its rows
     /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
@@ -703,6 +758,14 @@ impl<'c> Op<'c> for FilterOp {
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         Ok(Given::Passed(self.predicate.conjuncts_on(allocator, column)?))
+    }
+
+    /// Its input's, less the rows its predicate is expected to drop.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        let mut out = *inputs.first()?;
+        out.demote_ids();
+        self.predicate.estimate(&mut out);
+        Some(out)
     }
 
     /// Its input's, less some rows.

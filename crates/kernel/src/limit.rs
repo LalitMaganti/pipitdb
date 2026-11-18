@@ -4,6 +4,7 @@
 
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
@@ -23,6 +24,14 @@ impl<'c> Op<'c> for LimitOp {
     }
 
     fn reads(&self, _: &mut Needed) {}
+
+    /// At most `count` rows.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        let mut out = inputs.first()?.after_filters();
+        out.demote_ids();
+        out.keep_at_most(self.offset, self.count);
+        Some(out)
+    }
 
     /// Its input's, less some rows. The sort just before, if any, only needs
     /// to output the rows read here, if a `TopK` can count them.
