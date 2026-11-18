@@ -93,11 +93,13 @@ fn scan<'c>(
 }
 
 /// `slice JOIN thread ON utid = id`'s `dur` and `tid`, by row, of the
-/// slices whose `dur` is above `above`, if given.
+/// slices whose `dur` is above `above`, if given; written `thread JOIN slice`
+/// if `reversed`.
 fn join(
     slice: &DynScannable<'_>,
     thread: &DynScannable<'_>,
     above: Option<i64>,
+    reversed: bool,
 ) -> Result<Vec<(i64, i64)>, Error> {
     let mut plan = LogicalPlan::new(&Heap).unwrap();
     let (mut probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
@@ -113,9 +115,14 @@ fn join(
     let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
     let (utid, dur, id, tid) =
         (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
-    let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
-    let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
-    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
+    let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).unwrap();
+    let (slices, threads) = (columns([utid.id, dur.id]), columns([id.id, tid.id]));
+    let (op, children) = if reversed {
+        (JoinOp::new([id.id, utid.id], [threads, slices]), [build, probe])
+    } else {
+        (JoinOp::new([utid.id, id.id], [slices, threads]), [probe, build])
+    };
+    let children = SlowVec::fixed_from(&Heap, children.into_iter()).unwrap();
     plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
     plan.output.push(dur).unwrap();
     plan.output.push(tid).unwrap();
@@ -143,18 +150,20 @@ fn joins_rows_to_their_ids() {
     let slice = slices(&utids);
     // Each slice with a thread, in order: rows 1, 3 and 4 have none.
     let expected = [(0, 1005), (2, 3999), (5, 3048), (6, 1005)];
-    assert_eq!(join(&slice, &thread, None).unwrap(), expected);
+    assert_eq!(join(&slice, &thread, None, false).unwrap(), expected);
+    // Threads first: planning builds them still, as their ids are a sequence.
+    assert_eq!(join(&slice, &thread, None, true).unwrap(), expected);
     // Of slices a filter kept.
-    assert_eq!(join(&slice, &thread, Some(0)).unwrap(), expected[1..]);
+    assert_eq!(join(&slice, &thread, Some(0), false).unwrap(), expected[1..]);
     // No thread, so no slice is joined.
-    assert_eq!(join(&slice, &threads(&[], true), None).unwrap(), []);
+    assert_eq!(join(&slice, &threads(&[], true), None, false).unwrap(), []);
 }
 
 #[test]
 fn joins_only_to_sequences_so_far() {
     let slice = slices(&[Some(1)]);
-    assert_eq!(join(&slice, &threads(&[(0, 4)], false), None), Err(Error::Unsupported));
+    assert_eq!(join(&slice, &threads(&[(0, 4)], false), None, false), Err(Error::Unsupported));
     // A gap between batches.
     let gap = threads(&[(0, 4), (5, 4)], true);
-    assert_eq!(join(&slice, &gap, None), Err(Error::Unsupported));
+    assert_eq!(join(&slice, &gap, None, false), Err(Error::Unsupported));
 }

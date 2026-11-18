@@ -770,8 +770,9 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
     plan.output.push(dur).expect("allocates");
     if joined {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
-        let build_columns = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).expect("allocates");
-        let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns };
+        let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).expect("fixed");
+        let op =
+            JoinOp::new([utid.id, id.id], [columns([utid.id, dur.id]), columns([id.id, tid.id])]);
         let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).expect("allocates");
         plan.add_node(DynOp::new(&Heap, op).expect("allocates"), children).expect("allocates");
         plan.output.push(tid).expect("allocates");
