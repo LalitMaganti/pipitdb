@@ -11,7 +11,7 @@ use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::filter::{Comparison, Value};
-use pipit_kernel::join::JoinOp;
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
@@ -118,9 +118,9 @@ fn join(
     let columns = |ids: [u32; 2]| SlowVec::fixed_from(&Heap, ids.into_iter()).unwrap();
     let (slices, threads) = (columns([utid.id, dur.id]), columns([id.id, tid.id]));
     let (op, children) = if reversed {
-        (JoinOp::new([id.id, utid.id], [threads, slices]), [build, probe])
+        (JoinOp::new(JoinKind::Inner, [id.id, utid.id], [threads, slices]), [build, probe])
     } else {
-        (JoinOp::new([utid.id, id.id], [slices, threads]), [probe, build])
+        (JoinOp::new(JoinKind::Inner, [utid.id, id.id], [slices, threads]), [probe, build])
     };
     let children = SlowVec::fixed_from(&Heap, children.into_iter()).unwrap();
     plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
@@ -166,4 +166,45 @@ fn joins_only_to_sequences_so_far() {
     // A gap between batches.
     let gap = threads(&[(0, 4), (5, 4)], true);
     assert_eq!(join(&slice, &gap, None, false), Err(Error::Unsupported));
+}
+
+/// The `dur`s of the slices whose `utid` is (`Semi`) or isn't (`Anti`) a
+/// thread's `id`, in order.
+fn filtered(slice: &DynScannable<'_>, thread: &DynScannable<'_>, kind: JoinKind) -> Vec<i64> {
+    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let (probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
+    let (build, build_columns) = scan(&mut plan, thread, &["id"]);
+    let (utid, dur, id) = (probe_columns[0], probe_columns[1], build_columns[0]);
+    let slices = SlowVec::fixed_from(&Heap, [utid.id, dur.id].into_iter()).unwrap();
+    let op = JoinOp::new(kind, [utid.id, id.id], [slices, SlowVec::fixed(&Heap, 0).unwrap()]);
+    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
+    plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
+    plan.output.push(dur).unwrap();
+    optimize(&Heap, &mut plan).unwrap();
+    let planned = plan_nodes(&Heap, &plan).unwrap();
+    let physical = lower(&Heap, &mut plan, &planned).unwrap();
+    let query = QueryAllocators::new(&Heap);
+    let mut execution = physical.start(&query).unwrap();
+    let (mut batch, mut durs) = (RowBatch::new(), Vec::new());
+    let dur = physical.columns()[0].position;
+    while execution.next(&mut batch).unwrap() {
+        let selection = batch.selection();
+        for row in (0..selection.len()).map(|i| selection.kept().row(i) as usize) {
+            durs.push(batch.column(dur).int64s()[row]);
+        }
+    }
+    durs
+}
+
+#[test]
+fn keeps_rows_whose_ids_are_or_arent_in_a_table() {
+    let thread = threads(&[(0, 2048), (2048, 952)], true);
+    let slice = slices(&[Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048)]);
+    assert_eq!(filtered(&slice, &thread, JoinKind::Semi), [0, 2, 5]);
+    // A null isn't `NOT IN` a list it isn't in either.
+    assert_eq!(filtered(&slice, &thread, JoinKind::Anti), [1, 4]);
+    // Of an empty list, everything is `NOT IN`, nulls too, and nothing `IN`.
+    let none = threads(&[], true);
+    assert_eq!(filtered(&slice, &none, JoinKind::Semi), []);
+    assert_eq!(filtered(&slice, &none, JoinKind::Anti), [0, 1, 2, 3, 4, 5]);
 }
