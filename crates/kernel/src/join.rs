@@ -1,8 +1,8 @@
 //! `JoinOp`: an inner join of its two children on a key each, as Perfetto's
-//! joins on ids are. Each row of the first child, the probe side, is joined
-//! to the row of the second, the build side, whose key equals its own, if
-//! there is one: N:1. The build side is read whole first, as a pipeline of
-//! its own.
+//! joins on ids are. Each row of one child, the probe side, is joined to
+//! the row of the other, the build side, whose key equals its own, if there
+//! is one: N:1. Planning chooses which is which. The build side is read
+//! whole first, as a pipeline of its own.
 //!
 //! So far a build key must be a sequence, such as a table's id: a key's
 //! row is then the key less the first, so nothing is looked up. Any other
@@ -12,6 +12,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::filter::{self, Range};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
@@ -22,46 +23,55 @@ use crate::row_store::RowStore;
 use crate::slow_vec::SlowVec;
 use crate::step::{DynOperator, DynSource, Operator, Progress, Step};
 
-/// Outputs the probe side's columns, then `build_columns`.
+/// Outputs the probe side's columns, then the build side's.
 pub struct JoinOp {
-    /// The probe side's column it joins on, an `Int64`.
-    pub probe_key: ColumnId,
-    /// The build side's column it joins on, an `Int64`.
-    pub build_key: ColumnId,
-    /// The build side's columns it outputs.
-    pub build_columns: SlowVec<ColumnId>,
+    /// Each child's column it joins on, an `Int64`.
+    keys: [ColumnId; 2],
+    /// Each child's columns it outputs.
+    columns: [SlowVec<ColumnId>; 2],
+    /// Which child is the build side: the second, unless planning chooses
+    /// the first.
+    build: usize,
 }
 
 impl JoinOp {
+    /// Joins its children on `keys`, outputting `columns` of each.
+    pub fn new(keys: [ColumnId; 2], columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
+        JoinOp { keys, columns, build: 1 }
+    }
+
+    fn probe(&self) -> usize {
+        1 - self.build
+    }
+
     fn is_build_column(&self, column: ColumnId) -> bool {
-        column == self.build_key || self.build_columns.contains(&column)
+        column == *at!(self.keys, self.build) || at!(self.columns, self.build).contains(&column)
     }
 }
 
 impl<'c> Op<'c> for JoinOp {
-    /// Keeps the build columns needed.
+    /// Keeps the columns needed.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        self.build_columns.retain(|&column| needed.is_needed(column));
+        for columns in &mut self.columns {
+            columns.retain(|&column| needed.is_needed(column));
+        }
         self.reads(needed);
         Pruned::Keep
     }
 
     /// Its keys, and the build columns it outputs, which it copies.
     fn reads(&self, reads: &mut Needed) {
-        reads.need(self.probe_key);
-        reads.need(self.build_key);
-        for &column in self.build_columns.iter() {
+        for &key in &self.keys {
+            reads.need(key);
+        }
+        for &column in at!(self.columns, self.build).iter() {
             reads.need(column);
         }
     }
 
     /// Sequences of its keys, whose rows it finds by their numbers.
     fn accepts(&self, column: ColumnId) -> Forms {
-        if column == self.probe_key || column == self.build_key {
-            Forms::FLAT | Forms::SEQUENCE
-        } else {
-            Forms::FLAT
-        }
+        if self.keys.contains(&column) { Forms::FLAT | Forms::SEQUENCE } else { Forms::FLAT }
     }
 
     /// The probe side's columns, as they are. The build side's it outputs
@@ -77,41 +87,63 @@ impl<'c> Op<'c> for JoinOp {
         Ok(Given::Passed(None))
     }
 
+    /// Builds a side whose key is unique, as an N:1 join must: one whose key
+    /// is a sequence first, as it's held without being copied, then the
+    /// smaller. With no such side, the second, which fails until 1:N joins.
+    fn choose(&mut self, inputs: &[Estimate]) {
+        let &[first, second] = inputs else { failed!() };
+        // A better key, then fewer rows, with unknown as many as can be.
+        let rank = |input: &Estimate, key| (input.key(key), u64::MAX - input.rows.estimated);
+        let [left, right] = self.keys;
+        self.build = usize::from(rank(&first, left) <= rank(&second, right));
+    }
+
+    /// At most the probe side's rows, each joined to one build row, and its
+    /// keys, less any sequence, as rows are dropped.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        // Not the build side's keys: one build row may be joined to many.
+        let mut out = at!(inputs, self.probe()).after_filters();
+        out.demote_ids();
+        Some(out)
+    }
+
     /// The probe side's columns and order, less some rows, then the build
     /// columns.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        for (input, key) in [(0, self.probe_key), (1, self.build_key)] {
+        for (input, &key) in (0..).zip(&self.keys) {
             if c.input(input).type_of(key) != DataType::Int64 {
                 return Err(LowerError::WrongType(key));
             }
         }
-        let mut out = *c.input(0);
+        #[expect(clippy::cast_possible_truncation, reason = "0 or 1")]
+        let mut out = *c.input(self.probe() as u32);
         out.drop_rows();
         // Its rows are kept by the build side's keys, not by the probe
         // scan's values alone.
         out.scan = None;
-        for &column in self.build_columns.iter() {
+        for &column in at!(self.columns, self.build).iter() {
             out.push_column(c.column_of(column))?;
         }
         Ok(out)
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "0 or 1")]
     fn lower(
         &self,
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 2);
-        let (build, rows) = lowering.lower_side(node, 1)?;
+        let (build, rows) = lowering.lower_side(node, self.build as u32)?;
         let position = |column| {
             let Some(position) = rows.position_of(column) else { failed!() };
             position
         };
-        let build_columns = self.build_columns.iter().map(|&column| position(column));
+        let build_columns = at!(self.columns, self.build).iter().map(|&column| position(column));
         let build_columns = SlowVec::fixed_from(lowering.allocator(), build_columns)?;
-        let build_key = position(self.build_key);
-        lowering.lower_input(node, 0)?;
-        let probe_key = lowering.query_position(self.probe_key);
+        let build_key = position(*at!(self.keys, self.build));
+        lowering.lower_input(node, self.probe() as u32)?;
+        let probe_key = lowering.query_position(*at!(self.keys, self.probe()));
         let join = Join { build, probe_key, build_key, build_columns };
         lowering.add_operator(Step::Operator(DynOperator::new(lowering.allocator(), join)?))
     }
@@ -243,5 +275,40 @@ impl Operator for Join<'_> {
 
     fn finish(&self, _: &mut Context, _: &mut Built, _: &mut RowBatch) -> Result<Progress, Error> {
         Ok(Progress::NeedInput)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::Heap;
+    use crate::estimate::RowEstimate;
+    use crate::scannable::Key;
+
+    /// The child `JoinOp` builds, given its children's rows and keys.
+    fn built(first: (Option<u64>, Key), second: (Option<u64>, Key)) -> usize {
+        let estimate = |(rows, key): (Option<u64>, Key), column| {
+            let rows = rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly);
+            let mut estimate = Estimate::of(rows);
+            estimate.add_key(column, key);
+            estimate
+        };
+        let none = || SlowVec::fixed(&Heap, 0).unwrap();
+        let mut join = JoinOp::new([0, 1], [none(), none()]);
+        join.choose(&[estimate(first, 0), estimate(second, 1)]);
+        join.build
+    }
+
+    #[test]
+    fn builds_the_side_with_the_better_key_then_fewer_rows() {
+        let (few, many) = (Some(10), Some(1_000_000));
+        // A sequence, even if bigger, then a unique key, then fewer rows.
+        assert_eq!(built((many, Key::Id), (few, Key::Unique)), 0);
+        assert_eq!(built((many, Key::Unique), (few, Key::None)), 0);
+        assert_eq!(built((few, Key::Unique), (many, Key::Unique)), 0);
+        assert_eq!(built((many, Key::Unique), (few, Key::Unique)), 1);
+        // As written when nothing tells them apart.
+        assert_eq!(built((None, Key::None), (None, Key::None)), 1);
+        assert_eq!(built((few, Key::Id), (few, Key::Id)), 1);
     }
 }

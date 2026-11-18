@@ -24,7 +24,7 @@
   "filter.greater_nulls": 888271,
   "flat_hash_map.find": 209240,
   "join.scan": 7992,
-  "join.slice_thread": 1307299,
+  "join.slice_thread": 1307702,
   "lexer.long_text": 103648,
   "lexer.typical": 316536,
   "parser.expression": 467016,

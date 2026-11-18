@@ -360,8 +360,9 @@ pub unsafe extern "C" fn join_rows(data: *const u8, len: usize) -> u32 {
             nodes[side] = plan.add_node(op, SlowVec::fixed(&Heap, 0)?)?;
         }
         let [Some(probe_key), Some(build_key), Some(built)] = columns else { return Ok(0) };
-        let build_columns = SlowVec::fixed_from(&Heap, [built.id].into_iter())?;
-        let join = JoinOp { probe_key: probe_key.id, build_key: build_key.id, build_columns };
+        let probe_columns = SlowVec::fixed_from(&Heap, [probe_key.id].into_iter())?;
+        let build_columns = SlowVec::fixed_from(&Heap, [build_key.id, built.id].into_iter())?;
+        let join = JoinOp::new([probe_key.id, build_key.id], [probe_columns, build_columns]);
         plan.add_node(DynOp::new(&Heap, join)?, SlowVec::fixed_from(&Heap, nodes.into_iter())?)?;
         plan.output.push(built)?;
         optimize(&Heap, &mut plan)?;
