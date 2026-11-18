@@ -617,11 +617,11 @@ impl<'c> Op<'c> for ScanOp<'c> {
     ) -> Result<(), LowerError> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
-        let cutoff = lowering.query_cutoff(node).map(|key| {
+        let cutoff = lowering.query_cutoff(node).map(|(key, slot)| {
             let Some(scanned) = self.columns.iter().find(|c| c.binding.id == key.column) else {
                 failed!()
             };
-            Cutoff { column: scanned.column, descending: key.descending }
+            Cutoff { slot, column: scanned.column, descending: key.descending }
         });
         let source = self.scannable.scan(lowering.allocator(), read, conditions, cutoff)?;
         lowering.set_source(source);

@@ -144,8 +144,8 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     /// For `node`, a scan, the column a `TopK` above publishes a cutoff on,
-    /// if any.
-    pub fn query_cutoff(&self, node: &PlanNode<'c>) -> Option<SortKey> {
+    /// and the slot it publishes in, if any.
+    pub fn query_cutoff(&self, node: &PlanNode<'c>) -> Option<(SortKey, u32)> {
         at!(self.planned, self.plan.id_of(node) as usize).cutoff
     }
 
