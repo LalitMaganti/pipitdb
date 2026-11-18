@@ -213,7 +213,7 @@ fn first_read(
     column: ColumnId,
 ) -> (Load, bool, Forms) {
     let (mut at, mut above_parent) = (*at!(parents, maker), false);
-    let (mut first, mut accepted) = (None, OUTPUT_FORMS | Forms::LAZY);
+    let (mut first, mut accepted) = (None, ANY_FORM);
     while let Some((parent, slot)) = at {
         let op = &at!(nodes, parent as usize).op;
         if at!(reads, parent as usize).is_needed(column) {
@@ -241,6 +241,9 @@ fn first_read(
 /// The forms the plan's output columns may come in: whoever takes the
 /// output can make them flat.
 const OUTPUT_FORMS: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
+
+/// Every form, which what reads a column narrows.
+const ANY_FORM: Forms = OUTPUT_FORMS.union(Forms::LAZY).union(Forms::SEQUENCE);
 
 /// Chooses the forms each column is made in. A column may be made in any
 /// form every op that reads it accepts, as each passes it on as it is; its
@@ -402,9 +405,9 @@ mod tests {
         }
     }
 
-    /// Plans a maker, then a reader that takes dictionaries, then one that
+    /// Plans a maker, then a reader that takes `accepts`, then one that
     /// only takes flat columns, and returns the forms the maker is allowed.
-    fn allowed(passes_through: bool) -> Forms {
+    fn allowed(accepts: Forms, passes_through: bool) -> Forms {
         let allowed = Cell::new(Forms::FLAT);
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let column = plan.add_column("a", DataType::String, true).unwrap();
@@ -415,7 +418,7 @@ mod tests {
             )
             .unwrap();
         let readers = [
-            Reader { accepts: Forms::FLAT | Forms::DICTIONARY, passes_through },
+            Reader { accepts, passes_through },
             Reader { accepts: Forms::FLAT, passes_through: true },
         ];
         for reader in readers {
@@ -429,7 +432,16 @@ mod tests {
 
     #[test]
     fn forms_ignore_readers_above_an_op_that_does_not_pass_the_column_through() {
-        assert!(allowed(false).contains(Forms::DICTIONARY));
-        assert!(!allowed(true).contains(Forms::DICTIONARY));
+        let dictionaries = Forms::FLAT | Forms::DICTIONARY;
+        assert!(allowed(dictionaries, false).contains(Forms::DICTIONARY));
+        assert!(!allowed(dictionaries, true).contains(Forms::DICTIONARY));
+    }
+
+    #[test]
+    fn forms_are_any_their_readers_take() {
+        let sequences = Forms::FLAT | Forms::SEQUENCE;
+        assert!(allowed(sequences, false).contains(Forms::SEQUENCE));
+        // The output is never a sequence.
+        assert!(!allowed(sequences, true).contains(Forms::SEQUENCE));
     }
 }
