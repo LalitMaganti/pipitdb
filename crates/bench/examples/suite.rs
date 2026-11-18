@@ -228,11 +228,16 @@ impl Output {
         self.data_type = column.data_type();
         let null = column.is_null(row);
         self.nulls.push(null);
+        if let Form::Sequence(first) = column.form() {
+            self.words.push(first + i64::from(row));
+            return;
+        }
         let values = column.values();
         let value = match column.form() {
             Form::Flat => row as usize,
             Form::Constant => 0,
             Form::Dictionary(indices) => indices[row as usize] as usize,
+            Form::Sequence(_) => unreachable!(),
         };
         match self.data_type {
             DataType::Int64 => self.words.push(if null { 0 } else { values.int64s()[value] }),

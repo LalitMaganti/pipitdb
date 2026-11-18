@@ -277,18 +277,28 @@ impl Predicate {
     /// Whether every condition it has on `column` compares it with a string,
     /// and it has one.
     pub fn compares_only_strings(&self, column: u32) -> bool {
+        self.only(column, |leaf| {
+            matches!(leaf, Leaf::CompareString { .. } | Leaf::Like { .. } | Leaf::InStrings { .. })
+        })
+    }
+
+    /// Whether every condition it has on `column` compares it with an
+    /// integer or tests it for null, and it has one.
+    pub fn compares_only_integers(&self, column: u32) -> bool {
+        self.only(column, |leaf| {
+            matches!(leaf, Leaf::Compare { value: Value::Int64(_), .. } | Leaf::IsNull { .. })
+        })
+    }
+
+    /// Whether every condition it has on `column` is one `is`, and it has
+    /// one.
+    fn only(&self, column: u32, is: impl Fn(&Leaf) -> bool) -> bool {
         let leaves = self.nodes.iter().filter_map(|node| match *node {
             Node::Leaf(leaf) => Some(leaf),
             Node::And(..) | Node::Or(..) | Node::Not(_) => None,
         });
         let mut on_column = leaves.filter(|leaf| leaf.column() == column).peekable();
-        on_column.peek().is_some()
-            && on_column.all(|leaf| {
-                matches!(
-                    leaf,
-                    Leaf::CompareString { .. } | Leaf::Like { .. } | Leaf::InStrings { .. }
-                )
-            })
+        on_column.peek().is_some() && on_column.all(|leaf| is(&leaf))
     }
 
     /// The columns its comparisons and `IS NULL`s read, maybe more than once.

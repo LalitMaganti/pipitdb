@@ -540,7 +540,7 @@ impl StringExtreme {
             let value = match form {
                 Form::Flat => row,
                 Form::Dictionary(indices) => *at!(indices, row) as usize,
-                Form::Constant => failed!(),
+                Form::Constant | Form::Sequence(_) => failed!(),
             };
             #[expect(clippy::cast_possible_truncation, reason = "a batch's value")]
             (!values.is_null(value as u32)).then(|| strings.get(value))

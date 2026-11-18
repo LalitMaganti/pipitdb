@@ -557,7 +557,7 @@ fn load_string_ids(
                 }
             }
         }
-        Form::Constant => failed!(),
+        Form::Constant | Form::Sequence(_) => failed!(),
     }
     *copy = Some(ids);
     Ok(())
