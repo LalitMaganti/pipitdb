@@ -12,6 +12,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
+use crate::filter::{self, Range};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
@@ -201,46 +202,36 @@ impl Operator for Join<'_> {
             return Ok(Progress::Done);
         }
         let key = input.column(self.probe_key);
-        let (first, count) = (built.first, u64::from(built.count));
-        let rows = input.row_count() as usize;
-        let matched = at_mut!(built.matched, ..rows);
-        // Rows not joined are gathered too, as any build row: those kept
-        // are written below, so only those dropped already need one.
-        if !input.selection().is_prefix() {
-            matched.fill(0);
-        }
-        // Whether the probe row `row`, of key `value`, is joined, writing
-        // its build row: without branching, as misses are at random.
-        let mut join = |row: u16, value: i64| {
-            let build_row = value.wrapping_sub(first).cast_unsigned();
-            let joined = build_row < count;
-            #[expect(clippy::cast_possible_truncation, reason = "below `count` if joined")]
-            let build_row = if joined { build_row as u32 } else { 0 };
-            *at_mut!(matched, usize::from(row)) = build_row;
-            joined
-        };
+        let (first, count) = (built.first, built.count);
+        // The probe rows joined are those whose key is a build row's, as a
+        // filter on the key would keep them.
         output.copy_from(input);
-        let selection = output.selection_mut();
-        // A loop for each form, so none tests it each row.
+        let joined = Range { lo: first, span: u64::from(count - 1) };
+        filter::keep_within(key, joined, output.selection_mut(), None);
+        if output.selection().is_empty() || self.build_columns.is_empty() {
+            return Ok(Progress::NeedInput);
+        }
+        // Each row's build row, and any for a row not joined, as every row
+        // is gathered: in a loop of its own, which needs no branch.
+        let matched = at_mut!(built.matched, ..input.row_count() as usize);
+        let build_row = |value: i64| {
+            let row = value.wrapping_sub(first).cast_unsigned();
+            #[expect(clippy::cast_possible_truncation, reason = "below `count` if kept")]
+            let row = if row < u64::from(count) { row as u32 } else { 0 };
+            row
+        };
         match key.form() {
             Form::Sequence(start) => {
-                selection.retain(|row| join(row, start.wrapping_add(i64::from(row))));
+                for (row, out) in (0..).zip(matched.iter_mut()) {
+                    *out = build_row(start.wrapping_add(row));
+                }
             }
             Form::Flat => {
-                let values = key.int64s();
-                match key.validity() {
-                    None => selection.retain(|row| join(row, *at!(values, usize::from(row)))),
-                    Some(validity) => selection.retain(|row| {
-                        // SAFETY: `row` is one of the batch's, which are the key's.
-                        let valid = unsafe { validity.is_valid_unchecked(row.into()) };
-                        join(row, *at!(values, usize::from(row))) & valid
-                    }),
+                for (out, &value) in matched.iter_mut().zip(key.int64s()) {
+                    *out = build_row(value);
                 }
             }
             _ => failed!(),
-        }
-        if output.selection().is_empty() || self.build_columns.is_empty() {
-            return Ok(Progress::NeedInput);
         }
         let mut gathered = RowBatch::new();
         built.rows.gather(context, &mut gathered, matched, 0, |_, _| failed!())?;
