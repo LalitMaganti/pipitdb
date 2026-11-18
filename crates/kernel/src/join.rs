@@ -55,6 +55,13 @@ impl<'c> Op<'c> for JoinOp {
         }
     }
 
+    /// The probe side, for a column it makes: a row is kept only if the
+    /// condition holds, whichever side tests it. Not yet the build side, as
+    /// a build side some of whose ids a filter drops isn't a sequence.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        (!self.is_build_column(column)).then_some(0)
+    }
+
     /// Sequences of its keys, whose rows it finds by their numbers.
     fn accepts(&self, column: ColumnId) -> Forms {
         if column == self.probe_key || column == self.build_key {

@@ -2,6 +2,7 @@
 
 extern crate std;
 
+use std::vec;
 use std::vec::Vec;
 
 use crate::table::Table;
@@ -157,4 +158,70 @@ fn joins_only_to_sequences_so_far() {
     // A gap between batches.
     let gap = threads(&[(0, 4), (5, 4)], true);
     assert_eq!(join(&slice, &gap, None), Err(Error::Unsupported));
+}
+
+/// `slice JOIN thread ON utid = id WHERE dur > durs AND tid > tids`'s `dur`
+/// and `tid`, by row, and how many children each node of the optimized
+/// plan has, from the root down each side.
+fn filtered_above(
+    slice: &DynScannable<'_>,
+    thread: &DynScannable<'_>,
+    durs: i64,
+    tids: i64,
+) -> (Vec<(i64, i64)>, Vec<usize>) {
+    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let (probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
+    let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
+    let (utid, dur, id, tid) =
+        (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
+    let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
+    let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
+    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
+    let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
+    let greater = |column: u32, value| {
+        Node::Leaf(Leaf::Compare {
+            column,
+            comparison: Comparison::Greater,
+            value: Value::Int64(value),
+        })
+    };
+    let nodes = [greater(dur.id, durs), greater(tid.id, tids), Node::And(0, 1)];
+    let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
+    let children = SlowVec::fixed_from(&Heap, [join].into_iter()).unwrap();
+    plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), children).unwrap();
+    plan.output.push(dur).unwrap();
+    plan.output.push(tid).unwrap();
+    optimize(&Heap, &mut plan).unwrap();
+    let mut shape = Vec::new();
+    let mut pending = vec![plan.root];
+    while let Some(node) = pending.pop() {
+        let children = &plan.nodes[node as usize].children;
+        shape.push(children.len());
+        pending.extend(children.iter().rev());
+    }
+    let planned = plan_nodes(&Heap, &plan).unwrap();
+    let physical = lower(&Heap, &mut plan, &planned).unwrap();
+    let query = QueryAllocators::new(&Heap);
+    let mut execution = physical.start(&query).unwrap();
+    let (mut batch, mut rows) = (RowBatch::new(), Vec::new());
+    let [dur, tid] = [0, 1].map(|i| physical.columns()[i].position);
+    while execution.next(&mut batch).unwrap() {
+        let selection = batch.selection();
+        for row in (0..selection.len()).map(|i| selection.kept().row(i) as usize) {
+            rows.push((batch.column(dur).int64s()[row], batch.column(tid).int64s()[row]));
+        }
+    }
+    (rows, shape)
+}
+
+#[test]
+fn moves_conditions_above_a_join_to_its_sides() {
+    let thread = threads(&[(0, 2048), (2048, 952)], true);
+    let slice = slices(&[Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048)]);
+    let (rows, shape) = filtered_above(&slice, &thread, 0, 1005);
+    // `dur > 0` drops the first slice, `tid > 1005` the slice of thread 5.
+    assert_eq!(rows, [(2, 3999), (5, 3048)]);
+    // `dur > 0` goes to the probe side, over its scan. `tid > 1005` stays
+    // above the join until a build side can have gaps in its ids.
+    assert_eq!(shape, [1, 2, 1, 0, 0]);
 }

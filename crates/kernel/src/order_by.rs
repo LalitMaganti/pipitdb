@@ -3,7 +3,7 @@
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
-use crate::plan::{Op, PlanNode, SortKey};
+use crate::plan::{ColumnId, Op, PlanNode, SortKey};
 use crate::slow_vec::SlowVec;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
@@ -15,6 +15,11 @@ pub struct OrderByOp {
 }
 
 impl<'c> Op<'c> for OrderByOp {
+    /// Its input: it only reorders rows.
+    fn moves_condition(&self, _: ColumnId) -> Option<u32> {
+        Some(0)
+    }
+
     /// Makes no columns, and needs its keys.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         for key in self.keys.iter() {

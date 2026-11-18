@@ -1174,6 +1174,11 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
 impl<'c> Op<'c> for ComputeOp {
     /// Drops the items whose columns aren't needed, and itself with the
     /// last of them.
+    /// Its input, for a column it doesn't compute: it keeps every row.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        (!self.items.iter().any(|item| item.output == column)).then_some(0)
+    }
+
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         self.items.retain(|item| needed.is_needed(item.output));
         if self.items.is_empty() {

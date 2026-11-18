@@ -220,28 +220,64 @@ impl Predicate {
         column: u32,
     ) -> Result<Option<Predicate>, AllocError> {
         let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
+        let goes = |node| self.reads_only(node, column);
         #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
-        let root = self.copy_on(self.nodes.len() as u32 - 1, column, &mut nodes, None)?;
+        let root = self.copy_where(self.nodes.len() as u32 - 1, &goes, &mut nodes, None)?;
         if root.is_none() {
             return Ok(None);
         }
         Ok(Some(Predicate::checked(nodes, self.values.clone())))
     }
 
-    /// Copies node `node`'s conjuncts that read only `column` to `nodes`,
-    /// each joined to `root`, those so far, by `AND`: the new root.
-    fn copy_on(
+    /// Its top-level conjuncts split by where they can be applied instead:
+    /// those reading only columns `place` puts in one input, the same for
+    /// all, go to that input, at most 2, and the rest stay. Each part is its
+    /// conjuncts joined by `AND`, or `None` if it has none.
+    pub fn split(
+        &self,
+        allocator: &dyn Allocator,
+        place: impl Fn(u32) -> Option<u32>,
+    ) -> Result<[Option<Predicate>; 3], AllocError> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
+        let root = self.nodes.len() as u32 - 1;
+        // The stayers, then the movers to each input.
+        let mut parts = [const { None }; 3];
+        for (part, input) in parts.iter_mut().zip([None, Some(0), Some(1)]) {
+            let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
+            let goes = |node| self.place_of(node, &place) == input;
+            if self.copy_where(root, &goes, &mut nodes, None)?.is_some() {
+                *part = Some(Predicate::checked(nodes, self.values.clone()));
+            }
+        }
+        Ok(parts)
+    }
+
+    /// The input `place` puts every column node `node` reads in, if one.
+    fn place_of(&self, node: u32, place: &impl Fn(u32) -> Option<u32>) -> Option<u32> {
+        match *at!(self.nodes, node as usize) {
+            Node::Leaf(leaf) => place(leaf.column()).filter(|&input| input < 2),
+            Node::And(a, b) | Node::Or(a, b) => {
+                let input = self.place_of(a, place)?;
+                (self.place_of(b, place) == Some(input)).then_some(input)
+            }
+            Node::Not(a) => self.place_of(a, place),
+        }
+    }
+
+    /// Copies node `node`'s conjuncts that `goes` says to `nodes`, each
+    /// joined to `root`, those so far, by `AND`: the new root.
+    fn copy_where(
         &self,
         node: u32,
-        column: u32,
+        goes: &dyn Fn(u32) -> bool,
         nodes: &mut SlowVec<Node>,
         root: Option<u32>,
     ) -> Result<Option<u32>, AllocError> {
         if let Node::And(a, b) = *at!(self.nodes, node as usize) {
-            let root = self.copy_on(a, column, nodes, root)?;
-            return self.copy_on(b, column, nodes, root);
+            let root = self.copy_where(a, goes, nodes, root)?;
+            return self.copy_where(b, goes, nodes, root);
         }
-        if !self.reads_only(node, column) {
+        if !goes(node) {
             return Ok(root);
         }
         let copied = self.copy(node, nodes)?;

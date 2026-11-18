@@ -13,6 +13,7 @@ use crate::slow_vec::SlowVec;
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
     answer_from_summaries(allocator, plan)?;
+    place_filters(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -142,6 +143,75 @@ pub fn answer_from_summaries(
     }
     remove_unreachable_nodes(plan);
     Ok(())
+}
+
+/// Moves each filter's conditions as early in the plan as they can go, as
+/// Perfetto applies a condition at the scan of its table: each part goes
+/// below the op under it to the input that makes its columns, such as one
+/// side of a join, if the op says it can (`Op::moves_condition`), as a
+/// filter of its own there, until nothing more moves. A filter none of
+/// whose condition stays is removed.
+pub fn place_filters(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    // Filters only move down, so this ends.
+    while let Some(id) = move_one_filter(allocator, plan)? {
+        let _ = id;
+    }
+    remove_unreachable_nodes(plan);
+    Ok(())
+}
+
+/// Moves part of the first filter that can move, returning its id then, or
+/// `None` if none can.
+fn move_one_filter(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<Option<PlanNodeId>, AllocError> {
+    for id in 0..plan.nodes.len() {
+        let &[child] = &at!(plan.nodes, id).children[..] else { continue };
+        // Children are added before their parents.
+        let (below, rest) = plan.nodes.split_at_mut(id);
+        let moved = at_mut!(rest, 0).op.split_below(allocator, &at!(below, child as usize).op)?;
+        if moved.filters.iter().all(Option::is_none) {
+            continue;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let mut filter = id as PlanNodeId;
+        let mut under = child;
+        for (input, op) in moved.filters.into_iter().enumerate() {
+            let Some(op) = op else { continue };
+            let grandchild = *at!(at!(plan.nodes, under as usize).children, input);
+            let children = SlowVec::fixed_from(allocator, core::iter::once(grandchild))?;
+            // Just before the op it goes under, so inputs still come first.
+            insert_node(plan, under, PlanNode { op, children })?;
+            *at_mut!(at_mut!(plan.nodes, under as usize + 1).children, input) = under;
+            (under, filter) = (under + 1, filter + 1);
+        }
+        if moved.emptied {
+            bypass(plan, filter, under);
+            // Left unread, and so it's never moved again.
+            at_mut!(plan.nodes, filter as usize).children = SlowVec::fixed(allocator, 0)?;
+        }
+        return Ok(Some(filter));
+    }
+    Ok(None)
+}
+
+/// Makes what reads node `id` read `child`, its one child, instead, so it's
+/// left unread.
+fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
+    for node in plan.nodes.iter_mut() {
+        for c in node.children.iter_mut() {
+            if *c == id {
+                *c = child;
+            }
+        }
+    }
+    if plan.root == id {
+        plan.root = child;
+    }
 }
 
 /// Each node's parent, and which of its children it is; `None` for the
