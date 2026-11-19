@@ -1,21 +1,37 @@
-//! Join ordering by greedy operator ordering (GOO, Fegaras 1998): while
-//! more than one tree is left, join the two trees whose join makes the fewest
-//! rows.
+//! Join ordering in two steps, after Neumann and Radke's "Adaptive
+//! Optimization of Very Large Join Queries" (SIGMOD 2018).
 //!
-//! Each join reads a window of the graph's edges, so that dense graphs stay
-//! bounded by `WORK_MAX`. Once that work is spent, each join takes the first
-//! pair of trees that can be joined.
+//! First, greedy operator ordering (GOO, Fegaras 1998) makes a plan: while
+//! more than one tree is left, it joins the two trees whose join makes the
+//! fewest rows. Then exact dynamic programming improves it. Bottom up, it
+//! takes a window of a few subtrees of the plan and replaces the joins
+//! between them by the cheapest way to join them. A graph of up to
+//! `EXACT_MAX` relations is a single window, so its plan is the optimum.
+//!
+//! Both steps draw on `WORK_MAX`, so that dense graphs stay bounded. GOO
+//! reads a window of the graph's edges for each join, and once the work is
+//! spent it takes the first pair of trees that can be joined. The windows
+//! stop improving the plan once it's spent.
 //!
 //! Most functions are `#[inline(never)]`: inlined into one another, they were
 //! larger.
 
-use super::{Estimator, JoinTree, QueryGraph, RelationSet, as_written};
+use core::iter::repeat_n;
+
+use super::{Estimator, JoinTree, LIST_MAX, QueryGraph, RelationSet, as_written};
 use crate::allocator::Allocator;
 use crate::error::Error;
 use crate::slow_vec::SlowVec;
 
-/// No node, tree or edge.
+/// No node, tree, edge or unit.
 const NONE: u32 = u32::MAX;
+
+/// The most relations exact dynamic programming plans in one window. It takes
+/// about 3^n steps for n relations.
+const EXACT_MAX: usize = 12;
+
+/// How many subtrees a window of a bigger graph joins.
+const WINDOW: usize = 8;
 
 /// How many pairs of trees each join prices by all the edges between them.
 /// They are the pairs whose single edges make the fewest rows. A pair's rows
@@ -23,8 +39,8 @@ const NONE: u32 = u32::MAX;
 /// than a few.
 const TOP: usize = 16;
 
-/// The most work planning does before it takes the first pair it can: edges
-/// and hyperedges read. It's about 0.8 s at most.
+/// The most work planning does: edges and hyperedges read, and splits of a
+/// window tried, times the edges each checks. It's about 0.8 s at most.
 const WORK_MAX: usize = 1 << 27;
 
 /// A node of the plan. The graph's relations come first, then the joins.
@@ -56,6 +72,20 @@ struct Edge {
     dead: u32,
 }
 
+/// The cheapest tree found for a set of a window's units.
+#[derive(Clone, Copy)]
+struct Plan {
+    /// Its cost, or infinity until one is found.
+    cost: f64,
+    /// Its rows, or NaN until they're known.
+    rows: f64,
+    /// The units on its left side.
+    split: u32,
+}
+
+/// A set of units for which no tree has been found yet.
+const NO_PLAN: Plan = Plan { cost: f64::INFINITY, rows: f64::NAN, split: 0 };
+
 /// The plan as it is built, and the memory for building it.
 struct Planner<'a> {
     /// The graph being planned.
@@ -64,6 +94,9 @@ struct Planner<'a> {
     estimator: Estimator<'a>,
     /// The work left: see `WORK_MAX`.
     work: usize,
+    /// Whether the graph isn't connected, so that a join may be a cross
+    /// product.
+    crossing: bool,
     /// How many words a set of relations takes.
     words: usize,
     /// The plan's nodes.
@@ -76,13 +109,28 @@ struct Planner<'a> {
     /// A hyperedge with the same sides as the one linked before it is left
     /// out, as it can't change whether a join is valid.
     hypers: u32,
+    /// The cheapest tree of each set of the window's units.
+    plans: SlowVec<Plan>,
+    /// The edges between the window's units: the units of each side, as bits,
+    /// and the edge's index in the graph.
+    local: SlowVec<[u32; 3]>,
 }
 
-/// Plans a graph of three relations or more: GOO, as above.
+/// Plans a graph of three relations or more, as above.
 pub fn plan(allocator: &dyn Allocator, graph: &QueryGraph) -> Result<JoinTree, Error> {
-    let mut planner = Planner::new(allocator, graph)?;
+    let count = graph.relations.len();
+    // A small graph is one window, whose root is the last node. A bigger one
+    // has a window at each join, from the first.
+    let (units, first) = if count <= EXACT_MAX { (count, 2 * count - 2) } else { (WINDOW, count) };
+    let mut planner = Planner::new(allocator, graph, units)?;
     if !planner.greedy() {
         return as_written(allocator, graph);
+    }
+    // Joins come after their children, so each window's subtrees have
+    // already been improved.
+    #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
+    for root in first as u32..2 * count as u32 - 1 {
+        planner.refine(root, units)?;
     }
     planner.tree(allocator)
 }
@@ -116,7 +164,12 @@ fn meets(side: &RelationSet, set: &[u64]) -> (bool, bool) {
 }
 
 impl<'a> Planner<'a> {
-    fn new(allocator: &dyn Allocator, graph: &'a QueryGraph) -> Result<Planner<'a>, Error> {
+    /// A planner whose windows have up to `units` units.
+    fn new(
+        allocator: &dyn Allocator,
+        graph: &'a QueryGraph,
+        units: usize,
+    ) -> Result<Planner<'a>, Error> {
         let count = graph.relations.len();
         let words = count.div_ceil(64);
         #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
@@ -129,8 +182,22 @@ impl<'a> Planner<'a> {
         let nodes = SlowVec::fixed_from(allocator, nodes)?;
         let sets = SlowVec::zeroed(allocator, (2 * count - 1) * words)?;
         let edges = SlowVec::fixed(allocator, graph.edges.len())?;
-        let (work, hypers) = (WORK_MAX, NONE);
-        let mut planner = Planner { graph, estimator, work, words, nodes, sets, edges, hypers };
+        let plans = SlowVec::fixed(allocator, 1 << units)?;
+        let local = SlowVec::new(allocator, LIST_MAX)?;
+        let (work, crossing, hypers) = (WORK_MAX, false, NONE);
+        let mut planner = Planner {
+            graph,
+            estimator,
+            work,
+            crossing,
+            words,
+            nodes,
+            sets,
+            edges,
+            hypers,
+            plans,
+            local,
+        };
         for relation in 0..count {
             *at_mut!(planner.sets, relation * words + relation / 64) |= 1 << (relation % 64);
         }
@@ -328,6 +395,7 @@ impl<'a> Planner<'a> {
                 }
                 // The graph isn't connected: join the first relation's tree
                 // to another tree.
+                self.crossing = true;
                 a = at!(self.nodes, 0).place;
                 let relations = at!(self.nodes, ..relations).iter();
                 b = relations.map(|relation| relation.place).find(|&b| b != a).unwrap_or(a);
@@ -355,6 +423,151 @@ impl<'a> Planner<'a> {
             e = if e + 1 == graph.edges.len() { 0 } else { e + 1 };
         }
         self.estimator.finish()
+    }
+
+    /// Replaces the joins under `root` by the cheapest tree of up to `max` of
+    /// its subtrees, its units, found by exact dynamic programming. The units
+    /// are `root`'s children at first. Then the unit that makes the most rows
+    /// and is a join is replaced by its children, until there are `max`.
+    #[inline(never)]
+    fn refine(&mut self, root: u32, max: usize) -> Result<(), Error> {
+        if self.work == 0 {
+            return Ok(());
+        }
+        let mut units = [NONE; EXACT_MAX];
+        // The joins the units are replaced from, which take the new joins.
+        let mut slots = [NONE; EXACT_MAX];
+        let top = at!(self.nodes, root as usize);
+        (units[0], units[1], slots[0]) = (top.left, top.right, root);
+        let (mut k, mut splits) = (2, 9);
+        while k < max {
+            // The unit that makes the most rows and is a join, if any.
+            let (mut i, mut most) = (k, -1.0);
+            for (unit, at) in at!(units, ..k).iter().zip(0..) {
+                let node = at!(self.nodes, *unit as usize);
+                if node.right != NONE && node.rows > most {
+                    (i, most) = (at, node.rows);
+                }
+            }
+            if i == k {
+                break;
+            }
+            let unit = *at!(units, i);
+            let node = at!(self.nodes, unit as usize);
+            (*at_mut!(slots, k - 1), *at_mut!(units, k), *at_mut!(units, i)) =
+                (unit, node.right, node.left);
+            (k, splits) = (k + 1, 3 * splits);
+        }
+        let units = at!(units, ..k);
+        self.local.clear();
+        #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
+        for index in 0..self.edges.len() as u32 {
+            let masks = [0, 1].map(|right| self.mask(index as usize, right, root, units));
+            if let [Some(left), Some(right)] = masks
+                && !(left | right).is_power_of_two()
+            {
+                self.local.push([left, right, index])?;
+            }
+        }
+
+        let reads = self.read_cost() * self.edges.len();
+        self.work = self.work.saturating_sub(reads + splits * self.local.len());
+        let full = (1_u32 << k) - 1;
+        if self.work > 0 && self.solve(units, full) {
+            // The new root goes in `root`, which is made last.
+            self.build(units, &mut at!(slots, ..k - 1).iter().rev(), full)?;
+        }
+        Ok(())
+    }
+
+    /// The units that side `right` of edge `e` is in, as bits, if all its
+    /// relations are under `root`. An edge with a side outside the window
+    /// can't apply within it, so it's left out.
+    #[inline(never)]
+    fn mask(&self, e: usize, right: usize, root: u32, units: &[u32]) -> Option<u32> {
+        let meets = |node| self.meets(e, right, self.set(node));
+        meets(root).1.then(|| {
+            (0..).zip(units).fold(0, |mask, (i, &unit)| mask | u32::from(meets(unit).0) << i)
+        })
+    }
+
+    /// Finds the cheapest tree of each set of the window's `units`, up to the
+    /// set `full` of all of them. Returns whether there is one for `full`.
+    fn solve(&mut self, units: &[u32], full: u32) -> bool {
+        self.plans.clear();
+        self.plans.extend_within(repeat_n(NO_PLAN, full as usize + 1));
+        for (i, &unit) in units.iter().enumerate() {
+            *at_mut!(self.plans, 1 << i) = Plan { cost: 0.0, rows: self.rows(unit), split: 0 };
+        }
+        for set in 3..=full {
+            // Each split of the set is tried once: the left side holds its
+            // lowest unit.
+            let low = set.isolate_lowest_one();
+            let rest = set ^ low;
+            let mut sub = rest;
+            while sub != 0 {
+                sub = (sub - 1) & rest;
+                let (left, right) = (sub | low, rest ^ sub);
+                let (l, r) = (*at!(self.plans, left as usize), *at!(self.plans, right as usize));
+                if !(l.cost + r.cost).is_finite() || !self.joins(set, left, right) {
+                    continue;
+                }
+                let plan = at_mut!(self.plans, set as usize);
+                if plan.rows.is_nan() {
+                    plan.rows = self.estimator.finish();
+                }
+                let cost = l.cost + r.cost + plan.rows.max(1.0);
+                if cost < plan.cost {
+                    (plan.cost, plan.split) = (cost, left);
+                }
+            }
+        }
+        at!(self.plans, full as usize).cost.is_finite()
+    }
+
+    /// Whether units `left` and `right`, which together are `set`, can be
+    /// joined: an edge joins them, and every edge whose relations they bring
+    /// together applies. If `set`'s rows aren't known yet, it estimates them.
+    fn joins(&mut self, set: u32, left: u32, right: u32) -> bool {
+        let plans = |side: u32| at!(self.plans, side as usize).rows;
+        let estimate = plans(set).is_nan();
+        self.estimator.start(plans(left), plans(right));
+        let mut any = self.crossing;
+        for &[l, r, index] in self.local.iter() {
+            let both = l | r;
+            if both & !set != 0 || both & !left == 0 || both & !right == 0 {
+                continue;
+            }
+            let forward = l & !left == 0 && r & !right == 0;
+            if !(forward || l & !right == 0 && r & !left == 0) {
+                return false;
+            }
+            if estimate {
+                self.estimator.apply(at!(self.graph.edges, index as usize), forward);
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// Makes the window's cheapest tree of the units in `set`, putting its
+    /// joins in `slots`, and returns its root.
+    #[inline(never)]
+    fn build(
+        &mut self,
+        units: &[u32],
+        slots: &mut core::iter::Rev<core::slice::Iter<'_, u32>>,
+        set: u32,
+    ) -> Result<u32, Error> {
+        if set.is_power_of_two() {
+            return Ok(*at!(units, set.trailing_zeros() as usize));
+        }
+        let plan = *at!(self.plans, set as usize);
+        let left = self.build(units, slots, plan.split)?;
+        let right = self.build(units, slots, set ^ plan.split)?;
+        let Some(&slot) = slots.next() else { failed!() };
+        self.join(slot, left, right, plan.rows);
+        Ok(slot)
     }
 
     /// The plan as a `JoinTree`, whose nodes are the planner's, in the same
