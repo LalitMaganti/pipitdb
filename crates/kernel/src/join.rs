@@ -55,6 +55,14 @@ impl<'c> Op<'c> for JoinOp {
         }
     }
 
+    /// A condition on a probe-side column can be applied to the probe side.
+    /// Conditions on build-side columns stay above the join for now: a
+    /// filtered build side has gaps in its ids, which the join can't yet
+    /// handle.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        (!self.is_build_column(column)).then_some(0)
+    }
+
     /// Sequences of its keys, whose rows it finds by their numbers.
     fn accepts(&self, column: ColumnId) -> Forms {
         if column == self.probe_key || column == self.build_key {

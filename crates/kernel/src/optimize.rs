@@ -13,6 +13,7 @@ use crate::slow_vec::SlowVec;
 pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     prune_columns(allocator, plan)?;
     answer_from_summaries(allocator, plan)?;
+    place_filters(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -142,6 +143,74 @@ pub fn answer_from_summaries(
     }
     remove_unreachable_nodes(plan);
     Ok(())
+}
+
+/// Moves each filter's conditions as far down the plan as possible, so rows
+/// are dropped before work is done on them. For each condition, the op below
+/// the filter says which of its inputs, if any, it can go to
+/// (`Op::moves_condition`), and the condition becomes a filter on that input.
+/// This repeats until nothing moves. A filter left with no conditions is
+/// removed.
+pub fn place_filters(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<(), AllocError> {
+    // Filters only move down, so this ends.
+    while move_one_filter(allocator, plan)? {}
+    remove_unreachable_nodes(plan);
+    Ok(())
+}
+
+/// Moves the conditions of the first filter that can move any. Returns
+/// whether one did.
+fn move_one_filter(
+    allocator: &dyn Allocator,
+    plan: &mut LogicalPlan<'_>,
+) -> Result<bool, AllocError> {
+    for id in 0..plan.nodes.len() {
+        let &[child] = &at!(plan.nodes, id).children[..] else { continue };
+        // Children are added before their parents.
+        let (below, rest) = plan.nodes.split_at_mut(id);
+        let moved = at_mut!(rest, 0).op.split_below(allocator, &at!(below, child as usize).op)?;
+        if moved.filters.iter().all(Option::is_none) {
+            continue;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let mut filter = id as PlanNodeId;
+        let mut under = child;
+        for (input, op) in moved.filters.into_iter().enumerate() {
+            let Some(op) = op else { continue };
+            let grandchild = *at!(at!(plan.nodes, under as usize).children, input);
+            let children = SlowVec::fixed_from(allocator, core::iter::once(grandchild))?;
+            // Inserted just before the op it goes under, so every node still
+            // comes after its inputs.
+            insert_node(plan, under, PlanNode { op, children })?;
+            *at_mut!(at_mut!(plan.nodes, under as usize + 1).children, input) = under;
+            (under, filter) = (under + 1, filter + 1);
+        }
+        if moved.emptied {
+            bypass(plan, filter, under);
+            // Detached, so nothing reaches it and it isn't moved again.
+            at_mut!(plan.nodes, filter as usize).children = SlowVec::fixed(allocator, 0)?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Makes every node that reads node `id` read `child` instead, leaving `id`
+/// unreachable.
+fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
+    for node in plan.nodes.iter_mut() {
+        for c in node.children.iter_mut() {
+            if *c == id {
+                *c = child;
+            }
+        }
+    }
+    if plan.root == id {
+        plan.root = child;
+    }
 }
 
 /// Each node's parent, and which of its children it is; `None` for the

@@ -142,6 +142,12 @@ impl<'c> Op<'c> for AggregateOp {
         Ok(true)
     }
 
+    /// A condition on a group key can be applied to the input rows instead:
+    /// a group passes it exactly when its rows do.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        (self.answer.is_none() && self.keys.contains(&column)).then_some(0)
+    }
+
     /// A row per group: its keys, then its aggregates. Groups are output in
     /// the order first seen, so if the input is sorted by the keys, the
     /// output is too. Its keys must be `Int64` or strings, which are all the

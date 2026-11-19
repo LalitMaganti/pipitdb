@@ -113,6 +113,29 @@ pub trait Op<'c> {
         Ok(Given::Stop)
     }
 
+    /// Which input, if any, a condition from above on `column` can be
+    /// applied to instead, with the same result. For example, a condition on
+    /// a column one side of a join makes can be applied to that side. By
+    /// default, none.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        let _ = column;
+        None
+    }
+
+    /// For an op that drops rows by a condition, as a filter does: splits off
+    /// the parts of the condition that `below`, its child, can apply to one
+    /// of its inputs instead (see `moves_condition`), returning them as new
+    /// filters, one per input, and keeping the rest. By default, nothing is
+    /// split off.
+    fn split_below(
+        &mut self,
+        allocator: &dyn Allocator,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        let _ = (allocator, below);
+        Ok(Moved::none())
+    }
+
     /// Whether this makes `column` and takes conditions on it. By default,
     /// no.
     fn takes_condition(&self, column: ColumnId) -> bool {
@@ -176,6 +199,20 @@ pub trait Op<'c> {
     -> Result<(), LowerError>;
 }
 
+/// The filters split off an op's condition, one for each input of the op
+/// below, and whether nothing of the condition is left.
+pub struct Moved<'c> {
+    pub filters: [Option<DynOp<'c>>; 2],
+    pub emptied: bool,
+}
+
+impl<'c> Moved<'c> {
+    /// Nothing split off.
+    pub fn none() -> Moved<'c> {
+        Moved { filters: [None, None], emptied: false }
+    }
+}
+
 /// What an op gives up of its condition on a column.
 pub enum Given {
     /// It passes on other rows than its child's: nothing below can apply a
@@ -193,6 +230,9 @@ type TakeCondition =
     unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
 
 type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
+
+type SplitBelow<'c> =
+    unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -220,6 +260,8 @@ struct OpFunctions<'c> {
     materialize: Materialize<'c>,
     summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
     answer: Answer<'c>,
+    moves_condition: unsafe fn(NonNull<()>, ColumnId) -> Option<u32>,
+    split_below: SplitBelow<'c>,
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -266,6 +308,12 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
         // SAFETY: as for `prune`.
         answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
+        // SAFETY: as for `reads`.
+        moves_condition: |op, column| unsafe { value_of::<T>(op).moves_condition(column) },
+        // SAFETY: as for `prune`.
+        split_below: |op, allocator, below| unsafe {
+            value_mut_of::<T>(op).split_below(allocator, below)
+        },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -341,6 +389,21 @@ impl<'c> DynOp<'c> {
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.materialize)(self.op.as_ptr(), allocator, columns) }
+    }
+
+    pub(crate) fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.moves_condition)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn split_below(
+        &mut self,
+        allocator: &dyn Allocator,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.split_below)(self.op.as_ptr(), allocator, below) }
     }
 
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
@@ -694,6 +757,29 @@ impl<'c> Op<'c> for FilterOp {
         } else {
             Forms::FLAT | Forms::CONSTANT
         }
+    }
+
+    /// Splits off the conjuncts of its predicate that `below` can apply to
+    /// an input instead.
+    fn split_below(
+        &mut self,
+        allocator: &dyn Allocator,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        let [kept, first, second] =
+            self.predicate.split(allocator, |c| below.moves_condition(c))?;
+        if first.is_none() && second.is_none() {
+            return Ok(Moved::none());
+        }
+        let filter = |part: Option<Predicate>| {
+            part.map(|predicate| DynOp::new(allocator, FilterOp { predicate })).transpose()
+        };
+        let filters = [filter(first)?, filter(second)?];
+        let emptied = kept.is_none();
+        if let Some(kept) = kept {
+            self.predicate = kept;
+        }
+        Ok(Moved { filters, emptied })
     }
 
     /// A copy of the conjuncts of its predicate that read only `column`.
