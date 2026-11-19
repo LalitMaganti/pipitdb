@@ -7,6 +7,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
@@ -1176,6 +1177,11 @@ impl<'c> Op<'c> for ComputeOp {
     /// input: it neither drops nor adds rows.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         (!self.items.iter().any(|item| item.output == column)).then_some(0)
+    }
+
+    /// The same as its input's: it keeps every row, in order.
+    fn estimate(&self, inputs: &[Estimate]) -> Option<Estimate> {
+        Some(inputs.first().map_or(Estimate::UNKNOWN, |input| input.after_filters()))
     }
 
     /// Drops the items whose columns aren't needed, and itself with the
