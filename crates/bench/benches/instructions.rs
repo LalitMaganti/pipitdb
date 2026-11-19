@@ -7,6 +7,7 @@ use gungraun::prelude::*;
 use pipit_file::source::FileSource;
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
+use pipit_kernel::join_order::QueryGraph;
 use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::scannable::{Catalog, DynScannable};
@@ -54,6 +55,25 @@ fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
 }
 
 library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
+
+// Planning the joins of 2 to 12 tables, as a star and as a chain. Most
+// queries join few tables, so planning them has to be cheap.
+#[library_benchmark]
+#[bench::star_2(pipitdb_bench::join_graph(true, 2))]
+#[bench::star_3(pipitdb_bench::join_graph(true, 3))]
+#[bench::star_5(pipitdb_bench::join_graph(true, 5))]
+#[bench::star_8(pipitdb_bench::join_graph(true, 8))]
+#[bench::star_12(pipitdb_bench::join_graph(true, 12))]
+#[bench::chain_2(pipitdb_bench::join_graph(false, 2))]
+#[bench::chain_3(pipitdb_bench::join_graph(false, 3))]
+#[bench::chain_5(pipitdb_bench::join_graph(false, 5))]
+#[bench::chain_8(pipitdb_bench::join_graph(false, 8))]
+#[bench::chain_12(pipitdb_bench::join_graph(false, 12))]
+fn join_order(graph: QueryGraph) -> usize {
+    black_box(pipitdb_bench::plan_joins(black_box(&graph)))
+}
+
+library_benchmark_group!(name = join_order_group, benchmarks = [join_order]);
 
 // Perfetto's `filter_benchmark.cc`, on the same 2^20 rows, planned first.
 #[library_benchmark]
@@ -241,6 +261,7 @@ main!(
     library_benchmark_groups = lexer_group,
     parser_group,
     small_group,
+    join_order_group,
     perfetto_filter_group,
     pipeline_group,
     clickbench_group

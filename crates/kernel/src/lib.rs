@@ -26,6 +26,7 @@ pub mod function;
 mod group_table;
 mod hash_aggregate;
 pub mod join;
+pub mod join_order;
 pub mod like;
 pub mod limit;
 mod listed;

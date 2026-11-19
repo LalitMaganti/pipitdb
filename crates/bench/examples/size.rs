@@ -378,6 +378,24 @@ pub unsafe extern "C" fn join_rows(data: *const u8, len: usize) -> u32 {
     run().unwrap_or(u32::MAX)
 }
 
+/// Plans the joins of the graph at `graph` and returns how many nodes the join
+/// tree has, or `u32::MAX` if planning fails. The graph is built by the
+/// caller, so only planning is measured.
+///
+/// # Safety
+///
+/// `graph` must point to a `QueryGraph`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn join_order_nodes(
+    graph: *const pipit_kernel::join_order::QueryGraph,
+) -> u32 {
+    use pipit_kernel::join_order::enumerate;
+    // SAFETY: guaranteed by the caller.
+    let graph = unsafe { &*graph };
+    #[expect(clippy::cast_possible_truncation, reason = "at most 2 * `LIST_MAX`")]
+    enumerate(&Heap, graph).map_or(u32::MAX, |tree| tree.nodes.len() as u32)
+}
+
 /// Pushes `0..count` to a `SlowVec`, and returns the last.
 #[unsafe(no_mangle)]
 pub extern "C" fn vec_sum(count: u32) -> u64 {
