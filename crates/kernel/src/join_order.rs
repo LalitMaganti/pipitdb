@@ -227,11 +227,11 @@ impl QueryGraph {
 pub enum JoinNode {
     /// A relation, by index.
     Relation(u32),
-    /// A join of two earlier nodes, by index.
+    /// A join of two other nodes, by index.
     Join { left: u32, right: u32 },
 }
 
-/// A join tree. Each join comes after its children, and the root is last.
+/// A join tree. Its nodes can be in any order, but the root is last.
 pub struct JoinTree {
     pub nodes: SlowVec<JoinNode>,
 }
@@ -361,8 +361,8 @@ impl<'a> Estimator<'a> {
 /// Why a tree isn't a valid plan for its graph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Invalid {
-    /// It has no nodes, a node refers to one that isn't before it, a node
-    /// isn't used exactly once, or the root isn't last.
+    /// It has no nodes, a node refers to one that doesn't exist, or a node
+    /// isn't reached from the root exactly once.
     Shape,
     /// A relation is missing, repeated, or not in the graph.
     Relations,
@@ -395,18 +395,22 @@ pub fn cost(
     tree: &JoinTree,
 ) -> Result<Costed, Error> {
     let invalid = |why| Costed { cost: ROWS_MAX, rows: ROWS_MAX, valid: Err(why) };
+    let count = tree.nodes.len();
+    let Some(root) = count.checked_sub(1) else { return Ok(invalid(Invalid::Shape)) };
+    let Some(order) = post_order(allocator, tree)? else { return Ok(invalid(Invalid::Shape)) };
     let connected = graph.is_connected(allocator)?;
     let mut estimator = Estimator::new(allocator, graph)?;
     // Each node's relations and rows. A node's relations move to its parent.
-    let mut sets = SlowVec::fixed(allocator, tree.nodes.len())?;
-    let mut rows = SlowVec::fixed(allocator, tree.nodes.len())?;
-    let mut used = RelationSet::new(allocator)?;
+    let mut sets = SlowVec::fixed(allocator, count)?;
+    for _ in 0..count {
+        sets.push(RelationSet::new(allocator)?)?;
+    }
+    let mut rows = SlowVec::zeroed(allocator, count)?;
     let mut seen = RelationSet::new(allocator)?;
     let mut total = 0.0_f64;
-    let (mut valid, mut root) = (Ok(()), 0);
-    for (index, node) in (0_u32..).zip(tree.nodes.iter()) {
-        root = index;
-        let (set, count) = match *node {
+    let mut valid = Ok(());
+    for &node in order.iter() {
+        let (set, node_rows) = match *at!(tree.nodes, node as usize) {
             JoinNode::Relation(relation) => {
                 let Some(found) = graph.relations.get(relation as usize) else {
                     return Ok(invalid(Invalid::Relations));
@@ -422,15 +426,6 @@ pub fn cost(
                 (set, rows)
             }
             JoinNode::Join { left, right } => {
-                if left >= index || right >= index || left == right {
-                    return Ok(invalid(Invalid::Shape));
-                }
-                for child in [left, right] {
-                    if used.contains(child) {
-                        return Ok(invalid(Invalid::Shape));
-                    }
-                    used.insert(child)?;
-                }
                 let mut set =
                     core::mem::replace(at_mut!(sets, left as usize), RelationSet::new(allocator)?);
                 let other = at!(sets, right as usize);
@@ -452,17 +447,45 @@ pub fn cost(
                 (set, joined.rows)
             }
         };
-        sets.push(set)?;
-        rows.push(count)?;
-    }
-    let Some(&root_rows) = rows.last() else { return Ok(invalid(Invalid::Shape)) };
-    if used.len() as usize + 1 != tree.nodes.len() || used.contains(root) {
-        return Ok(invalid(Invalid::Shape));
+        *at_mut!(sets, node as usize) = set;
+        *at_mut!(rows, node as usize) = node_rows;
     }
     if seen.len() as usize != graph.relations.len() {
         return Ok(invalid(Invalid::Relations));
     }
-    Ok(Costed { cost: total, rows: root_rows, valid })
+    Ok(Costed { cost: total, rows: *at!(rows, root), valid })
+}
+
+/// The nodes of `tree` in an order that puts each join after its children,
+/// found by walking down from the root. `None` if a node is reached more than
+/// once, or not at all, or a join refers to a node that doesn't exist.
+fn post_order(allocator: &dyn Allocator, tree: &JoinTree) -> Result<Option<SlowVec<u32>>, Error> {
+    let count = tree.nodes.len();
+    let mut order = SlowVec::fixed(allocator, count)?;
+    let mut reached = RelationSet::new(allocator)?;
+    let mut stack = SlowVec::new(allocator, LIST_MAX)?;
+    #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
+    stack.push((count as u32 - 1, false))?;
+    while let Some((node, done)) = stack.pop() {
+        if done {
+            order.push(node)?;
+            continue;
+        }
+        if reached.contains(node) {
+            return Ok(None);
+        }
+        reached.insert(node)?;
+        stack.push((node, true))?;
+        if let JoinNode::Join { left, right } = *at!(tree.nodes, node as usize) {
+            for child in [right, left] {
+                if child as usize >= count {
+                    return Ok(None);
+                }
+                stack.push((child, false))?;
+            }
+        }
+    }
+    Ok((order.len() == count).then_some(order))
 }
 
 /// Whether joining `left` and `right` applies every edge whose relations

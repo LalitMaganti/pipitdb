@@ -56,7 +56,7 @@ fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
 
 library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
 
-// Planning the joins of 2 to 12 tables, as a star and as a chain. Most
+// Planning the joins of 2 to 16 tables, as a star and as a chain. Most
 // queries join few tables, so planning them has to be cheap.
 #[library_benchmark]
 #[bench::star_2(pipitdb_bench::join_graph(true, 2))]
@@ -64,11 +64,15 @@ library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]
 #[bench::star_5(pipitdb_bench::join_graph(true, 5))]
 #[bench::star_8(pipitdb_bench::join_graph(true, 8))]
 #[bench::star_12(pipitdb_bench::join_graph(true, 12))]
+#[bench::star_13(pipitdb_bench::join_graph(true, 13))]
+#[bench::star_16(pipitdb_bench::join_graph(true, 16))]
 #[bench::chain_2(pipitdb_bench::join_graph(false, 2))]
 #[bench::chain_3(pipitdb_bench::join_graph(false, 3))]
 #[bench::chain_5(pipitdb_bench::join_graph(false, 5))]
 #[bench::chain_8(pipitdb_bench::join_graph(false, 8))]
 #[bench::chain_12(pipitdb_bench::join_graph(false, 12))]
+#[bench::chain_13(pipitdb_bench::join_graph(false, 13))]
+#[bench::chain_16(pipitdb_bench::join_graph(false, 16))]
 fn join_order(graph: QueryGraph) -> usize {
     black_box(pipitdb_bench::plan_joins(black_box(&graph)))
 }

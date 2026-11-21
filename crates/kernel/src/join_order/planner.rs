@@ -1,21 +1,49 @@
-//! Join ordering by greedy operator ordering (GOO, Fegaras 1998): while
-//! more than one tree is left, join the two trees whose join makes the fewest
-//! rows.
+//! Join ordering after Neumann and Radke's "Adaptive Optimization of Very
+//! Large Join Queries" (SIGMOD 2018).
 //!
-//! Each join reads a window of the graph's edges, so that dense graphs stay
-//! bounded by `WORK_MAX`. Once that work is spent, each join takes the first
-//! pair of trees that can be joined.
+//! A graph is planned exactly by `DPhyp` (Moerkotte and Neumann, SIGMOD
+//! 2008) if it has few enough pairs to join. It joins each connected set of
+//! relations to each connected set beside it, and keeps the cheapest tree of
+//! each set.
+//!
+//! Any other graph gets a plan from greedy operator ordering (GOO, Fegaras
+//! 1998): while more than one tree is left, it joins the two trees whose
+//! join makes the fewest rows. Then exact dynamic programming improves it.
+//! Bottom up, it takes a window of a few subtrees of the plan and replaces
+//! the joins between them by the cheapest way to join them.
+//!
+//! Everything draws on `WORK_MAX`, so that dense graphs stay bounded. GOO
+//! reads a window of the graph's edges for each join, and once the work is
+//! spent it takes the first pair of trees that can be joined.
 //!
 //! Most functions are `#[inline(never)]`: inlined into one another, they were
 //! larger.
 
-use super::{Estimator, JoinTree, QueryGraph, RelationSet, as_written};
+use core::iter::repeat_n;
+
+use super::{Estimator, JoinTree, LIST_MAX, QueryGraph, RelationSet, as_written};
 use crate::allocator::Allocator;
 use crate::error::Error;
 use crate::slow_vec::SlowVec;
 
-/// No node, tree or edge.
+/// No node, tree, edge or unit.
 const NONE: u32 = u32::MAX;
+
+/// The most units, relations or subtrees, `DPhyp` joins at once: a set of
+/// them is the bits of a `u64`.
+const UNITS_MAX: usize = 64;
+
+/// The most connected sets of relations, and pairs of them, `DPhyp` visits to
+/// plan a graph exactly.
+const VISITS_MAX: usize = 1 << 11;
+
+/// The most relations of a graph that is planned exactly however its
+/// relations are joined, as even a clique's 2^n sets and 3^n / 2 pairs are
+/// few.
+const SMALL_MAX: usize = 10;
+
+/// How many subtrees a window of a bigger graph joins.
+const WINDOW: usize = 8;
 
 /// How many pairs of trees each join prices by all the edges between them.
 /// They are the pairs whose single edges make the fewest rows. A pair's rows
@@ -23,8 +51,8 @@ const NONE: u32 = u32::MAX;
 /// than a few.
 const TOP: usize = 16;
 
-/// The most work planning does before it takes the first pair it can: edges
-/// and hyperedges read. It's about 0.8 s at most.
+/// The most work planning does: edges read, by GOO and by `DPhyp`. It's
+/// about 0.8 s at most.
 const WORK_MAX: usize = 1 << 27;
 
 /// A node of the plan. The graph's relations come first, then the joins.
@@ -56,6 +84,31 @@ struct Edge {
     dead: u32,
 }
 
+/// The cheapest tree found for a set of units, in a hash table.
+#[derive(Clone, Copy)]
+struct Plan {
+    /// The units, or 0 for an empty slot.
+    set: u64,
+    /// Its cost.
+    cost: f64,
+    /// Its rows.
+    rows: f64,
+    /// The units on its left side.
+    split: u64,
+}
+
+/// An empty slot, or a set of units for which no tree has been found.
+const NO_PLAN: Plan = Plan { set: 0, cost: f64::INFINITY, rows: f64::NAN, split: 0 };
+
+/// An edge between units.
+#[derive(Clone, Copy)]
+struct Link {
+    /// The units of its left side, then of its right.
+    sides: [u64; 2],
+    /// Its index in the graph.
+    edge: u32,
+}
+
 /// The plan as it is built, and the memory for building it.
 struct Planner<'a> {
     /// The graph being planned.
@@ -64,6 +117,9 @@ struct Planner<'a> {
     estimator: Estimator<'a>,
     /// The work left: see `WORK_MAX`.
     work: usize,
+    /// Whether the graph isn't connected, so that a join may be a cross
+    /// product.
+    crossing: bool,
     /// How many words a set of relations takes.
     words: usize,
     /// The plan's nodes.
@@ -76,15 +132,63 @@ struct Planner<'a> {
     /// A hyperedge with the same sides as the one linked before it is left
     /// out, as it can't change whether a join is valid.
     hypers: u32,
+    /// For each relation of the units being planned, its unit.
+    label: SlowVec<u8>,
+    /// The edges between the units being planned.
+    links: SlowVec<Link>,
+    /// For each unit, the units an edge of one relation a side joins it to.
+    adjacent: [u64; UNITS_MAX],
+    /// Whether an edge between the units has a side of more than one.
+    hyper: bool,
+    /// The units being planned.
+    full: u64,
+    /// While counting visits, how many more there may be.
+    visits: usize,
+    /// The cheapest tree of each connected set of units, by `find`.
+    plans: SlowVec<Plan>,
 }
 
-/// Plans a graph of three relations or more: GOO, as above.
+/// Plans a graph of three relations or more, as above.
 pub fn plan(allocator: &dyn Allocator, graph: &QueryGraph) -> Result<JoinTree, Error> {
+    let count = graph.relations.len();
     let mut planner = Planner::new(allocator, graph)?;
+    if count <= UNITS_MAX {
+        // Each relation is a unit, and the root is the last node.
+        let (mut units, mut slots) = ([0; UNITS_MAX], [0; UNITS_MAX]);
+        #[expect(clippy::cast_possible_truncation, reason = "at most `UNITS_MAX`")]
+        for relation in 0..count as u32 {
+            *at_mut!(units, relation as usize) = relation;
+            *at_mut!(slots, relation as usize) = count as u32 + relation - 1;
+            *at_mut!(planner.label, relation as usize) = relation as u8;
+        }
+        // The root.
+        *at_mut!(slots, 0) = *at!(slots, count - 2) + 1;
+        planner.links(NONE, count)?;
+        // A graph of n relations has at most 2^n connected sets.
+        let small = (count <= SMALL_MAX).then_some(1 << count);
+        if let Some(found) = small.or_else(|| planner.count(count, VISITS_MAX)) {
+            planner.plans = SlowVec::fixed(allocator, table(found, count))?;
+            if planner.solve(at!(units, ..count), at!(slots, ..count - 1), found, false)? {
+                return planner.tree(allocator);
+            }
+        }
+    }
+    planner.plans = SlowVec::fixed(allocator, table(1 << WINDOW, WINDOW))?;
     if !planner.greedy() {
         return as_written(allocator, graph);
     }
+    // Joins come after their children, so each window's subtrees have
+    // already been improved.
+    #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
+    for root in count as u32..2 * count as u32 - 1 {
+        planner.refine(root)?;
+    }
     planner.tree(allocator)
+}
+
+/// The length of a hash table for `sets` sets and `units` units.
+fn table(sets: usize, units: usize) -> usize {
+    (2 * (sets + units)).next_power_of_two()
 }
 
 /// The first relation of `set`, and whether it has more than one.
@@ -116,6 +220,7 @@ fn meets(side: &RelationSet, set: &[u64]) -> (bool, bool) {
 }
 
 impl<'a> Planner<'a> {
+    /// A planner, with no room for plans yet.
     fn new(allocator: &dyn Allocator, graph: &'a QueryGraph) -> Result<Planner<'a>, Error> {
         let count = graph.relations.len();
         let words = count.div_ceil(64);
@@ -129,8 +234,28 @@ impl<'a> Planner<'a> {
         let nodes = SlowVec::fixed_from(allocator, nodes)?;
         let sets = SlowVec::zeroed(allocator, (2 * count - 1) * words)?;
         let edges = SlowVec::fixed(allocator, graph.edges.len())?;
-        let (work, hypers) = (WORK_MAX, NONE);
-        let mut planner = Planner { graph, estimator, work, words, nodes, sets, edges, hypers };
+        let label = SlowVec::zeroed(allocator, count)?;
+        let links = SlowVec::new(allocator, LIST_MAX)?;
+        let plans = SlowVec::fixed(allocator, 0)?;
+        let (work, crossing, hypers) = (WORK_MAX, false, NONE);
+        let mut planner = Planner {
+            graph,
+            estimator,
+            work,
+            crossing,
+            words,
+            nodes,
+            sets,
+            edges,
+            hypers,
+            label,
+            links,
+            adjacent: [0; UNITS_MAX],
+            hyper: false,
+            full: 0,
+            visits: 0,
+            plans,
+        };
         for relation in 0..count {
             *at_mut!(planner.sets, relation * words + relation / 64) |= 1 << (relation % 64);
         }
@@ -328,6 +453,7 @@ impl<'a> Planner<'a> {
                 }
                 // The graph isn't connected: join the first relation's tree
                 // to another tree.
+                self.crossing = true;
                 a = at!(self.nodes, 0).place;
                 let relations = at!(self.nodes, ..relations).iter();
                 b = relations.map(|relation| relation.place).find(|&b| b != a).unwrap_or(a);
@@ -355,6 +481,348 @@ impl<'a> Planner<'a> {
             e = if e + 1 == graph.edges.len() { 0 } else { e + 1 };
         }
         self.estimator.finish()
+    }
+
+    /// Replaces the joins under `root` by the cheapest tree of up to `WINDOW`
+    /// of its subtrees, its units. The units are `root`'s children at first.
+    /// Then the unit that makes the most rows and is a join is replaced by
+    /// its children, until there are `WINDOW`.
+    #[inline(never)]
+    fn refine(&mut self, root: u32) -> Result<(), Error> {
+        if self.work == 0 {
+            return Ok(());
+        }
+        let mut units = [NONE; WINDOW];
+        // The joins the units are replaced from, which take the new joins.
+        let mut slots = [NONE; WINDOW];
+        let top = *at!(self.nodes, root as usize);
+        (units[0], units[1], slots[0]) = (top.left, top.right, root);
+        let mut k = 2;
+        while k < WINDOW {
+            // The unit that makes the most rows and is a join, if any.
+            let (mut i, mut rows) = (k, -1.0);
+            for (unit, at) in at!(units, ..k).iter().zip(0..) {
+                let node = at!(self.nodes, *unit as usize);
+                if node.right != NONE && node.rows > rows {
+                    (i, rows) = (at, node.rows);
+                }
+            }
+            if i == k {
+                break;
+            }
+            let unit = *at!(units, i);
+            let node = at!(self.nodes, unit as usize);
+            (*at_mut!(slots, k - 1), *at_mut!(units, k), *at_mut!(units, i)) =
+                (unit, node.right, node.left);
+            k += 1;
+        }
+        if k < 3 {
+            return Ok(());
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `WINDOW`")]
+        for (i, &unit) in at!(units, ..k).iter().enumerate() {
+            for w in 0..self.words {
+                let mut word = *at!(self.sets, unit as usize * self.words + w);
+                while word != 0 {
+                    *at_mut!(self.label, w * 64 + word.trailing_zeros() as usize) = i as u8;
+                    word &= word - 1;
+                }
+            }
+        }
+        self.links(root, k)?;
+        self.solve(at!(units, ..k), at!(slots, ..k - 1), 1 << k, true)?;
+        Ok(())
+    }
+
+    /// Finds the edges between `units` units, which `label` gives, of the
+    /// edges whose relations are all under `root`, or of all if `root` is
+    /// `NONE`.
+    #[inline(never)]
+    fn links(&mut self, root: u32, units: usize) -> Result<(), Error> {
+        self.work = self.work.saturating_sub(self.read_cost() * self.edges.len());
+        self.links.clear();
+        (self.adjacent, self.hyper) = ([0; UNITS_MAX], false);
+        #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
+        'edges: for edge in 0..self.edges.len() as u32 {
+            let mut sides = [0_u64; 2];
+            for (right, side) in sides.iter_mut().enumerate() {
+                let e = edge as usize;
+                if root != NONE && !self.meets(e, right, self.set(root)).1 {
+                    continue 'edges;
+                }
+                *side = if *at!(at!(self.edges, e).more, right) {
+                    let side = self.side(e, right);
+                    (0..side.words()).fold(0, |units, w| {
+                        let mut word = side.word(w);
+                        let mut units = units;
+                        while word != 0 {
+                            let relation = w * 64 + word.trailing_zeros() as usize;
+                            units |= 1 << at!(self.label, relation);
+                            word &= word - 1;
+                        }
+                        units
+                    })
+                } else {
+                    1 << at!(self.label, *at!(at!(self.edges, e).first, right) as usize)
+                };
+            }
+            let [left, right] = sides;
+            if (left | right).is_power_of_two() {
+                continue;
+            }
+            self.links.push(Link { sides, edge })?;
+            if left.is_power_of_two() && right.is_power_of_two() {
+                *at_mut!(self.adjacent, left.trailing_zeros() as usize) |= right;
+                *at_mut!(self.adjacent, right.trailing_zeros() as usize) |= left;
+            } else {
+                self.hyper = true;
+            }
+        }
+        self.full = u64::MAX >> (UNITS_MAX - units);
+        Ok(())
+    }
+
+    /// How many connected sets of the first `units` units, and pairs of them,
+    /// `DPhyp` visits, if fewer than `limit`. With hyperedges, it counts some
+    /// sets that aren't connected and pairs that can't be joined.
+    #[inline(never)]
+    fn count(&mut self, units: usize, limit: usize) -> Option<usize> {
+        self.visits = limit;
+        self.enumerate(units, false);
+        (self.visits > 0).then(|| limit - self.visits)
+    }
+
+    /// Finds the cheapest tree of each connected set of `units`, of which
+    /// there are at most `sets`, and if there's one of them all, makes
+    /// it, putting its joins in `slots`. Returns whether it did.
+    ///
+    /// If `every`, it tries every split of every set rather than `DPhyp`'s
+    /// pairs. In a window that's as cheap, and `DPhyp`'s other choice between
+    /// trees of the same cost made some plans of the generated graphs four
+    /// times as costly.
+    #[inline(never)]
+    fn solve(
+        &mut self,
+        units: &[u32],
+        slots: &[u32],
+        sets: usize,
+        every: bool,
+    ) -> Result<bool, Error> {
+        self.plans.clear();
+        self.plans.extend_within(repeat_n(NO_PLAN, table(sets, units.len())));
+        for (i, &unit) in units.iter().enumerate() {
+            let (set, slot) = (1 << i, self.find(1 << i));
+            *at_mut!(self.plans, slot) = Plan { set, cost: 0.0, rows: self.rows(unit), split: 0 };
+        }
+        if every {
+            check!(units.len() <= WINDOW);
+            // Each split of a set is tried once: the left side holds its
+            // lowest unit. Its sides' trees are done, as they're smaller sets.
+            for set in 3..=self.full {
+                let low = set.isolate_lowest_one();
+                let rest = set ^ low;
+                let mut sub = rest;
+                while sub != 0 {
+                    sub = (sub - 1) & rest;
+                    if self.has(sub | low) && self.has(rest ^ sub) {
+                        self.pair(sub | low, rest ^ sub);
+                    }
+                }
+            }
+        } else {
+            // It visits no more than were counted, or than `SMALL_MAX` units have.
+            self.enumerate(units.len(), true);
+        }
+        let full = self.find(self.full);
+        if at!(self.plans, full).set != self.full {
+            return Ok(false);
+        }
+        self.build(units, &mut slots.iter().rev(), self.full)?;
+        Ok(true)
+    }
+
+    /// Joins each pair of connected sets of the first `units` units if
+    /// `solve`, or counts them.
+    fn enumerate(&mut self, units: usize, solve: bool) {
+        for unit in (0..units).rev() {
+            let set = 1 << unit;
+            self.complements(set, solve);
+            self.subgraphs(set, set | (set - 1), solve);
+        }
+    }
+
+    /// The units an edge joins to all of `set`, outside `set` and `excluded`:
+    /// for a side of more than one unit, its lowest.
+    #[inline(never)]
+    fn neighbors(&mut self, set: u64, excluded: u64) -> u64 {
+        self.work = self.work.saturating_sub(self.links.len());
+        let outside = self.full & !(set | excluded);
+        if self.crossing {
+            return outside;
+        }
+        let (mut near, mut rest) = (0, set);
+        while rest != 0 {
+            near |= at!(self.adjacent, rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
+        near &= outside;
+        for link in self.links.iter().filter(|_| self.hyper) {
+            let [left, right] = link.sides;
+            if left & !set == 0 && right & !outside == 0 {
+                near |= right.isolate_lowest_one();
+            }
+            if right & !set == 0 && left & !outside == 0 {
+                near |= left.isolate_lowest_one();
+            }
+        }
+        near
+    }
+
+    /// Joins each connected set that grows from `set` outside `excluded` to
+    /// the sets beside it, or counts those sets and pairs.
+    fn subgraphs(&mut self, set: u64, excluded: u64, solve: bool) {
+        let near = self.neighbors(set, excluded);
+        for grow in [false, true] {
+            let mut more = 0_u64;
+            loop {
+                more = more.wrapping_sub(near) & near;
+                if more == 0 || !solve && self.visits == 0 {
+                    break;
+                }
+                if !solve && !grow {
+                    self.visits -= 1;
+                }
+                if grow {
+                    self.subgraphs(set | more, excluded | near, solve);
+                } else if !solve || self.has(set | more) {
+                    self.complements(set | more, solve);
+                }
+            }
+        }
+    }
+
+    /// Joins the connected set `left` to each connected set beside it above
+    /// its lowest unit, so that each pair is joined once, or counts them.
+    fn complements(&mut self, left: u64, solve: bool) {
+        let excluded = left | (left.isolate_lowest_one() - 1);
+        let near = self.neighbors(left, excluded);
+        let mut rest = near;
+        while rest != 0 {
+            let unit = 1 << rest.ilog2();
+            rest ^= unit;
+            self.grow(left, unit, excluded | near & (unit | (unit - 1)), solve);
+        }
+    }
+
+    /// Joins `left` to `right` and to each connected set that grows from
+    /// `right` outside `excluded`, or counts them.
+    fn grow(&mut self, left: u64, right: u64, excluded: u64, solve: bool) {
+        if !solve {
+            if self.visits == 0 {
+                return;
+            }
+            self.visits -= 1;
+        } else if self.has(right) {
+            self.pair(left, right);
+        }
+        let near = self.neighbors(right, excluded);
+        let mut more = 0_u64;
+        loop {
+            more = more.wrapping_sub(near) & near;
+            if more == 0 {
+                break;
+            }
+            self.grow(left, right | more, excluded | near, solve);
+        }
+    }
+
+    /// The slot of `set` in `plans`, or the empty slot it would take.
+    #[inline(never)]
+    fn find(&self, set: u64) -> usize {
+        let mask = self.plans.len() - 1;
+        let mut i = (set.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & mask;
+        for _ in 0..=mask {
+            let found = at!(self.plans, i).set;
+            if found == 0 || found == set {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+        // The table has room for every set it's given.
+        failed!()
+    }
+
+    /// Whether `set` has a tree.
+    fn has(&self, set: u64) -> bool {
+        at!(self.plans, self.find(set)).set == set
+    }
+
+    /// Makes the join of units `left` and `right` the cheapest tree of both,
+    /// if it can be joined and is cheaper.
+    #[inline(never)]
+    fn pair(&mut self, left: u64, right: u64) {
+        let (l, r) = (*at!(self.plans, self.find(left)), *at!(self.plans, self.find(right)));
+        let set = left | right;
+        let i = self.find(set);
+        let found = *at!(self.plans, i);
+        let fresh = found.set != set;
+        if l.set != left || r.set != right || !self.joins(set, left, right, [l.rows, r.rows], fresh)
+        {
+            return;
+        }
+        let rows = if fresh { self.estimator.finish() } else { found.rows };
+        let cost = l.cost + r.cost + rows.max(1.0);
+        if fresh || cost < found.cost {
+            *at_mut!(self.plans, i) = Plan { set, cost, rows, split: left };
+        }
+    }
+
+    /// Whether units `left` and `right`, which together are `set`, can be
+    /// joined: an edge joins them, and every edge whose relations they bring
+    /// together applies. If `estimate`, it estimates the join's rows from
+    /// those of each side.
+    fn joins(&mut self, set: u64, left: u64, right: u64, rows: [f64; 2], estimate: bool) -> bool {
+        self.work = self.work.saturating_sub(self.links.len());
+        if estimate {
+            self.estimator.start(rows[0], rows[1]);
+        }
+        let mut any = self.crossing;
+        for link in self.links.iter() {
+            let [l, r] = link.sides;
+            let both = l | r;
+            if both & !set != 0 || both & !left == 0 || both & !right == 0 {
+                continue;
+            }
+            let forward = l & !left == 0 && r & !right == 0;
+            if !(forward || l & !right == 0 && r & !left == 0) {
+                return false;
+            }
+            if estimate {
+                self.estimator.apply(at!(self.graph.edges, link.edge as usize), forward);
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// Makes the cheapest tree of the units in `set`, putting its joins in
+    /// `slots`, and returns its root.
+    #[inline(never)]
+    fn build(
+        &mut self,
+        units: &[u32],
+        slots: &mut core::iter::Rev<core::slice::Iter<'_, u32>>,
+        set: u64,
+    ) -> Result<u32, Error> {
+        if set.is_power_of_two() {
+            return Ok(*at!(units, set.trailing_zeros() as usize));
+        }
+        let plan = *at!(self.plans, self.find(set));
+        let left = self.build(units, slots, plan.split)?;
+        let right = self.build(units, slots, set ^ plan.split)?;
+        let Some(&slot) = slots.next() else { failed!() };
+        self.join(slot, left, right, plan.rows);
+        Ok(slot)
     }
 
     /// The plan as a `JoinTree`, whose nodes are the planner's, in the same
@@ -407,12 +875,35 @@ mod tests {
 
     #[test]
     fn plans_are_valid_and_no_worse_than_written() {
-        for count in [3, 10, 70] {
+        for count in [3, 10, 13, 70] {
             let graph = cycle(count);
             let planned = cost(&Heap, &graph, &enumerate(&Heap, &graph).unwrap()).unwrap();
             let written = cost(&Heap, &graph, &as_written(&Heap, &graph).unwrap()).unwrap();
             assert!(planned.valid.is_ok() && planned.cost <= written.cost);
         }
+    }
+
+    /// A chain of 50 relations, each left joined to all those before it.
+    /// It's planned exactly, as it has few connected sets, but has too many
+    /// relations for each set of them to be read.
+    #[test]
+    fn long_graphs_with_few_connected_sets_are_planned_exactly() {
+        let mut graph = QueryGraph::new(&Heap).unwrap();
+        for relation in 0..50_u32 {
+            let rows = 10 + u64::from(relation * 7919 % 1000);
+            graph.relations.push(Relation { rows, unfiltered_rows: rows }).unwrap();
+            graph.equivalences.push(EquivalenceSet { domain: rows }).unwrap();
+            let (mut left, mut right) =
+                (RelationSet::new(&Heap).unwrap(), RelationSet::new(&Heap).unwrap());
+            (0..relation).for_each(|before| left.insert(before).unwrap());
+            right.insert(relation).unwrap();
+            if relation > 0 {
+                let (kind, equivalence) = (JoinKind::Left, relation);
+                graph.edges.push(JoinEdge { left, right, kind, equivalence }).unwrap();
+            }
+        }
+        let planned = cost(&Heap, &graph, &enumerate(&Heap, &graph).unwrap()).unwrap();
+        assert!(planned.valid.is_ok());
     }
 
     #[test]
