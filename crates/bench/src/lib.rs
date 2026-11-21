@@ -9,6 +9,9 @@ use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::join::JoinOp;
+use pipit_kernel::join_order::{
+    EquivalenceSet, JoinEdge, JoinKind, QueryGraph, Relation, RelationSet, enumerate,
+};
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
@@ -779,4 +782,38 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
     optimize(&Heap, &mut plan).expect("optimizes");
     let planned = plan_nodes(&Heap, &plan).expect("plans");
     lower(&Heap, &mut plan, &planned).expect("lowers")
+}
+
+/// A query graph of `count` tables. If `star`, each table joins the first
+/// one; if not, each joins the one before it. Each join is many-to-one on the
+/// smaller table's key, and the tables' rows differ, so the order matters.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn join_graph(star: bool, count: u32) -> QueryGraph {
+    let set = |relation: u32| {
+        let mut set = RelationSet::new(&Heap).expect("allocates");
+        set.insert(relation).expect("allocates");
+        set
+    };
+    let mut graph = QueryGraph::new(&Heap).expect("allocates");
+    for relation in 0..count {
+        let rows = 100 + u64::from(relation) * 2_654_435_761 % 100_000;
+        graph.relations.push(Relation { rows, unfiltered_rows: rows }).expect("allocates");
+        let Some(before) = relation.checked_sub(1) else { continue };
+        let other = if star { 0 } else { before };
+        let domain = rows.min(graph.relations.get(other as usize).expect("added").rows);
+        graph.equivalences.push(EquivalenceSet { domain }).expect("allocates");
+        let edge = JoinEdge {
+            left: set(other),
+            right: set(relation),
+            kind: JoinKind::Inner,
+            equivalence: before,
+        };
+        graph.edges.push(edge).expect("allocates");
+    }
+    graph
+}
+
+/// Plans the joins of `graph`, and returns how many nodes the plan has.
+pub fn plan_joins(graph: &QueryGraph) -> usize {
+    enumerate(&Heap, graph).map_or(0, |tree| tree.nodes.len())
 }
