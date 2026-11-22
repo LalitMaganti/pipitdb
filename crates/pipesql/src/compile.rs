@@ -323,6 +323,9 @@ mod tests {
             for (&c, (_, values)) in physical.columns().iter().zip(&mut columns) {
                 let column = batch.column(c.position);
                 values.extend(rows.iter().map(|&row| match column.data_type() {
+                    // A null, which no test value is.
+                    #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+                    _ if column.is_null(row as u32) => f64::NEG_INFINITY,
                     #[expect(clippy::cast_precision_loss, reason = "small test values")]
                     DataType::Int64 => column.int64s()[row] as f64,
                     DataType::Float64 => column.float64s()[row],
@@ -367,6 +370,19 @@ mod tests {
         assert_eq!(error("FROM t |> CROSS JOIN ids"), (ErrorCode::Unsupported, 21));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
+    }
+
+    #[test]
+    fn computes_logic() {
+        // `AND`, `OR` and `NOT`, null only where unknown: `x` is 1, then null.
+        let null = f64::NEG_INFINITY;
+        assert_eq!(kept("FROM n |> SELECT x = 1 AND x = 1 AS y"), [1.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x = 2 AND x = 1 AS y"), [0.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x = 1 OR x IS NULL AS y"), [1.0, 1.0]);
+        assert_eq!(kept("FROM n |> SELECT x = 2 OR x = 1 AS y"), [1.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x IS NULL AND x = 1 AS y"), [0.0, null]);
+        assert_eq!(kept("FROM n |> SELECT NOT x = 1 AS y"), [0.0, null]);
+        assert_eq!(error("FROM t |> SELECT s AND a = 1 AS y"), (ErrorCode::NumberCondition, 17));
     }
 
     #[test]
