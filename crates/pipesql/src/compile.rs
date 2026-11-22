@@ -119,7 +119,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
-        let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
+        let node = self.plan.add_node(op, &[])?;
         Ok(Relation { node, columns })
     }
 

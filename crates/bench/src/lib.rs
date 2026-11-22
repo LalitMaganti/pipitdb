@@ -763,7 +763,7 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
             bound[i as usize] = Some(binding);
         }
         let op = DynOp::new(&Heap, ScanOp::new(table, reads)).expect("allocates");
-        let node = plan.add_node(op, SlowVec::fixed(&Heap, 0).expect("allocates"));
+        let node = plan.add_node(op, &[]);
         (node.expect("allocates"), bound.map(|b| b.expect("bound")))
     };
     let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
@@ -772,8 +772,8 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
         let build_columns = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).expect("allocates");
         let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns };
-        let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).expect("allocates");
-        plan.add_node(DynOp::new(&Heap, op).expect("allocates"), children).expect("allocates");
+        let children = [probe, build];
+        plan.add_node(DynOp::new(&Heap, op).expect("allocates"), &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }
     optimize(&Heap, &mut plan).expect("optimizes");

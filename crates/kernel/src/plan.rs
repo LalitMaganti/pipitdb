@@ -13,6 +13,7 @@ use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
 use crate::function::DynFunction;
+use crate::inline_vec::InlineVec;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
@@ -446,8 +447,14 @@ impl<'c> DynOp<'c> {
 /// An operation, and the nodes whose rows it reads.
 pub struct PlanNode<'c> {
     pub op: DynOp<'c>,
-    pub children: SlowVec<PlanNodeId>,
+    pub children: Children,
 }
+
+/// The most nodes a node reads, as a join does.
+pub const CHILDREN_MAX: usize = 2;
+
+/// The nodes a node reads, in order.
+pub type Children = InlineVec<PlanNodeId, CHILDREN_MAX>;
 
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
@@ -533,10 +540,10 @@ impl<'c> LogicalPlan<'c> {
     pub fn add_node(
         &mut self,
         op: DynOp<'c>,
-        children: SlowVec<PlanNodeId>,
+        children: &[PlanNodeId],
     ) -> Result<PlanNodeId, AllocError> {
         let id = self.nodes.len() as PlanNodeId;
-        self.nodes.push(PlanNode { op, children })?;
+        self.nodes.push(PlanNode { op, children: Children::from_slice(children)? })?;
         self.root = id;
         Ok(id)
     }
