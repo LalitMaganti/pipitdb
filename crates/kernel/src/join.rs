@@ -242,7 +242,7 @@ impl Operator for Join<'_> {
             _ => failed!(),
         }
         let mut gathered = RowBatch::new();
-        built.rows.gather(context, &mut gathered, matched, 0, |_, _| failed!())?;
+        built.rows.gather(context, &mut gathered, matched, 0, &mut |_, _| failed!())?;
         for c in 0..gathered.column_count() {
             let Ok(()) = output.push_column(gathered.column(c).clone()) else { failed!() };
         }
