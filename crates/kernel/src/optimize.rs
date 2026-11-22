@@ -14,6 +14,11 @@ pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result
     prune_columns(allocator, plan)?;
     answer_from_summaries(allocator, plan)?;
     place_filters(allocator, plan)?;
+    // Filters are now as low as they go: an outer join made inner by one
+    // above it lets them go lower.
+    if simplify_outer_joins(plan) {
+        place_filters(allocator, plan)?;
+    }
     push_down_conditions(allocator, plan)?;
     choose_forms(allocator, plan)
 }
@@ -196,6 +201,22 @@ fn move_one_filter(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// Simplifies each op given the op that reads it, such as an outer join
+/// into an inner one: see `Op::simplify_under`. Returns whether any
+/// changed.
+fn simplify_outer_joins(plan: &mut LogicalPlan<'_>) -> bool {
+    let mut changed = false;
+    for id in 0..plan.nodes.len() {
+        // Children are added before their parents.
+        let (below, rest) = plan.nodes.split_at_mut(id);
+        let above = &at!(rest, 0).op;
+        for &child in at!(rest, 0).children.iter() {
+            changed |= at_mut!(below, child as usize).op.simplify_under(above);
+        }
+    }
+    changed
 }
 
 /// Makes every node that reads node `id` read `child` instead, leaving `id`

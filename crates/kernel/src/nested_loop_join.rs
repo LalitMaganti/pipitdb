@@ -17,7 +17,7 @@ use crate::group_table::{GroupTable, KEYS_MAX, NONE};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Given, Op, PlanNode};
+use crate::plan::{ColumnId, DynOp, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::row_store::RowStore;
 use crate::selection::{Kept, Selection};
@@ -102,6 +102,18 @@ impl<'c> Op<'c> for NestedLoopJoinOp {
             return Some(0);
         }
         (self.kind == JoinKind::Inner).then_some(1)
+    }
+
+    /// A left join under an op that drops every row with nulls for the
+    /// build columns, such as a filter on `b.x > 1`, keeps no unmatched
+    /// probe row, so is an inner join, whose conditions can move.
+    fn simplify_under(&mut self, above: &DynOp<'c>) -> bool {
+        let rejected = above.rejects_nulls(&|column| self.is_build_column(column));
+        if self.kind != JoinKind::Left || !rejected {
+            return false;
+        }
+        self.kind = JoinKind::Inner;
+        true
     }
 
     /// The probe side's columns, as they are. The build side's it outputs

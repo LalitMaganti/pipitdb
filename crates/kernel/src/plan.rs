@@ -184,6 +184,21 @@ pub trait Op<'c> {
         Ok(false)
     }
 
+    /// Whether this drops every row where all of `columns` are null, as a
+    /// filter on `x > 1` does for `x`. By default, it doesn't.
+    fn rejects_nulls(&self, columns: &dyn Fn(ColumnId) -> bool) -> bool {
+        let _ = columns;
+        false
+    }
+
+    /// Simplifies this given `above`, the op that reads it, such as an
+    /// outer join into an inner one when `above` drops the rows it adds
+    /// nulls to. Returns whether it changed. By default, nothing.
+    fn simplify_under(&mut self, above: &DynOp<'c>) -> bool {
+        let _ = above;
+        false
+    }
+
     /// What this needs of the rows of input `input`. By default, nothing.
     fn needs(&self, input: u32) -> InputNeeds<'_> {
         let _ = input;
@@ -263,6 +278,8 @@ struct OpFunctions<'c> {
     answer: Answer<'c>,
     moves_condition: unsafe fn(NonNull<()>, ColumnId) -> Option<u32>,
     split_below: SplitBelow<'c>,
+    rejects_nulls: unsafe fn(NonNull<()>, &dyn Fn(ColumnId) -> bool) -> bool,
+    simplify_under: unsafe fn(NonNull<()>, &DynOp<'c>) -> bool,
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -315,6 +332,10 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         split_below: |op, allocator, below| unsafe {
             value_mut_of::<T>(op).split_below(allocator, below)
         },
+        // SAFETY: as for `reads`.
+        rejects_nulls: |op, columns| unsafe { value_of::<T>(op).rejects_nulls(columns) },
+        // SAFETY: as for `prune`.
+        simplify_under: |op, above| unsafe { value_mut_of::<T>(op).simplify_under(above) },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -405,6 +426,17 @@ impl<'c> DynOp<'c> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
         unsafe { (self.functions.split_below)(self.op.as_ptr(), allocator, below) }
+    }
+
+    pub(crate) fn rejects_nulls(&self, columns: &dyn Fn(ColumnId) -> bool) -> bool {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.rejects_nulls)(self.op.as_ptr(), columns) }
+    }
+
+    pub(crate) fn simplify_under(&mut self, above: &DynOp<'c>) -> bool {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.simplify_under)(self.op.as_ptr(), above) }
     }
 
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
@@ -764,6 +796,11 @@ impl<'c> Op<'c> for FilterOp {
         } else {
             Forms::FLAT | Forms::CONSTANT
         }
+    }
+
+    /// Whether its predicate is never true where `columns` are null.
+    fn rejects_nulls(&self, columns: &dyn Fn(ColumnId) -> bool) -> bool {
+        self.predicate.rejects_nulls(columns)
     }
 
     /// Splits off the conjuncts of its predicate that `below` can apply to

@@ -229,6 +229,50 @@ impl Predicate {
         Ok(Some(Predicate::checked(nodes, self.values.clone())))
     }
 
+    /// Whether this is never true for a row where every column `null` says
+    /// is null, whatever the others are: as `x > 1` for `x`, but not
+    /// `x IS NULL`, nor `x > 1 OR y > 1`.
+    pub fn rejects_nulls(&self, null: &dyn Fn(u32) -> bool) -> bool {
+        // What each node can be, by SQL's logic: a bit each for true, false
+        // and null. `OR` is `NOT (NOT a AND NOT b)` in it too.
+        const TRUE: u8 = 1;
+        const FALSE: u8 = 2;
+        const NULL: u8 = 4;
+        let not = |a: u8| {
+            let swapped =
+                if a & TRUE != 0 { FALSE } else { 0 } | if a & FALSE != 0 { TRUE } else { 0 };
+            (a & NULL) | swapped
+        };
+        let and = |a: u8, b: u8| {
+            let unknown = |x: u8, y: u8| x & NULL != 0 && y & (TRUE | NULL) != 0;
+            let mut can = 0;
+            if a & b & TRUE != 0 {
+                can |= TRUE;
+            }
+            if (a | b) & FALSE != 0 {
+                can |= FALSE;
+            }
+            if unknown(a, b) || unknown(b, a) {
+                can |= NULL;
+            }
+            can
+        };
+        let mut can = [0_u8; PREDICATE_NODES_MAX];
+        for (i, node) in self.nodes.iter().enumerate() {
+            let is = |i: u32| *at!(can, i as usize);
+            *at_mut!(can, i) = match *node {
+                Node::Leaf(Leaf::IsNull { column }) if null(column) => TRUE,
+                Node::Leaf(Leaf::IsNull { .. }) => TRUE | FALSE,
+                Node::Leaf(leaf) if null(leaf.column()) => NULL,
+                Node::Leaf(_) => TRUE | FALSE | NULL,
+                Node::Not(a) => not(is(a)),
+                Node::And(a, b) => and(is(a), is(b)),
+                Node::Or(a, b) => not(and(not(is(a)), not(is(b)))),
+            };
+        }
+        self.nodes.last().is_some() && at!(can, self.nodes.len() - 1) & TRUE == 0
+    }
+
     /// Splits its top-level conjuncts by where they can go. A conjunct whose
     /// columns `place` puts all in the same input, 0 or 1, goes to that
     /// input; any other stays. Returns the conjuncts that stay, then those
@@ -760,6 +804,22 @@ mod tests {
             Kept::None => StdVec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
         }
+    }
+
+    #[test]
+    fn knows_what_rejects_nulls() {
+        const X: Expr = Expr::Greater(0, 1);
+        const Y: Expr = Expr::Greater(1, 1);
+        let rejects =
+            |expr: &Expr, null: &[u32]| predicate_of(expr).rejects_nulls(&|c| null.contains(&c));
+        assert!(rejects(&X, &[0]) && !rejects(&X, &[1]));
+        assert!(!rejects(&Expr::IsNull(0), &[0]));
+        assert!(rejects(&Expr::Not(&Expr::IsNull(0)), &[0]));
+        // `NOT NULL` is null.
+        assert!(rejects(&Expr::Not(&X), &[0]));
+        assert!(rejects(&Expr::And(&X, &Y), &[0]));
+        assert!(!rejects(&Expr::Or(&X, &Y), &[0]) && rejects(&Expr::Or(&X, &Y), &[0, 1]));
+        assert!(!rejects(&Expr::Or(&X, &Expr::IsNull(0)), &[0]));
     }
 
     #[test]

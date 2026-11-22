@@ -12,6 +12,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::expression::{Expr, ExprOp, ExprStep};
+use pipit_kernel::filter::{Comparison, Value};
 use pipit_kernel::lower::lower;
 use pipit_kernel::nested_loop_join::{JoinKind, NestedLoopJoinOp};
 use pipit_kernel::optimize::optimize;
@@ -117,6 +118,7 @@ fn condition(on: On, [pk, pv, bk, bv]: [u32; 4]) -> Option<Expr> {
 enum Above {
     Nothing,
     IsNull,
+    Positive,
 }
 
 /// Each output row's probe `v`, and build `v` if the kind outputs it, of
@@ -138,7 +140,11 @@ fn join(
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(&Heap, join).unwrap(), &children).unwrap();
     if above != Above::Nothing {
-        let leaf = Node::Leaf(Leaf::IsNull { column: build_v.id });
+        let (column, value) = (build_v.id, Value::Int64(0));
+        let leaf = match above {
+            Above::IsNull => Node::Leaf(Leaf::IsNull { column }),
+            _ => Node::Leaf(Leaf::Compare { column, comparison: Comparison::Greater, value }),
+        };
         let nodes = SlowVec::fixed_from(&Heap, [leaf].into_iter()).unwrap();
         let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
         let children = [join];
@@ -207,6 +213,7 @@ fn expected(
     match above {
         Above::Nothing => {}
         Above::IsNull => rows.retain(|&(_, b)| b.is_none()),
+        Above::Positive => rows.retain(|&(_, b)| b.is_some_and(|b| b > 0)),
     }
     rows.sort_unstable();
     rows
@@ -276,4 +283,21 @@ fn keeps_a_null_test_on_the_build_side_above_a_left_join() {
     let (rows, _) = join(&probe, &build, JoinKind::Left, op, Above::IsNull);
     assert_eq!(rows, [(1, None)]);
     assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, op, Above::IsNull));
+}
+
+#[test]
+fn makes_a_left_join_inner_under_a_filter_that_drops_its_nulls() {
+    // `build.v > 0` drops every probe row with nulls for the build side, so
+    // the join is inner, and the filter moves to the build side's scan.
+    let probe_keys = [Some(1), Some(2), Some(3)];
+    let build_keys = [Some(1), Some(3), Some(3)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    let op = On::Equal;
+    let (rows, shape) = join(&probe, &build, JoinKind::Left, op, Above::Positive);
+    assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, op, Above::Positive));
+    assert_eq!(rows, [(2, Some(1)), (2, Some(2))]);
+    assert_eq!(shape, [2, 0, 1, 0]);
+    // `IS NULL` keeps them, so the join stays left, under the filter.
+    let (_, shape) = join(&probe, &build, JoinKind::Left, op, Above::IsNull);
+    assert_eq!(shape, [1, 2, 0, 0]);
 }

@@ -465,6 +465,8 @@ mod tests {
             kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a IS NULL |> SELECT id"),
             [11.0, 12.0]
         );
+        // A condition never true for nulls makes the join inner.
+        assert_eq!(kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a > 0 |> SELECT id"), [10.0]);
         let product =
             ([1.0, 2.0, 1.0, 2.0, 1.0, 2.0].into(), [10.0, 10.0, 11.0, 11.0, 12.0, 12.0].into());
         assert_eq!(joined("FROM t |> CROSS JOIN ids |> SELECT a, id"), product);
