@@ -109,6 +109,8 @@ pub enum Unsupported {
     GroupKey = 8,
     /// An `ORDER BY` key that isn't a column.
     OrderBy = 9,
+    /// A join, which can't be run yet.
+    Join = 10,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -40,6 +40,9 @@ pub enum Item {
     Clause(&'static [&'static str], Shared),
     /// These words, then a list, as `List` does: `Clause`, but required.
     After(&'static [&'static str], Shared),
+    /// This word, if the query has it next, as `OUTER` in `LEFT OUTER JOIN`:
+    /// an empty `List` either way.
+    Optional(&'static str),
 }
 
 /// The pieces of grammar stages are built from.

@@ -89,11 +89,46 @@ pub const ORDER_BY: Rule = Rule {
     compile: compile_order_by,
 };
 
+pub const JOIN: Rule = Rule {
+    keyword: "join",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    compile: compile_join,
+};
+
+pub const INNER_JOIN: Rule = Rule {
+    keyword: "inner",
+    point: Point::Stage,
+    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    compile: compile_join,
+};
+
+pub const LEFT_JOIN: Rule = Rule {
+    keyword: "left",
+    point: Point::Stage,
+    items: &[
+        Item::Optional("outer"),
+        Item::After(&["join"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+    ],
+    compile: compile_join,
+};
+
+pub const CROSS_JOIN: Rule = Rule {
+    keyword: "cross",
+    point: Point::Stage,
+    items: &[Item::After(&["join"], Shared::Name)],
+    compile: compile_join,
+};
+
 /// Selecting and filtering rows.
 pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
+
+/// Joining tables, apart, so a registry without it doesn't pay for it.
+pub const JOINS: &[Rule] = &[JOIN, INNER_JOIN, LEFT_JOIN, CROSS_JOIN];
 
 /// The aggregate functions, by name.
 const FUNCTIONS: [(&str, Function); 5] = [
@@ -125,6 +160,12 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
     compiler.plan.add_node(filter, children)?;
     Ok(())
+}
+
+/// `[INNER] JOIN t ON c`, `LEFT [OUTER] JOIN t ON c` and `CROSS JOIN t`,
+/// which can't be run yet.
+fn compile_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    Err(Error::unsupported(Unsupported::Join, compiler.span(stage)))
 }
 
 // These stages change which columns are in scope and what they're called,

@@ -22,10 +22,11 @@ use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::choices::CHOICES;
 use pipit_pipesql::compile::compile;
 use pipit_pipesql::registry::Registry;
-use pipit_pipesql::stages::{AGGREGATION, RELATIONAL};
+use pipit_pipesql::stages::{AGGREGATION, JOINS, RELATIONAL};
 
 /// Every stage and function PipeSQL comes with, but those behind features.
-static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[CHOICES]);
+static REGISTRY: Registry =
+    Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[CHOICES]);
 
 /// A table a query can read: its name, and its Parquet file.
 #[repr(C)]
