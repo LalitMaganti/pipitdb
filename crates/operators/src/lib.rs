@@ -10,5 +10,3 @@ pub mod table;
 
 #[cfg(test)]
 mod join_tests;
-#[cfg(test)]
-mod nested_loop_join_tests;

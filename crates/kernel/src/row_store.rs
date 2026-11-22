@@ -248,14 +248,15 @@ impl RowStore {
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
         // Found once for every column: a row held whole is its own place.
-        let mut found = [0_u32; BATCH_ROWS_MAX as usize];
+        let mut found = None;
         let places = if self.places.is_empty() {
             rows
         } else {
-            for (found, &row) in found.iter_mut().zip(rows) {
+            let mut buffer = context.indices_buffer(count as usize * 4)?;
+            for (found, &row) in buffer.as_mut_slice::<u32>().iter_mut().zip(rows) {
                 *found = self.place(row);
             }
-            at!(found, ..count as usize)
+            at!(found.insert(buffer).as_slice::<u32>(), ..count as usize)
         };
         let first_place = *at!(places, 0);
         let (held, start) = self.find(first_place);

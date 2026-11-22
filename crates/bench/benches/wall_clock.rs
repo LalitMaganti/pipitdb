@@ -75,12 +75,17 @@ fn scan(c: &mut Criterion) {
     group.finish();
 }
 
-/// 1M slices joined to 64K threads by id, by number or by hash, against
-/// scanning the slices alone.
+/// 1M slices joined to 64K threads by id: ids stored as a sequence, shuffled,
+/// or spread far apart, against scanning the slices alone.
 fn join(c: &mut Criterion) {
     let mut group = c.benchmark_group("join");
     group.throughput(Throughput::Elements(1 << 20));
-    let joins = [("scan", Joined::No), ("slice_thread", Joined::ById), ("hashed", Joined::ByHash)];
+    let joins = [
+        ("scan", Joined::No),
+        ("slice_thread", Joined::Ids),
+        ("shuffled", Joined::Shuffled),
+        ("spread", Joined::Spread),
+    ];
     for (name, joined) in joins {
         let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
         group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));

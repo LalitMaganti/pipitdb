@@ -8,9 +8,8 @@ use pipit_kernel::error::Error;
 use pipit_kernel::expression::{Compute, Expr, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
-use pipit_kernel::join::JoinOp;
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::{PhysicalPlan, lower};
-use pipit_kernel::nested_loop_join::{JoinKind, NestedLoopJoinOp};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::pipeline::{Execution, Pipeline};
@@ -705,15 +704,9 @@ pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
     plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
 }
 
-/// The op joining slices to threads `joined` says, on `utid = id`, which
-/// outputs `tid`.
+/// The op joining slices to threads on `utid = id`, which outputs `tid`.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-fn join_op(joined: Joined, utid: u32, id: u32, tid: u32) -> DynOp<'static> {
-    if joined == Joined::ById {
-        let build_columns = SlowVec::fixed_from(&Heap, [tid].into_iter()).expect("allocates");
-        let op = JoinOp { probe_key: utid, build_key: id, build_columns };
-        return DynOp::new(&Heap, op).expect("allocates");
-    }
+fn join_op(utid: u32, id: u32, tid: u32) -> DynOp<'static> {
     let step = |op, a, b| ExprStep {
         op,
         data_type: DataType::Int64,
@@ -726,20 +719,53 @@ fn join_op(joined: Joined, utid: u32, id: u32, tid: u32) -> DynOp<'static> {
     let steps =
         [step(ExprOp::Column, utid, 0), step(ExprOp::Column, id, 0), step(ExprOp::Eq, 0, 1)];
     let nodes = SlowVec::fixed_from(&Heap, steps.into_iter()).expect("allocates");
-    let build_columns = SlowVec::fixed_from(&Heap, [id, tid].into_iter()).expect("allocates");
-    let op =
-        NestedLoopJoinOp { kind: JoinKind::Inner, condition: Some(Expr { nodes }), build_columns };
+    let build_columns = SlowVec::fixed_from(&Heap, [tid].into_iter()).expect("allocates");
+    let op = JoinOp { kind: JoinKind::Inner, condition: Some(Expr { nodes }), build_columns };
     DynOp::new(&Heap, op).expect("allocates")
 }
 
-/// Whether `join_plan` joins the slices to their threads, and how.
+/// A flat column of `rows` of `values`.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+fn int64_column(values: &mut dyn Iterator<Item = i64>, rows: u32) -> ColumnView {
+    let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
+    for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
+        *slot = value;
+    }
+    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).expect("allocates")
+}
+
+/// Whether `join_plan` joins the slices to their threads, and how the
+/// threads' ids are, which decides how `JoinOp` finds a slice's thread.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Joined {
     No,
-    /// By `JoinOp`, which finds a thread by its id's number.
-    ById,
-    /// By `NestedLoopJoinOp`, which hashes the threads by id.
-    ByHash,
+    /// Stored as a sequence from 0: a thread is found by its id's number.
+    Ids,
+    /// 0 up, in another order: found in an array, by its id's number.
+    Shuffled,
+    /// Spread over 2^40: found by hashing.
+    Spread,
+}
+
+impl Joined {
+    /// The ids of the `rows` threads from `first`, of `threads`.
+    #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+    fn ids(self, context: &mut Context, first: u32, rows: u32, threads: u32) -> ColumnView {
+        if matches!(self, Joined::No | Joined::Ids) {
+            return ColumnView::sequence(context, i64::from(first), rows).expect("allocates");
+        }
+        int64_column(&mut (i64::from(first)..).map(|i| self.id(i, i64::from(threads))), rows)
+    }
+
+    /// Thread `i`'s id, where its ids are `threads`, a power of two.
+    fn id(self, i: i64, threads: i64) -> i64 {
+        match self {
+            Joined::No | Joined::Ids => i,
+            // Odd, so a bijection of a power of two's numbers.
+            Joined::Shuffled => i.wrapping_mul(40_503) & (threads - 1),
+            Joined::Spread => i.wrapping_mul(2_654_435_761) & ((1 << 40) - 1),
+        }
+    }
 }
 
 /// `slices` slices joined to their threads, of which there are `threads`,
@@ -750,31 +776,33 @@ pub enum Joined {
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'static> {
     let mut context = Context::new(&Heap);
-    let int64s = |values: &mut dyn Iterator<Item = i64>, rows: u32| {
-        let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
-        for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
-            *slot = value;
-        }
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).expect("allocates")
-    };
+    let int64s = int64_column;
     let groups = |rows: u32| {
         (0..rows.div_ceil(BATCH_ROWS_MAX)).map(move |g| {
             let first = g * BATCH_ROWS_MAX;
             (first, (rows - first).min(BATCH_ROWS_MAX))
         })
     };
-    let mut thread_groups = Vec::new();
-    for (first, rows) in groups(threads) {
-        let id = ColumnView::sequence(&mut context, i64::from(first), rows).expect("allocates");
-        let tid = int64s(&mut (i64::from(first)..).map(|id| id + 1000), rows);
-        thread_groups.push([id, tid]);
-    }
+    let thread_groups: Vec<[ColumnView; 2]> = groups(threads)
+        .map(|(first, rows)| {
+            [
+                joined.ids(&mut context, first, rows, threads),
+                int64s(&mut (i64::from(first)..).map(|id| id + 1000), rows),
+            ]
+        })
+        .collect();
     // Uniform over ten ninths of the threads' ids, so 9 in 10 are one's.
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
     let span = u64::from(threads) * 10 / 9;
     let mut utid = move || {
         state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        i64::try_from((state >> 33) % span).unwrap_or(0)
+        let utid = i64::try_from((state >> 33) % span).unwrap_or(0);
+        // A spread id is the thread's, unless it's past the last.
+        if joined == Joined::Spread && utid < i64::from(threads) {
+            joined.id(utid, 0)
+        } else {
+            utid
+        }
     };
     let mut slice_groups = Vec::new();
     for (first, rows) in groups(slices) {
@@ -809,7 +837,7 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
     if joined != Joined::No {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
         let children = [probe, build];
-        let op = join_op(joined, utid.id, id.id, tid.id);
+        let op = join_op(utid.id, id.id, tid.id);
         plan.add_node(op, &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }

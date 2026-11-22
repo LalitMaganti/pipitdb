@@ -1,4 +1,5 @@
-//! Joins planned and run as a frontend's would be, over in-memory tables.
+//! Nested-loop joins planned and run as a frontend's would be, over
+//! in-memory tables, checked against each pair of rows tested by hand.
 
 extern crate std;
 
@@ -10,9 +11,9 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
-use pipit_kernel::error::Error;
+use pipit_kernel::expression::{Expr, ExprOp, ExprStep};
 use pipit_kernel::filter::{Comparison, Value};
-use pipit_kernel::join::JoinOp;
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
@@ -21,7 +22,7 @@ use pipit_kernel::plan::{
 };
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
-use pipit_kernel::row_batch::RowBatch;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -43,154 +44,133 @@ fn int64s(values: &[Option<i64>]) -> ColumnView {
     ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
 }
 
-fn some(values: impl Iterator<Item = i64>) -> Vec<Option<i64>> {
-    values.map(Some).collect()
-}
-
-/// `thread`: `id` from 0, in row groups of `groups` rows, as a sequence if
-/// `sequence`, and `tid`, 1000 more.
-fn threads(groups: &[(i64, u32)], sequence: bool) -> DynScannable<'static> {
-    let mut context = Context::new(&Heap);
-    let row_groups: Vec<[ColumnView; 2]> = groups
-        .iter()
-        .map(|&(first, rows)| {
-            let ids = first..first + i64::from(rows);
-            let id = if sequence {
-                ColumnView::sequence(&mut context, first, rows).unwrap()
-            } else {
-                int64s(&some(ids.clone()))
-            };
-            [id, int64s(&some(ids.map(|id| id + 1000)))]
+/// A table of `k`, as given, and `v`, its row number, in batches.
+fn table(keys: &[Option<i64>]) -> DynScannable<'static> {
+    let groups: Vec<[ColumnView; 2]> = keys
+        .chunks(BATCH_ROWS_MAX as usize)
+        .zip((0..).step_by(BATCH_ROWS_MAX as usize))
+        .map(|(keys, first)| {
+            let rows: Vec<Option<i64>> = (first..).take(keys.len()).map(Some).collect();
+            [int64s(keys), int64s(&rows)]
         })
         .collect();
-    let groups: Vec<&[ColumnView]> = row_groups.iter().map(|group| &group[..]).collect();
-    let schema = [("id", DataType::Int64), ("tid", DataType::Int64)];
+    let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+    let schema = [("k", DataType::Int64), ("v", DataType::Int64)];
     DynScannable::new(&Heap, Table::new(&Heap, &schema, &groups).unwrap()).unwrap()
 }
 
-/// `slice`: `utid`, as given, and `dur`, its row number.
-fn slices(utids: &[Option<i64>]) -> DynScannable<'static> {
-    let durs: Vec<Option<i64>> = (0..).take(utids.len()).map(Some).collect();
-    let schema = [("utid", DataType::Int64), ("dur", DataType::Int64)];
-    let columns = [int64s(utids), int64s(&durs)];
-    DynScannable::new(&Heap, Table::new(&Heap, &schema, &[columns.as_slice()]).unwrap()).unwrap()
+/// A table of `k`, stored as a sequence from each group's first for its
+/// rows, and `v`, its row number; and its keys.
+fn sequences(groups: &[(i64, u32)]) -> (DynScannable<'static>, Vec<Option<i64>>) {
+    let mut keys = Vec::new();
+    let mut row = 0;
+    let groups: Vec<[ColumnView; 2]> = groups
+        .iter()
+        .map(|&(first, rows)| {
+            keys.extend((first..).take(rows as usize).map(Some));
+            let numbers: Vec<Option<i64>> = (row..).take(rows as usize).map(Some).collect();
+            row += i64::from(rows);
+            [ColumnView::sequence(&mut Context::new(&Heap), first, rows).unwrap(), int64s(&numbers)]
+        })
+        .collect();
+    let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+    let schema = [("k", DataType::Int64), ("v", DataType::Int64)];
+    (DynScannable::new(&Heap, Table::new(&Heap, &schema, &groups).unwrap()).unwrap(), keys)
 }
 
-/// A scan of `columns` of `table`, as new columns of `plan`.
+/// A scan of `k` and `v` of `table`, as new columns of `plan`.
 fn scan<'c>(
     plan: &mut LogicalPlan<'c>,
     table: &'c DynScannable<'c>,
-    columns: &[&str],
-) -> (PlanNodeId, Vec<NamedColumn>) {
-    let mut reads = SlowVec::new(&Heap, 8).unwrap();
+) -> (PlanNodeId, [NamedColumn; 2]) {
+    let mut reads = SlowVec::new(&Heap, 2).unwrap();
     let mut bound = Vec::new();
-    for (i, &name) in (0..).zip(columns) {
+    for (i, name) in (0..).zip(["k", "v"]) {
         let binding = plan.add_column(name, DataType::Int64, true).unwrap();
         reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).unwrap();
         bound.push(binding);
     }
     let op = DynOp::new(&Heap, ScanOp::new(table, reads)).unwrap();
-    (plan.add_node(op, &[]).unwrap(), bound)
+    let node = plan.add_node(op, &[]).unwrap();
+    (node, [bound[0], bound[1]])
 }
 
-/// `slice JOIN thread ON utid = id`'s `dur` and `tid`, by row, of the
-/// slices whose `dur` is above `above`, if given.
-fn join(
-    slice: &DynScannable<'_>,
-    thread: &DynScannable<'_>,
-    above: Option<i64>,
-) -> Result<Vec<(i64, i64)>, Error> {
-    let mut plan = LogicalPlan::new(&Heap).unwrap();
-    let (mut probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
-    if let Some(value) = above {
-        let comparison = Comparison::Greater;
-        let leaf =
-            Leaf::Compare { column: probe_columns[1].id, comparison, value: Value::Int64(value) };
-        let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-        let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
-        let children = [probe];
-        probe = plan.add_node(filter, &children).unwrap();
-    }
-    let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
-    let (utid, dur, id, tid) =
-        (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
-    let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
-    let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
-    let children = [probe, build];
-    plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
-    plan.output.push(dur).unwrap();
-    plan.output.push(tid).unwrap();
-    optimize(&Heap, &mut plan).unwrap();
-    let planned = plan_nodes(&Heap, &plan).unwrap();
-    let physical = lower(&Heap, &mut plan, &planned).unwrap();
-    let query = QueryAllocators::new(&Heap);
-    let mut execution = physical.start(&query).unwrap();
-    let (mut batch, mut rows) = (RowBatch::new(), Vec::new());
-    let [dur, tid] = [0, 1].map(|i| physical.columns()[i].position);
-    while execution.next(&mut batch)? {
-        let selection = batch.selection();
-        for row in (0..selection.len()).map(|i| selection.kept().row(i) as usize) {
-            rows.push((batch.column(dur).int64s()[row], batch.column(tid).int64s()[row]));
-        }
-    }
-    Ok(rows)
+fn step(op: ExprOp, a: u32, b: u32) -> ExprStep {
+    ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value: 0, double_value: 0.0 }
 }
 
-#[test]
-fn joins_rows_to_their_ids() {
-    // Ids across two row groups, so a batch's sequence follows another's.
-    let thread = threads(&[(0, 2048), (2048, 952)], true);
-    let utids = [Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048), Some(5)];
-    let slice = slices(&utids);
-    // Each slice with a thread, in order: rows 1, 3 and 4 have none.
-    let expected = [(0, 1005), (2, 3999), (5, 3048), (6, 1005)];
-    assert_eq!(join(&slice, &thread, None).unwrap(), expected);
-    // Of slices a filter kept.
-    assert_eq!(join(&slice, &thread, Some(0)).unwrap(), expected[1..]);
-    // No thread, so no slice is joined.
-    assert_eq!(join(&slice, &threads(&[], true), None).unwrap(), []);
+/// A join's condition, of the probe and build sides' `k` and `v`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum On {
+    /// `k = k`, which the join hashes by.
+    Equal,
+    /// `k < k`, which it can't.
+    Less,
+    /// `k = k AND v < v`, which it hashes by `k`, then tests.
+    EqualAndLess,
+    /// None: a cross join.
+    Always,
 }
 
-#[test]
-fn joins_only_to_sequences_so_far() {
-    let slice = slices(&[Some(1)]);
-    assert_eq!(join(&slice, &threads(&[(0, 4)], false), None), Err(Error::Unsupported));
-    // A gap between batches.
-    let gap = threads(&[(0, 4), (5, 4)], true);
-    assert_eq!(join(&slice, &gap, None), Err(Error::Unsupported));
-}
-
-/// Runs `slice JOIN thread ON utid = id WHERE dur > durs AND tid > tids`,
-/// returning each row's `dur` and `tid`, and the optimized plan's shape:
-/// each node's number of children, from the root down, first side first.
-fn filtered_above(
-    slice: &DynScannable<'_>,
-    thread: &DynScannable<'_>,
-    durs: i64,
-    tids: i64,
-) -> (Vec<(i64, i64)>, Vec<usize>) {
-    let mut plan = LogicalPlan::new(&Heap).unwrap();
-    let (probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
-    let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
-    let (utid, dur, id, tid) =
-        (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
-    let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
-    let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
-    let children = [probe, build];
-    let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
-    let greater = |column: u32, value| {
-        Node::Leaf(Leaf::Compare {
-            column,
-            comparison: Comparison::Greater,
-            value: Value::Int64(value),
-        })
+/// The condition `on`, of the probe side's `k` and `v` and the build side's.
+fn condition(on: On, [pk, pv, bk, bv]: [u32; 4]) -> Option<Expr> {
+    let column = |c| step(ExprOp::Column, c, 0);
+    let nodes = match on {
+        On::Equal => vec![column(pk), column(bk), step(ExprOp::Eq, 0, 1)],
+        On::Less => vec![column(pk), column(bk), step(ExprOp::Lt, 0, 1)],
+        On::EqualAndLess => vec![
+            column(pk),
+            column(bk),
+            step(ExprOp::Eq, 0, 1),
+            column(pv),
+            column(bv),
+            step(ExprOp::Lt, 3, 4),
+            step(ExprOp::And, 2, 5),
+        ],
+        On::Always => return None,
     };
-    let nodes = [greater(dur.id, durs), greater(tid.id, tids), Node::And(0, 1)];
-    let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
-    let children = [join];
-    plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), &children).unwrap();
-    plan.output.push(dur).unwrap();
-    plan.output.push(tid).unwrap();
+    Some(Expr { nodes: SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap() })
+}
+
+/// A filter above a join, on the build side's `v`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Above {
+    Nothing,
+    IsNull,
+    Positive,
+}
+
+/// Each output row's probe `v`, and build `v` if the kind outputs it, of
+/// `probe <kind> JOIN build ON <on>`, sorted, under filter `above`; and the optimized plan's
+/// shape, each node's number of children from the root down.
+fn join(
+    probe: &DynScannable<'_>,
+    build: &DynScannable<'_>,
+    kind: JoinKind,
+    on: On,
+    above: Above,
+) -> (Vec<(i64, Option<i64>)>, Vec<usize>) {
+    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let (probe, [probe_k, probe_v]) = scan(&mut plan, probe);
+    let (build, [build_k, build_v]) = scan(&mut plan, build);
+    let condition = condition(on, [probe_k.id, probe_v.id, build_k.id, build_v.id]);
+    let build_columns = SlowVec::fixed_from(&Heap, [build_k.id, build_v.id].into_iter()).unwrap();
+    let join = JoinOp { kind, condition, build_columns };
+    let children = [probe, build];
+    let join = plan.add_node(DynOp::new(&Heap, join).unwrap(), &children).unwrap();
+    if above != Above::Nothing {
+        let (column, value) = (build_v.id, Value::Int64(0));
+        let leaf = match above {
+            Above::IsNull => Node::Leaf(Leaf::IsNull { column }),
+            _ => Node::Leaf(Leaf::Compare { column, comparison: Comparison::Greater, value }),
+        };
+        let nodes = SlowVec::fixed_from(&Heap, [leaf].into_iter()).unwrap();
+        let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
+        let children = [join];
+        plan.add_node(filter, &children).unwrap();
+    }
+    plan.output.push(probe_v).unwrap();
+    plan.output.push(build_v).unwrap();
     optimize(&Heap, &mut plan).unwrap();
     let mut shape = Vec::new();
     let mut pending = vec![plan.root];
@@ -203,26 +183,164 @@ fn filtered_above(
     let physical = lower(&Heap, &mut plan, &planned).unwrap();
     let query = QueryAllocators::new(&Heap);
     let mut execution = physical.start(&query).unwrap();
-    let (mut batch, mut rows) = (RowBatch::new(), Vec::new());
-    let [dur, tid] = [0, 1].map(|i| physical.columns()[i].position);
+    let mut batch = RowBatch::new();
+    let mut rows = Vec::new();
+    let positions: Vec<u32> = physical.columns().iter().map(|column| column.position).collect();
     while execution.next(&mut batch).unwrap() {
         let selection = batch.selection();
-        for row in (0..selection.len()).map(|i| selection.kept().row(i) as usize) {
-            rows.push((batch.column(dur).int64s()[row], batch.column(tid).int64s()[row]));
+        for row in (0..selection.len()).map(|i| selection.kept().row(i)) {
+            let probe = batch.column(positions[0]).int64s()[row as usize];
+            let build = positions
+                .get(1)
+                .map(|&p| batch.column(p))
+                .and_then(|column| (!column.is_null(row)).then(|| column.int64s()[row as usize]));
+            rows.push((probe, build));
         }
     }
+    rows.sort_unstable();
     (rows, shape)
 }
 
+/// What `join` should give, by testing every pair.
+fn expected(
+    probe: &[Option<i64>],
+    build: &[Option<i64>],
+    kind: JoinKind,
+    on: On,
+    above: Above,
+) -> Vec<(i64, Option<i64>)> {
+    // A probe row's `v` is its number, as is a build row's.
+    let holds = |(p, a): (i64, Option<i64>), (b, k): (i64, Option<i64>)| match (on, a, k) {
+        (On::Always, _, _) => true,
+        (_, None, _) | (_, _, None) => false,
+        (On::Equal, Some(a), Some(k)) => a == k,
+        (On::Less, Some(a), Some(k)) => a < k,
+        (On::EqualAndLess, Some(a), Some(k)) => a == k && p < b,
+    };
+    let mut rows = Vec::new();
+    for (p, &a) in (0..).zip(probe) {
+        let matches: Vec<i64> =
+            (0..).zip(build).filter(|&(b, &k)| holds((p, a), (b, k))).map(|(b, _)| b).collect();
+        rows.extend(matches.iter().map(|&b| (p, Some(b))));
+        if matches.is_empty() && kind == JoinKind::Left {
+            rows.push((p, None));
+        }
+    }
+    match above {
+        Above::Nothing => {}
+        Above::IsNull => rows.retain(|&(_, b)| b.is_none()),
+        Above::Positive => rows.retain(|&(_, b)| b.is_some_and(|b| b > 0)),
+    }
+    rows.sort_unstable();
+    rows
+}
+
+const KINDS: [JoinKind; 2] = [JoinKind::Inner, JoinKind::Left];
+
 #[test]
-fn moves_conditions_above_a_join_to_its_sides() {
-    let thread = threads(&[(0, 2048), (2048, 952)], true);
-    let slice = slices(&[Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048)]);
-    let (rows, shape) = filtered_above(&slice, &thread, 0, 1005);
-    // `dur > 0` drops slice 0, and `tid > 1005` the slice of thread 5.
-    assert_eq!(rows, [(2, 3999), (5, 3048)]);
-    // `dur > 0` moves below the join, onto the slice scan. `tid > 1005`
-    // stays above the join until the join can handle a build side with gaps
-    // in its ids.
-    assert_eq!(shape, [1, 2, 1, 0, 0]);
+fn joins_every_kind_on_any_condition() {
+    // Probe rows over two batches, so a batch's matches come a build row at
+    // a time, and nulls, which match nothing.
+    let probe_keys: Vec<Option<i64>> = (0..2100).map(|i| (i % 7 != 3).then_some(i % 5)).collect();
+    let build_keys = [Some(1), Some(3), None, Some(3), Some(9)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    for kind in KINDS {
+        for on in [On::Equal, On::Less, On::EqualAndLess, On::Always] {
+            assert_eq!(
+                join(&probe, &build, kind, on, Above::Nothing).0,
+                expected(&probe_keys, &build_keys, kind, on, Above::Nothing),
+                "{kind:?} {on:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hashes_a_build_side_of_many_batches() {
+    // Keys repeat within and across the build side's batches, so a probe
+    // row's build rows of its keys come over several rounds.
+    let probe_keys: Vec<Option<i64>> =
+        (0..2100).map(|i| (i % 11 != 0).then_some(i % 900)).collect();
+    let build_keys: Vec<Option<i64>> =
+        (0..3000).map(|i| (i % 13 != 0).then_some(i % 700)).collect();
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    for kind in KINDS {
+        for on in [On::Equal, On::EqualAndLess] {
+            assert_eq!(
+                join(&probe, &build, kind, on, Above::Nothing).0,
+                expected(&probe_keys, &build_keys, kind, on, Above::Nothing),
+                "{kind:?} {on:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn joins_to_an_empty_build_side() {
+    let probe_keys = [Some(1), None];
+    let probe = table(&probe_keys);
+    for kind in KINDS {
+        let op = On::Equal;
+        assert_eq!(
+            join(&probe, &table(&[]), kind, op, Above::Nothing).0,
+            expected(&probe_keys, &[], kind, op, Above::Nothing)
+        );
+    }
+}
+
+#[test]
+fn keeps_a_null_test_on_the_build_side_above_a_left_join() {
+    // `build.v IS NULL` keeps only the probe rows nothing matched: moved to
+    // the build side, it would drop every build row first.
+    let probe_keys = [Some(1), Some(2), Some(3)];
+    let build_keys = [Some(1), Some(3)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    let op = On::Equal;
+    let (rows, _) = join(&probe, &build, JoinKind::Left, op, Above::IsNull);
+    assert_eq!(rows, [(1, None)]);
+    assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, op, Above::IsNull));
+}
+
+#[test]
+fn makes_a_left_join_inner_under_a_filter_that_drops_its_nulls() {
+    // `build.v > 0` drops every probe row with nulls for the build side, so
+    // the join is inner, and the filter moves to the build side's scan.
+    let probe_keys = [Some(1), Some(2), Some(3)];
+    let build_keys = [Some(1), Some(3), Some(3)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    let op = On::Equal;
+    let (rows, shape) = join(&probe, &build, JoinKind::Left, op, Above::Positive);
+    assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, op, Above::Positive));
+    assert_eq!(rows, [(2, Some(1)), (2, Some(2))]);
+    assert_eq!(shape, [2, 0, 1, 0]);
+    // `IS NULL` keeps them, so the join stays left, under the filter.
+    let (_, shape) = join(&probe, &build, JoinKind::Left, op, Above::IsNull);
+    assert_eq!(shape, [1, 2, 0, 0]);
+}
+
+#[test]
+fn finds_build_rows_by_their_keys() {
+    let probe_keys: Vec<Option<i64>> =
+        [Some(5), Some(-1), Some(2999), None, Some(3000), Some(2048), Some(5), Some(2), Some(9)]
+            .into_iter()
+            .chain((0..3000).map(|i| Some(i * 7 % 3100)))
+            .collect();
+    let probe = table(&probe_keys);
+    // Ids across batches, each following the last, as a table's are, found
+    // with no array; with a gap, and in another order, found in an array;
+    // and repeated, hashed.
+    let groups: [&[(i64, u32)]; 4] =
+        [&[(0, 2048), (2048, 952)], &[(0, 4), (5, 4)], &[(10, 4), (0, 4)], &[(0, 4), (2, 4)]];
+    for groups in groups {
+        let (build, build_keys) = sequences(groups);
+        for kind in KINDS {
+            for on in [On::Equal, On::EqualAndLess] {
+                assert_eq!(
+                    join(&probe, &build, kind, on, Above::Nothing).0,
+                    expected(&probe_keys, &build_keys, kind, on, Above::Nothing),
+                    "{groups:?} {kind:?} {on:?}"
+                );
+            }
+        }
+    }
 }

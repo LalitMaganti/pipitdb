@@ -33,7 +33,6 @@ mod listed;
 pub mod lower;
 mod murmur_hash;
 pub mod names;
-pub mod nested_loop_join;
 pub mod optimize;
 pub mod order_by;
 pub mod output_properties;

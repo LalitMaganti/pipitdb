@@ -7,9 +7,9 @@ use pipit_kernel::expression::{
     ComputeItem, ComputeOp, EXPR_NODES_MAX, Expr, ExprOp, expr_can_be_null,
 };
 use pipit_kernel::filter::{Comparison, Value};
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
-use pipit_kernel::nested_loop_join::{JoinKind, NestedLoopJoinOp};
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
@@ -330,7 +330,7 @@ fn join(
     };
     let allocator = compiler.allocator();
     let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
-    let op = DynOp::new(allocator, NestedLoopJoinOp { kind, condition, build_columns })?;
+    let op = DynOp::new(allocator, JoinOp { kind, condition, build_columns })?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())
