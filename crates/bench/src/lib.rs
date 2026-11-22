@@ -5,11 +5,12 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::{Compute, ExprOp, ExprProgram, ExprStep, PRESENT};
+use pipit_kernel::expression::{Compute, Expr, ExprOp, ExprProgram, ExprStep, PRESENT};
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::{PhysicalPlan, lower};
+use pipit_kernel::nested_loop_join::{JoinKind, NestedLoopJoinOp};
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::pipeline::{Execution, Pipeline};
@@ -704,13 +705,50 @@ pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
     plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
 }
 
+/// The op joining slices to threads `joined` says, on `utid = id`, which
+/// outputs `tid`.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+fn join_op(joined: Joined, utid: u32, id: u32, tid: u32) -> DynOp<'static> {
+    if joined == Joined::ById {
+        let build_columns = SlowVec::fixed_from(&Heap, [tid].into_iter()).expect("allocates");
+        let op = JoinOp { probe_key: utid, build_key: id, build_columns };
+        return DynOp::new(&Heap, op).expect("allocates");
+    }
+    let step = |op, a, b| ExprStep {
+        op,
+        data_type: DataType::Int64,
+        a,
+        b,
+        c: 0,
+        int_value: 0,
+        double_value: 0.0,
+    };
+    let steps =
+        [step(ExprOp::Column, utid, 0), step(ExprOp::Column, id, 0), step(ExprOp::Eq, 0, 1)];
+    let nodes = SlowVec::fixed_from(&Heap, steps.into_iter()).expect("allocates");
+    let build_columns = SlowVec::fixed_from(&Heap, [id, tid].into_iter()).expect("allocates");
+    let op =
+        NestedLoopJoinOp { kind: JoinKind::Inner, condition: Some(Expr { nodes }), build_columns };
+    DynOp::new(&Heap, op).expect("allocates")
+}
+
+/// Whether `join_plan` joins the slices to their threads, and how.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Joined {
+    No,
+    /// By `JoinOp`, which finds a thread by its id's number.
+    ById,
+    /// By `NestedLoopJoinOp`, which hashes the threads by id.
+    ByHash,
+}
+
 /// `slices` slices joined to their threads, of which there are `threads`,
 /// as Perfetto's `slice JOIN thread USING (utid)`: each slice's `dur` and its
 /// thread's `tid`. A thread's `id` is stored as a sequence, and 9 in 10
-/// slices' `utid`s, at random, are a thread's. If not `joined`, the slices'
+/// slices' `utid`s, at random, are a thread's. Without a join, the slices'
 /// `dur` alone, to tell what the join costs. Kept for the rest of the run.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'static> {
+pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'static> {
     let mut context = Context::new(&Heap);
     let int64s = |values: &mut dyn Iterator<Item = i64>, rows: u32| {
         let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
@@ -768,12 +806,11 @@ pub fn join_plan(slices: u32, threads: u32, joined: bool) -> PhysicalPlan<'stati
     };
     let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
     plan.output.push(dur).expect("allocates");
-    if joined {
+    if joined != Joined::No {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
-        let build_columns = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).expect("allocates");
-        let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns };
         let children = [probe, build];
-        plan.add_node(DynOp::new(&Heap, op).expect("allocates"), &children).expect("allocates");
+        let op = join_op(joined, utid.id, id.id, tid.id);
+        plan.add_node(op, &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }
     optimize(&Heap, &mut plan).expect("optimizes");

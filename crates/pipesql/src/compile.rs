@@ -454,6 +454,17 @@ mod tests {
         assert_eq!(joined("FROM t |> INNER JOIN ids ON a < v |> SELECT a, v"), less);
         assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = v |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = 2 |> SELECT a"), []);
+        // Conditions that aren't comparisons, which have no keys.
+        assert_eq!(kept("FROM t |> JOIN ids ON a |> SELECT a"), [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(kept("FROM t |> JOIN ids ON s LIKE 'it%' |> SELECT v"), [1.0, 2.0, 3.0]);
+        let null = f64::NEG_INFINITY;
+        let left = ([10.0, 11.0, 12.0].into(), [1.0, null, null].into());
+        assert_eq!(joined("FROM ids |> LEFT JOIN t ON id = b |> SELECT id, a"), left);
+        assert_eq!(joined("FROM ids |> left outer join t ON id = b |> SELECT id, a"), left);
+        assert_eq!(
+            kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a IS NULL |> SELECT id"),
+            [11.0, 12.0]
+        );
         let product =
             ([1.0, 2.0, 1.0, 2.0, 1.0, 2.0].into(), [10.0, 10.0, 11.0, 11.0, 12.0, 12.0].into());
         assert_eq!(joined("FROM t |> CROSS JOIN ids |> SELECT a, id"), product);
@@ -471,6 +482,11 @@ mod tests {
         let twice = names("FROM t |> RENAME b AS id |> EXTEND a |> JOIN ids USING (id)");
         assert_eq!(twice, [&b"id"[..], b"a", b"f", b"s", b"a", b"v"]);
         assert_eq!(kept("FROM t |> RENAME b AS id |> JOIN ids USING (id) |> SELECT v"), [1.0]);
+        // A left join's comes from the rows so far, so is never null.
+        let null = f64::NEG_INFINITY;
+        let left = run("FROM ids |> RENAME v AS a |> LEFT JOIN t USING (a) |> SELECT a, id, b");
+        let values: StdVec<_> = left.into_iter().map(|(_, values)| values).collect();
+        assert_eq!(values, [[1.0, 2.0, 3.0], [10.0, 11.0, 12.0], [10.0, 20.0, null]]);
         let two = "FROM t |> RENAME b AS id |> EXTEND a AS v |> JOIN ids USING (id, v) |> SELECT a";
         assert_eq!(kept(two), [1.0]);
         assert_eq!(
@@ -522,7 +538,7 @@ mod tests {
         let types = error("FROM t |> RENAME s AS id |> JOIN ids USING (id)");
         assert_eq!(types, (ErrorCode::ExpectedOneKind, 44));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
-        assert_eq!(error("FROM t |> left outer join ids ON b = id").0, ErrorCode::Unsupported);
+        assert_eq!(error("FROM t |> LEFT JOIN ids, n ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
         // Both tables have `a`.
         assert_eq!(error("FROM t |> JOIN t ON a = 1"), (ErrorCode::AmbiguousColumn, 20));

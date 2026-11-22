@@ -295,6 +295,18 @@ impl RowStore {
         Ok(count)
     }
 
+    /// As `gather`, of a store that dropped no column: one copy, which
+    /// the joins share.
+    #[inline(never)]
+    pub(crate) fn gather_held(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+        rows: &[u32],
+    ) -> Result<u32, Error> {
+        self.gather(context, out, rows, 0, &mut |_, _| failed!())
+    }
+
     /// Column `column`'s `count` values from `at` in the order `scatter` was
     /// given, if it copied the column.
     #[inline(never)]

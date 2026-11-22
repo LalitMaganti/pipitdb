@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
+use pipitdb_bench::{Joined, count_nodes, count_tokens, expression, long_text, typical_queries};
 
 fn lexer(c: &mut Criterion) {
     let mut group = c.benchmark_group("lexer");
@@ -75,11 +75,13 @@ fn scan(c: &mut Criterion) {
     group.finish();
 }
 
-/// 1M slices joined to 64K threads by id, against scanning the slices alone.
+/// 1M slices joined to 64K threads by id, by number or by hash, against
+/// scanning the slices alone.
 fn join(c: &mut Criterion) {
     let mut group = c.benchmark_group("join");
     group.throughput(Throughput::Elements(1 << 20));
-    for (name, joined) in [("scan", false), ("slice_thread", true)] {
+    let joins = [("scan", Joined::No), ("slice_thread", Joined::ById), ("hashed", Joined::ByHash)];
+    for (name, joined) in joins {
         let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
         group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
     }

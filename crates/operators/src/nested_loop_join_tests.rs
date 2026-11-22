@@ -1,0 +1,279 @@
+//! Nested-loop joins planned and run as a frontend's would be, over
+//! in-memory tables, checked against each pair of rows tested by hand.
+
+extern crate std;
+
+use std::vec;
+use std::vec::Vec;
+
+use crate::table::Table;
+use pipit_kernel::allocator::Heap;
+use pipit_kernel::buffer::Buffer;
+use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::context::Context;
+use pipit_kernel::expression::{Expr, ExprOp, ExprStep};
+use pipit_kernel::lower::lower;
+use pipit_kernel::nested_loop_join::{JoinKind, NestedLoopJoinOp};
+use pipit_kernel::optimize::optimize;
+use pipit_kernel::output_properties::plan_nodes;
+use pipit_kernel::plan::{
+    DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp,
+};
+use pipit_kernel::predicate::{Leaf, Node, Predicate};
+use pipit_kernel::query_allocators::QueryAllocators;
+use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
+use pipit_kernel::scannable::DynScannable;
+use pipit_kernel::slow_vec::SlowVec;
+
+fn int64s(values: &[Option<i64>]) -> ColumnView {
+    let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+    for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
+        *slot = value.unwrap_or(0);
+    }
+    // A bit a row, set where it isn't null.
+    let validity = values.iter().any(Option::is_none).then(|| {
+        let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+        let bytes = bits.as_mut_slice::<u8>();
+        bytes.fill(0);
+        for (row, value) in values.iter().enumerate() {
+            bytes[row / 8] |= u8::from(value.is_some()) << (row % 8);
+        }
+        bits
+    });
+    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
+}
+
+/// A table of `k`, as given, and `v`, its row number, in batches.
+fn table(keys: &[Option<i64>]) -> DynScannable<'static> {
+    let groups: Vec<[ColumnView; 2]> = keys
+        .chunks(BATCH_ROWS_MAX as usize)
+        .zip((0..).step_by(BATCH_ROWS_MAX as usize))
+        .map(|(keys, first)| {
+            let rows: Vec<Option<i64>> = (first..).take(keys.len()).map(Some).collect();
+            [int64s(keys), int64s(&rows)]
+        })
+        .collect();
+    let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+    let schema = [("k", DataType::Int64), ("v", DataType::Int64)];
+    DynScannable::new(&Heap, Table::new(&Heap, &schema, &groups).unwrap()).unwrap()
+}
+
+/// A scan of `k` and `v` of `table`, as new columns of `plan`.
+fn scan<'c>(
+    plan: &mut LogicalPlan<'c>,
+    table: &'c DynScannable<'c>,
+) -> (PlanNodeId, [NamedColumn; 2]) {
+    let mut reads = SlowVec::new(&Heap, 2).unwrap();
+    let mut bound = Vec::new();
+    for (i, name) in (0..).zip(["k", "v"]) {
+        let binding = plan.add_column(name, DataType::Int64, true).unwrap();
+        reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).unwrap();
+        bound.push(binding);
+    }
+    let op = DynOp::new(&Heap, ScanOp::new(table, reads)).unwrap();
+    let node = plan.add_node(op, &[]).unwrap();
+    (node, [bound[0], bound[1]])
+}
+
+fn step(op: ExprOp, a: u32, b: u32) -> ExprStep {
+    ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value: 0, double_value: 0.0 }
+}
+
+/// A join's condition, of the probe and build sides' `k` and `v`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum On {
+    /// `k = k`, which the join hashes by.
+    Equal,
+    /// `k < k`, which it can't.
+    Less,
+    /// `k = k AND v < v`, which it hashes by `k`, then tests.
+    EqualAndLess,
+    /// None: a cross join.
+    Always,
+}
+
+/// The condition `on`, of the probe side's `k` and `v` and the build side's.
+fn condition(on: On, [pk, pv, bk, bv]: [u32; 4]) -> Option<Expr> {
+    let column = |c| step(ExprOp::Column, c, 0);
+    let nodes = match on {
+        On::Equal => vec![column(pk), column(bk), step(ExprOp::Eq, 0, 1)],
+        On::Less => vec![column(pk), column(bk), step(ExprOp::Lt, 0, 1)],
+        On::EqualAndLess => vec![
+            column(pk),
+            column(bk),
+            step(ExprOp::Eq, 0, 1),
+            column(pv),
+            column(bv),
+            step(ExprOp::Lt, 3, 4),
+            step(ExprOp::And, 2, 5),
+        ],
+        On::Always => return None,
+    };
+    Some(Expr { nodes: SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap() })
+}
+
+/// A filter above a join, on the build side's `v`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Above {
+    Nothing,
+    IsNull,
+}
+
+/// Each output row's probe `v`, and build `v` if the kind outputs it, of
+/// `probe <kind> JOIN build ON <on>`, sorted, under filter `above`; and the optimized plan's
+/// shape, each node's number of children from the root down.
+fn join(
+    probe: &DynScannable<'_>,
+    build: &DynScannable<'_>,
+    kind: JoinKind,
+    on: On,
+    above: Above,
+) -> (Vec<(i64, Option<i64>)>, Vec<usize>) {
+    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let (probe, [probe_k, probe_v]) = scan(&mut plan, probe);
+    let (build, [build_k, build_v]) = scan(&mut plan, build);
+    let condition = condition(on, [probe_k.id, probe_v.id, build_k.id, build_v.id]);
+    let build_columns = SlowVec::fixed_from(&Heap, [build_k.id, build_v.id].into_iter()).unwrap();
+    let join = NestedLoopJoinOp { kind, condition, build_columns };
+    let children = [probe, build];
+    let join = plan.add_node(DynOp::new(&Heap, join).unwrap(), &children).unwrap();
+    if above != Above::Nothing {
+        let leaf = Node::Leaf(Leaf::IsNull { column: build_v.id });
+        let nodes = SlowVec::fixed_from(&Heap, [leaf].into_iter()).unwrap();
+        let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
+        let children = [join];
+        plan.add_node(filter, &children).unwrap();
+    }
+    let outputs_build = matches!(kind, JoinKind::Inner | JoinKind::Left);
+    plan.output.push(probe_v).unwrap();
+    if outputs_build {
+        plan.output.push(build_v).unwrap();
+    }
+    optimize(&Heap, &mut plan).unwrap();
+    let mut shape = Vec::new();
+    let mut pending = vec![plan.root];
+    while let Some(node) = pending.pop() {
+        let children = &plan.nodes[node as usize].children;
+        shape.push(children.len());
+        pending.extend(children.iter().rev());
+    }
+    let planned = plan_nodes(&Heap, &plan).unwrap();
+    let physical = lower(&Heap, &mut plan, &planned).unwrap();
+    let query = QueryAllocators::new(&Heap);
+    let mut execution = physical.start(&query).unwrap();
+    let mut batch = RowBatch::new();
+    let mut rows = Vec::new();
+    let positions: Vec<u32> = physical.columns().iter().map(|column| column.position).collect();
+    while execution.next(&mut batch).unwrap() {
+        let selection = batch.selection();
+        for row in (0..selection.len()).map(|i| selection.kept().row(i)) {
+            let probe = batch.column(positions[0]).int64s()[row as usize];
+            let build = positions
+                .get(1)
+                .map(|&p| batch.column(p))
+                .and_then(|column| (!column.is_null(row)).then(|| column.int64s()[row as usize]));
+            rows.push((probe, build));
+        }
+    }
+    rows.sort_unstable();
+    (rows, shape)
+}
+
+/// What `join` should give, by testing every pair.
+fn expected(
+    probe: &[Option<i64>],
+    build: &[Option<i64>],
+    kind: JoinKind,
+    on: On,
+    above: Above,
+) -> Vec<(i64, Option<i64>)> {
+    // A probe row's `v` is its number, as is a build row's.
+    let holds = |(p, a): (i64, Option<i64>), (b, k): (i64, Option<i64>)| match (on, a, k) {
+        (On::Always, _, _) => true,
+        (_, None, _) | (_, _, None) => false,
+        (On::Equal, Some(a), Some(k)) => a == k,
+        (On::Less, Some(a), Some(k)) => a < k,
+        (On::EqualAndLess, Some(a), Some(k)) => a == k && p < b,
+    };
+    let mut rows = Vec::new();
+    for (p, &a) in (0..).zip(probe) {
+        let matches: Vec<i64> =
+            (0..).zip(build).filter(|&(b, &k)| holds((p, a), (b, k))).map(|(b, _)| b).collect();
+        rows.extend(matches.iter().map(|&b| (p, Some(b))));
+        if matches.is_empty() && kind == JoinKind::Left {
+            rows.push((p, None));
+        }
+    }
+    match above {
+        Above::Nothing => {}
+        Above::IsNull => rows.retain(|&(_, b)| b.is_none()),
+    }
+    rows.sort_unstable();
+    rows
+}
+
+const KINDS: [JoinKind; 2] = [JoinKind::Inner, JoinKind::Left];
+
+#[test]
+fn joins_every_kind_on_any_condition() {
+    // Probe rows over two batches, so a batch's matches come a build row at
+    // a time, and nulls, which match nothing.
+    let probe_keys: Vec<Option<i64>> = (0..2100).map(|i| (i % 7 != 3).then_some(i % 5)).collect();
+    let build_keys = [Some(1), Some(3), None, Some(3), Some(9)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    for kind in KINDS {
+        for on in [On::Equal, On::Less, On::EqualAndLess, On::Always] {
+            assert_eq!(
+                join(&probe, &build, kind, on, Above::Nothing).0,
+                expected(&probe_keys, &build_keys, kind, on, Above::Nothing),
+                "{kind:?} {on:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hashes_a_build_side_of_many_batches() {
+    // Keys repeat within and across the build side's batches, so a probe
+    // row's build rows of its keys come over several rounds.
+    let probe_keys: Vec<Option<i64>> =
+        (0..2100).map(|i| (i % 11 != 0).then_some(i % 900)).collect();
+    let build_keys: Vec<Option<i64>> =
+        (0..3000).map(|i| (i % 13 != 0).then_some(i % 700)).collect();
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    for kind in KINDS {
+        for on in [On::Equal, On::EqualAndLess] {
+            assert_eq!(
+                join(&probe, &build, kind, on, Above::Nothing).0,
+                expected(&probe_keys, &build_keys, kind, on, Above::Nothing),
+                "{kind:?} {on:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn joins_to_an_empty_build_side() {
+    let probe_keys = [Some(1), None];
+    let probe = table(&probe_keys);
+    for kind in KINDS {
+        let op = On::Equal;
+        assert_eq!(
+            join(&probe, &table(&[]), kind, op, Above::Nothing).0,
+            expected(&probe_keys, &[], kind, op, Above::Nothing)
+        );
+    }
+}
+
+#[test]
+fn keeps_a_null_test_on_the_build_side_above_a_left_join() {
+    // `build.v IS NULL` keeps only the probe rows nothing matched: moved to
+    // the build side, it would drop every build row first.
+    let probe_keys = [Some(1), Some(2), Some(3)];
+    let build_keys = [Some(1), Some(3)];
+    let (probe, build) = (table(&probe_keys), table(&build_keys));
+    let op = On::Equal;
+    let (rows, _) = join(&probe, &build, JoinKind::Left, op, Above::IsNull);
+    assert_eq!(rows, [(1, None)]);
+    assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, op, Above::IsNull));
+}

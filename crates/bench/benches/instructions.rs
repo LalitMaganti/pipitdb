@@ -101,10 +101,12 @@ fn pipeline(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
 }
 
-// 64K slices joined to 4K threads by id, against scanning the slices alone.
+// 64K slices joined to 4K threads by id, by number or by hash, against
+// scanning the slices alone.
 #[library_benchmark]
-#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, false))]
-#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, true))]
+#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::No))]
+#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::ById))]
+#[bench::hashed(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::ByHash))]
 fn join(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }

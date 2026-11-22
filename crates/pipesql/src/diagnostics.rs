@@ -242,7 +242,7 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "a double".into(),
         ),
         what if what == Unsupported::Join as u16 => {
-            ("left joins can't be run yet".into(), "a left join".into())
+            ("this kind of join can't be run yet".into(), "a join".into())
         }
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }
