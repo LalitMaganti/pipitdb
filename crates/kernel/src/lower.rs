@@ -113,7 +113,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
         self.lower_node(*at!(node.children, input as usize))?;
         let planned = at!(at!(self.planned, id as usize).inputs, input as usize);
         self.rows = &planned.rows;
-        for step in planned.steps.iter() {
+        if let Some(step) = &planned.step {
             self.apply(step)?;
         }
         Ok(())
@@ -160,8 +160,9 @@ impl<'p, 'c> Lowering<'p, 'c> {
     pub fn query_sort_keep(&self) -> Option<u32> {
         let sort = self.query_rows().open_sort?;
         let node = at!(self.planned, sort.node as usize);
-        let InputStep::Sort { keep, .. } =
-            at!(at!(node.inputs, sort.input as usize).steps, sort.step);
+        let Some(InputStep::Sort { keep, .. }) = &at!(node.inputs, sort.input as usize).step else {
+            failed!()
+        };
         *keep
     }
 
