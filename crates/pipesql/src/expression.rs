@@ -111,9 +111,7 @@ fn compile(
             push(compiler, nodes, constant)?;
         }
         Tag::Unary if node.operator() == Operator::Negate => negate(compiler, node, depth, nodes)?,
-        Tag::Unary if matches!(node.operator(), Operator::IsNull | Operator::IsNotNull) => {
-            null_test(compiler, node, depth, nodes)?;
-        }
+        Tag::Unary => unary(compiler, node, depth, nodes)?,
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
         Tag::Call => (compiler.registry().call)(compiler, node, depth, nodes)?,
         Tag::Case => case(compiler, node, depth, nodes)?,
@@ -130,6 +128,8 @@ fn compile(
                 Operator::LessEqual => ExprOp::Le,
                 Operator::Greater => ExprOp::Gt,
                 Operator::GreaterEqual => ExprOp::Ge,
+                Operator::And => ExprOp::And,
+                Operator::Or => ExprOp::Or,
                 _ => {
                     return Err(Error::unsupported(
                         Unsupported::SelectExpression,
@@ -313,15 +313,20 @@ fn case(
     push_case(compiler, node, nodes, &branches, otherwise)
 }
 
-/// Appends the nodes of `x IS NULL` or `x IS NOT NULL`, the node `node`,
+/// Appends the nodes of `x IS [NOT] NULL` or `NOT x`, the node `node`,
 /// `depth` deep.
-fn null_test(
+fn unary(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
     nodes: &mut SlowVec<ExprStep>,
 ) -> Result<(), Error> {
-    let op = if node.operator() == Operator::IsNull { ExprOp::IsNull } else { ExprOp::IsNotNull };
+    let op = match node.operator() {
+        Operator::IsNull => ExprOp::IsNull,
+        Operator::IsNotNull => ExprOp::IsNotNull,
+        Operator::Not => ExprOp::Not,
+        _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
+    };
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
     let a = nodes.len() as u32 - 1;

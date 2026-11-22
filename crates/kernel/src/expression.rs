@@ -60,6 +60,13 @@ pub enum ExprOp {
     IsNull,
     /// Whether `a` isn't null, as 0 or 1, never null.
     IsNotNull,
+    /// `a AND b`, of integers true where they aren't 0, as 0 or 1: null
+    /// only where it's unknown, as SQL's is: `NULL AND 0` is 0.
+    And,
+    /// `a OR b`: `NULL OR 1` is 1.
+    Or,
+    /// `NOT a`.
+    Not,
     /// A branch of the `Case` after it: its condition `a`, or `PRESENT` to
     /// take the rows where its value isn't null, as `coalesce`'s do, and its
     /// value `b`. Computes nothing itself.
@@ -242,6 +249,7 @@ fn run(
             }
             ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
+            ExprOp::And | ExprOp::Or | ExprOp::Not => logic(context, step, registers)?,
             ExprOp::When | ExprOp::Argument => {
                 *at_mut!(registers, i) = None;
                 continue;
@@ -493,6 +501,40 @@ fn null_test(
     let mut values = context.values_buffer(rows * 8)?;
     present(a.validity(), step.op == ExprOp::IsNull, values.as_mut_slice());
     ColumnView::new(context, DataType::Int64, values, None)
+}
+
+/// `step`'s `AND`, `OR` or `NOT` at every row, as 0 or 1, or null where
+/// it's unknown.
+#[inline(never)]
+fn logic(
+    context: &mut Context,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let a = register(registers, step.a);
+    let b = (step.op != ExprOp::Not).then(|| register(registers, step.b));
+    let rows = a.row_count();
+    let truth = |column: &ColumnView, row: u32| {
+        (!column.is_null(row)).then(|| *at!(column.int64s(), row as usize) != 0)
+    };
+    let mut values = context.values_buffer(rows as usize * 8)?;
+    let mut validity = context.small_buffer((rows as usize).div_ceil(8))?;
+    let known = validity.as_mut_slice::<u8>();
+    known.fill(0);
+    let mut unknown = false;
+    for (row, o) in (0..rows).zip(values.as_mut_slice::<i64>()) {
+        let (x, y) = (truth(a, row), b.map(|b| truth(b, row)));
+        let value = match (step.op, y) {
+            (ExprOp::And, Some(y)) if x == Some(false) || y == Some(false) => Some(false),
+            (ExprOp::Or, Some(y)) if x == Some(true) || y == Some(true) => Some(true),
+            (ExprOp::And | ExprOp::Or, Some(y)) => x.and(y),
+            _ => x.map(|x| !x),
+        };
+        *o = i64::from(value == Some(true));
+        unknown |= value.is_none();
+        *at_mut!(known, row as usize / 8) |= u8::from(value.is_some()) << (row % 8);
+    }
+    ColumnView::new(context, DataType::Int64, values, unknown.then_some(validity))
 }
 
 /// The branch `k` of a choice: its condition, or `None` to take the rows
@@ -787,7 +829,8 @@ pub enum ExprError {
     /// Integer arithmetic in an argument of `coalesce`, or a branch of
     /// `CASE`, which only some rows use, which could overflow on the others.
     SomeRows,
-    /// A number, not a string, as a condition of `CASE`.
+    /// A number, not a string, as a condition of `CASE`, or an integer as
+    /// an operand of `AND`, `OR` or `NOT`.
     Condition,
     /// Arguments of `coalesce`, or values of `CASE`, of one type.
     Choices,
@@ -913,6 +956,19 @@ impl Typer<'_> {
                 }
             }
             ExprOp::Case => self.type_case(nodes, node),
+            ExprOp::And | ExprOp::Or | ExprOp::Not => {
+                let operands =
+                    if node.op == ExprOp::Not { &[node.a][..] } else { &[node.a, node.b] };
+                let mut registers = [0; 2];
+                for (register, &operand) in registers.iter_mut().zip(operands) {
+                    if at!(self.nodes, operand as usize).0.is_some_and(|t| t != DataType::Int64) {
+                        return Err(ExprError::Condition);
+                    }
+                    *register = self.materialize(operand, DataType::Int64)?;
+                }
+                let [a, b] = registers;
+                Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, b))?))
+            }
             ExprOp::IsNull | ExprOp::IsNotNull => {
                 let a_type = at!(self.nodes, node.a as usize).0;
                 let a = self.materialize(node.a, a_type.unwrap_or(DataType::Int64))?;
@@ -929,10 +985,17 @@ impl Typer<'_> {
             ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
                 data_type == Some(DataType::Int64) || fails(node.a) || fails(node.b)
             }
-            ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
-                fails(node.a) || fails(node.b)
+            ExprOp::Eq
+            | ExprOp::Ne
+            | ExprOp::Lt
+            | ExprOp::Le
+            | ExprOp::Gt
+            | ExprOp::Ge
+            | ExprOp::And
+            | ExprOp::Or => fails(node.a) || fails(node.b),
+            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Not | ExprOp::Argument => {
+                fails(node.a)
             }
-            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Argument => fails(node.a),
             // Only its first condition is computed for every row: a `PRESENT`
             // one tests its value.
             ExprOp::Case => {
