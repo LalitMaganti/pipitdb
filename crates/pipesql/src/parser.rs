@@ -516,6 +516,14 @@ impl Parser<'_> {
                         Step::Push(Pending::Call(name), 0)
                     }
                 }
+                // `t.x`, a column of alias `t`, as one name.
+                Keyword::None if self.current().kind == TokenKind::Dot => {
+                    self.advance()?;
+                    let column = self.expect(TokenKind::Identifier)?;
+                    let len = column.span.start + column.span.len - token.span.start;
+                    let span = Span { start: token.span.start, len };
+                    Step::Operand(leaf(Token { kind: token.kind, span })?)
+                }
                 Keyword::None => Step::Operand(leaf(token)?),
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
                 // Over all that follows, as in `count(DISTINCT a)`.

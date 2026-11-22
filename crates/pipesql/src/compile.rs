@@ -2,8 +2,9 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
-use pipit_kernel::allocator::Allocator;
+use pipit_kernel::allocator::{AllocError, Allocator};
 use pipit_kernel::column::Forms;
+use pipit_kernel::names::Name;
 use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
 };
@@ -23,6 +24,22 @@ pub struct Relation {
     pub columns: SlowVec<NamedColumn>,
 }
 
+/// A table alias, as `GoogleSQL`'s: a name for the columns a table had when
+/// it was named, so `t.x` is that `x` whatever stages since have done to
+/// the scope. Its columns are `alias_columns[start..end]`.
+#[derive(Clone, Copy, Default)]
+struct TableAlias {
+    name: Name,
+    start: u32,
+    end: u32,
+}
+
+/// The most aliases in scope at once, one for each table joined.
+const ALIASES_MAX: usize = 64;
+
+/// The most columns of all aliases at once.
+const ALIAS_COLUMNS_MAX: usize = ALIASES_MAX * PLAN_COLUMNS_MAX;
+
 /// A plan being compiled from a query, which each stage's rule adds to.
 pub struct Compiler<'q, 'c> {
     source: &'q [u8],
@@ -33,6 +50,11 @@ pub struct Compiler<'q, 'c> {
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SlowVec<NamedColumn>,
+    /// The aliases `t.x` can name columns by, the first `alias_count`, and
+    /// their columns.
+    aliases: [TableAlias; ALIASES_MAX],
+    alias_count: usize,
+    alias_columns: SlowVec<NamedColumn>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -82,22 +104,46 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
     /// case, as SQL does. Two columns may share a name, as after `SELECT a,
     /// a`, but then the name can't be used, as in Perfetto.
+    #[inline(never)]
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
-        self.find_in(&self.scope, name)
-    }
-
-    /// The one column of `columns` that `name` names, ignoring case.
-    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
-        let text = self.text(name.span());
-        let named = |column: &&NamedColumn| {
-            same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
+        let text = self.text(name.span()).as_bytes();
+        let Some(dot) = text.iter().position(|&byte| byte == b'.') else {
+            return self.find_named(&self.scope, text, name.span());
         };
-        let mut found = columns.iter().filter(named);
-        let Some(&column) = found.next() else {
+        let (wanted, column) = (at!(text, ..dot).trim_ascii(), at!(text, dot + 1..).trim_ascii());
+        let mut found = at!(self.aliases, ..self.alias_count)
+            .iter()
+            .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
+        let Some(alias) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
         if found.next().is_some() {
             return Err(Error::new(ErrorCode::AmbiguousColumn, name.span()));
+        }
+        let columns = at!(self.alias_columns, alias.start as usize..alias.end as usize);
+        self.find_named(columns, column, name.span())
+    }
+
+    /// The one column of `columns` that `name` names, ignoring case.
+    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
+        self.find_named(columns, self.text(name.span()).as_bytes(), name.span())
+    }
+
+    /// The one column of `columns` named `text`, ignoring case, for `span`.
+    fn find_named(
+        &self,
+        columns: &[NamedColumn],
+        text: &[u8],
+        span: Span,
+    ) -> Result<NamedColumn, Error> {
+        let named =
+            |column: &&NamedColumn| same_word(self.plan.names.get(column.name).as_bytes(), text);
+        let mut found = columns.iter().filter(named);
+        let Some(&column) = found.next() else {
+            return Err(Error::new(ErrorCode::UnknownColumn, span));
+        };
+        if found.next().is_some() {
+            return Err(Error::new(ErrorCode::AmbiguousColumn, span));
         }
         Ok(column)
     }
@@ -126,6 +172,28 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
         let node = self.plan.add_node(op, &[])?;
         Ok(Relation { node, columns })
+    }
+
+    /// Adds the alias `name`, a name, for `columns`.
+    pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
+        let name = self.plan.names.add(self.text(name.span()))?;
+        if self.alias_count == ALIASES_MAX {
+            return Err(AllocError.into());
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
+        let start = self.alias_columns.len() as u32;
+        self.alias_columns.extend_from_slice(columns)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
+        let end = self.alias_columns.len() as u32;
+        *at_mut!(self.aliases, self.alias_count) = TableAlias { name, start, end };
+        self.alias_count += 1;
+        Ok(())
+    }
+
+    /// Drops every alias, as a stage that makes a new scope does.
+    pub fn clear_aliases(&mut self) {
+        self.alias_count = 0;
+        self.alias_columns.retain(|_| false);
     }
 
     /// The value of `node`, an `Integer`.
@@ -161,6 +229,9 @@ pub fn compile<'c>(
         registry,
         plan: LogicalPlan::new(allocator)?,
         scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+        aliases: [TableAlias::default(); ALIASES_MAX],
+        alias_count: 0,
+        alias_columns: SlowVec::new(allocator, ALIAS_COLUMNS_MAX)?,
         allocator,
     };
     let query = ast.node(ast.root());
@@ -406,6 +477,31 @@ mod tests {
             kept("FROM t |> RENAME b AS id, a AS v |> JOIN ids USING (v, id) |> SELECT v"),
             [1.0]
         );
+    }
+
+    #[test]
+    fn names_columns_by_table_aliases() {
+        let values =
+            |query| run(query).into_iter().map(|(_, values)| values).collect::<StdVec<_>>();
+        // A table joined to itself, told apart by aliases.
+        let selfjoin = values("FROM t AS x |> JOIN t AS y ON x.a < y.a |> SELECT x.a, y.b");
+        assert_eq!(selfjoin, [[1.0], [20.0]]);
+        // A table's name is its alias, and a column keeps its own name.
+        let named = run("FROM t |> JOIN ids ON t.b = ids.id |> SELECT t.a, ids.v");
+        assert_eq!(named, [(b"a".to_vec(), [1.0].to_vec()), (b"v".to_vec(), [1.0].to_vec())]);
+        // `AS` names what a stage made.
+        let renamed =
+            values("FROM t |> SELECT a + 1 AS a |> AS s |> JOIN t ON s.a = t.a |> SELECT s.a, t.b");
+        assert_eq!(renamed, [[2.0], [20.0]]);
+        // An alias names the columns its table had, whatever their names now.
+        assert_eq!(kept("FROM t |> RENAME a AS z |> SELECT t.a"), [1.0, 2.0]);
+        let joined =
+            "FROM t AS x |> JOIN t AS y ON x.a < y.a |> WHERE x.b + y.b = 30 |> SELECT x.a";
+        assert_eq!(kept(joined), [1.0]);
+        // `SELECT` makes a new table, which no alias names.
+        assert_eq!(error("FROM t |> SELECT a |> SELECT t.a"), (ErrorCode::UnknownColumn, 29));
+        assert_eq!(error("FROM t |> SELECT u.a"), (ErrorCode::UnknownColumn, 17));
+        assert_eq!(error("FROM t |> JOIN t ON t.a = 1"), (ErrorCode::AmbiguousColumn, 20));
     }
 
     #[test]
