@@ -237,6 +237,9 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "only integer and string columns can be grouped by yet".into(),
             "not an integer or string column".into(),
         ),
+        what if what == Unsupported::Join as u16 => {
+            ("joins can't be run yet".into(), "a join".into())
+        }
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }
 }
