@@ -3,6 +3,7 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
+use pipit_kernel::cross_join::CrossJoinOp;
 use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
 use pipit_kernel::filter::{Comparison, Value};
 use pipit_kernel::limit::LimitOp;
@@ -95,14 +96,14 @@ pub const JOIN: Rule = Rule {
     keyword: "join",
     point: Point::Stage,
     items: &[Item::One(Shared::Name), Item::Clause(&["on"], Shared::Expr)],
-    compile: compile_join,
+    compile: compile_inner_join,
 };
 
 pub const INNER_JOIN: Rule = Rule {
     keyword: "inner",
     point: Point::Stage,
     items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["on"], Shared::Expr)],
-    compile: compile_join,
+    compile: compile_inner_join,
 };
 
 pub const LEFT_JOIN: Rule = Rule {
@@ -113,14 +114,14 @@ pub const LEFT_JOIN: Rule = Rule {
         Item::After(&["join"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
     ],
-    compile: compile_join,
+    compile: compile_left_join,
 };
 
 pub const CROSS_JOIN: Rule = Rule {
     keyword: "cross",
     point: Point::Stage,
     items: &[Item::After(&["join"], Shared::Name)],
-    compile: compile_join,
+    compile: compile_cross_join,
 };
 
 /// Selecting and filtering rows.
@@ -155,7 +156,11 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let condition = compiler.node(stage.first_child());
+    filter(compiler, compiler.node(stage.first_child()))
+}
+
+/// Keeps the rows so far that condition `condition` is true for.
+fn filter(compiler: &mut Compiler<'_, '_>, condition: Node) -> Result<(), Error> {
     let predicate = match compile_condition(compiler, condition) {
         Err(error) if error == Error::unsupported(Unsupported::Where, error.span) => {
             // Its own error, if an expression can't be what it is either.
@@ -201,10 +206,54 @@ fn computed_condition(
     Ok(Predicate::new(nodes))
 }
 
-/// `[INNER] JOIN t ON c`, `LEFT [OUTER] JOIN t ON c` and `CROSS JOIN t`,
-/// which can't be run yet.
-fn compile_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+/// `[INNER] JOIN t ON c`: each pair of a row so far and a row of table `t`
+/// that condition `c` is true for, with the columns of both: a cross join,
+/// then `WHERE c`.
+fn compile_inner_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let table = compiler.node(stage.first_child());
+    cross_join(compiler, table)?;
+    let on = compiler.node(stage.first_child() + 1);
+    if on.child_count() == 0 {
+        return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
+    }
+    filter(compiler, only(compiler, on)?)
+}
+
+/// `CROSS JOIN t`: each pair of a row so far and a row of table `t`.
+fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    cross_join(compiler, compiler.node(stage.first_child()))
+}
+
+/// `LEFT [OUTER] JOIN t ON c`, which can't be run yet.
+fn compile_left_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     Err(Error::unsupported(Unsupported::Join, compiler.span(stage)))
+}
+
+/// Pairs each row so far with each row of table `table`, a name or a list
+/// of one. The scope is the columns of both, so a name in both is
+/// ambiguous.
+fn cross_join(compiler: &mut Compiler<'_, '_>, mut table: Node) -> Result<(), Error> {
+    let probe = compiler.plan.root;
+    if table.tag() == Tag::List {
+        table = only(compiler, table)?;
+    }
+    let build = compiler.compile_relation(table)?;
+    compiler.scope.extend_from_slice(&build.columns)?;
+    let allocator = compiler.allocator();
+    let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
+    let op = DynOp::new(allocator, CrossJoinOp { build_columns })?;
+    let children = [probe, build.node];
+    compiler.plan.add_node(op, &children)?;
+    Ok(())
+}
+
+/// The one item of `list`.
+fn only(compiler: &Compiler<'_, '_>, list: Node) -> Result<Node, Error> {
+    if list.child_count() != 1 {
+        let second = compiler.node(list.first_child() + 1);
+        return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(second)));
+    }
+    Ok(compiler.node(list.first_child()))
 }
 
 // These stages change which columns are in scope and what they're called,

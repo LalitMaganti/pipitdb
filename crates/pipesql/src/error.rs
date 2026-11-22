@@ -109,7 +109,7 @@ pub enum Unsupported {
     GroupKey = 8,
     /// An `ORDER BY` key that isn't a column.
     OrderBy = 9,
-    /// A join, which can't be run yet.
+    /// A left join, which can't be run yet.
     Join = 10,
     /// A condition that's a double, not a comparison or an integer.
     DoubleCondition = 11,

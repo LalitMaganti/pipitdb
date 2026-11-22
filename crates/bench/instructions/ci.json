@@ -57,9 +57,9 @@
   "predicate.or": 4635624,
   "query.typical": 861453,
   "scan.table": 210560,
-  "small.point": 39833,
+  "small.point": 38176,
   "small_planned.order": 452615,
-  "small_planned.point": 4488,
+  "small_planned.point": 4218,
   "string_pool_get.distinct": 240683,
   "string_pool_intern.distinct": 2248997,
   "string_pool_intern.repeats": 1503096

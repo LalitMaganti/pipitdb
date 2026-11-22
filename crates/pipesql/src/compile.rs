@@ -364,12 +364,37 @@ mod tests {
     }
 
     #[test]
-    fn parses_joins_it_cant_run_yet() {
-        assert_eq!(error("FROM t |> JOIN ids ON b = id"), (ErrorCode::Unsupported, 15));
-        assert_eq!(error("FROM t |> left outer join ids ON b = id"), (ErrorCode::Unsupported, 26));
-        assert_eq!(error("FROM t |> CROSS JOIN ids"), (ErrorCode::Unsupported, 21));
+    fn joins_tables() {
+        let joined = |query| {
+            let mut columns = run(query).into_iter().map(|(_, values)| values);
+            (columns.next().unwrap(), columns.next().unwrap())
+        };
+        assert_eq!(
+            joined("FROM t |> JOIN ids ON b = id |> SELECT a, v"),
+            ([1.0].into(), [1.0].into())
+        );
+        // Pairs come out a row of the joined table at a time.
+        let less = ([1.0, 1.0, 2.0].into(), [2.0, 3.0, 3.0].into());
+        assert_eq!(joined("FROM t |> INNER JOIN ids ON a < v |> SELECT a, v"), less);
+        assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = v |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = 2 |> SELECT a"), []);
+        let product =
+            ([1.0, 2.0, 1.0, 2.0, 1.0, 2.0].into(), [10.0, 10.0, 11.0, 11.0, 12.0, 12.0].into());
+        assert_eq!(joined("FROM t |> CROSS JOIN ids |> SELECT a, id"), product);
+        // Of only the rows so far's columns, so no column of `ids` is held.
+        assert_eq!(kept("FROM t |> CROSS JOIN ids |> SELECT a"), [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn rejects_joins_it_cant_run() {
+        assert_eq!(error("FROM t |> JOIN ids"), (ErrorCode::ExpectedWord, 15));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
+        assert_eq!(error("FROM t |> left outer join ids ON b = id").0, ErrorCode::Unsupported);
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
+        // Both tables have `a`.
+        assert_eq!(error("FROM t |> JOIN t ON a = 1"), (ErrorCode::AmbiguousColumn, 20));
+        assert_eq!(error("FROM t |> JOIN ids ON s"), (ErrorCode::NumberCondition, 22));
+        assert_eq!(error("FROM t |> JOIN ids ON f"), (ErrorCode::Unsupported, 22));
     }
 
     #[test]

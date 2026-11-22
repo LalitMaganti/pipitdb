@@ -16,6 +16,7 @@ pub mod bytes;
 pub mod column;
 pub mod condition;
 pub mod context;
+pub mod cross_join;
 mod eight;
 mod erase;
 pub mod error;

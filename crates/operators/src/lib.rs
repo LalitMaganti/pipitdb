@@ -9,4 +9,6 @@ extern crate pipit_kernel;
 pub mod table;
 
 #[cfg(test)]
+mod cross_join_tests;
+#[cfg(test)]
 mod join_tests;
