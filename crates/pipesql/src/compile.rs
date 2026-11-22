@@ -386,6 +386,16 @@ mod tests {
     }
 
     #[test]
+    fn filters_by_computed_conditions() {
+        // What a predicate can't test is computed.
+        assert_eq!(kept("FROM t |> WHERE a < b |> SELECT a"), [1.0, 2.0]);
+        assert_eq!(kept("FROM t |> WHERE a * 10 = b AND a > 1 |> SELECT a"), [2.0]);
+        assert_eq!(kept("FROM n |> WHERE x = x |> SELECT x"), [1.0]);
+        assert_eq!(error("FROM t |> WHERE s"), (ErrorCode::NumberCondition, 16));
+        assert_eq!(error("FROM t |> WHERE f"), (ErrorCode::Unsupported, 16));
+    }
+
+    #[test]
     fn filters_with_where() {
         assert_eq!(kept("FROM t |> WHERE a > 1 |> SELECT b"), [20.0]);
         assert_eq!(kept("FROM t |> WHERE 15 < b AND NOT a = 1 |> SELECT b"), [20.0]);
@@ -624,10 +634,11 @@ mod tests {
     #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
-        assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::Unsupported, 16));
-        assert_eq!(error("FROM t |> WHERE a + 1 IS NULL"), (ErrorCode::Unsupported, 16));
+        // Conditions a predicate can't test are typed as expressions.
+        assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::ExpectedOneKind, 16));
+        assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::ExpectedOneKind, 16));
+        assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::ExpectedString, 16));
+        assert_eq!(kept("FROM t |> WHERE a + 1 IS NULL |> SELECT a"), []);
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));
@@ -659,9 +670,10 @@ mod tests {
         let long = format!("FROM t |> SELECT a{} AS x", " + a".repeat(200));
         assert_eq!(error(&long), (ErrorCode::ExpressionTooLarge, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
-        assert_eq!(error("FROM t |> WHERE a > b"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE a + 1 > 2"), (ErrorCode::Unsupported, 16));
-        assert_eq!(error("FROM t |> WHERE a"), (ErrorCode::Unsupported, 16));
+        // Computed, as a predicate can't test them.
+        assert_eq!(kept("FROM t |> WHERE a > b |> SELECT a"), []);
+        assert_eq!(kept("FROM t |> WHERE a + 1 > 2 |> SELECT a"), [2.0]);
+        assert_eq!(kept("FROM t |> WHERE a |> SELECT a"), [1.0, 2.0]);
         assert_eq!(error("FROM t |> WHERE f > 1.5"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 20));
         assert_eq!(

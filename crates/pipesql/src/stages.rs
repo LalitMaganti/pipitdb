@@ -4,11 +4,13 @@
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
+use pipit_kernel::filter::{Comparison, Value};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
+use pipit_kernel::predicate::{Leaf, Node as PredicateNode, Predicate};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
@@ -154,12 +156,49 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let condition = compiler.node(stage.first_child());
-    let predicate = compile_condition(compiler, condition)?;
+    let predicate = match compile_condition(compiler, condition) {
+        Err(error) if error == Error::unsupported(Unsupported::Where, error.span) => {
+            // Its own error, if an expression can't be what it is either.
+            match computed_condition(compiler, condition) {
+                Err(other) if other.code == ErrorCode::Unsupported => return Err(error),
+                computed => computed?,
+            }
+        }
+        predicate => predicate?,
+    };
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(filter, &children)?;
     Ok(())
+}
+
+/// A condition a predicate can't test, such as `a < b`, computed as a column
+/// after the rows so far's, and a predicate keeping the rows it's true for.
+fn computed_condition(
+    compiler: &mut Compiler<'_, '_>,
+    condition: Node,
+) -> Result<Predicate, Error> {
+    let (expr, data_type) = compile_expr(compiler, condition)?;
+    match data_type {
+        DataType::Int64 => {}
+        DataType::String => {
+            return Err(Error::new(ErrorCode::NumberCondition, compiler.span(condition)));
+        }
+        DataType::Float64 => {
+            return Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(condition)));
+        }
+    }
+    let output = compiler.plan.add_column("where", DataType::Int64, true)?.id;
+    let allocator = compiler.allocator();
+    add_compute(
+        compiler,
+        SlowVec::fixed_from(allocator, [ComputeItem { output, expr }].into_iter())?,
+    )?;
+    let true_ =
+        Leaf::Compare { column: output, comparison: Comparison::NotEqual, value: Value::Int64(0) };
+    let nodes = SlowVec::fixed_from(allocator, [PredicateNode::Leaf(true_)].into_iter())?;
+    Ok(Predicate::new(nodes))
 }
 
 /// `[INNER] JOIN t ON c`, `LEFT [OUTER] JOIN t ON c` and `CROSS JOIN t`,

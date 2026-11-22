@@ -111,6 +111,8 @@ pub enum Unsupported {
     OrderBy = 9,
     /// A join, which can't be run yet.
     Join = 10,
+    /// A condition that's a double, not a comparison or an integer.
+    DoubleCondition = 11,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
