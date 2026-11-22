@@ -90,7 +90,7 @@ fn scan<'c>(
         bound.push(binding);
     }
     let op = DynOp::new(&Heap, ScanOp::new(table, reads)).unwrap();
-    (plan.add_node(op, SlowVec::fixed(&Heap, 0).unwrap()).unwrap(), bound)
+    (plan.add_node(op, &[]).unwrap(), bound)
 }
 
 /// `slice JOIN thread ON utid = id`'s `dur` and `tid`, by row, of the
@@ -108,16 +108,16 @@ fn join(
             Leaf::Compare { column: probe_columns[1].id, comparison, value: Value::Int64(value) };
         let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
         let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
-        let children = SlowVec::fixed_from(&Heap, [probe].into_iter()).unwrap();
-        probe = plan.add_node(filter, children).unwrap();
+        let children = [probe];
+        probe = plan.add_node(filter, &children).unwrap();
     }
     let (build, build_columns) = scan(&mut plan, thread, &["id", "tid"]);
     let (utid, dur, id, tid) =
         (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
     let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
     let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
-    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
-    plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
+    let children = [probe, build];
+    plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
     plan.output.push(dur).unwrap();
     plan.output.push(tid).unwrap();
     optimize(&Heap, &mut plan).unwrap();
@@ -176,8 +176,8 @@ fn filtered_above(
         (probe_columns[0], probe_columns[1], build_columns[0], build_columns[1]);
     let joined = SlowVec::fixed_from(&Heap, [tid.id].into_iter()).unwrap();
     let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
-    let children = SlowVec::fixed_from(&Heap, [probe, build].into_iter()).unwrap();
-    let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), children).unwrap();
+    let children = [probe, build];
+    let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
     let greater = |column: u32, value| {
         Node::Leaf(Leaf::Compare {
             column,
@@ -187,8 +187,8 @@ fn filtered_above(
     };
     let nodes = [greater(dur.id, durs), greater(tid.id, tids), Node::And(0, 1)];
     let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
-    let children = SlowVec::fixed_from(&Heap, [join].into_iter()).unwrap();
-    plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), children).unwrap();
+    let children = [join];
+    plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), &children).unwrap();
     plan.output.push(dur).unwrap();
     plan.output.push(tid).unwrap();
     optimize(&Heap, &mut plan).unwrap();

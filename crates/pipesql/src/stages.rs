@@ -157,8 +157,8 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     let predicate = compile_condition(compiler, condition)?;
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(filter, children)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(filter, &children)?;
     Ok(())
 }
 
@@ -347,8 +347,8 @@ fn add_compute(
     }
     let allocator = compiler.allocator();
     let compute = DynOp::new(allocator, ComputeOp { items: computed })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(compute, children)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(compute, &children)?;
     Ok(())
 }
 
@@ -369,8 +369,8 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         keys.push(SortKey { column, descending: key.descending() })?;
     }
     let order_by = DynOp::new(allocator, OrderByOp { keys })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(order_by, children)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(order_by, &children)?;
     Ok(())
 }
 
@@ -389,8 +389,8 @@ fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     };
     let allocator = compiler.allocator();
     let limit = DynOp::new(allocator, LimitOp { count, offset })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(limit, children)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(limit, &children)?;
     Ok(())
 }
 
@@ -467,8 +467,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         scope.push(binding)?;
     }
     let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates, answer: None })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(aggregate, children)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
     Ok(())
 }

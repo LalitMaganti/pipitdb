@@ -337,7 +337,7 @@ mod tests {
         let b_column = ScanColumn { column: 1, binding: b, forms: Forms::FLAT };
         assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        plan.add_node(scan, &[]).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
 
         let physical = lower_planned(&mut plan).unwrap();
@@ -411,10 +411,10 @@ mod tests {
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let scan = plan.add_node(scan, &[]).unwrap();
         let op = Knows { asks, known: &known, sorted_by_b: &sorted_by_b };
         let op = DynOp::new(&Heap, op).unwrap();
-        plan.add_node(op, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        plan.add_node(op, &[scan]).unwrap();
         assert!(plan.output.push(bindings[read[0] as usize]).is_ok());
         lower_planned(&mut plan).unwrap();
         drop(plan);
@@ -464,7 +464,7 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let mut input = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let mut input = plan.add_node(scan, &[]).unwrap();
         if let Some(groups) = groups {
             let binding = plan.add_column("n", DataType::Int64, true).unwrap();
             let function = crate::aggregate::Function::CountStar;
@@ -476,20 +476,19 @@ mod tests {
                 answer: None,
             };
             let aggregate = DynOp::new(&Heap, aggregate).unwrap();
-            let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
-            input = plan.add_node(aggregate, children).unwrap();
+            let children = [input];
+            input = plan.add_node(aggregate, &children).unwrap();
         }
         let sort_keys =
             keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
         let order_by =
             crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
         let order_by = DynOp::new(&Heap, order_by).unwrap();
-        let children = SlowVec::fixed_from(&Heap, [input].into_iter()).unwrap();
-        let ordered = plan.add_node(order_by, children).unwrap();
+        let children = [input];
+        let ordered = plan.add_node(order_by, &children).unwrap();
         if let Some((count, offset)) = limit {
             let limit = DynOp::new(&Heap, crate::limit::LimitOp { count, offset }).unwrap();
-            plan.add_node(limit, SlowVec::fixed_from(&Heap, [ordered].into_iter()).unwrap())
-                .unwrap();
+            plan.add_node(limit, &[ordered]).unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
         lower_planned(&mut plan).unwrap().pipeline().describe()
@@ -532,13 +531,13 @@ mod tests {
             ids.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let mut node = plan.add_node(scan, &[]).unwrap();
         for (column, descending) in [(1, false), (0, true)] {
             let key = SortKey { column: ids[column].id, descending };
             let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
             let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap();
-            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
-            node = plan.add_node(order_by, children).unwrap();
+            let children = [node];
+            node = plan.add_node(order_by, &children).unwrap();
         }
         assert!(plan.output.push(ids[0]).is_ok());
         assert_eq!(lower_planned(&mut plan).unwrap().pipeline().describe(), "Scan | Sort");
@@ -556,7 +555,7 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        plan.add_node(scan, &[]).unwrap();
         for &i in output {
             assert!(plan.output.push(bindings[i]).is_ok());
         }
@@ -661,14 +660,14 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let scan = plan.add_node(scan, &[]).unwrap();
         let (a, b) = (bindings[0].id, bindings[1].id);
         let greater =
             Leaf::Compare { column: a, comparison: Comparison::Greater, value: Value::Int64(1) };
         let nodes = [Node::Leaf(greater), Node::Leaf(Leaf::IsNull { column: b }), Node::Or(0, 1)];
         let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
         let filter = DynOp::new(&Heap, FilterOp { predicate }).unwrap();
-        plan.add_node(filter, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
 
@@ -735,7 +734,7 @@ mod tests {
                 }
             }
             let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-            plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+            plan.add_node(scan, &[]).unwrap();
             plan
         };
         assert_eq!(lower_planned(&mut plan(70)).err(), Some(LowerError::TooManyColumns));
@@ -887,14 +886,14 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(table, columns)).unwrap();
-        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let mut node = plan.add_node(scan, &[]).unwrap();
         for &(column, comparison, value) in filters {
             let column = bindings[column].id;
             let leaf = Leaf::Compare { column, comparison, value: Value::Int64(value) };
             let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
             let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
-            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
-            node = plan.add_node(filter, children).unwrap();
+            let children = [node];
+            node = plan.add_node(filter, &children).unwrap();
         }
         for &i in output {
             assert!(plan.output.push(bindings[i]).is_ok());
@@ -1001,7 +1000,7 @@ mod tests {
             ids.push(binding.id);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let mut node = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let mut node = plan.add_node(scan, &[]).unwrap();
         for stage in stages {
             let op = match *stage {
                 Stage::Filter => {
@@ -1022,8 +1021,8 @@ mod tests {
                     DynOp::new(&Heap, crate::limit::LimitOp { count, offset: 0 }).unwrap()
                 }
             };
-            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
-            node = plan.add_node(op, children).unwrap();
+            let children = [node];
+            node = plan.add_node(op, &children).unwrap();
         }
         let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
         assert!(plan.output.push(a).is_ok());
@@ -1103,7 +1102,7 @@ mod tests {
         let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
         let columns = SlowVec::fixed_from(&Heap, columns.into_iter()).unwrap();
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let scan = plan.add_node(scan, &[]).unwrap();
         let mut aggregates = StdVec::new();
         for (function, input) in
             [(Function::CountStar, None), (Function::Min, Some(a.id)), (Function::Max, Some(a.id))]
@@ -1118,7 +1117,7 @@ mod tests {
             answer: None,
         };
         let aggregate = DynOp::new(&Heap, aggregate).unwrap();
-        plan.add_node(aggregate, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        plan.add_node(aggregate, &[scan]).unwrap();
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
         let physical = lower_planned(&mut plan).unwrap();
         let query = QueryAllocators::new(&Heap);
@@ -1184,7 +1183,7 @@ mod tests {
             bindings.push(binding);
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
-        let scan = plan.add_node(scan, SlowVec::fixed(&Heap, 0).unwrap()).unwrap();
+        let scan = plan.add_node(scan, &[]).unwrap();
         let leaf = Leaf::Compare {
             column: bindings[0].id,
             comparison: Comparison::Greater,
@@ -1192,12 +1191,11 @@ mod tests {
         };
         let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
         let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
-        let mut below =
-            plan.add_node(filter, SlowVec::fixed_from(&Heap, [scan].into_iter()).unwrap()).unwrap();
+        let mut below = plan.add_node(filter, &[scan]).unwrap();
         for &accepts in accepts {
             let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();
-            let children = SlowVec::fixed_from(&Heap, [below].into_iter()).unwrap();
-            below = plan.add_node(reads, children).unwrap();
+            let children = [below];
+            below = plan.add_node(reads, &children).unwrap();
         }
         choose_forms(&Heap, &mut plan).unwrap();
         plan.nodes.len()

@@ -5,7 +5,7 @@
 use crate::allocator::{AllocError, Allocator};
 use crate::column::Forms;
 use crate::plan::{
-    ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
+    Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
 use crate::slow_vec::SlowVec;
 
@@ -138,7 +138,7 @@ pub fn answer_from_summaries(
         let node = at_mut!(rest, 0);
         let &[child] = &node.children[..] else { continue };
         if node.op.answer(allocator, &at!(below, child as usize).op)? {
-            node.children = SlowVec::fixed(allocator, 0)?;
+            node.children = Children::new();
         }
     }
     remove_unreachable_nodes(plan);
@@ -181,7 +181,7 @@ fn move_one_filter(
         for (input, op) in moved.filters.into_iter().enumerate() {
             let Some(op) = op else { continue };
             let grandchild = *at!(at!(plan.nodes, under as usize).children, input);
-            let children = SlowVec::fixed_from(allocator, core::iter::once(grandchild))?;
+            let children = Children::from_slice(&[grandchild])?;
             // Inserted just before the op it goes under, so every node still
             // comes after its inputs.
             insert_node(plan, under, PlanNode { op, children })?;
@@ -191,7 +191,7 @@ fn move_one_filter(
         if moved.emptied {
             bypass(plan, filter, under);
             // Detached, so nothing reaches it and it isn't moved again.
-            at_mut!(plan.nodes, filter as usize).children = SlowVec::fixed(allocator, 0)?;
+            at_mut!(plan.nodes, filter as usize).children = Children::new();
         }
         return Ok(true);
     }
@@ -374,7 +374,7 @@ pub fn choose_forms(
             Load::Below(parent, slot) => *at!(at!(plan.nodes, parent as usize).children, slot),
             Load::AtRoot | Load::Never => plan.root,
         };
-        let children = SlowVec::fixed_from(allocator, core::iter::once(below))?;
+        let children = Children::from_slice(&[below])?;
         // Just before what reads it, so inputs still come before their readers.
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
         let id = match load {
@@ -480,19 +480,14 @@ mod tests {
         let allowed = Cell::new(Forms::FLAT);
         let mut plan = LogicalPlan::new(&Heap).unwrap();
         let column = plan.add_column("a", DataType::String, true).unwrap();
-        let mut node = plan
-            .add_node(
-                DynOp::new(&Heap, Maker(&allowed)).unwrap(),
-                SlowVec::fixed(&Heap, 0).unwrap(),
-            )
-            .unwrap();
+        let mut node = plan.add_node(DynOp::new(&Heap, Maker(&allowed)).unwrap(), &[]).unwrap();
         let readers = [
             Reader { accepts, passes_through },
             Reader { accepts: Forms::FLAT, passes_through: true },
         ];
         for reader in readers {
-            let children = SlowVec::fixed_from(&Heap, [node].into_iter()).unwrap();
-            node = plan.add_node(DynOp::new(&Heap, reader).unwrap(), children).unwrap();
+            let children = [node];
+            node = plan.add_node(DynOp::new(&Heap, reader).unwrap(), &children).unwrap();
         }
         assert!(plan.output.push(column).is_ok());
         choose_forms(&Heap, &mut plan).unwrap();
