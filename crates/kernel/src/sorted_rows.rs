@@ -293,7 +293,7 @@ impl SortedRows {
             }
             Ok(ColumnView::new(context, data_type, values, nulls.then_some(validity))?)
         };
-        self.rows.gather(context, out, rows, at, given)
+        self.rows.gather(context, out, rows, at, &mut { given })
     }
 
     /// Copies the columns `RowStore::scatter` can into the order, once

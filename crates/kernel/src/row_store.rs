@@ -239,7 +239,7 @@ impl RowStore {
         out: &mut RowBatch,
         rows: &[u32],
         at: u32,
-        mut given: impl FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
+        given: &mut dyn FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
     ) -> Result<u32, Error> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         let count = rows.len().min(BATCH_ROWS_MAX as usize) as u32;
@@ -805,7 +805,8 @@ mod tests {
         let mut got = Vec::new();
         for chunk in all.chunks(BATCH_ROWS_MAX as usize) {
             assert_eq!(
-                store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap() as usize,
+                store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap()
+                    as usize,
                 chunk.len()
             );
             if chunk[0] == 0 {
@@ -819,7 +820,7 @@ mod tests {
         let backwards: Vec<u32> = (0..store.len()).rev().step_by(3).collect();
         let mut got = Vec::new();
         for chunk in backwards.chunks(BATCH_ROWS_MAX as usize) {
-            store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap();
+            store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap();
             got.extend(read(&out));
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
@@ -838,7 +839,7 @@ mod tests {
         let last = BATCH_ROWS_MAX * 2 - 1;
         let rows = [last, 3, BATCH_ROWS_MAX, 0];
         let mut out = RowBatch::new();
-        store.gather(&mut context, &mut out, &rows, 0, |_, _| failed!()).unwrap();
+        store.gather(&mut context, &mut out, &rows, 0, &mut |_, _| failed!()).unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let null = (None, b"v0".to_vec());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
@@ -885,7 +886,7 @@ mod tests {
         for (chunk, at) in
             rows.chunks(BATCH_ROWS_MAX as usize).zip((0..).step_by(BATCH_ROWS_MAX as usize))
         {
-            store.gather(&mut context, &mut out, chunk, at, |_, _| failed!()).unwrap();
+            store.gather(&mut context, &mut out, chunk, at, &mut |_, _| failed!()).unwrap();
             for (r, &row) in chunk.iter().enumerate() {
                 assert_eq!(out.column(0).int64s()[r], value(row));
                 assert_eq!(out.column(2).int64s()[r], value(row) * 10 + 1);
