@@ -4,7 +4,9 @@
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
 use pipit_kernel::cross_join::CrossJoinOp;
-use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
+use pipit_kernel::expression::{
+    ComputeItem, ComputeOp, EXPR_NODES_MAX, Expr, ExprOp, expr_can_be_null,
+};
 use pipit_kernel::filter::{Comparison, Value};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
@@ -15,11 +17,12 @@ use pipit_kernel::predicate::{Leaf, Node as PredicateNode, Predicate};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::Compiler;
+use crate::compile::{Compiler, Relation};
 use crate::condition::compile_condition;
 use crate::error::{Error, ErrorCode, Unsupported};
-use crate::expression::{compile_expr, is_null};
+use crate::expression::{check_type, compile_expr, expr_node, is_null};
 use crate::keywords::same_word;
+use crate::parser::LIST_MAX;
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -95,14 +98,22 @@ pub const ORDER_BY: Rule = Rule {
 pub const JOIN: Rule = Rule {
     keyword: "join",
     point: Point::Stage,
-    items: &[Item::One(Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    items: &[
+        Item::One(Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
     compile: compile_inner_join,
 };
 
 pub const INNER_JOIN: Rule = Rule {
     keyword: "inner",
     point: Point::Stage,
-    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    items: &[
+        Item::After(&["join"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
     compile: compile_inner_join,
 };
 
@@ -113,6 +124,7 @@ pub const LEFT_JOIN: Rule = Rule {
         Item::Optional("outer"),
         Item::After(&["join"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
     ],
     compile: compile_left_join,
 };
@@ -171,6 +183,11 @@ fn filter(compiler: &mut Compiler<'_, '_>, condition: Node) -> Result<(), Error>
         }
         predicate => predicate?,
     };
+    add_filter(compiler, predicate)
+}
+
+/// Keeps the rows so far that `predicate` is true for.
+fn add_filter(compiler: &mut Compiler<'_, '_>, predicate: Predicate) -> Result<(), Error> {
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp { predicate })?;
     let children = [compiler.plan.root];
@@ -194,6 +211,12 @@ fn computed_condition(
             return Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(condition)));
         }
     }
+    truth_of(compiler, expr)
+}
+
+/// A predicate keeping the rows `expr`, an integer, is true for, computed
+/// as a column after the rows so far's.
+fn truth_of(compiler: &mut Compiler<'_, '_>, expr: Expr) -> Result<Predicate, Error> {
     let output = compiler.plan.add_column("where", DataType::Int64, true)?.id;
     let allocator = compiler.allocator();
     add_compute(
@@ -208,20 +231,32 @@ fn computed_condition(
 
 /// `[INNER] JOIN t ON c`: each pair of a row so far and a row of table `t`
 /// that condition `c` is true for, with the columns of both: a cross join,
-/// then `WHERE c`.
+/// then `WHERE c`. Or `USING (k)`, as `ON k = t.k`, with `k` once.
 fn compile_inner_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let table = compiler.node(stage.first_child());
-    cross_join(compiler, table)?;
-    let on = compiler.node(stage.first_child() + 1);
-    if on.child_count() == 0 {
-        return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
+    let first = stage.first_child();
+    let (table, on, using) =
+        (compiler.node(first), compiler.node(first + 1), compiler.node(first + 2));
+    let build = cross_join(compiler, table)?;
+    match (on.child_count(), using.child_count()) {
+        (0, 0) => Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table))),
+        (_, 0) => {
+            compiler.scope.extend_from_slice(&build.columns)?;
+            filter(compiler, only(compiler, on)?)
+        }
+        (0, _) => {
+            let expr = using_columns(compiler, &build, using)?;
+            let predicate = truth_of(compiler, expr)?;
+            add_filter(compiler, predicate)
+        }
+        _ => Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using))),
     }
-    filter(compiler, only(compiler, on)?)
 }
 
 /// `CROSS JOIN t`: each pair of a row so far and a row of table `t`.
 fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    cross_join(compiler, compiler.node(stage.first_child()))
+    let build = cross_join(compiler, compiler.node(stage.first_child()))?;
+    compiler.scope.extend_from_slice(&build.columns)?;
+    Ok(())
 }
 
 /// `LEFT [OUTER] JOIN t ON c`, which can't be run yet.
@@ -230,21 +265,67 @@ fn compile_left_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
 }
 
 /// Pairs each row so far with each row of table `table`, a name or a list
-/// of one. The scope is the columns of both, so a name in both is
-/// ambiguous.
-fn cross_join(compiler: &mut Compiler<'_, '_>, mut table: Node) -> Result<(), Error> {
+/// of one, and returns the table, whose columns the caller puts in scope.
+fn cross_join(compiler: &mut Compiler<'_, '_>, mut table: Node) -> Result<Relation, Error> {
     let probe = compiler.plan.root;
     if table.tag() == Tag::List {
         table = only(compiler, table)?;
     }
     let build = compiler.compile_relation(table)?;
-    compiler.scope.extend_from_slice(&build.columns)?;
     let allocator = compiler.allocator();
     let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
     let op = DynOp::new(allocator, CrossJoinOp { build_columns })?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
-    Ok(())
+    Ok(build)
+}
+
+/// `USING`'s condition, that each column of the list `using` is equal on
+/// both sides, and its scope: those columns, the rows so far's, then the
+/// rest of `build`'s.
+fn using_columns(
+    compiler: &mut Compiler<'_, '_>,
+    build: &Relation,
+    using: Node,
+) -> Result<Expr, Error> {
+    let allocator = compiler.allocator();
+    let mut nodes = SlowVec::new(allocator, EXPR_NODES_MAX)?;
+    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    // Each build column joined on, one for each name in the list.
+    let mut joined = [0; LIST_MAX];
+    for i in 0..using.child_count() {
+        let name = listed_once(compiler, using, i, 0)?;
+        let (left, right) = (compiler.find_column(name)?, compiler.find_in(&build.columns, name)?);
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let at = nodes.len() as u32;
+        nodes.push(expr_node(ExprOp::Column, left.id, 0, 0))?;
+        nodes.push(expr_node(ExprOp::Column, right.id, 0, 0))?;
+        nodes.push(expr_node(ExprOp::Eq, at, at + 1, 0))?;
+        if i > 0 {
+            // ANDed with the equalities before it, whose result is just before.
+            nodes.push(expr_node(ExprOp::And, at - 1, at + 2, 0))?;
+        }
+        scope.push(left)?;
+        *at_mut!(joined, i as usize) = right.id;
+    }
+    // The rest of the rows so far's, even another name for a column joined
+    // on, or a second copy of one.
+    let joined_on = scope.len();
+    for column in compiler.scope.iter() {
+        let named = |joined: &NamedColumn| (joined.name, joined.id) == (column.name, column.id);
+        if !at!(scope, ..joined_on).iter().any(named) {
+            scope.push(*column)?;
+        }
+    }
+    for column in build.columns.iter() {
+        if !at!(joined, ..using.child_count() as usize).contains(&column.id) {
+            scope.push(*column)?;
+        }
+    }
+    let expr = Expr { nodes };
+    check_type(compiler, &expr, using)?;
+    compiler.scope = scope;
+    Ok(expr)
 }
 
 /// The one item of `list`.

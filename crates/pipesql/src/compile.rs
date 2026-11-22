@@ -83,11 +83,16 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// case, as SQL does. Two columns may share a name, as after `SELECT a,
     /// a`, but then the name can't be used, as in Perfetto.
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
+        self.find_in(&self.scope, name)
+    }
+
+    /// The one column of `columns` that `name` names, ignoring case.
+    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
         let text = self.text(name.span());
         let named = |column: &&NamedColumn| {
             same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
         };
-        let mut found = self.scope.iter().filter(named);
+        let mut found = columns.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
@@ -386,8 +391,40 @@ mod tests {
     }
 
     #[test]
+    fn joins_using_columns() {
+        let names = |query| run(query).into_iter().map(|(name, _)| name).collect::<StdVec<_>>();
+        // The column joined on once, first, then the rest of each side's.
+        let joined = names("FROM t |> RENAME b AS id |> JOIN ids USING (id)");
+        assert_eq!(joined, [&b"id"[..], b"a", b"f", b"s", b"v"]);
+        // A second copy of a column stays.
+        let twice = names("FROM t |> RENAME b AS id |> EXTEND a |> JOIN ids USING (id)");
+        assert_eq!(twice, [&b"id"[..], b"a", b"f", b"s", b"a", b"v"]);
+        assert_eq!(kept("FROM t |> RENAME b AS id |> JOIN ids USING (id) |> SELECT v"), [1.0]);
+        let two = "FROM t |> RENAME b AS id |> EXTEND a AS v |> JOIN ids USING (id, v) |> SELECT a";
+        assert_eq!(kept(two), [1.0]);
+        assert_eq!(
+            kept("FROM t |> RENAME b AS id, a AS v |> JOIN ids USING (v, id) |> SELECT v"),
+            [1.0]
+        );
+    }
+
+    #[test]
     fn rejects_joins_it_cant_run() {
         assert_eq!(error("FROM t |> JOIN ids"), (ErrorCode::ExpectedWord, 15));
+        assert_eq!(error("FROM t |> JOIN ids USING (id)"), (ErrorCode::UnknownColumn, 26));
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING (id, id)"),
+            (ErrorCode::ListedTwice, 48)
+        );
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING id"),
+            (ErrorCode::ExpectedToken, 43)
+        );
+        let both = error("FROM t |> RENAME b AS id |> JOIN ids ON a = v USING (id)");
+        assert_eq!(both, (ErrorCode::UnexpectedToken, 53));
+        // `s` is a string, and `id` an integer.
+        let types = error("FROM t |> RENAME s AS id |> JOIN ids USING (id)");
+        assert_eq!(types, (ErrorCode::ExpectedOneKind, 44));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> left outer join ids ON b = id").0, ErrorCode::Unsupported);
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));

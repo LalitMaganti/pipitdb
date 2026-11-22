@@ -43,6 +43,9 @@ pub enum Item {
     /// This word, if the query has it next, as `OUTER` in `LEFT OUTER JOIN`:
     /// an empty `List` either way.
     Optional(&'static str),
+    /// If the query has these words next, a list, as `List` does, in
+    /// parentheses, as `USING (a, b)`; if not, an empty `List`.
+    Parenthesized(&'static [&'static str], Shared),
 }
 
 /// The pieces of grammar stages are built from.

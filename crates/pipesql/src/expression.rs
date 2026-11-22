@@ -24,8 +24,14 @@ pub fn compile_expr(
     let mut nodes = SlowVec::new(compiler.allocator(), EXPR_NODES_MAX)?;
     compile(compiler, node, 0, &mut nodes)?;
     let expr = Expr { nodes };
+    let data_type = check_type(compiler, &expr, node)?;
+    Ok((expr, data_type))
+}
+
+/// The type `expr` computes, or the error, at `node`, of typing it.
+pub fn check_type(compiler: &Compiler<'_, '_>, expr: &Expr, node: Node) -> Result<DataType, Error> {
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
-    let data_type = check_expr_type(&expr, &type_of).map_err(|error| {
+    check_expr_type(expr, &type_of).map_err(|error| {
         let span = compiler.span(node);
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
@@ -41,8 +47,7 @@ pub fn compile_expr(
             ExprError::OutOfMemory => ErrorCode::OutOfMemory,
         };
         Error::new(code, span)
-    })?;
-    Ok((expr, data_type))
+    })
 }
 
 /// Whether `node` is the literal `NULL`.
@@ -51,7 +56,7 @@ pub fn is_null(compiler: &Compiler<'_, '_>, node: Node) -> bool {
 }
 
 /// A node of `op` reading nodes `a` and `b`, or of value `int_value`.
-fn expr_node(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
+pub(crate) fn expr_node(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
     ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value, double_value: 0.0 }
 }
 
