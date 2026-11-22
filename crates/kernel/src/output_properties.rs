@@ -103,7 +103,6 @@ pub struct Column {
 pub struct OpenSort {
     pub node: PlanNodeId,
     pub input: u32,
-    pub step: usize,
 }
 
 /// Whether `a` holds the same columns as `b`, as often each.
@@ -312,9 +311,10 @@ pub enum InputStep {
 
 /// One input of a node, once planned.
 pub struct PlannedInput {
-    /// What runs on the input, in order, before the node reads it.
-    pub steps: SlowVec<InputStep>,
-    /// What is known of the rows after `steps`.
+    /// What runs on the input before the node reads it: only a sort, so
+    /// far.
+    pub step: Option<InputStep>,
+    /// What is known of the rows after `step`.
     pub rows: OutputProperties,
 }
 
@@ -331,9 +331,6 @@ pub struct PlannedNode {
 
 /// By node, what's decided about it.
 pub type Planned = SlowVec<PlannedNode>;
-
-/// The most steps planned for one input: only a sort, so far.
-const INPUT_STEPS_MAX: usize = 1;
 
 /// What an op derives its output from.
 pub struct DeriveContext<'p, 'c> {
@@ -375,8 +372,11 @@ impl DeriveContext<'_, '_> {
         // pipeline never cuts off this scan.
         let slots = self.planned.iter().filter(|node| node.cutoff.is_some()).count();
         let node = at_mut!(self.planned, sort.node as usize);
-        let InputStep::Sort { keys, keep, publish, scan, .. } =
-            at_mut!(at_mut!(node.inputs, sort.input as usize).steps, sort.step);
+        let Some(InputStep::Sort { keys, keep, publish, scan, .. }) =
+            &mut at_mut!(node.inputs, sort.input as usize).step
+        else {
+            failed!()
+        };
         *keep = Some(rows);
         let first = *at!(keys, 0);
         let Some(scan) = *scan else { return };
@@ -444,26 +444,27 @@ impl InputPlanner<'_> {
         // What was planned between the sort and here still says it's open, as
         // in Perfetto: only a LIMIT reads that, and it drops the open sort.
         let node = at_mut!(planned, sort.node as usize);
-        let steps = &mut at_mut!(node.inputs, sort.input as usize).steps;
-        // Only sorts are planned so far, and nothing after a sort before its
-        // order is read, so it's the last step.
-        check!(sort.step + 1 == steps.len());
-        let Some(InputStep::Sort { unsorted, scan, .. }) = steps.pop() else { failed!() };
+        let step = &mut at_mut!(node.inputs, sort.input as usize).step;
+        let Some(InputStep::Sort { unsorted, scan, .. }) = step.take() else { failed!() };
         (rows.arrangements, rows.scan) = (unsorted, scan);
         true
     }
 
     fn sort(&mut self, keys: &[SortKey]) -> Result<(), AllocError> {
         let rows = &mut self.out.rows;
-        let sort = OpenSort { node: self.node, input: self.input, step: self.out.steps.len() };
+        // Only one step fits, as a full list fails.
+        if self.out.step.is_some() {
+            return Err(AllocError);
+        }
+        let sort = OpenSort { node: self.node, input: self.input };
         let keys_copy = SlowVec::fixed_from(self.allocator, keys.iter().copied())?;
-        self.out.steps.push(InputStep::Sort {
+        self.out.step = Some(InputStep::Sort {
             keys: keys_copy,
             keep: None,
             publish: None,
             unsorted: rows.arrangements,
             scan: rows.scan.take(),
-        })?;
+        });
         rows.arrangements = Arrangements::NONE;
         rows.arrangements.push(&[], keys);
         rows.open_sort = Some(sort);
@@ -498,7 +499,7 @@ fn plan_node_inputs(
     for &child in node.children.iter() {
         check!(child < id);
         let rows = at!(planned, child as usize).output;
-        inputs.push(PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows })?;
+        inputs.push(PlannedInput { step: None, rows })?;
     }
     for (i, out) in (0..).zip(inputs.iter_mut()) {
         let mut input = InputPlanner { allocator, node: id, input: i, out };
