@@ -639,6 +639,12 @@ impl Parser<'_> {
                 Item::List(shared) => self.list_of(shared)?,
                 Item::Clause(words, shared) => self.clause(words, shared, false)?,
                 Item::After(words, shared) => self.clause(words, shared, true)?,
+                Item::Optional(word) => {
+                    if self.at_word(word) {
+                        self.advance()?;
+                    }
+                    self.list(Tag::List, &[])
+                }
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));

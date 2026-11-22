@@ -195,13 +195,13 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::expression::{Bind, call_bound};
     use crate::registry::FunctionRule;
-    use crate::stages::{AGGREGATION, RELATIONAL};
+    use crate::stages::{AGGREGATION, JOINS, RELATIONAL};
 
     #[cfg(not(feature = "string-functions"))]
     static REGISTRY: Registry =
-        Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[CHOICES, HALF]);
+        Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[CHOICES, HALF]);
     #[cfg(feature = "string-functions")]
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[
         CHOICES,
         HALF,
         crate::string_functions::STRING_FUNCTIONS,
@@ -358,6 +358,15 @@ mod tests {
         assert_eq!(run("FROM t |> SELECT b |> SELECT b"), core::slice::from_ref(&b));
         // Names match ignoring case, and keep the case they were made with.
         assert_eq!(run("FROM t |> SELECT B"), [b]);
+    }
+
+    #[test]
+    fn parses_joins_it_cant_run_yet() {
+        assert_eq!(error("FROM t |> JOIN ids ON b = id"), (ErrorCode::Unsupported, 15));
+        assert_eq!(error("FROM t |> left outer join ids ON b = id"), (ErrorCode::Unsupported, 26));
+        assert_eq!(error("FROM t |> CROSS JOIN ids"), (ErrorCode::Unsupported, 21));
+        assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
+        assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
     }
 
     #[test]
