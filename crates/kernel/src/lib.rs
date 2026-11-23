@@ -49,6 +49,7 @@ mod row_layout_sort;
 mod row_store;
 pub mod scannable;
 pub mod selection;
+pub mod settings;
 mod slab_allocator;
 pub mod sort;
 mod sorted_rows;

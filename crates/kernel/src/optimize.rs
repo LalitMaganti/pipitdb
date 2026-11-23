@@ -4,7 +4,7 @@
 
 use crate::allocator::AllocError;
 use crate::column::Forms;
-use crate::containers::SmallVec;
+use crate::containers::{SmallVec, SpillVec};
 use crate::env::Env;
 use crate::estimate::Estimate;
 use crate::expression::Exprs;
@@ -109,39 +109,40 @@ pub fn prune_columns(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocE
             pending.push((child, Some((id, slot))))?;
         }
     }
-    remove_unreachable_nodes(plan);
+    remove_unreachable_nodes(env, plan)?;
     Ok(())
 }
 
 /// Removes the nodes pruning or answering left unread, so nothing after it
 /// can reach them, and orders the rest so inputs come before what reads
 /// them: a pass may rebuild part of a plan in another order.
-fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
+fn remove_unreachable_nodes(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     // Each node's new id: the order a walk from the root finishes them, then
     // the unreachable ones'.
-    let mut new_ids = [PlanNodeId::MAX; PLAN_NODES_MAX];
-    let mut pending = [(0, false); 2 * PLAN_NODES_MAX];
-    let (mut count, mut kept) = (1, 0);
-    *at_mut!(pending, 0) = (plan.root, false);
-    while count > 0 {
-        count -= 1;
-        let (id, children_done) = *at!(pending, count);
-        if *at!(new_ids, id as usize) != PlanNodeId::MAX {
+    let count = plan.nodes.len();
+    let mut new_ids =
+        SpillVec::<PlanNodeId, NODES_INLINE>::filled(env, PLAN_NODES_MAX, count, PlanNodeId::MAX)?;
+    // Nodes to visit, and, with `DONE`, to number once their children are.
+    let mut pending = SpillVec::<PlanNodeId, NODES_INLINE>::new(env, 2 * PLAN_NODES_MAX);
+    pending.push(plan.root)?;
+    let mut kept = 0;
+    while let Some(next) = pending.pop() {
+        let id = next & !DONE;
+        let new_id = at_mut!(new_ids, id as usize);
+        if *new_id != PlanNodeId::MAX {
             continue;
         }
-        if children_done {
-            *at_mut!(new_ids, id as usize) = kept;
+        if next & DONE != 0 {
+            *new_id = kept;
             kept += 1;
             continue;
         }
-        *at_mut!(pending, count) = (id, true);
-        count += 1;
-        for &child in at!(plan.nodes, id as usize).children.iter() {
-            *at_mut!(pending, count) = (child, false);
-            count += 1;
+        let children = at!(plan.nodes, id as usize).children.iter().copied();
+        for next in core::iter::once(id | DONE).chain(children) {
+            pending.push(next)?;
         }
     }
-    let unreachable = at_mut!(new_ids, ..plan.nodes.len()).iter_mut();
+    let unreachable = new_ids.iter_mut();
     for (id, next) in unreachable.filter(|id| **id == PlanNodeId::MAX).zip(kept..) {
         *id = next;
     }
@@ -162,7 +163,17 @@ fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
     while plan.nodes.len() > kept as usize {
         plan.nodes.pop();
     }
+    Ok(())
 }
+
+/// How many nodes' ids and pending visits walking a plan holds in place, as
+/// most plans have no more.
+const NODES_INLINE: usize = 64;
+
+/// Marks a node to visit as having its children visited.
+const DONE: PlanNodeId = 1 << 31;
+
+const _: () = assert!(PLAN_NODES_MAX < DONE as usize);
 
 /// Has each op that can make its rows from what its one child knows of its
 /// own without reading them, such as an aggregate from a file's statistics,
@@ -177,7 +188,7 @@ pub fn answer_from_summaries(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<()
             node.children = Children::new();
         }
     }
-    remove_unreachable_nodes(plan);
+    remove_unreachable_nodes(env, plan)?;
     Ok(())
 }
 
@@ -190,7 +201,7 @@ pub fn answer_from_summaries(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<()
 pub fn place_filters(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     // Filters only move down, so this ends.
     while move_one_filter(env, plan)? {}
-    remove_unreachable_nodes(plan);
+    remove_unreachable_nodes(env, plan)?;
     Ok(())
 }
 
@@ -647,7 +658,7 @@ mod tests {
         }
         at_mut!(plan.nodes, 1).children = Children::from_slice(&[3]).unwrap();
         plan.root = 1;
-        remove_unreachable_nodes(&mut plan);
+        remove_unreachable_nodes(Env::current(), &mut plan).unwrap();
         assert_eq!(plan.nodes.len(), 2);
         assert_eq!((plan.root, &at!(plan.nodes, 1).children[..]), (1, &[0][..]));
     }

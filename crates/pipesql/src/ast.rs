@@ -7,8 +7,8 @@
 #![allow(unsafe_code)]
 
 use crate::error::{ErrorCode, Span};
-use crate::settings::build_setting;
 use core::ptr::NonNull;
+use pipit_kernel::settings::build_setting;
 
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::buffer::Primitive;
