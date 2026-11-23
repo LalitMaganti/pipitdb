@@ -21,7 +21,7 @@ use crate::registry::{Item, Point, Rule, Shared};
 pub const FROM: Rule = Rule {
     keyword: "from",
     point: Point::Source,
-    items: &[Item::One(Shared::Name)],
+    items: &[Item::One(Shared::Name), Item::Clause(&["as"], Shared::Name)],
     compile: compile_from,
 };
 
@@ -88,6 +88,13 @@ pub const ORDER_BY: Rule = Rule {
     compile: compile_order_by,
 };
 
+pub const AS: Rule = Rule {
+    keyword: "as",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Name)],
+    compile: compile_as,
+};
+
 pub const JOIN: Rule = Rule {
     keyword: "join",
     point: Point::Stage,
@@ -133,7 +140,8 @@ pub const CROSS_JOIN: Rule = Rule {
 };
 
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
+pub const RELATIONAL: &[Rule] =
+    &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT, AS];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
@@ -155,11 +163,28 @@ pub(crate) fn aggregate(name: &[u8]) -> Option<(&'static str, Function)> {
     FUNCTIONS.iter().find(|(f, _)| same_word(f.as_bytes(), name)).copied()
 }
 
-/// `FROM t`: scans the table `t`, whose columns are then in scope.
+/// `FROM t [AS a]`: scans the table `t`, whose columns are then in scope,
+/// and named by alias `a`, or else `t`.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let relation = compiler.compile_relation(compiler.node(stage.first_child()))?;
+    let table = compiler.node(stage.first_child());
+    let relation = compiler.compile_relation(table)?;
+    let alias = alias_or(compiler, compiler.node(stage.first_child() + 1), table)?;
+    compiler.add_alias(alias, &relation.columns)?;
     compiler.scope = relation.columns;
     Ok(())
+}
+
+/// `AS a`: the columns in scope, named by alias `a`, the only one.
+fn compile_as(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    compiler.clear_aliases();
+    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    scope.extend_from_slice(&compiler.scope)?;
+    compiler.add_alias(compiler.node(stage.first_child()), &scope)
+}
+
+/// The alias in the list `alias`, `AS`'s, or `table` if it's empty.
+fn alias_or(compiler: &Compiler<'_, '_>, alias: Node, table: Node) -> Result<Node, Error> {
+    if alias.child_count() == 0 { Ok(table) } else { only(compiler, alias) }
 }
 
 /// `WHERE c`: keeps the rows condition `c` is true for: an integer, true
@@ -187,6 +212,15 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
 /// which can't be run yet.
 fn compile_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     Err(Error::unsupported(Unsupported::Join, compiler.span(stage)))
+}
+
+/// The one item of `list`.
+fn only(compiler: &Compiler<'_, '_>, list: Node) -> Result<Node, Error> {
+    if list.child_count() != 1 {
+        let second = compiler.node(list.first_child() + 1);
+        return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(second)));
+    }
+    Ok(compiler.node(list.first_child()))
 }
 
 // These stages change which columns are in scope and what they're called,
@@ -223,6 +257,10 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     }
     add_compute(compiler, computed)?;
     compiler.scope = scope;
+    // A new table, as GoogleSQL's `SELECT` makes, which no alias names.
+    if !extend {
+        compiler.clear_aliases();
+    }
     Ok(())
 }
 
@@ -491,6 +529,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let children = [compiler.plan.root];
     compiler.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
+    compiler.clear_aliases();
     Ok(())
 }
 
@@ -561,47 +600,50 @@ mod tests {
 
     #[test]
     fn parses_queries() {
-        assert_eq!(parse("from t"), "(Query (FROM t))");
+        assert_eq!(parse("from t"), "(Query (FROM t (List )))");
         assert_eq!(
             parse("FROM slice |> WHERE dur > 1000 |> SELECT name, dur / 1000, count(*)"),
-            "(Query (FROM slice) (WHERE (Greater dur 1000)) \
+            "(Query (FROM slice (List )) (WHERE (Greater dur 1000)) \
              (SELECT (List name (Divide dur 1000) (Call count *))))"
         );
         assert_eq!(
             parse("FROM t |> WHERE url LIKE '%x%' AND a = 1"),
-            "(Query (FROM t) (WHERE (And (Like url '%x%') (Equal a 1))))"
+            "(Query (FROM t (List )) (WHERE (And (Like url '%x%') (Equal a 1))))"
         );
         assert_eq!(
             parse("FROM t |> WHERE a IS NULL OR NOT b is not null"),
-            "(Query (FROM t) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
+            "(Query (FROM t (List )) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
         );
-        assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
+        assert_eq!(
+            parse("FROM t |> LIMIT 10 offset 5"),
+            "(Query (FROM t (List )) (LIMIT 10 (List 5)))"
+        );
         // A qualified name is one name, spaces and all.
         assert_eq!(
             parse("FROM t |> WHERE t.a > u . b"),
-            "(Query (FROM t) (WHERE (Greater t.a u . b)))"
+            "(Query (FROM t (List )) (WHERE (Greater t.a u . b)))"
         );
-        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
+        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t (List )) (LIMIT 1 (List )))");
         assert_eq!(
             parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10"),
-            "(Query (FROM t) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
+            "(Query (FROM t (List )) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
         );
         assert_eq!(
             parse("FROM t |> SELECT a AS b, c |> RENAME b as d |> SET a = b"),
-            "(Query (FROM t) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
+            "(Query (FROM t (List )) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
              (SET (List (Named b a))))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*), sum(x) group by a, b"),
-            "(Query (FROM t) (AGGREGATE (List (Call count *) (Call sum x)) (List a b)))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Call count *) (Call sum x)) (List a b)))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*)"),
-            "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Call count *)) (List )))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*) AS n GROUP BY a AS k"),
-            "(Query (FROM t) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
         );
     }
 
