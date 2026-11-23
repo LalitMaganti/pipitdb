@@ -1010,6 +1010,43 @@ impl From<AllocError> for ExprError {
     }
 }
 
+/// How an op whose operands are typed alike is typed.
+#[derive(Clone, Copy)]
+struct Rule {
+    /// The error if an operand is a string, then if one is a double.
+    errors: [Option<ExprError>; 2],
+    /// Whether a NULL operand makes it NULL.
+    null_is_null: bool,
+    /// Whether it's an integer, rather than of its operands' type.
+    integer: bool,
+}
+
+const OP_COUNT: usize = ExprOp::Call as usize + 1;
+
+/// By op, how it's typed, if by a `Rule`.
+static RULES: [Option<Rule>; OP_COUNT] = rules();
+
+const fn rules() -> [Option<Rule>; OP_COUNT] {
+    let arithmetic =
+        Rule { errors: [Some(ExprError::Numbers), None], null_is_null: true, integer: false };
+    let condition = Some(ExprError::Condition);
+    let logic = Rule { errors: [condition, condition], null_is_null: false, integer: true };
+    let test = Rule { errors: [None, None], null_is_null: false, integer: true };
+    let mut rules = [None; OP_COUNT];
+    rules[ExprOp::Add as usize] = Some(arithmetic);
+    rules[ExprOp::Sub as usize] = Some(arithmetic);
+    rules[ExprOp::Mul as usize] = Some(arithmetic);
+    rules[ExprOp::Div as usize] = Some(arithmetic);
+    rules[ExprOp::Mod as usize] =
+        Some(Rule { errors: [Some(ExprError::Numbers), Some(ExprError::Integers)], ..arithmetic });
+    rules[ExprOp::And as usize] = Some(logic);
+    rules[ExprOp::Or as usize] = Some(logic);
+    rules[ExprOp::Not as usize] = Some(logic);
+    rules[ExprOp::IsNull as usize] = Some(test);
+    rules[ExprOp::IsNotNull as usize] = Some(test);
+    rules
+}
+
 /// A step of no value, reading registers `a` and `b`.
 const fn step(op: ExprOp, data_type: DataType, a: u32, b: u32) -> ExprStep {
     ExprStep { op, data_type, a, b, c: 0, int_value: 0, double_value: 0.0 }
@@ -1073,7 +1110,6 @@ impl Typer<'_> {
         nodes: &[ExprStep],
         node: &ExprStep,
     ) -> Result<(Option<DataType>, u32), ExprError> {
-        let (a, b) = (node.a as usize, node.b as usize);
         match node.op {
             ExprOp::Column => {
                 let data_type = (self.type_of)(node.a);
@@ -1089,25 +1125,6 @@ impl Typer<'_> {
             ExprOp::Null | ExprOp::When => Ok((None, 0)),
             ExprOp::Argument | ExprOp::Call => self.type_call(node),
             ExprOp::ToDouble => failed!(),
-            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
-                let (a_type, b_type) = (at!(self.nodes, a).0, at!(self.nodes, b).0);
-                let either = |data_type| a_type == Some(data_type) || b_type == Some(data_type);
-                if either(DataType::String) {
-                    return Err(ExprError::Numbers);
-                }
-                if node.op == ExprOp::Mod && either(DataType::Float64) {
-                    return Err(ExprError::Integers);
-                }
-                // Any arithmetic with NULL is NULL.
-                if a_type.is_none() || b_type.is_none() {
-                    return Ok((None, 0));
-                }
-                let data_type =
-                    if either(DataType::Float64) { DataType::Float64 } else { DataType::Int64 };
-                let a = self.materialize(node.a, data_type)?;
-                let b = self.materialize(node.b, data_type)?;
-                Ok((Some(data_type), self.add(step(node.op, data_type, a, b))?))
-            }
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 self.type_comparison(nodes, node)
             }
@@ -1125,25 +1142,57 @@ impl Typer<'_> {
             }
             ExprOp::Case => self.type_case(nodes, node),
             ExprOp::In => self.type_in(node),
-            ExprOp::And | ExprOp::Or | ExprOp::Not => {
-                let operands =
-                    if node.op == ExprOp::Not { &[node.a][..] } else { &[node.a, node.b] };
-                let mut registers = [0; 2];
-                for (register, &operand) in registers.iter_mut().zip(operands) {
-                    if at!(self.nodes, operand as usize).0.is_some_and(|t| t != DataType::Int64) {
-                        return Err(ExprError::Condition);
-                    }
-                    *register = self.materialize(operand, DataType::Int64)?;
-                }
-                let [a, b] = registers;
-                Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, b))?))
-            }
-            ExprOp::IsNull | ExprOp::IsNotNull => {
-                let a_type = at!(self.nodes, node.a as usize).0;
-                let a = self.materialize(node.a, a_type.unwrap_or(DataType::Int64))?;
-                Ok((Some(DataType::Int64), self.add(step(node.op, DataType::Int64, a, 0))?))
+            ExprOp::Add
+            | ExprOp::Sub
+            | ExprOp::Mul
+            | ExprOp::Div
+            | ExprOp::Mod
+            | ExprOp::And
+            | ExprOp::Or
+            | ExprOp::Not
+            | ExprOp::IsNull
+            | ExprOp::IsNotNull => self.type_by_rule(node),
+        }
+    }
+
+    /// Types `node` by its op's `Rule`: its operands, which are of one
+    /// type, a double where any is, or an integer if all are NULL.
+    fn type_by_rule(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+        let Some(rule) = *at!(RULES, node.op as usize) else { failed!() };
+        let [(a, _), (b, b_len)] = node.operands();
+        let both = [a, b];
+        let operands = at!(both, ..=b_len as usize);
+        let mut types = 0_u8;
+        let mut null = false;
+        for &operand in operands {
+            match at!(self.nodes, operand as usize).0 {
+                Some(data_type) => types |= 1 << data_type as u8,
+                None => null = true,
             }
         }
+        for (data_type, error) in [DataType::String, DataType::Float64].into_iter().zip(rule.errors)
+        {
+            if types >> data_type as u8 & 1 != 0
+                && let Some(error) = error
+            {
+                return Err(error);
+            }
+        }
+        if null && rule.null_is_null {
+            return Ok((None, 0));
+        }
+        let data_type = match types {
+            _ if types >> DataType::Float64 as u8 & 1 != 0 => DataType::Float64,
+            _ if types >> DataType::String as u8 & 1 != 0 => DataType::String,
+            _ => DataType::Int64,
+        };
+        let mut registers = [0; 2];
+        for (register, &operand) in registers.iter_mut().zip(operands) {
+            *register = self.materialize(operand, data_type)?;
+        }
+        let result = if rule.integer { DataType::Int64 } else { data_type };
+        let [a, b] = registers;
+        Ok((Some(result), self.add(step(node.op, result, a, b))?))
     }
 
     /// Types `node`, an `In`, whose operand must be of its list's kind:
@@ -1170,33 +1219,20 @@ impl Typer<'_> {
     fn can_fail(&self, nodes: &[ExprStep], node: &ExprStep, data_type: Option<DataType>) -> bool {
         let fails = |i: u32| at!(self.nodes, i as usize).2;
         match node.op {
-            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod => {
-                data_type == Some(DataType::Int64) || fails(node.a) || fails(node.b)
+            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Mod
+                if data_type == Some(DataType::Int64) =>
+            {
+                true
             }
-            ExprOp::Eq
-            | ExprOp::Ne
-            | ExprOp::Lt
-            | ExprOp::Le
-            | ExprOp::Gt
-            | ExprOp::Ge
-            | ExprOp::And
-            | ExprOp::Or => fails(node.a) || fails(node.b),
-            ExprOp::Like
-            | ExprOp::IsNull
-            | ExprOp::IsNotNull
-            | ExprOp::Not
-            | ExprOp::In
-            | ExprOp::Argument => fails(node.a),
             // Only its first condition is computed for every row: a `PRESENT`
             // one tests its value.
             ExprOp::Case => {
                 let first = at!(nodes, node.a as usize);
                 fails(if first.a == PRESENT { first.b } else { first.a })
             }
-            ExprOp::Call => (node.a..node.a + node.b).any(fails),
-            ExprOp::Column | ExprOp::Constant | ExprOp::Null | ExprOp::ToDouble | ExprOp::When => {
-                false
-            }
+            // Its `Case` reads what it does.
+            ExprOp::When => false,
+            _ => node.operands().into_iter().any(|(start, len)| (start..start + len).any(fails)),
         }
     }
 
