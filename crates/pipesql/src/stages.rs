@@ -289,7 +289,7 @@ fn join(
         Some(condition) => conjuncts_of(env, &compiler.plan.exprs, condition)?,
         None => SmallVec::fixed(env, 0)?,
     };
-    let op = DynOp::new(env, JoinOp::new(kind, conjuncts, columns))?;
+    let op = DynOp::new(env, JoinOp::new(env, kind, conjuncts, columns)?)?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())

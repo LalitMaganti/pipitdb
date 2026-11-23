@@ -290,7 +290,7 @@ fn rebuild(
         }
         let columns =
             [columns_of(env, relation_of, under_left)?, columns_of(env, relation_of, under_right)?];
-        let op = JoinOp::new(Kind::Inner, conjuncts, columns);
+        let op = JoinOp::new(env, Kind::Inner, conjuncts, columns)?;
         let Some(slot) = slots.next() else { failed!() };
         let plan_node = at_mut!(plan.nodes, slot as usize);
         plan_node.op = DynOp::new(env, op)?;

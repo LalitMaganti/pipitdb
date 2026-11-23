@@ -57,12 +57,11 @@ pub struct JoinOp {
     /// an `Int64`, is true for, not 0 or null. With none, every pair: a
     /// cross join.
     conjuncts: Conjuncts,
-    /// Each child's columns, at most a batch's, and a bit for each it
-    /// outputs, which pruning clears: planning finds which child a column
-    /// comes from by them all.
+    /// Each child's columns, and a bit for each it outputs, which pruning
+    /// clears: planning finds which child a column comes from by them all.
+    /// Only those it outputs need fit in a batch.
     columns: [SmallVec<ColumnId>; 2],
-    /// For each child, a bit for each of its `columns` it outputs.
-    outputs: [u64; 2],
+    outputs: [Bitmap; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
     build: u32,
@@ -70,15 +69,21 @@ pub struct JoinOp {
 
 impl JoinOp {
     /// A join of `kind` on `condition`, outputting `columns` of each child.
-    pub fn new(kind: JoinKind, conjuncts: Conjuncts, columns: [SmallVec<ColumnId>; 2]) -> JoinOp {
+    pub fn new(
+        env: &Env,
+        kind: JoinKind,
+        conjuncts: Conjuncts,
+        columns: [SmallVec<ColumnId>; 2],
+    ) -> Result<JoinOp, AllocError> {
         let all = |columns: &SmallVec<ColumnId>| {
-            check!(columns.len() <= COLUMNS);
-            #[expect(clippy::cast_possible_truncation, reason = "at most `COLUMNS`")]
-            let len = columns.len() as u32;
-            u64::MAX.checked_shr(64 - len).unwrap_or(0)
+            let mut outputs = Bitmap::new(env, columns.len())?;
+            for i in 0..columns.len() {
+                outputs.set(i);
+            }
+            Ok::<_, AllocError>(outputs)
         };
-        let outputs = [all(at!(columns, 0)), all(at!(columns, 1))];
-        JoinOp { kind, conjuncts, columns, outputs, build: 1 }
+        let outputs = [all(at!(columns, 0))?, all(at!(columns, 1))?];
+        Ok(JoinOp { kind, conjuncts, columns, outputs, build: 1 })
     }
 
     pub(crate) fn kind(&self) -> JoinKind {
@@ -116,18 +121,19 @@ impl JoinOp {
         self.kind == JoinKind::Left && self.build == 0
     }
 
-    /// The build side's columns it outputs, and how many.
-    fn build_columns(&self) -> ([ColumnId; COLUMNS], usize) {
-        let (columns, outputs) = (self.build as usize, *at!(self.outputs, self.build as usize));
+    /// The build side's columns it outputs, and how many: no more than a
+    /// batch holds.
+    fn build_columns(&self) -> Result<([ColumnId; COLUMNS], usize), LowerError> {
+        let outputs = at!(self.outputs, self.build as usize);
         let mut out = [0; COLUMNS];
         let mut count = 0;
-        for (i, &column) in at!(self.columns, columns).iter().enumerate() {
-            if outputs >> i & 1 != 0 {
-                *at_mut!(out, count) = column;
+        for (i, &column) in at!(self.columns, self.build as usize).iter().enumerate() {
+            if outputs.get(i) {
+                *out.get_mut(count).ok_or(LowerError::TooManyColumns)? = column;
                 count += 1;
             }
         }
-        (out, count)
+        Ok((out, count))
     }
 
     fn is_build_column(&self, column: ColumnId) -> bool {
@@ -158,7 +164,7 @@ impl JoinOp {
         exprs: &Exprs,
         build: &OutputProperties,
         tested: &[Expr],
-    ) -> ([ColumnId; COLUMNS], usize) {
+    ) -> Result<([ColumnId; COLUMNS], usize), LowerError> {
         let mut held = [0; COLUMNS];
         let mut count = 0;
         let mut add = |column| {
@@ -169,14 +175,14 @@ impl JoinOp {
                 count += 1;
             }
         };
-        let (outputs, output_count) = self.build_columns();
+        let (outputs, output_count) = self.build_columns()?;
         for &column in at!(outputs, ..output_count) {
             add(column);
         }
         for &condition in tested {
             columns_of(exprs.nodes(condition), condition.root, &mut add);
         }
-        (held, count)
+        Ok((held, count))
     }
 
     /// `probe`'s columns, then the `held` columns of `build`: a pair's.
@@ -205,7 +211,7 @@ impl<'c> Op<'c> for JoinOp {
         for (columns, outputs) in self.columns.iter().zip(&mut self.outputs) {
             for (i, &column) in columns.iter().enumerate() {
                 if !needed.is_needed(column) {
-                    *outputs &= !(1 << i);
+                    outputs.clear(i);
                 }
             }
         }
@@ -220,7 +226,7 @@ impl<'c> Op<'c> for JoinOp {
         }
         for (columns, outputs) in self.columns.iter().zip(&self.outputs) {
             for (i, &column) in columns.iter().enumerate() {
-                if outputs >> i & 1 != 0 {
+                if outputs.get(i) {
                     reads.need(column);
                 }
             }
@@ -291,7 +297,7 @@ impl<'c> Op<'c> for JoinOp {
     /// an inner or left join, whose rows come out by build row, in no order.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let (probe, build) = (self.probe(), self.build);
-        let (held, count) = self.held(c.exprs(), c.input(build), &self.conjuncts);
+        let (held, count) = self.held(c.exprs(), c.input(build), &self.conjuncts)?;
         let pairs = self.pairs(c.input(probe), c.input(build), at!(held, ..count))?;
         for &condition in self.conjuncts.iter() {
             let nodes = c.exprs().nodes(condition);
@@ -306,7 +312,7 @@ impl<'c> Op<'c> for JoinOp {
         if self.keeps_build() {
             out.make_nullable();
         }
-        let (outputs, count) = self.build_columns();
+        let (outputs, count) = self.build_columns()?;
         let mut out = self.pairs(&out, c.input(build), at!(outputs, ..count))?;
         out.arrangements = Arrangements::NONE;
         out.drop_rows();
@@ -331,7 +337,7 @@ impl<'c> Op<'c> for JoinOp {
         let keys = Self::keys(exprs, probe, rows, &self.conjuncts, &mut tested);
         let mut condition = None;
         if !tested.is_empty() {
-            let (held, count) = self.held(exprs, rows, &tested);
+            let (held, count) = self.held(exprs, rows, &tested)?;
             let pairs = self.pairs(probe, rows, at!(held, ..count))?;
             let mut programs = SmallVec::fixed(env, tested.len())?;
             for &conjunct in tested.iter() {
@@ -341,7 +347,7 @@ impl<'c> Op<'c> for JoinOp {
             }
             condition = Some(Compute { programs });
         }
-        let (held, count) = self.held(exprs, rows, &tested);
+        let (held, count) = self.held(exprs, rows, &tested)?;
         let held = at!(held, ..count);
         let position = |&column: &ColumnId| {
             let Some(position) = rows.position_of(column) else { failed!() };
@@ -352,7 +358,7 @@ impl<'c> Op<'c> for JoinOp {
             *at = position(column);
         }
         let mut build_types = [DataType::Int64; BATCH_COLUMNS_MAX as usize];
-        let (outputs, count) = self.build_columns();
+        let (outputs, count) = self.build_columns()?;
         for (data_type, &column) in build_types.iter_mut().zip(at!(outputs, ..count)) {
             *data_type = rows.type_of(column);
         }
@@ -1043,7 +1049,7 @@ mod tests {
         };
         let one = |column| SmallVec::fixed_from(Env::current(), [column].into_iter()).unwrap();
         let conjuncts = SmallVec::fixed_from(Env::current(), condition.into_iter()).unwrap();
-        let mut join = JoinOp::new(kind, conjuncts, [one(0), one(1)]);
+        let mut join = JoinOp::new(Env::current(), kind, conjuncts, [one(0), one(1)]).unwrap();
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build
     }
@@ -1059,7 +1065,9 @@ mod tests {
         let condition = exprs.add(nodes.nodes()).unwrap();
         let conjuncts = SmallVec::fixed_from(Env::current(), [condition].into_iter()).unwrap();
         let two = |a, b| SmallVec::fixed_from(Env::current(), [a, b].into_iter()).unwrap();
-        let mut join = JoinOp::new(JoinKind::Inner, conjuncts, [two(0, 2), two(1, 3)]);
+        let mut join =
+            JoinOp::new(Env::current(), JoinKind::Inner, conjuncts, [two(0, 2), two(1, 3)])
+                .unwrap();
         let mut needed = Needed::none(Env::current(), 4, &exprs).unwrap();
         needed.need(2);
         needed.need(3);
@@ -1068,6 +1076,22 @@ mod tests {
         first.add_key(0, Key::Id);
         join.choose(&exprs, &[first, Estimate::of(RowEstimate::exactly(10))]);
         assert_eq!(join.build, 0);
+    }
+
+    #[test]
+    fn has_sides_wider_than_a_batch_until_pruned() {
+        let env = Env::current();
+        let wide = SmallVec::fixed_from(env, 0..100).unwrap();
+        let narrow = SmallVec::fixed_from(env, [100].into_iter()).unwrap();
+        let none = SmallVec::fixed(env, 0).unwrap();
+        let mut join = JoinOp::new(env, JoinKind::Inner, none, [wide, narrow]).unwrap();
+        let exprs = Exprs::new(env).unwrap();
+        let mut needed = Needed::none(env, 101, &exprs).unwrap();
+        needed.need(99);
+        join.prune(&mut needed);
+        let mut reads = Needed::none(env, 101, &exprs).unwrap();
+        join.reads(&mut reads);
+        assert!(reads.is_needed(99) && !reads.is_needed(0) && !reads.is_needed(100));
     }
 
     #[test]
