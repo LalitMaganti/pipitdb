@@ -98,8 +98,9 @@ impl<T: Primitive> Array<T> {
         Array::allocate(env, len, false)
     }
 
-    /// The `Env` the values came from.
-    pub fn env(&self) -> &Env {
+    /// The `Env` the values came from, which frees them, and grows a
+    /// `SmallVec`'s.
+    fn env(&self) -> &Env {
         // SAFETY: an `Env` outlives what's allocated from it.
         unsafe { self.env.as_ref() }
     }
