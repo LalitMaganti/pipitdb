@@ -5,6 +5,7 @@ mod estimate;
 mod exact;
 mod graph;
 mod greedy;
+mod region;
 mod tree;
 mod windows;
 
@@ -12,6 +13,7 @@ pub use estimate::{Estimator, ROWS_MAX};
 pub use graph::{
     EquivalenceSet, Executable, JoinEdge, JoinKind, QueryGraph, Relation, RelationSet,
 };
+pub(crate) use region::plan_regions;
 pub use tree::{JoinNode, JoinTree, Node};
 
 use crate::error::Error;
