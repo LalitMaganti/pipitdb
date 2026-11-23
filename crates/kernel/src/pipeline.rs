@@ -41,7 +41,7 @@ impl<'a> Pipeline<'a> {
 
     /// Creates the state of a run, in one allocation from `env`'s base
     /// allocator, which steps' states also allocate from; batches allocate
-    /// from its fixed allocators. Its steps read its `statement`, if it has
+    /// from its slab allocators. Its steps read its `statement`, if it has
     /// one.
     pub fn start<'r>(
         &'r self,

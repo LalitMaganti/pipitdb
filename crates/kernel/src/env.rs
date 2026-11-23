@@ -14,33 +14,33 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
-use crate::fixed_allocator::{FixedAllocator, INDICES_BYTES, SMALL_BYTES, VALUES_BYTES};
+use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BYTES};
 
 /// A query's environment. Its memory is its budget, which plans, states, lists and column data
-/// of no fixed size come from, and a `FixedAllocator` for each kind of
-/// column buffer its batches are made of, taking their chunks from it, so
+/// of no fixed size come from, and a `SlabAllocator` for each kind of
+/// column buffer its batches are made of, taking their slabs from it, so
 /// everything a query takes counts against its budget, this included.
 ///
 /// It lives in memory from the allocator it was made with, so it never
 /// moves.
 pub struct Env {
     budget: Budget,
-    values: FixedAllocator<'static>,
-    indices: FixedAllocator<'static>,
-    small: FixedAllocator<'static>,
-    /// Each of the allocators above, by `Kind`, so finding one doesn't
+    values: SlabAllocator<'static>,
+    indices: SlabAllocator<'static>,
+    small: SlabAllocator<'static>,
+    /// Each of the allocators above, by `MemoryKind`, so finding one doesn't
     /// branch.
     allocators: [NonNull<dyn Allocator>; KIND_COUNT],
-    /// Frees the block this is in, and the allocator in it.
+    /// Frees the allocation this is in, and the allocator in it.
     free: unsafe fn(NonNull<Env>),
-    /// The bytes of the block this is in.
-    block_bytes: usize,
+    /// The bytes of the allocation this is in.
+    allocation_bytes: usize,
 }
 
 /// Allocates from the allocator an `Env` was made with while the bytes
 /// allocated stay within `limit`, and fails past it.
 struct Budget {
-    /// The allocator, in the same block as the `Env`.
+    /// The allocator, in the same allocation as the `Env`.
     base: NonNull<dyn Allocator>,
     limit: usize,
     /// The bytes allocated now.
@@ -52,22 +52,22 @@ struct Budget {
 /// Which of an `Env`'s allocators memory comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
-pub enum Kind {
+pub enum MemoryKind {
     /// Its budget.
     Base,
-    /// Blocks for a batch's 8-byte values, with their buffer's header.
+    /// Slots for a batch's 8-byte values, with their buffer's header.
     Values,
-    /// Blocks for a batch's 4-byte values, such as dictionary indices.
+    /// Slots for a batch's 4-byte values, such as dictionary indices.
     Indices,
-    /// Blocks for the small things a batch's columns need.
+    /// Slots for the small things a batch's columns need.
     Small,
 }
 
-const KIND_COUNT: usize = Kind::Small as usize + 1;
+const KIND_COUNT: usize = MemoryKind::Small as usize + 1;
 
 /// An `Env` and the allocator it was made with, in one allocation from it.
 #[repr(C)]
-struct Block<A> {
+struct Allocation<A> {
     env: Env,
     base: A,
 }
@@ -85,17 +85,17 @@ impl Env {
         base: A,
         limit: usize,
     ) -> Result<OwnedEnv, AllocError> {
-        let layout = Layout::new::<Block<A>>();
+        let layout = Layout::new::<Allocation<A>>();
         if layout.size() > limit {
             return Err(AllocError);
         }
-        let block = base.allocate(layout)?.cast::<Block<A>>();
-        // SAFETY: the block has room for a `Block<A>`, each of whose fields
+        let allocation = base.allocate(layout)?.cast::<Allocation<A>>();
+        // SAFETY: the allocation has room for a `Allocation<A>`, each of whose fields
         // is written before anything reads it. It's freed only by `free`,
-        // with the fixed allocators borrowing its budget, so the budget can
+        // with the slab allocators borrowing its budget, so the budget can
         // be lent for `'static` here.
         unsafe {
-            let at = block.as_ptr();
+            let at = allocation.as_ptr();
             (&raw mut (*at).base).write(base);
             let base: &dyn Allocator = &(*at).base;
             let budget = &raw mut (*at).env.budget;
@@ -107,9 +107,9 @@ impl Env {
             });
             let budget: &'static Budget = &*budget;
             let env = &raw mut (*at).env;
-            (&raw mut (*env).values).write(FixedAllocator::new(budget, VALUES_BYTES));
-            (&raw mut (*env).indices).write(FixedAllocator::new(budget, INDICES_BYTES));
-            (&raw mut (*env).small).write(FixedAllocator::new(budget, SMALL_BYTES));
+            (&raw mut (*env).values).write(SlabAllocator::new(budget, VALUES_BYTES));
+            (&raw mut (*env).indices).write(SlabAllocator::new(budget, INDICES_BYTES));
+            (&raw mut (*env).small).write(SlabAllocator::new(budget, SMALL_BYTES));
             let allocators: [NonNull<dyn Allocator>; KIND_COUNT] = [
                 NonNull::from(budget),
                 NonNull::from(&(*env).values),
@@ -118,9 +118,9 @@ impl Env {
             ];
             (&raw mut (*env).allocators).write(allocators);
             (&raw mut (*env).free).write(free::<A>);
-            (&raw mut (*env).block_bytes).write(layout.size());
+            (&raw mut (*env).allocation_bytes).write(layout.size());
         }
-        Ok(OwnedEnv(block.cast()))
+        Ok(OwnedEnv(allocation.cast()))
     }
 
     /// As `new`, one that's never freed, so outlives everything: for one
@@ -151,17 +151,17 @@ impl Env {
     }
 
     /// The allocator memory of `kind` comes from.
-    pub fn allocator(&self, kind: Kind) -> &dyn Allocator {
+    pub fn allocator(&self, kind: MemoryKind) -> &dyn Allocator {
         // SAFETY: each points into this `Env`, which outlives the borrow.
         unsafe { at!(self.allocators, kind as usize).as_ref() }
     }
 
-    /// Whether nothing allocated from it is held: only its own block and
-    /// its block allocators' chunks are.
+    /// Whether nothing allocated from it is held: only its own allocation and
+    /// its slab allocators' slabs are.
     pub fn holds_nothing(&self) -> bool {
         let fixed = [&self.values, &self.indices, &self.small];
-        let chunks: usize = fixed.iter().map(|fixed| fixed.chunk_bytes()).sum();
-        fixed.iter().all(|fixed| fixed.is_idle()) && self.used() == self.block_bytes + chunks
+        let slabs: usize = fixed.iter().map(|fixed| fixed.slab_bytes()).sum();
+        fixed.iter().all(|fixed| fixed.is_idle()) && self.used() == self.allocation_bytes + slabs
     }
 
     /// The bytes allocated now, this included.
@@ -190,7 +190,7 @@ impl Deref for OwnedEnv {
 
 impl Drop for OwnedEnv {
     fn drop(&mut self) {
-        // SAFETY: `free` was made for this `Env`'s block, and whoever made
+        // SAFETY: `free` was made for this `Env`'s allocation, and whoever made
         // it promised nothing allocated from it is left.
         unsafe { (self.free)(self.0) }
     }
@@ -239,27 +239,27 @@ impl OwnedEnv {
     }
 }
 
-/// Frees `env`, a `Block<A>`'s, and its allocator.
+/// Frees `env`, a `Allocation<A>`'s, and its allocator.
 ///
 /// # Safety
 ///
-/// `env` must be in a `Block<A>` from `Env::new`, with nothing
+/// `env` must be in a `Allocation<A>` from `Env::new`, with nothing
 /// allocated from it left.
 unsafe fn free<A: Allocator>(env: NonNull<Env>) {
-    let block = env.cast::<Block<A>>();
-    // SAFETY: the block holds both fields. Dropping the fixed allocators
-    // first gives their chunks back, so all that's left is the block, which
+    let allocation = env.cast::<Allocation<A>>();
+    // SAFETY: the allocation holds both fields. Dropping the slab allocators
+    // first gives their slabs back, so all that's left is the allocation, which
     // `base` then frees from outside it. They're dropped one by one, not as
     // an `Env`, whose `&mut` would end the budget's borrow they hold; the
     // rest needs no drop.
     unsafe {
-        let env = &raw mut (*block.as_ptr()).env;
+        let env = &raw mut (*allocation.as_ptr()).env;
         (&raw mut (*env).values).drop_in_place();
         (&raw mut (*env).indices).drop_in_place();
         (&raw mut (*env).small).drop_in_place();
-        check!((*block.as_ptr()).env.used() == size_of::<Block<A>>());
-        let base = (&raw const (*block.as_ptr()).base).read();
-        base.deallocate(block.cast(), Layout::new::<Block<A>>());
+        check!((*allocation.as_ptr()).env.used() == size_of::<Allocation<A>>());
+        let base = (&raw const (*allocation.as_ptr()).base).read();
+        base.deallocate(allocation.cast(), Layout::new::<Allocation<A>>());
     }
 }
 
@@ -271,7 +271,7 @@ impl Budget {
         if used > self.limit {
             return Err(AllocError);
         }
-        // SAFETY: the allocator lives in the `Env`'s block, as this does.
+        // SAFETY: the allocator lives in the `Env`'s allocation, as this does.
         let base = unsafe { self.base.as_ref() };
         let ptr = if zeroed { base.allocate_zeroed(layout) } else { base.allocate(layout) }?;
         self.used.set(used);
@@ -414,7 +414,7 @@ mod tests {
         // SAFETY: what's allocated from it is dropped before it's released.
         let env = unsafe { Env::new(Heap, usize::MAX) }.unwrap();
         let empty = env.used();
-        drop(Buffer::allocate_in(&env, Kind::Small, 8).unwrap());
+        drop(Buffer::allocate_in(&env, MemoryKind::Small, 8).unwrap());
         assert!(env.holds_nothing());
         assert!(env.used() > empty);
         env.release();

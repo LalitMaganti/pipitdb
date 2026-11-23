@@ -4,7 +4,7 @@
 use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::buffer::{Buffer, HEADER_BYTES};
-use crate::env::{Env, Kind};
+use crate::env::{Env, MemoryKind};
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
@@ -330,7 +330,7 @@ impl Store {
     fn add_block(&mut self, env: &Env) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
-        let block = unsafe { Buffer::allocate_uninit(env, Kind::Base, BLOCK_CAPACITY) };
+        let block = unsafe { Buffer::allocate_uninit(env, MemoryKind::Base, BLOCK_CAPACITY) };
         self.blocks.push(block?)?;
         self.block_end = 0;
         Ok(())

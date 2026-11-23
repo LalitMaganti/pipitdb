@@ -5,7 +5,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::env::{Env, Kind};
+use crate::env::{Env, MemoryKind};
 
 pub const BUFFER_ALIGNMENT_BYTES: usize = 64;
 
@@ -44,7 +44,7 @@ struct Header {
     /// What the bytes came from.
     env: NonNull<Env>,
     /// Which of its allocators that is.
-    kind: Kind,
+    kind: MemoryKind,
 }
 
 pub(crate) const HEADER_BYTES: usize = size_of::<Header>();
@@ -53,11 +53,15 @@ impl Buffer {
     /// Allocates `size_bytes` zeroed bytes from `env`'s base allocator.
     #[inline(never)]
     pub fn allocate(env: &Env, size_bytes: usize) -> Result<Buffer, AllocError> {
-        Buffer::allocate_in(env, Kind::Base, size_bytes)
+        Buffer::allocate_in(env, MemoryKind::Base, size_bytes)
     }
 
     /// As `allocate`, from `env`'s allocator of `kind`.
-    pub fn allocate_in(env: &Env, kind: Kind, size_bytes: usize) -> Result<Buffer, AllocError> {
+    pub fn allocate_in(
+        env: &Env,
+        kind: MemoryKind,
+        size_bytes: usize,
+    ) -> Result<Buffer, AllocError> {
         // SAFETY: the bytes come zeroed.
         unsafe { Buffer::allocate_with((env, kind), size_bytes, true) }
     }
@@ -72,7 +76,7 @@ impl Buffer {
     #[inline(never)]
     pub unsafe fn allocate_uninit(
         env: &Env,
-        kind: Kind,
+        kind: MemoryKind,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
         // SAFETY: upheld by the caller.
@@ -86,7 +90,7 @@ impl Buffer {
     ///
     /// As for `allocate_uninit` unless `zeroed`.
     unsafe fn allocate_with(
-        (env, kind): (&Env, Kind),
+        (env, kind): (&Env, MemoryKind),
         size_bytes: usize,
         zeroed: bool,
     ) -> Result<Buffer, AllocError> {

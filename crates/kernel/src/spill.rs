@@ -7,6 +7,7 @@
 //! own threads, behind them.
 
 use crate::bitmap::BitSlice;
+use crate::bytes::ByteRange;
 use crate::column::{ColumnView, DataType, Strings, Validity};
 use crate::context::Context;
 use crate::error::Error;
@@ -16,33 +17,26 @@ use crate::row_batch::BATCH_ROWS_MAX;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LogId(pub u64);
 
-/// Where bytes appended to a log are.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Block {
-    pub offset: u64,
-    pub len: u64,
-}
-
 pub trait SpillStore {
     /// A new, empty log.
     fn create(&self) -> Result<LogId, Error>;
 
     /// Appends `bytes` to `log`, which isn't sealed. Each block starts where
     /// the one before ended.
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error>;
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error>;
 
     /// Ends writing to `log`. Only a sealed log can be read.
     fn seal(&self, log: LogId) -> Result<(), Error>;
 
     /// Says `blocks` of `log` will be read soon, so a remote store can fetch
     /// them together. By default, nothing is done.
-    fn prefetch(&self, log: LogId, blocks: &[Block]) {
+    fn prefetch(&self, log: LogId, blocks: &[ByteRange]) {
         let _ = (log, blocks);
     }
 
     /// Reads `block` of `log`, which is sealed, into `into`, which is its
     /// length.
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error>;
+    fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error>;
 
     /// Deletes `log`, sealed or not.
     fn delete(&self, log: LogId);
@@ -54,11 +48,11 @@ pub struct SpilledColumn {
     pub data_type: DataType,
     pub row_count: u32,
     /// Its values, or if its type has bytes, views into them.
-    pub values: Block,
+    pub values: ByteRange,
     /// If its type has bytes, them, one string after another.
-    pub bytes: Option<Block>,
+    pub bytes: Option<ByteRange>,
     /// Its null bitmap, if it may have nulls.
-    pub validity: Option<Block>,
+    pub validity: Option<ByteRange>,
 }
 
 /// How many rows' null bits, or strings' views, `write_column` appends at
@@ -90,7 +84,11 @@ pub fn write_column(
 
 /// Appends `validity`'s bits from the first row, shifted a chunk at a time
 /// if the view starts mid-byte, so they need no memory.
-fn write_validity(store: &dyn SpillStore, log: LogId, validity: Validity) -> Result<Block, Error> {
+fn write_validity(
+    store: &dyn SpillStore,
+    log: LogId,
+    validity: Validity,
+) -> Result<ByteRange, Error> {
     let (bits, shift) = validity.bits();
     let len = BitSlice::<u8>::words_for(validity.row_count() as usize);
     let mut chunk = [0_u8; CHUNK_BYTES];
@@ -116,7 +114,7 @@ fn write_strings(
     store: &dyn SpillStore,
     log: LogId,
     strings: Strings<'_>,
-) -> Result<(Block, Option<Block>), Error> {
+) -> Result<(ByteRange, Option<ByteRange>), Error> {
     let mut chunk = [0_u8; CHUNK_ROWS as usize * 8];
     let (mut views, mut filled, mut start) = (None, 0, 0_u32);
     for row in 0..strings.len() {
@@ -152,10 +150,10 @@ fn write_strings(
 }
 
 /// `appended` added to `block`, which it follows.
-fn grow(block: Option<Block>, appended: Block) -> Block {
+fn grow(block: Option<ByteRange>, appended: ByteRange) -> ByteRange {
     match block {
         None => appended,
-        Some(block) => Block { offset: block.offset, len: block.len + appended.len },
+        Some(block) => ByteRange { offset: block.offset, len: block.len + appended.len },
     }
 }
 
@@ -246,7 +244,7 @@ mod tests {
             Ok(LogId(logs.len() as u64 - 1))
         }
 
-        fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
+        fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error> {
             let mut logs = self.logs.borrow_mut();
             let log = logs[index(log)].as_mut().ok_or(Error::Io)?;
             assert!(!log.sealed);
@@ -255,7 +253,7 @@ mod tests {
             if log.pending.len() >= PART {
                 self.upload(log);
             }
-            Ok(Block { offset, len: bytes.len() as u64 })
+            Ok(ByteRange { offset, len: bytes.len() as u64 })
         }
 
         fn seal(&self, log: LogId) -> Result<(), Error> {
@@ -268,7 +266,7 @@ mod tests {
             Ok(())
         }
 
-        fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+        fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error> {
             let logs = self.logs.borrow();
             let log = logs[index(log)].as_ref().ok_or(Error::Io)?;
             if !log.sealed {

@@ -6,7 +6,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
-use pipit_kernel::env::Kind;
+use pipit_kernel::env::MemoryKind;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
 use crate::footer::{Chunk, Column};
@@ -548,7 +548,7 @@ impl<'s> ChunkReader<'s> {
     fn read_bytes(&self, context: &Context, at: u64, len: u64) -> Result<Buffer, Error> {
         let len = usize::try_from(len).map_err(|_| Error::Corrupt)?;
         // SAFETY: reading fills every byte, or fails.
-        let mut bytes = unsafe { Buffer::allocate_uninit(context.env(), Kind::Base, len)? };
+        let mut bytes = unsafe { Buffer::allocate_uninit(context.env(), MemoryKind::Base, len)? };
         self.source.read(at, bytes.as_mut_slice::<u8>())?;
         Ok(bytes)
     }
@@ -578,7 +578,7 @@ fn reusable(context: &Context, buffer: Option<Buffer>, len: usize) -> Result<Buf
     match buffer {
         Some(buffer) if buffer.is_unique() && buffer.size_bytes() >= len => Ok(buffer),
         // SAFETY: what's read from it is written first, or fails.
-        _ => Ok(unsafe { Buffer::allocate_uninit(context.env(), Kind::Base, len)? }),
+        _ => Ok(unsafe { Buffer::allocate_uninit(context.env(), MemoryKind::Base, len)? }),
     }
 }
 
