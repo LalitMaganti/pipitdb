@@ -5,13 +5,12 @@
 
 use core::mem::MaybeUninit;
 
-use crate::ast::{Ast, BLOCK_BYTES, DATA_MAX, Node, Nodes, Operator, Tag};
+use crate::ast::{Ast, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use pipit_kernel::buffer::Buffer;
-use pipit_kernel::env::{Env, Kind};
+use pipit_kernel::env::Env;
 use pipit_kernel::small_vec::SmallVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
@@ -52,10 +51,9 @@ impl<'a> Parser<'a> {
     pub(crate) fn new(env: &'a Env, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(env, Kind::Base, BLOCK_BYTES) }
+        let nodes = Nodes::new(env)
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { env, source, lexer, current, nodes: Nodes::new(first), failed: None })
+        Ok(Parser { env, source, lexer, current, nodes, failed: None })
     }
 
     /// The token the parser is on.
@@ -812,6 +810,7 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ast::BLOCK_BYTES;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
