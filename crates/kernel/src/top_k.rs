@@ -5,7 +5,7 @@
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
-use crate::column::DataType;
+use crate::column::{DataType, Values};
 use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::env::Env;
@@ -40,13 +40,12 @@ struct TopK {
     publish: Option<u32>,
 }
 
-/// The rows held, the cutoff once there is one, the keys of a batch's rows
-/// laid out, and how many rows have been output.
+/// The rows held, the cutoff once there is one, and the keys of a batch's
+/// rows laid out.
 struct Kept {
     rows: SortedRows,
     cutoff: Option<Cutoff>,
     keys: SmallVec<u8>,
-    emitted: u32,
 }
 
 /// The last row kept: its keys laid out, and by key, where the strings of its
@@ -55,6 +54,22 @@ struct Cutoff {
     keys: SmallVec<u8>,
     strings: SmallVec<Option<(usize, usize)>>,
     bytes: SmallVec<u8>,
+}
+
+impl Cutoff {
+    /// The string of key `k`, if it's a string key and not null.
+    fn string(&self, k: usize) -> Option<&[u8]> {
+        at!(self.strings, k).map(|(start, len)| at!(self.bytes, start..start + len))
+    }
+}
+
+/// How row `row` of `values`, a string column, compares with the cutoff's
+/// string `theirs`, nulls first, as `None` orders.
+#[inline]
+fn compare_string(values: Values, row: u32, theirs: Option<&[u8]>, descending: bool) -> Ordering {
+    let mine = (!values.is_null(row)).then(|| values.strings().get(row as usize));
+    let ordering = mine.cmp(&theirs);
+    if descending { ordering.reverse() } else { ordering }
 }
 
 impl Breaker for TopK {
@@ -67,7 +82,7 @@ impl Breaker for TopK {
         let env = context.env();
         let rows = SortedRows::new(env)?;
         let keys = SmallVec::new(env, 1 << 31)?;
-        Ok(Kept { rows, cutoff: None, keys, emitted: 0 })
+        Ok(Kept { rows, cutoff: None, keys })
     }
 
     fn consume(
@@ -109,8 +124,7 @@ impl Breaker for TopK {
         kept: &mut Kept,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        kept.emitted += kept.rows.gather(context, output, kept.emitted)?;
-        Ok(kept.emitted < kept.rows.order_len())
+        kept.rows.serve(context, output)
     }
 }
 
@@ -138,8 +152,7 @@ impl TopK {
         let (values, string) = (column.values(), column.data_type() == DataType::String);
         let float = column.data_type() == DataType::Float64;
         let words = if string { &[][..] } else { values.words() };
-        let their_string =
-            at!(cutoff.strings, 0).map(|(start, len)| at!(cutoff.bytes, start..start + len));
+        let their_string = cutoff.string(0);
         let at = usize::from(slot.offset);
         let mut bits = [0; 8];
         if !string {
@@ -157,10 +170,7 @@ impl TopK {
             let row = u32::from(row);
             let present = !values.is_null(row);
             let ordering = if string {
-                let mine = present.then(|| values.strings().get(row as usize));
-                // Nulls first, as `None` orders.
-                let ordering = mine.cmp(&their_string);
-                if slot.descending { ordering.reverse() } else { ordering }
+                compare_string(values, row, their_string, slot.descending)
             } else {
                 let mine = present.then(|| Word { bits: *at!(words, row as usize), float });
                 encode_nullable(slot, mine).cmp(&theirs)
@@ -242,13 +252,7 @@ fn compare(
     for (k, key) in columns.iter().enumerate() {
         let slot = layout.slot(k);
         let ordering = if let Some(column) = key.string() {
-            let values = input.column(column).values();
-            let mine = (!values.is_null(row)).then(|| values.strings().get(row as usize));
-            let theirs =
-                at!(cutoff.strings, k).map(|(start, len)| at!(cutoff.bytes, start..start + len));
-            // Nulls first, as `None` orders.
-            let ordering = mine.cmp(&theirs);
-            if slot.descending { ordering.reverse() } else { ordering }
+            compare_string(input.column(column).values(), row, cutoff.string(k), slot.descending)
         } else {
             let start = usize::from(slot.offset);
             let end = columns
