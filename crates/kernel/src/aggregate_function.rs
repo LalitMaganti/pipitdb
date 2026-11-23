@@ -15,6 +15,7 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::group_table::write_strings;
+use crate::ordered::ordered_if;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::string_pool::Id;
 
@@ -62,7 +63,7 @@ pub(crate) struct AggregateInputLoader {
 
 impl AggregateInputLoader {
     /// Loads the first `rows` rows `select` keeps of `column`, a flat
-    /// `Int64`, or the first `rows` of it if `select` is empty.
+    /// `Int64` or `Float64`, or the first `rows` of it if `select` is empty.
     pub(crate) fn load<'a>(
         &'a mut self,
         context: &mut Context,
@@ -71,7 +72,7 @@ impl AggregateInputLoader {
         rows: usize,
     ) -> Result<AggregateInput<'a>, Error> {
         let AggregateInputLoader { values, valid } = self;
-        let values = gathered(context, select, column.int64s(), values)?;
+        let values = gathered(context, select, column.values().words(), values)?;
         *valid = validity(context, column, select, rows)?;
         Ok(AggregateInput { values, valid: valid.as_ref().map(Buffer::as_slice), rows })
     }
@@ -206,17 +207,25 @@ pub(crate) trait AggregateFunction {
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]);
 }
 
-/// The function that computes `function`.
-pub(crate) fn make_aggregate_function(function: Function) -> &'static dyn AggregateFunction {
-    match function {
-        Function::CountStar => &CountStar,
-        Function::Count => &Count,
-        Function::Sum => &Sum,
+/// The function that computes `function` of values of `input`.
+pub(crate) fn make_aggregate_function(
+    function: Function,
+    input: DataType,
+) -> &'static dyn AggregateFunction {
+    let double = input == DataType::Float64;
+    match (function, double) {
+        (Function::CountStar, _) => &CountStar,
+        (Function::Count, _) => &Count,
+        (Function::Sum, false) => &Sum,
+        (Function::Sum, true) => &DoubleSum { mean: false },
         // Flips every bit but the sign: the least value is the greatest word.
-        Function::Min => &Extreme { mask: !(1 << 63) },
+        (Function::Min, false) => &Extreme { mask: !(1 << 63), double: false },
+        (Function::Min, true) => &Extreme { mask: !(1 << 63), double: true },
         // Flips the sign: words order as the values do, the least being zero.
-        Function::Max => &Extreme { mask: 1 << 63 },
-        Function::Avg => &Avg,
+        (Function::Max, false) => &Extreme { mask: 1 << 63, double: false },
+        (Function::Max, true) => &Extreme { mask: 1 << 63, double: true },
+        (Function::Avg, false) => &Avg,
+        (Function::Avg, true) => &DoubleSum { mean: true },
     }
 }
 
@@ -452,15 +461,24 @@ impl AggregateFunction for Sum {
 /// `MIN` or `MAX`: a group's extreme value, null if it holds none. The state
 /// is the value, its bits flipped by a mask chosen so that, as unsigned words, the
 /// larger state is the value wanted and zero is below every value: a zeroed
-/// state holds nothing, and states merge by unsigned maximum.
+/// state holds nothing, and states merge by unsigned maximum. A double's bits
+/// are first made to order as an integer's, with `ordered_if`.
 struct Extreme {
+    /// What a value's bits are flipped by.
     mask: u64,
+    /// Whether its values are doubles' bits.
+    double: bool,
 }
 
 impl Extreme {
     /// `value` as a state, or zero if not `valid`.
     fn encode(&self, value: i64, valid: bool) -> u64 {
-        (value.cast_unsigned() ^ self.mask) & mask(valid).cast_unsigned()
+        (ordered_if(value, self.double).cast_unsigned() ^ self.mask) & mask(valid).cast_unsigned()
+    }
+
+    /// The value `state` holds.
+    fn decode(&self, state: i64) -> i64 {
+        ordered_if((state.cast_unsigned() ^ self.mask).cast_signed(), self.double)
     }
 }
 
@@ -501,7 +519,7 @@ impl AggregateFunction for Extreme {
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
         for (value, &group) in values.iter_mut().zip(groups) {
-            *value = (states.word(group).cast_unsigned() ^ self.mask).cast_signed();
+            *value = self.decode(states.word(group));
         }
         write_seen(valid, groups, &states);
     }
@@ -672,6 +690,70 @@ impl AggregateFunction for Avg {
         }
         for (byte, groups) in valid.iter_mut().zip(groups.chunks(8)) {
             let held = |group| *at!(Avg::state(&states, group), AVG_COUNT) != 0;
+            *byte =
+                (0..).zip(groups).fold(0, |byte, (i, &group)| byte | u8::from(held(group)) << i);
+        }
+    }
+}
+
+/// The double whose bits are `value`, or 0.0 if not `valid`.
+fn double(value: i64, valid: bool) -> f64 {
+    f64::from_bits((value & mask(valid)).cast_unsigned())
+}
+
+/// The sum of `input`'s doubles that aren't null, added in order.
+fn batch_double_sum(input: &AggregateInput) -> f64 {
+    let values = at!(input.values, ..input.rows).iter().enumerate();
+    values.fold(0.0, |sum, (row, &value)| sum + double(value, input.is_valid(row)))
+}
+
+/// `SUM` or `AVG` of doubles: the state is the total's bits, then how many
+/// values it's of, which is 0 for a null result.
+struct DoubleSum {
+    /// Whether it's `AVG`.
+    mean: bool,
+}
+
+impl AggregateFunction for DoubleSum {
+    fn state_words(&self) -> usize {
+        2
+    }
+
+    fn reads_input(&self) -> bool {
+        true
+    }
+
+    fn tracks_seen(&self) -> bool {
+        false
+    }
+
+    fn update(&self, input: &AggregateInput, groups: &[u32], states: GroupStates, _: &mut bool) {
+        scatter(input, groups, states, 2, |state, value, valid| {
+            let sum = double(*at!(state, 0), true) + double(value, valid);
+            *at_mut!(state, 0) = sum.to_bits().cast_signed();
+            *at_mut!(state, 1) += i64::from(valid);
+        });
+    }
+
+    fn update_group(&self, input: &AggregateInput, group: u32, states: GroupStates, _: &mut bool) {
+        // SAFETY: the group exists, and a `DoubleSum` state is two words.
+        let state = unsafe { core::slice::from_raw_parts_mut(states.state(group), 2) };
+        let sum = double(*at!(state, 0), true) + batch_double_sum(input);
+        *at_mut!(state, 0) = sum.to_bits().cast_signed();
+        *at_mut!(state, 1) += i64::try_from(input.count_valid()).unwrap_or(0);
+    }
+
+    fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
+        // SAFETY: each group exists, and a `DoubleSum` state is two words.
+        let state = |group| unsafe { core::slice::from_raw_parts(states.state(group), 2) };
+        for (value, &group) in values.iter_mut().zip(groups) {
+            let state = state(group);
+            #[expect(clippy::cast_precision_loss, reason = "means are approximate")]
+            let count = if self.mean { *at!(state, 1) as f64 } else { 1.0 };
+            *value = (double(*at!(state, 0), true) / count).to_bits().cast_signed();
+        }
+        for (byte, groups) in valid.iter_mut().zip(groups.chunks(8)) {
+            let held = |group| *at!(state(group), 1) != 0;
             *byte =
                 (0..).zip(groups).fold(0, |byte, (i, &group)| byte | u8::from(held(group)) << i);
         }

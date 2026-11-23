@@ -232,8 +232,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "not a function of a column".into(),
         ),
         what if what == Unsupported::AggregateType as u16 => (
-            "only integer columns can be aggregated yet".into(),
-            "not an integer column".into(),
+            "strings can't be summed or averaged".into(),
+            "a string column".into(),
         ),
         what if what == Unsupported::OrderBy as u16 => {
             ("only columns can be sorted by yet".into(), "not a column".into())

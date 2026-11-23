@@ -20,7 +20,8 @@ use crate::step::Step;
 use crate::values::Values;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
-/// `Int64` values, but for `Min` and `Max`, which read strings too.
+/// `Int64` values, `Sum`, `Min`, `Max` and `Avg` doubles too, and `Min` and
+/// `Max` strings too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Function {
     /// How many rows there are.
@@ -44,6 +45,7 @@ impl Function {
         match self {
             Function::Avg => DataType::Float64,
             Function::Min | Function::Max => input,
+            Function::Sum if input == DataType::Float64 => DataType::Float64,
             Function::CountStar | Function::Count | Function::Sum => DataType::Int64,
         }
     }
@@ -52,8 +54,9 @@ impl Function {
     /// #383.
     pub fn reads(self, input: DataType) -> bool {
         match self {
-            Function::Min | Function::Max => matches!(input, DataType::Int64 | DataType::String),
-            _ => input == DataType::Int64,
+            Function::Min | Function::Max => true,
+            Function::Sum | Function::Avg => input != DataType::String,
+            Function::CountStar | Function::Count => input == DataType::Int64,
         }
     }
 }
