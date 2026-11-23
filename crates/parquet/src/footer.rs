@@ -4,7 +4,7 @@
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::DataType;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};
 use pipit_kernel::slow_vec::SlowVec;
 
@@ -106,8 +106,8 @@ const GROUPS_MAX: usize = 1 << 20;
 const CHUNKS_MAX: usize = 1 << 24;
 
 impl ParquetFile {
-    /// Reads `source`'s footer, with memory from `allocator`.
-    pub fn open(allocator: &Global, source: &dyn ByteSource) -> Result<ParquetFile, Error> {
+    /// Reads `source`'s footer, with memory from `env`.
+    pub fn open(env: &Env, source: &dyn ByteSource) -> Result<ParquetFile, Error> {
         // The footer, then its length and the magic bytes again.
         let mut tail = [0; 8];
         let len = source.len();
@@ -117,9 +117,9 @@ impl ParquetFile {
             return Err(Error::Corrupt);
         }
         let size = usize::try_from(footer_len).map_err(|_| Error::Corrupt)?;
-        let mut footer = Buffer::allocate(allocator, size)?;
+        let mut footer = Buffer::allocate(env, size)?;
         source.read(len - 8 - footer_len, footer.as_mut_slice::<u8>())?;
-        parse(allocator, footer.as_slice::<u8>()).ok_or(Error::Corrupt)?
+        parse(env, footer.as_slice::<u8>()).ok_or(Error::Corrupt)?
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -145,12 +145,12 @@ impl ParquetFile {
 
 /// The footer's `FileMetaData`: `None` if it's damaged, and an error if it
 /// can't be read.
-fn parse(allocator: &Global, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
+fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     let (Ok(mut names), Ok(mut columns), Ok(mut group_rows), Ok(mut chunks)) = (
-        Names::new(allocator, 1 << 16),
-        SlowVec::new(allocator, COLUMNS_MAX),
-        SlowVec::new(allocator, GROUPS_MAX),
-        SlowVec::new(allocator, CHUNKS_MAX),
+        Names::new(env, 1 << 16),
+        SlowVec::new(env, COLUMNS_MAX),
+        SlowVec::new(env, GROUPS_MAX),
+        SlowVec::new(env, CHUNKS_MAX),
     ) else {
         return Some(Err(Error::OutOfMemory));
     };
@@ -360,8 +360,8 @@ mod tests {
     const SMALL: &[u8] = include_bytes!("../tests/data/small.parquet");
 
     fn small() -> ParquetFile {
-        let global = Global::current();
-        ParquetFile::open(global, &SMALL).unwrap()
+        let env = Env::current();
+        ParquetFile::open(env, &SMALL).unwrap()
     }
 
     extern crate std;
@@ -402,16 +402,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri can't use real files")]
     fn reads_through_a_file() {
-        let global = Global::current();
+        let env = Env::current();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.parquet");
-        let file = ParquetFile::open(global, &FileSource::open(path).unwrap()).unwrap();
+        let file = ParquetFile::open(env, &FileSource::open(path).unwrap()).unwrap();
         assert_eq!(file.row_groups(), 3);
     }
 
     #[test]
     fn rejects_what_isnt_parquet() {
-        let global = Global::current();
+        let env = Env::current();
         let bytes: &[u8] = b"not parquet at all";
-        assert_eq!(ParquetFile::open(global, &bytes).err(), Some(Error::Corrupt));
+        assert_eq!(ParquetFile::open(env, &bytes).err(), Some(Error::Corrupt));
     }
 }

@@ -6,8 +6,8 @@ use crate::bitmap::BitSlice;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
@@ -85,20 +85,20 @@ pub(crate) struct RowStore {
 }
 
 impl RowStore {
-    pub(crate) fn new(allocator: &Global) -> Result<RowStore, AllocError> {
+    pub(crate) fn new(env: &Env) -> Result<RowStore, AllocError> {
         Ok(RowStore {
-            held: SlowVec::new(allocator, 1 << 31)?,
+            held: SlowVec::new(env, 1 << 31)?,
             batches: 0,
             width: 0,
             dense: 0,
-            places: SlowVec::new(allocator, 1 << 31)?,
-            packing: SlowVec::new(allocator, 1 << 6)?,
+            places: SlowVec::new(env, 1 << 31)?,
+            packing: SlowVec::new(env, 1 << 6)?,
             packed: 0,
             nullable: 0,
             dropped: 0,
-            placeholders: SlowVec::new(allocator, 1 << 6)?,
+            placeholders: SlowVec::new(env, 1 << 6)?,
             scattered: 0,
-            copies: SlowVec::new(allocator, 1 << 24)?,
+            copies: SlowVec::new(env, 1 << 24)?,
         })
     }
 
@@ -342,7 +342,7 @@ impl RowStore {
     ) -> Result<(), Error> {
         self.flush(context)?;
         let (width, rows) = (self.width as usize, words.len());
-        let allocator = context.allocator();
+        let env = context.env();
         // A bit for each column to copy, and each column's type.
         let (mut copy, mut types) = (0_u64, [DataType::Int64; 63]);
         for c in 0..width.min(63) {
@@ -367,7 +367,7 @@ impl RowStore {
         // 0. Columns decoded from the words, in order already: a bit for
         // each of the columns copied.
         let moved = copy | dropped;
-        let mut copies = Copies::new(allocator, moved.count_ones() as usize, rows)?;
+        let mut copies = Copies::new(env, moved.count_ones() as usize, rows)?;
         let mut in_order = 0_u64;
         if let Some(decode) = decode.as_mut() {
             for (k, c) in columns(moved).enumerate().filter(|&(_, c)| decoded >> c & 1 != 0) {
@@ -418,7 +418,7 @@ impl RowStore {
             }
         }
         // 3. Each region in order.
-        copies.put_in_order(allocator, words, in_order)?;
+        copies.put_in_order(env, words, in_order)?;
         self.copies = copies.views(context, columns(moved).map(|c| *at!(types, c)))?;
         self.scattered = moved;
         Ok(())
@@ -455,9 +455,9 @@ struct Copies {
 }
 
 impl Copies {
-    fn new(allocator: &Global, columns: usize, rows: usize) -> Result<Copies, Error> {
+    fn new(env: &Env, columns: usize, rows: usize) -> Result<Copies, Error> {
         let batches = rows.div_ceil(BATCH_ROWS_MAX as usize);
-        let buffers = SlowVec::fixed_from(allocator, (0..columns * batches).map(|_| None))?;
+        let buffers = SlowVec::fixed_from(env, (0..columns * batches).map(|_| None))?;
         Ok(Copies { buffers, rows, batches })
     }
 
@@ -515,8 +515,8 @@ impl Copies {
     /// in cache: each slot's word in `words` says where in its region the
     /// value that arrived in it goes.
     /// Columns with a bit in `in_order` are left as they are.
-    fn put_in_order(&self, allocator: &Global, words: &[u64], in_order: u64) -> Result<(), Error> {
-        let mut values = SlowVec::<i64>::zeroed(allocator, 1 << REGION_BITS)?;
+    fn put_in_order(&self, env: &Env, words: &[u64], in_order: u64) -> Result<(), Error> {
+        let mut values = SlowVec::<i64>::zeroed(env, 1 << REGION_BITS)?;
         for first in (0..self.rows).step_by(1 << REGION_BITS) {
             let end = self.rows.min(first + (1 << REGION_BITS));
             for k in (0..self.buffers.len() / self.batches).filter(|k| in_order >> k & 1 == 0) {
@@ -538,7 +538,7 @@ impl Copies {
         context: &mut Context,
         types: impl Iterator<Item = DataType>,
     ) -> Result<SlowVec<ColumnView>, Error> {
-        let mut views = SlowVec::fixed(context.allocator(), self.buffers.len())?;
+        let mut views = SlowVec::fixed(context.env(), self.buffers.len())?;
         for (data_type, buffers) in types.zip(self.buffers.chunks_mut(self.batches)) {
             for buffer in buffers {
                 let Some(buffer) = buffer.take() else { failed!() };
@@ -584,11 +584,8 @@ impl Packing {
         let mut validity =
             context.small_buffer(BitSlice::<u8>::words_for(BATCH_ROWS_MAX as usize))?;
         validity.as_mut_slice::<u8>().fill(0);
-        let bytes = if data_type.has_bytes() {
-            Some(SlowVec::new(context.allocator(), 1 << 31)?)
-        } else {
-            None
-        };
+        let bytes =
+            if data_type.has_bytes() { Some(SlowVec::new(context.env(), 1 << 31)?) } else { None };
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
     }
 
@@ -786,9 +783,9 @@ mod tests {
 
     #[test]
     fn hands_back_rows_shared_and_packed_in_any_order() {
-        let global = Global::current();
-        let mut context = Context::new(global, None);
-        let mut store = RowStore::new(global).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         // Shared, packed, shared after packed rows, and packed again.
         let keeps: [(i64, Keep); 4] = [
             (0, |_| true),
@@ -838,9 +835,9 @@ mod tests {
 
     #[test]
     fn gathers_across_batches_with_and_without_nulls() {
-        let global = Global::current();
-        let mut context = Context::new(global, None);
-        let mut store = RowStore::new(global).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         let with = batch(&mut context, 0, |_| true);
         store.append(&mut context, &with).unwrap();
         let without = batch_without_nulls(&mut context, 10_000);
@@ -859,9 +856,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn scatters_columns_into_an_order() {
-        let global = Global::current();
-        let mut context = Context::new(global, None);
-        let mut store = RowStore::new(global).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         let batches = 40;
         for b in 0..batches {
             let mut batch = batch_without_nulls(&mut context, i64::from(b) * 10_000);

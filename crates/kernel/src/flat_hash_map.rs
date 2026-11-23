@@ -14,7 +14,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
-use crate::global::Global;
+use crate::env::Env;
 use crate::murmur_hash;
 
 /// A key: compared, and hashed as Perfetto's `MurmurHash` hashes it.
@@ -229,14 +229,14 @@ impl Base {
     /// each laid out as `slot`. Out of line, as is all of `Base` that isn't
     /// on a lookup's path, as Perfetto's is in `flat_hash_map.cc`.
     #[inline(never)]
-    fn new(allocator: &Global, capacity: usize, slot: Layout) -> Result<Base, AllocError> {
+    fn new(env: &Env, capacity: usize, slot: Layout) -> Result<Base, AllocError> {
         check!(capacity.is_power_of_two() && slot.align() <= BUFFER_ALIGNMENT_BYTES);
         let capacity = capacity.max(CAPACITY_MIN);
         let slots_at = (capacity + CLONES).next_multiple_of(slot.align());
         let bytes = slot.size().checked_mul(capacity).and_then(|size| size.checked_add(slots_at));
         // SAFETY: the control bytes are written below, and a slot only once
         // a key is put in it, before it's read.
-        let storage = unsafe { Buffer::allocate_uninit(allocator, bytes.ok_or(AllocError)?)? };
+        let storage = unsafe { Buffer::allocate_uninit(env, bytes.ok_or(AllocError)?)? };
         let ctrl = storage.as_non_null();
         // SAFETY: within the storage.
         let slots = unsafe { ctrl.add(slots_at) };
@@ -309,8 +309,8 @@ impl Base {
     /// Replaces this with an empty table of twice the slots, laid out as
     /// `slot`, and returns the old one, whose keys the caller moves over.
     #[inline(never)]
-    fn grow(&mut self, allocator: &Global, slot: Layout) -> Result<Base, AllocError> {
-        let grown = Base::new(allocator, self.capacity * 2, slot)?;
+    fn grow(&mut self, env: &Env, slot: Layout) -> Result<Base, AllocError> {
+        let grown = Base::new(env, self.capacity * 2, slot)?;
         Ok(mem::replace(self, grown))
     }
 
@@ -339,13 +339,13 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     const SLOT: Layout = Layout::new::<(K, V)>();
 
     /// An empty map of `capacity` slots, a power of two, or 128 if more.
-    pub fn new(allocator: &Global, capacity: usize) -> Result<Self, AllocError> {
-        Ok(FlatHashMap { base: Base::new(allocator, capacity, Self::SLOT)?, slots: PhantomData })
+    pub fn new(env: &Env, capacity: usize) -> Result<Self, AllocError> {
+        Ok(FlatHashMap { base: Base::new(env, capacity, Self::SLOT)?, slots: PhantomData })
     }
 
     /// An empty map with room for `len` keys before it grows.
-    pub fn for_len(allocator: &Global, len: usize) -> Result<Self, AllocError> {
-        FlatHashMap::new(allocator, (len * 100 / LOAD_LIMIT_PERCENT + 1).next_power_of_two())
+    pub fn for_len(env: &Env, len: usize) -> Result<Self, AllocError> {
+        FlatHashMap::new(env, (len * 100 / LOAD_LIMIT_PERCENT + 1).next_power_of_two())
     }
 
     /// How many keys it has.
@@ -396,15 +396,10 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     }
 
     /// Adds `key` with `value`, unless it has it. Returns its value, and
-    /// whether it was added. Grows, allocating from `allocator`, if full.
+    /// whether it was added. Grows, allocating from `env`, if full.
     #[inline]
-    pub fn insert(
-        &mut self,
-        allocator: &Global,
-        key: K,
-        value: V,
-    ) -> Result<(&mut V, bool), AllocError> {
-        let (at, added) = self.find_or_prepare_insert(allocator, key)?;
+    pub fn insert(&mut self, env: &Env, key: K, value: V) -> Result<(&mut V, bool), AllocError> {
+        let (at, added) = self.find_or_prepare_insert(env, key)?;
         let slot = self.base.slot::<(K, V)>(at);
         if added {
             // SAFETY: a slot of this map, claimed for `key`.
@@ -421,14 +416,14 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     #[inline]
     pub fn insert_by(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         hash: u64,
         equal: impl Fn(&K) -> bool,
         key: K,
         value: V,
     ) -> Result<(&mut (K, V), bool), AllocError> {
         check!(key.hash() == hash);
-        let (at, added) = self.find_or_prepare_insert_by(allocator, hash, equal)?;
+        let (at, added) = self.find_or_prepare_insert_by(env, hash, equal)?;
         let slot = self.base.slot::<(K, V)>(at);
         if added {
             // SAFETY: a slot of this map, claimed for `key`.
@@ -508,12 +503,8 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     /// The slot holding `key`, and false, or else a slot claimed for it, and
     /// true. Out of line, as Perfetto's is: compiled once for each map type.
     #[inline(never)]
-    fn find_or_prepare_insert(
-        &mut self,
-        allocator: &Global,
-        key: K,
-    ) -> Result<(usize, bool), AllocError> {
-        self.find_or_prepare_insert_by(allocator, key.hash(), |&held| held == key)
+    fn find_or_prepare_insert(&mut self, env: &Env, key: K) -> Result<(usize, bool), AllocError> {
+        self.find_or_prepare_insert_by(env, key.hash(), |&held| held == key)
     }
 
     /// As `find_or_prepare_insert`, for the key hashed as `hash` that `equal`
@@ -521,7 +512,7 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     #[inline]
     fn find_or_prepare_insert_by(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         hash: u64,
         equal: impl Fn(&K) -> bool,
     ) -> Result<(usize, bool), AllocError> {
@@ -530,7 +521,7 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
             Err(at) => at,
         };
         if self.base.growth_left == 0 {
-            self.grow_and_rehash(allocator)?;
+            self.grow_and_rehash(env)?;
             at = self.base.first_free_or_tombstone(hash);
         }
         let mut free = true;
@@ -550,8 +541,8 @@ impl<K: Key, V: Copy> FlatHashMap<K, V> {
     /// Allocating it is shared by every map, in `Base::grow`: only moving the
     /// keys over is compiled for each map type.
     #[inline(never)]
-    fn grow_and_rehash(&mut self, allocator: &Global) -> Result<(), AllocError> {
-        let old = self.base.grow(allocator, Self::SLOT)?;
+    fn grow_and_rehash(&mut self, env: &Env) -> Result<(), AllocError> {
+        let old = self.base.grow(env, Self::SLOT)?;
         for at in 0..old.capacity {
             if is_used(*at!(old.ctrl(), at)) {
                 // SAFETY: a used slot holds a key and value.
@@ -587,12 +578,12 @@ mod tests {
 
     #[test]
     fn inserts_keys_that_share_a_hash_by_what_equal_says() {
-        let global = Global::current();
-        let mut map = FlatHashMap::<Halves, u32>::new(global, 1).unwrap();
+        let env = Env::current();
+        let mut map = FlatHashMap::<Halves, u32>::new(env, 1).unwrap();
         for (i, key) in (0_u32..).zip([7 << 32 | 1, 7 << 32 | 2, 7 << 32 | 1, 9 << 32]) {
             let (key, hash) = (Halves(key), key >> 32);
             let ((_, value), added) =
-                map.insert_by(global, hash, |held| *held == key, key, i).unwrap();
+                map.insert_by(env, hash, |held| *held == key, key, i).unwrap();
             assert_eq!((*value, added), if i == 2 { (0, false) } else { (i, true) });
         }
         assert_eq!(map.len(), 3);
@@ -601,13 +592,13 @@ mod tests {
 
     #[test]
     fn finds_what_it_holds_as_it_grows() {
-        let global = Global::current();
-        let mut map = FlatHashMap::<i64, i64>::new(global, 1).unwrap();
+        let env = Env::current();
+        let mut map = FlatHashMap::<i64, i64>::new(env, 1).unwrap();
         // Enough to grow several times, with keys whose low bits are the same.
         for key in (-500..500).map(|i| i * 1024) {
-            assert_eq!(map.insert(global, key, key + 1).unwrap(), (&mut (key + 1), true));
+            assert_eq!(map.insert(env, key, key + 1).unwrap(), (&mut (key + 1), true));
         }
-        assert_eq!(map.insert(global, 0, 7).unwrap(), (&mut 1, false));
+        assert_eq!(map.insert(env, 0, 7).unwrap(), (&mut 1, false));
         assert_eq!(map.len(), 1000);
         assert!((-500..500).all(|i| map.find(i * 1024) == Some(&(i * 1024 + 1))));
         assert!((1..1000).all(|i| map.find(i).is_none()));
@@ -618,13 +609,13 @@ mod tests {
 
     #[test]
     fn reuses_the_slots_of_erased_keys() {
-        let global = Global::current();
-        let mut map = FlatHashMap::<i64, ()>::new(global, 128).unwrap();
+        let env = Env::current();
+        let mut map = FlatHashMap::<i64, ()>::new(env, 128).unwrap();
         // Many times what fits, but never more than a few at once. As in
         // Perfetto's, erasing doesn't give back room to grow into: tombstones
         // are filled again only where a probe reaches them first.
         for key in 0..10_000 {
-            map.insert(global, key, ()).unwrap();
+            map.insert(env, key, ()).unwrap();
             if key >= 8 {
                 assert!(map.erase(key - 8));
             }
@@ -639,11 +630,11 @@ mod tests {
 
     #[test]
     fn keys_strings_by_their_bytes() {
-        let global = Global::current();
+        let env = Env::current();
         let owned = b"ab".to_vec();
-        let mut map = FlatHashMap::<&[u8], ()>::for_len(global, 4).unwrap();
+        let mut map = FlatHashMap::<&[u8], ()>::for_len(env, 4).unwrap();
         for key in [&b""[..], &b"a"[..], &b"ab"[..], &owned[..]] {
-            map.insert(global, key, ()).unwrap();
+            map.insert(env, key, ()).unwrap();
         }
         assert_eq!(map.len(), 3);
         assert!(map.find(b"ab").is_some() && map.find(b"").is_some());
@@ -653,7 +644,7 @@ mod tests {
     #[test]
     fn fails_to_grow_past_its_allocator() {
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let limited = unsafe { Global::new(Heap, 4096) }.unwrap();
+        let limited = unsafe { Env::new(Heap, 4096) }.unwrap();
         let mut map = FlatHashMap::<i64, ()>::new(&limited, 128).unwrap();
         assert!((0..1000).any(|key| map.insert(&limited, key, ()).is_err()));
         // What it held before is still there.

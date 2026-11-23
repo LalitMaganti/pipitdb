@@ -4,30 +4,30 @@
 
 use crate::allocator::AllocError;
 use crate::column::Forms;
+use crate::env::Env;
 use crate::estimate::Estimate;
 use crate::expression::Exprs;
-use crate::global::Global;
 use crate::join_planner::plan_regions;
 use crate::plan::{
     Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
 use crate::slow_vec::SlowVec;
 
-/// Runs every pass over `plan`, with scratch memory from `allocator`.
-pub fn optimize(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
-    prune_columns(allocator, plan)?;
-    answer_from_summaries(allocator, plan)?;
-    place_filters(allocator, plan)?;
-    push_down_conditions(allocator, plan)?;
+/// Runs every pass over `plan`, with scratch memory from `env`.
+pub fn optimize(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
+    prune_columns(env, plan)?;
+    answer_from_summaries(env, plan)?;
+    place_filters(env, plan)?;
+    push_down_conditions(env, plan)?;
     // Runs after pushdown, which can make scans skip rows, and before
     // forms, which depend on what is chosen here. Joins planned in a new
     // order choose again, and keep only the columns needed.
-    let estimates = choose_by_estimates(allocator, plan)?;
-    if plan_regions(allocator, plan, &estimates)? {
-        prune_columns(allocator, plan)?;
-        choose_by_estimates(allocator, plan)?;
+    let estimates = choose_by_estimates(env, plan)?;
+    if plan_regions(env, plan, &estimates)? {
+        prune_columns(env, plan)?;
+        choose_by_estimates(env, plan)?;
     }
-    choose_forms(allocator, plan)
+    choose_forms(env, plan)
 }
 
 /// The columns something later in a plan uses, by id.
@@ -40,11 +40,11 @@ pub struct Needed<'e> {
 impl<'e> Needed<'e> {
     /// None of `count` columns, of a plan whose expressions are `exprs`.
     pub(crate) fn none(
-        allocator: &Global,
+        env: &Env,
         count: usize,
         exprs: &'e Exprs,
     ) -> Result<Needed<'e>, AllocError> {
-        let columns = SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))?;
+        let columns = SlowVec::fixed_from(env, core::iter::repeat_n(false, count))?;
         Ok(Needed { columns, exprs })
     }
 
@@ -80,14 +80,14 @@ pub enum Pruned {
 /// Drops columns that nothing in the plan uses, so sources read less and ops
 /// skip work nobody reads, as Perfetto's `PruneColumns`. From the output down,
 /// each op drops what it makes that isn't needed, and marks what it reads.
-pub fn prune_columns(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
-    let mut needed = Needed::none(allocator, plan.columns.len(), &plan.exprs)?;
+pub fn prune_columns(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
+    let mut needed = Needed::none(env, plan.columns.len(), &plan.exprs)?;
     for column in plan.output.iter() {
         needed.need(column.id);
     }
     // Nodes left to prune, and where each is referred to from: its parent's
     // children, or the root if `None`.
-    let mut pending = SlowVec::new(allocator, PLAN_NODES_MAX)?;
+    let mut pending = SlowVec::new(env, PLAN_NODES_MAX)?;
     pending.push((plan.root, None::<(PlanNodeId, usize)>))?;
     while let Some((mut id, from)) = pending.pop() {
         loop {
@@ -166,16 +166,13 @@ fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
 /// Has each op that can make its rows from what its one child knows of its
 /// own without reading them, such as an aggregate from a file's statistics,
 /// do so. The child is then left unread, and removed.
-pub fn answer_from_summaries(
-    allocator: &Global,
-    plan: &mut LogicalPlan<'_>,
-) -> Result<(), AllocError> {
+pub fn answer_from_summaries(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     for id in 0..plan.nodes.len() {
         // Children are added before their parents.
         let (below, rest) = plan.nodes.split_at_mut(id);
         let node = at_mut!(rest, 0);
         let &[child] = &node.children[..] else { continue };
-        if node.op.answer(allocator, &at!(below, child as usize).op)? {
+        if node.op.answer(env, &at!(below, child as usize).op)? {
             node.children = Children::new();
         }
     }
@@ -189,22 +186,22 @@ pub fn answer_from_summaries(
 /// (`Op::moves_condition`), and the condition becomes a filter on that input.
 /// This repeats until nothing moves. A filter left with no conditions is
 /// removed.
-pub fn place_filters(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
+pub fn place_filters(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     // Filters only move down, so this ends.
-    while move_one_filter(allocator, plan)? {}
+    while move_one_filter(env, plan)? {}
     remove_unreachable_nodes(plan);
     Ok(())
 }
 
 /// Moves the conditions of the first filter that can move any. Returns
 /// whether one did.
-fn move_one_filter(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<bool, AllocError> {
+fn move_one_filter(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<bool, AllocError> {
     for id in 0..plan.nodes.len() {
         let &[child] = &at!(plan.nodes, id).children[..] else { continue };
         // Children are added before their parents.
         let (below, rest) = plan.nodes.split_at_mut(id);
         let below = &at!(below, child as usize).op;
-        let moved = at_mut!(rest, 0).op.split_below(&plan.exprs, allocator, below)?;
+        let moved = at_mut!(rest, 0).op.split_below(&plan.exprs, env, below)?;
         if moved.filters.iter().all(Option::is_none) {
             continue;
         }
@@ -250,11 +247,11 @@ fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
 /// and lets each op make the choices that depend on them, such as which
 /// side of a join to build. Returns the estimates.
 pub fn choose_by_estimates(
-    allocator: &Global,
+    env: &Env,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<SlowVec<Estimate>, AllocError> {
-    let mut estimates = SlowVec::fixed(allocator, plan.nodes.len())?;
-    let mut inputs = SlowVec::new(allocator, PLAN_NODES_MAX)?;
+    let mut estimates = SlowVec::fixed(env, plan.nodes.len())?;
+    let mut inputs = SlowVec::new(env, PLAN_NODES_MAX)?;
     let exprs = &plan.exprs;
     for node in plan.nodes.iter_mut() {
         inputs.retain(|_| false);
@@ -271,11 +268,11 @@ pub fn choose_by_estimates(
 /// Each node's parent, and which of its children it is; `None` for the
 /// root.
 fn parents(
-    allocator: &Global,
+    env: &Env,
     plan: &LogicalPlan<'_>,
 ) -> Result<SlowVec<Option<(PlanNodeId, usize)>>, AllocError> {
     let orphans = core::iter::repeat_n(None, plan.nodes.len());
-    let mut parents = SlowVec::fixed_from(allocator, orphans)?;
+    let mut parents = SlowVec::fixed_from(env, orphans)?;
     for (id, node) in (0..).zip(plan.nodes.iter()) {
         for (slot, &child) in node.children.iter().enumerate() {
             *at_mut!(parents, child as usize) = Some((id, slot));
@@ -288,11 +285,8 @@ fn parents(
 /// conditions on, copies of the parts of filters' predicates above it that
 /// read only that column, up to the first op that passes on other rows, so
 /// it can skip rows failing them. The filters still test every row.
-pub fn push_down_conditions(
-    allocator: &Global,
-    plan: &mut LogicalPlan<'_>,
-) -> Result<(), AllocError> {
-    let parents = parents(allocator, plan)?;
+pub fn push_down_conditions(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
+    let parents = parents(env, plan)?;
     for maker in 0..plan.nodes.len() {
         for column in (0..).take(plan.columns.len()) {
             if !at!(plan.nodes, maker).op.takes_condition(column) {
@@ -301,11 +295,11 @@ pub fn push_down_conditions(
             let mut at = *at!(parents, maker);
             while let Some((parent, _)) = at {
                 let parent_op = &mut at_mut!(plan.nodes, parent as usize).op;
-                let given = parent_op.give_condition(&plan.exprs, allocator, column)?;
+                let given = parent_op.give_condition(&plan.exprs, env, column)?;
                 let Given::Passed(condition) = given else { break };
                 if let Some(condition) = condition {
                     let maker = &mut at_mut!(plan.nodes, maker).op;
-                    maker.take_condition(&plan.exprs, allocator, column, condition)?;
+                    maker.take_condition(&plan.exprs, env, column, condition)?;
                 }
                 at = *at!(parents, parent as usize);
             }
@@ -382,21 +376,21 @@ const ANY_FORM: Forms = OUTPUT_FORMS.union(Forms::LAZY).union(Forms::SEQUENCE);
 /// between could drop rows, and one nothing reads is never loaded. Each op
 /// takes part through `Op`: what it reads and accepts, what it will make,
 /// and what loads it.
-pub fn choose_forms(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
+pub fn choose_forms(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     let (nodes, columns) = (plan.nodes.len(), plan.columns.len());
-    let parents = parents(allocator, plan)?;
-    let mut reads = SlowVec::fixed(allocator, nodes)?;
+    let parents = parents(env, plan)?;
+    let mut reads = SlowVec::fixed(env, nodes)?;
     for node in plan.nodes.iter() {
-        let mut read = Needed::none(allocator, columns, &plan.exprs)?;
+        let mut read = Needed::none(env, columns, &plan.exprs)?;
         node.op.reads(&mut read);
         reads.push(read)?;
     }
-    let mut output = Needed::none(allocator, columns, &plan.exprs)?;
+    let mut output = Needed::none(env, columns, &plan.exprs)?;
     for column in plan.output.iter() {
         output.need(column.id);
     }
     // Each column made lazy: what made it, and where it's loaded.
-    let mut lazy = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    let mut lazy = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
     for maker in 0..nodes {
         for column in (0..).take(columns) {
             let (load, above_parent, accepted) =
@@ -422,11 +416,11 @@ pub fn choose_forms(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<()
         if at!(lazy, ..i).iter().any(|entry| same(&entry)) {
             continue;
         }
-        let mut loaded = SlowVec::fixed(allocator, at!(lazy, i..).iter().filter(same).count())?;
+        let mut loaded = SlowVec::fixed(env, at!(lazy, i..).iter().filter(same).count())?;
         for &(_, _, column, forms) in at!(lazy, i..).iter().filter(same) {
             loaded.push((column, forms))?;
         }
-        let op = at!(plan.nodes, maker).op.materialize(allocator, loaded)?;
+        let op = at!(plan.nodes, maker).op.materialize(env, loaded)?;
         let below = match load {
             Load::Below(parent, slot) => *at!(at!(plan.nodes, parent as usize).children, slot),
             Load::AtRoot | Load::Never => plan.root,
@@ -536,21 +530,21 @@ mod tests {
     /// Plans a maker, then a reader that takes `accepts`, then one that
     /// only takes flat columns, and returns the forms the maker is allowed.
     fn allowed(accepts: Forms, passes_through: bool) -> Forms {
-        let global = Global::current();
+        let env = Env::current();
         let allowed = Cell::new(Forms::FLAT);
-        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut plan = LogicalPlan::new(env).unwrap();
         let column = plan.add_column("a", DataType::String, true).unwrap();
-        let mut node = plan.add_node(DynOp::new(global, Maker(&allowed)).unwrap(), &[]).unwrap();
+        let mut node = plan.add_node(DynOp::new(env, Maker(&allowed)).unwrap(), &[]).unwrap();
         let readers = [
             Reader { accepts, passes_through },
             Reader { accepts: Forms::FLAT, passes_through: true },
         ];
         for reader in readers {
             let children = [node];
-            node = plan.add_node(DynOp::new(global, reader).unwrap(), &children).unwrap();
+            node = plan.add_node(DynOp::new(env, reader).unwrap(), &children).unwrap();
         }
         assert!(plan.output.push(column).is_ok());
-        choose_forms(global, &mut plan).unwrap();
+        choose_forms(env, &mut plan).unwrap();
         allowed.get()
     }
 
@@ -589,7 +583,7 @@ mod tests {
         fn take_condition(
             &mut self,
             _: &Exprs,
-            _: &Global,
+            _: &Env,
             _: ColumnId,
             _: Conjuncts,
         ) -> Result<(), AllocError> {
@@ -610,10 +604,10 @@ mod tests {
         fn give_condition(
             &mut self,
             _: &Exprs,
-            allocator: &Global,
+            env: &Env,
             _: ColumnId,
         ) -> Result<Given, AllocError> {
-            Ok(Given::Passed(Some(SlowVec::fixed_from(allocator, [self.0].into_iter())?)))
+            Ok(Given::Passed(Some(SlowVec::fixed_from(env, [self.0].into_iter())?)))
         }
 
         fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
@@ -642,9 +636,9 @@ mod tests {
     #[test]
     fn orders_reachable_nodes_inputs_first() {
         // Node 1 reads node 3, after it, and nothing reads nodes 0 and 2.
-        let mut plan = LogicalPlan::new(Global::current()).unwrap();
+        let mut plan = LogicalPlan::new(Env::current()).unwrap();
         let reader = || {
-            DynOp::new(Global::current(), Reader { accepts: Forms::FLAT, passes_through: true })
+            DynOp::new(Env::current(), Reader { accepts: Forms::FLAT, passes_through: true })
                 .unwrap()
         };
         for children in [&[][..], &[0], &[], &[]] {
@@ -660,22 +654,22 @@ mod tests {
     #[test]
     fn chooses_once_conditions_are_pushed_down() {
         let (taken, seen) = (Cell::new(false), Cell::new(None));
-        let mut plan = LogicalPlan::new(Global::current()).unwrap();
+        let mut plan = LogicalPlan::new(Env::current()).unwrap();
         let column = plan.add_column("a", DataType::Int64, true).unwrap();
-        let mut null = ExprBuilder::new(Global::current()).unwrap();
+        let mut null = ExprBuilder::new(Env::current()).unwrap();
         let a = null.column(0).unwrap();
         null.node(ExprOp::IsNull, a, 0).unwrap();
         let null = plan.exprs.add(null.nodes()).unwrap();
         let mut node =
-            plan.add_node(DynOp::new(Global::current(), Taker(&taken)).unwrap(), &[]).unwrap();
+            plan.add_node(DynOp::new(Env::current(), Taker(&taken)).unwrap(), &[]).unwrap();
         for op in [
-            DynOp::new(Global::current(), Giver(null)).unwrap(),
-            DynOp::new(Global::current(), Chooser { taken: &taken, seen: &seen }).unwrap(),
+            DynOp::new(Env::current(), Giver(null)).unwrap(),
+            DynOp::new(Env::current(), Chooser { taken: &taken, seen: &seen }).unwrap(),
         ] {
             node = plan.add_node(op, &[node]).unwrap();
         }
         assert!(plan.output.push(column).is_ok());
-        optimize(Global::current(), &mut plan).unwrap();
+        optimize(Env::current(), &mut plan).unwrap();
         assert_eq!(seen.get(), Some(true));
     }
 }

@@ -782,23 +782,19 @@ mod tests {
     use super::*;
 
     use crate::context::Context;
-    use crate::global::Global;
+    use crate::env::Env;
 
     #[test]
     fn reads_values_and_nulls() {
-        let global = Global::current();
-        let mut values = Buffer::allocate(global, 4 * 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 4 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3, 4]);
-        let mut validity = Buffer::allocate(global, 1).unwrap();
+        let mut validity = Buffer::allocate(env, 1).unwrap();
         validity.as_mut_slice::<u8>()[0] = 0b1011;
 
-        let column = ColumnView::new(
-            &mut Context::new(global, None),
-            DataType::Int64,
-            values,
-            Some(validity),
-        )
-        .unwrap();
+        let column =
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, Some(validity))
+                .unwrap();
         assert_eq!(column.int64s(), [1, 2, 3, 4]);
         assert!(column.is_null(2));
         assert!(!column.is_null(3));
@@ -811,9 +807,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Int64")]
     fn reading_the_wrong_type_panics() {
-        let global = Global::current();
-        let values = Buffer::allocate(global, 8).unwrap();
-        ColumnView::new(&mut Context::new(global, None), DataType::Float64, values, None)
+        let env = Env::current();
+        let values = Buffer::allocate(env, 8).unwrap();
+        ColumnView::new(&mut Context::new(env, None), DataType::Float64, values, None)
             .unwrap()
             .int64s();
     }
@@ -857,19 +853,19 @@ mod tests {
 
     /// `values`, each a start and length into `bytes`, as views.
     fn views(bytes: &[u8], values: &[(u32, u32)], validity: Option<u8>) -> ColumnView {
-        let global = Global::current();
-        let mut page = Buffer::allocate(global, bytes.len().max(1)).unwrap();
+        let env = Env::current();
+        let mut page = Buffer::allocate(env, bytes.len().max(1)).unwrap();
         page.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(bytes);
-        let mut views = Buffer::allocate(global, values.len() * 8).unwrap();
+        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
         for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
             view.copy_from_slice(&[start, len]);
         }
         let validity = validity.map(|bits| {
-            let mut buffer = Buffer::allocate(global, 1).unwrap();
+            let mut buffer = Buffer::allocate(env, 1).unwrap();
             buffer.as_mut_slice::<u8>()[0] = bits;
             buffer
         });
-        ColumnView::strings(&mut Context::new(global, None), views, page, validity).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), views, page, validity).unwrap()
     }
 
     #[test]
@@ -890,48 +886,47 @@ mod tests {
     #[test]
     #[should_panic(expected = "has_bytes")]
     fn strings_need_their_bytes() {
-        let global = Global::current();
+        let env = Env::current();
         let _ = ColumnView::new(
-            &mut Context::new(global, None),
+            &mut Context::new(env, None),
             DataType::String,
-            Buffer::allocate(global, 8).unwrap(),
+            Buffer::allocate(env, 8).unwrap(),
             None,
         )
         .unwrap();
     }
 
     fn int64s(values: &[i64], nulls: &[usize]) -> ColumnView {
-        let global = Global::current();
-        let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut bits =
-                Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
+            let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
             bits.as_mut_slice::<u8>().fill(0xff);
             for &row in nulls {
                 BitSlice::of_mut(bits.as_mut_slice::<u8>()).clear(row);
             }
             bits
         });
-        ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, validity).unwrap()
+        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, validity).unwrap()
     }
 
     fn indices(indices: &[u32]) -> Buffer {
-        let global = Global::current();
-        let mut buffer = Buffer::allocate(global, indices.len() * 4).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, indices.len() * 4).unwrap();
         buffer.as_mut_slice::<u32>().copy_from_slice(indices);
         buffer
     }
 
     #[test]
     fn maps_rows_to_values_in_each_form() {
-        let global = Global::current();
-        let mut context = crate::context::Context::new(global, None);
+        let env = Env::current();
+        let mut context = crate::context::Context::new(env, None);
         // A dictionary of 10, 20 and a null, as Parquet's nulls point at one.
         let bounds = Bounds { min: 10, max: 20 };
         let dictionary = int64s(&[10, 20, 0], &[2]).with_bounds(bounds);
         let column = ColumnView::dictionary(
-            &mut Context::new(global, None),
+            &mut Context::new(env, None),
             &dictionary,
             indices(&[1, 0, 2, 1, 1]),
         )
@@ -940,7 +935,7 @@ mod tests {
         assert_eq!(column.bounds(), Some(bounds));
         assert_eq!(column.slice(1, 2).flatten(&mut context).unwrap().bounds(), Some(bounds));
         assert_eq!(
-            ColumnView::constant(&mut Context::new(global, None), &dictionary.slice(0, 1), 3)
+            ColumnView::constant(&mut Context::new(env, None), &dictionary.slice(0, 1), 3)
                 .unwrap()
                 .bounds(),
             Some(bounds)
@@ -956,19 +951,19 @@ mod tests {
         assert_eq!(sliced.int64s(), [10, 0, 20]);
 
         let constant =
-            ColumnView::constant(&mut Context::new(global, None), &int64s(&[7], &[]), 4).unwrap();
+            ColumnView::constant(&mut Context::new(env, None), &int64s(&[7], &[]), 4).unwrap();
         assert!(matches!(constant.form(), Form::Constant));
         assert_eq!(constant.slice(1, 2).flatten(&mut context).unwrap().int64s(), [7, 7]);
         let nulls =
-            ColumnView::constant(&mut Context::new(global, None), &int64s(&[0], &[0]), 3).unwrap();
+            ColumnView::constant(&mut Context::new(env, None), &int64s(&[0], &[0]), 3).unwrap();
         assert!((0..3).all(|row| nulls.is_null(row)));
     }
 
     #[test]
     fn keeps_a_lazy_views_handle() {
-        let global = Global::current();
+        let env = Env::current();
         let column =
-            ColumnView::lazy(&mut Context::new(global, None), DataType::Int64, &[1, 2, 3], 10)
+            ColumnView::lazy(&mut Context::new(env, None), DataType::Int64, &[1, 2, 3], 10)
                 .unwrap();
         assert!(column.is_lazy());
         assert_eq!(column.handle(), (&[1, 2, 3][..], 0));
@@ -980,23 +975,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "check failed")]
     fn lazy_views_have_no_values() {
-        let global = Global::current();
+        let env = Env::current();
         let column =
-            ColumnView::lazy(&mut Context::new(global, None), DataType::Int64, &[1], 2).unwrap();
+            ColumnView::lazy(&mut Context::new(env, None), DataType::Int64, &[1], 2).unwrap();
         let _ = column.values();
     }
 
     #[test]
     fn flattens_strings() {
-        let global = Global::current();
-        let mut context = crate::context::Context::new(global, None);
+        let env = Env::current();
+        let mut context = crate::context::Context::new(env, None);
         let dictionary = strings(&["ab", "cde"]);
-        let column = ColumnView::dictionary(
-            &mut Context::new(global, None),
-            &dictionary,
-            indices(&[1, 1, 0]),
-        )
-        .unwrap();
+        let column =
+            ColumnView::dictionary(&mut Context::new(env, None), &dictionary, indices(&[1, 1, 0]))
+                .unwrap();
         let flat = column.flatten(&mut context).unwrap();
         let strings = flat.string_values();
         assert_eq!(

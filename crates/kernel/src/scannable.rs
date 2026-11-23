@@ -15,9 +15,9 @@ use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::{Bounds, ColumnView, DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
+use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
-use crate::global::Global;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -87,12 +87,12 @@ pub trait Scannable {
     /// default, `None`.
     fn scan_within<'s>(
         &'s self,
-        allocator: &Global,
+        env: &Env,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
     ) -> Result<Option<DynSource<'s>>, AllocError> {
-        let _ = (allocator, columns, conditions, cutoff);
+        let _ = (env, columns, conditions, cutoff);
         Ok(None)
     }
 
@@ -176,7 +176,7 @@ type ScannableOpen =
 
 type ScannableScanWithin<'a> = unsafe fn(
     NonNull<()>,
-    &Global,
+    &Env,
     &[(u32, Forms)],
     &[Condition],
     Option<Cutoff>,
@@ -198,7 +198,7 @@ type ScannableLoad = unsafe fn(
 ) -> Result<ColumnView, Error>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
-/// allocator, and functions that know its type.
+/// `Env`, and functions that know its type.
 pub struct DynScannable<'a> {
     scannable: ErasedBox,
     column_count: unsafe fn(NonNull<()>) -> u32,
@@ -222,14 +222,11 @@ pub struct DynScannable<'a> {
 }
 
 impl<'a> DynScannable<'a> {
-    pub fn new<T: Scannable + 'a>(
-        allocator: &Global,
-        scannable: T,
-    ) -> Result<DynScannable<'a>, AllocError> {
+    pub fn new<T: Scannable + 'a>(env: &Env, scannable: T) -> Result<DynScannable<'a>, AllocError> {
         const { assert!(align_of::<T::State<'a>>() <= BUFFER_ALIGNMENT_BYTES) };
         const { assert!(align_of::<T::Loader>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(DynScannable {
-            scannable: Box::new(allocator, scannable)?.erase(),
+            scannable: Box::new(env, scannable)?.erase(),
             // SAFETY: only called with this scannable and its state, as is each below.
             column_count: |scannable| unsafe { value_of::<T>(scannable).column_count() },
             // SAFETY: as above.
@@ -265,8 +262,8 @@ impl<'a> DynScannable<'a> {
             },
             // SAFETY: as above. The source borrows the scannable, for as
             // long as `scan` says.
-            scan_within: |scannable, allocator, columns, conditions, cutoff| unsafe {
-                value_of::<T>(scannable).scan_within(allocator, columns, conditions, cutoff)
+            scan_within: |scannable, env, columns, conditions, cutoff| unsafe {
+                value_of::<T>(scannable).scan_within(env, columns, conditions, cutoff)
             },
             // SAFETY: as above.
             forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
@@ -345,12 +342,12 @@ impl<'a> DynScannable<'a> {
     /// columns, or sorting after `cutoff`'s.
     pub fn scan(
         &self,
-        allocator: &Global,
+        env: &Env,
         columns: impl ExactSizeIterator<Item = (u32, Forms)>,
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
     ) -> Result<DynSource<'_>, AllocError> {
-        let columns = SlowVec::fixed_from(allocator, columns)?;
+        let columns = SlowVec::fixed_from(env, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         let column_count = self.column_count();
         // Each set holds flat, which every scannable can write, so checked
@@ -368,14 +365,14 @@ impl<'a> DynScannable<'a> {
             // source borrows `self`.
             let within = unsafe {
                 let scannable = self.scannable.as_ptr();
-                (self.scan_within)(scannable, allocator, &columns, conditions, cutoff)?
+                (self.scan_within)(scannable, env, &columns, conditions, cutoff)?
             };
             if let Some(source) = within {
                 return Ok(source);
             }
         }
         let scan = Scan { scannable: NonNull::from(self).cast(), columns };
-        let step = Box::new(allocator, scan)?.erase();
+        let step = Box::new(env, scan)?.erase();
         // SAFETY: the functions take a `Scan` and the scannable's state, and
         // the `Scan` borrows `self` for as long as the source lives.
         let source = unsafe {
@@ -396,13 +393,13 @@ impl<'a> DynScannable<'a> {
     /// `forms`.
     pub fn materialize(
         &self,
-        allocator: &Global,
+        env: &Env,
         positions: SlowVec<u32>,
         forms: SlowVec<Forms>,
     ) -> Result<DynTransform<'_>, AllocError> {
         check!(forms.len() == positions.len() && forms.iter().all(|f| f.contains(Forms::FLAT)));
         let materialize = Materialize { scannable: NonNull::from(self).cast(), positions, forms };
-        let step = Box::new(allocator, materialize)?.erase();
+        let step = Box::new(env, materialize)?.erase();
         // SAFETY: the functions take a `Materialize` and the scannable's
         // loader, and the `Materialize` borrows `self` for as long as the
         // transform lives.
@@ -516,7 +513,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::column::ColumnView;
     use crate::context::Context;
-    use crate::global::Global;
+    use crate::env::Env;
     use crate::pipeline::Pipeline;
     use crate::selection::Kept;
     use crate::step::{Step, Transform};
@@ -557,20 +554,20 @@ mod tests {
             (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
-            let global = Global::current();
+            let env = Env::current();
             if *done {
                 return Ok(false);
             }
             batch.reset(2);
             for &(column, _) in *columns {
-                let mut values = Buffer::allocate(global, 16).unwrap();
+                let mut values = Buffer::allocate(env, 16).unwrap();
                 let value = i64::from(column);
                 values.as_mut_slice::<i64>().copy_from_slice(&[value, value + 10]);
                 assert!(
                     batch
                         .push_column(
                             ColumnView::new(
-                                &mut Context::new(global, None),
+                                &mut Context::new(env, None),
                                 DataType::Int64,
                                 values,
                                 None
@@ -587,8 +584,8 @@ mod tests {
 
     #[test]
     fn describes_its_columns() {
-        let global = Global::current();
-        let scannable = DynScannable::new(global, Columns).unwrap();
+        let env = Env::current();
+        let scannable = DynScannable::new(env, Columns).unwrap();
         assert_eq!(scannable.column_count(), 3);
         assert_eq!(scannable.column_name(1), "b");
         assert!(scannable.column_type(2) == DataType::Int64);
@@ -596,14 +593,14 @@ mod tests {
 
     #[test]
     fn scans_chosen_columns_through_a_pipeline() {
-        let global = Global::current();
-        let scannable = DynScannable::new(global, Columns).unwrap();
+        let env = Env::current();
+        let scannable = DynScannable::new(env, Columns).unwrap();
         let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
         let pipeline = Pipeline::new(
-            scannable.scan(global, columns, &[], None).unwrap(),
-            SlowVec::new(global, 1).unwrap(),
+            scannable.scan(env, columns, &[], None).unwrap(),
+            SlowVec::new(env, 1).unwrap(),
         );
-        let query = Global::current();
+        let query = Env::current();
         let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
@@ -713,19 +710,18 @@ mod tests {
 
     #[test]
     fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
-        let global = Global::current();
+        let env = Env::current();
         let loads = RefCell::new(StdVec::new());
-        let scannable = DynScannable::new(global, Counted { loads: &loads }).unwrap();
-        let source = scannable
-            .scan(global, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None)
-            .unwrap();
-        let keep = Step::Transform(DynTransform::new(global, KeepOdd).unwrap());
-        let positions = SlowVec::fixed_from(global, [0].into_iter()).unwrap();
-        let flat = SlowVec::fixed_from(global, [Forms::FLAT].into_iter()).unwrap();
-        let load = Step::Transform(scannable.materialize(global, positions, flat).unwrap());
+        let scannable = DynScannable::new(env, Counted { loads: &loads }).unwrap();
+        let source =
+            scannable.scan(env, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None).unwrap();
+        let keep = Step::Transform(DynTransform::new(env, KeepOdd).unwrap());
+        let positions = SlowVec::fixed_from(env, [0].into_iter()).unwrap();
+        let flat = SlowVec::fixed_from(env, [Forms::FLAT].into_iter()).unwrap();
+        let load = Step::Transform(scannable.materialize(env, positions, flat).unwrap());
         let pipeline =
-            Pipeline::new(source, SlowVec::fixed_from(global, [keep, load].into_iter()).unwrap());
-        let query = Global::current();
+            Pipeline::new(source, SlowVec::fixed_from(env, [keep, load].into_iter()).unwrap());
+        let query = Env::current();
         let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut kept = StdVec::new();

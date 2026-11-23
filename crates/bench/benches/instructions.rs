@@ -223,9 +223,9 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
     let file: &'static FileSource =
         Box::leak(Box::new(FileSource::open(&path).expect("clickbench/fetch.sh fetched it")));
     let sources: &'static [&dyn ByteSource] = Box::leak(Box::new([file as &dyn ByteSource]));
-    let global = pipitdb_bench::global();
-    let table = ParquetTable::open(global, &Codecs, sources).expect("a Parquet file");
-    let hits = Hits(DynScannable::new(global, table).expect("allocates"));
+    let env = pipitdb_bench::env();
+    let table = ParquetTable::open(env, &Codecs, sources).expect("a Parquet file");
+    let hits = Hits(DynScannable::new(env, table).expect("allocates"));
     let query = pipitdb_bench::real::clickbench_query(name).expect("a query pipitdb runs");
     Some(pipitdb_bench::plan(Box::leak(Box::new(hits)), query).expect("compiles"))
 }

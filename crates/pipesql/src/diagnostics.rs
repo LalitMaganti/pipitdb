@@ -277,7 +277,7 @@ fn token(kind: TokenKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::global::Global;
+    use pipit_kernel::env::Env;
 
     use crate::parser::parse_expression;
 
@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn renders_a_parse_error() {
         let source = "a +\n  (b * c";
-        let error = parse_expression(Global::current(), source.as_bytes()).unwrap_err();
+        let error = parse_expression(Env::current(), source.as_bytes()).unwrap_err();
         assert_eq!(
             render(source, "query", &error),
             "error[E0007]: expected `)`, found the end of the query\n \
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn compact_round_trips() {
-        let error = parse_expression(Global::current(), b"a b").unwrap_err();
+        let error = parse_expression(Env::current(), b"a b").unwrap_err();
         let text = compact(&error);
         assert_eq!(text, "pipit:E0006:2+1:0");
         assert_eq!(parse_compact(&text), Some(error));

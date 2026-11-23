@@ -4,7 +4,7 @@
 use core::ops::{Deref, DerefMut};
 
 use crate::allocator::AllocError;
-use crate::global::Global;
+use crate::env::Env;
 use crate::slow_vec::SlowVec;
 
 /// A word bits are packed in.
@@ -143,8 +143,8 @@ pub struct Bitmap {
 
 impl Bitmap {
     /// `len` bits, all clear.
-    pub fn new(global: &Global, len: usize) -> Result<Bitmap, AllocError> {
-        Ok(Bitmap { words: SlowVec::zeroed(global, BitSlice::<u64>::words_for(len))? })
+    pub fn new(env: &Env, len: usize) -> Result<Bitmap, AllocError> {
+        Ok(Bitmap { words: SlowVec::zeroed(env, BitSlice::<u64>::words_for(len))? })
     }
 
     /// Clears every bit.
@@ -183,7 +183,7 @@ mod tests {
         let expected: std::vec::Vec<usize> = (3..18).filter(|&at| at != 10).chain([21]).collect();
         assert_eq!(set, expected);
 
-        let mut bitmap = Bitmap::new(Global::current(), 130).unwrap();
+        let mut bitmap = Bitmap::new(Env::current(), 130).unwrap();
         bitmap.set(129);
         assert!(bitmap.get(129) && !bitmap.get(128));
         assert_eq!(bitmap.words().len(), 3);

@@ -1,4 +1,4 @@
-//! `Box`: one value, in memory from the allocator it was made with.
+//! `Box`: one value, in memory from the `Env` it was made with.
 //! `ErasedBox`: a `Box` whose type has been forgotten.
 
 use core::mem::ManuallyDrop;
@@ -7,9 +7,9 @@ use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
-use crate::global::Global;
+use crate::env::Env;
 
-/// The value lives in a `Buffer`, which also remembers the allocator, so a
+/// The value lives in a `Buffer`, which also remembers the `Env`, so a
 /// `Box` isn't generic over it.
 pub struct Box<T> {
     buffer: Buffer,
@@ -17,10 +17,10 @@ pub struct Box<T> {
 }
 
 impl<T> Box<T> {
-    pub fn new(allocator: &Global, value: T) -> Result<Box<T>, AllocError> {
+    pub fn new(env: &Env, value: T) -> Result<Box<T>, AllocError> {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         // SAFETY: the value is written before anything reads it.
-        let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
+        let mut buffer = unsafe { Buffer::allocate_uninit(env, size_of::<T>())? };
         let value_ptr = buffer.as_mut_non_null().cast::<T>();
         // SAFETY: the buffer has room for a `T`, aligned for it.
         unsafe { value_ptr.write(value) };
@@ -93,9 +93,9 @@ mod tests {
 
     #[test]
     fn holds_and_drops_its_value() {
-        let global = Global::current();
+        let env = Env::current();
         let live = Rc::new(());
-        let mut boxed = Box::new(global, (1, live.clone())).unwrap();
+        let mut boxed = Box::new(env, (1, live.clone())).unwrap();
         boxed.0 += 1;
         assert_eq!(boxed.0, 2);
         assert_eq!(Rc::strong_count(&live), 2);
@@ -105,9 +105,9 @@ mod tests {
 
     #[test]
     fn drops_its_value_once_erased() {
-        let global = Global::current();
+        let env = Env::current();
         let live = Rc::new(());
-        let erased = Box::new(global, live.clone()).unwrap().erase();
+        let erased = Box::new(env, live.clone()).unwrap().erase();
         // SAFETY: it holds an `Rc<()>`.
         assert_eq!(unsafe { erased.as_ptr().cast::<Rc<()>>().as_ref() }, &live);
         assert_eq!(Rc::strong_count(&live), 2);

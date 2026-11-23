@@ -13,14 +13,14 @@ pub const STRING_FUNCTIONS: &[FunctionRule] = &[
     FunctionRule {
         name: "length",
         compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Length { bytes: false })?);
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Length { bytes: false })?);
             call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
         },
     },
     FunctionRule {
         name: "octet_length",
         compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Length { bytes: true })?);
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Length { bytes: true })?);
             call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
         },
     },

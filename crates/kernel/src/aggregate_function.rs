@@ -11,8 +11,8 @@ use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, Validity};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::group_table::write_strings;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::string_pool::Id;
@@ -137,15 +137,15 @@ pub(crate) struct SeenBytes {
 }
 
 impl SeenBytes {
-    pub(crate) fn new(allocator: &Global) -> Result<SeenBytes, AllocError> {
-        Ok(SeenBytes { bytes: Blocks::new(allocator, 1)?, tracking: false, groups: 0 })
+    pub(crate) fn new(env: &Env) -> Result<SeenBytes, AllocError> {
+        Ok(SeenBytes { bytes: Blocks::new(env, 1)?, tracking: false, groups: 0 })
     }
 
     /// What to pass as `GroupStates::seen` for a batch with `groups` groups
     /// in all, whose input holds nulls if `nulls`.
     pub(crate) fn get(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         groups: usize,
         nulls: bool,
     ) -> Result<Option<&[*mut u8]>, AllocError> {
@@ -154,7 +154,7 @@ impl SeenBytes {
             return Ok(None);
         }
         // New groups' bytes start zeroed.
-        self.bytes.reserve(allocator, groups)?;
+        self.bytes.reserve(env, groups)?;
         if !self.tracking {
             // Every group so far added only values.
             self.tracking = true;
@@ -549,7 +549,7 @@ impl StringExtreme {
         let mut touched = context.indices_buffer(rows * 4)?;
         let touched = touched.as_mut_slice::<u32>();
         let mut count = 0;
-        let allocator = context.allocator();
+        let env = context.env();
         let pool = context.string_pool()?;
         for i in 0..rows {
             let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
@@ -580,8 +580,7 @@ impl StringExtreme {
         for &group in at!(touched, ..count) {
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a row")]
             let row = (states.word(group) & !BATCH_ROW) as usize;
-            *states.word_mut(group) =
-                i64::from(pool.intern_string(allocator, string(row))?.raw_id());
+            *states.word_mut(group) = i64::from(pool.intern_string(env, string(row))?.raw_id());
         }
         Ok(())
     }

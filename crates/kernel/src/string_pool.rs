@@ -3,8 +3,8 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, HEADER_BYTES};
+use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
-use crate::global::Global;
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
@@ -153,40 +153,32 @@ impl Key for Interned {
 }
 
 impl StringPool {
-    /// A pool holding only the null string. `allocator` must outlive it.
-    pub fn new(allocator: &Global) -> Result<StringPool, AllocError> {
+    /// A pool holding only the null string. `env` must outlive it.
+    pub fn new(env: &Env) -> Result<StringPool, AllocError> {
         let mut store = Store {
-            blocks: SlowVec::new(allocator, BLOCKS_MAX)?,
+            blocks: SlowVec::new(env, BLOCKS_MAX)?,
             block_end: 0,
-            large_strings: SlowVec::new(allocator, 1 << 31)?,
+            large_strings: SlowVec::new(env, 1 << 31)?,
         };
-        store.add_block(allocator)?;
+        store.add_block(env)?;
         // The null string's slot, so no string's id is 0.
         store.insert_in_current_block(&[]);
-        Ok(StringPool { store, string_index: FlatHashMap::new(allocator, INDEX_CAPACITY)? })
+        Ok(StringPool { store, string_index: FlatHashMap::new(env, INDEX_CAPACITY)? })
     }
 
     /// Interns `str` and returns its id: the same each time it's interned.
     /// After an error, the pool mustn't be used again.
     #[inline]
-    pub fn intern_string(
-        &mut self,
-        allocator: &Global,
-        str: Option<&[u8]>,
-    ) -> Result<Id, AllocError> {
+    pub fn intern_string(&mut self, env: &Env, str: Option<&[u8]>) -> Result<Id, AllocError> {
         let Some(str) = str else { return Ok(Id::NULL) };
-        Ok(self.intern_numbered(allocator, str)?.0)
+        Ok(self.intern_numbered(env, str)?.0)
     }
 
     /// As `intern_string`, also returning the string's number: strings are
     /// numbered from 0 in the order first interned.
     #[inline]
-    pub fn intern_numbered(
-        &mut self,
-        allocator: &Global,
-        str: &[u8],
-    ) -> Result<(Id, u32), AllocError> {
-        self.intern_hashed(allocator, str, murmur_hash::bytes(str))
+    pub fn intern_numbered(&mut self, env: &Env, str: &[u8]) -> Result<(Id, u32), AllocError> {
+        self.intern_hashed(env, str, murmur_hash::bytes(str))
     }
 
     /// Interns `count` strings, `string(i)` for each, giving each one's id
@@ -195,7 +187,7 @@ impl StringPool {
     /// waited for one by one.
     pub fn intern_strings<'s>(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         count: usize,
         string: impl Fn(usize) -> Option<&'s [u8]>,
         mut out: impl FnMut(usize, Id, u32),
@@ -205,7 +197,7 @@ impl StringPool {
         if self.string_index.capacity() <= CACHED_SLOTS {
             for i in 0..count {
                 let (id, number) = match string(i) {
-                    Some(str) => self.intern_numbered(allocator, str)?,
+                    Some(str) => self.intern_numbered(env, str)?,
                     None => (Id::NULL, NO_NUMBER),
                 };
                 out(i, id, number);
@@ -214,7 +206,7 @@ impl StringPool {
         }
         for first in (0..count).step_by(CHUNK_ROWS) {
             let rows = CHUNK_ROWS.min(count - first);
-            self.intern_chunk(allocator, first, rows, &string, &mut out)?;
+            self.intern_chunk(env, first, rows, &string, &mut out)?;
         }
         Ok(())
     }
@@ -223,7 +215,7 @@ impl StringPool {
     /// slots are loaded, then the strings they hold, then they're compared.
     fn intern_chunk<'s>(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         first: usize,
         rows: usize,
         string: &impl Fn(usize) -> Option<&'s [u8]>,
@@ -251,7 +243,7 @@ impl StringPool {
             let (id, number) = match *str {
                 None => (Id::NULL, NO_NUMBER),
                 Some(str) if !found.0.is_null() && self.store.equals(found.0, str) => found,
-                Some(str) => self.intern_hashed(allocator, str, hash)?,
+                Some(str) => self.intern_hashed(env, str, hash)?,
             };
             out(first + i, id, number);
         }
@@ -260,12 +252,7 @@ impl StringPool {
 
     /// As `intern_numbered`, for `str`, hashed as `hash`.
     #[inline]
-    fn intern_hashed(
-        &mut self,
-        allocator: &Global,
-        str: &[u8],
-        hash: u64,
-    ) -> Result<(Id, u32), AllocError> {
+    fn intern_hashed(&mut self, env: &Env, str: &[u8], hash: u64) -> Result<(Id, u32), AllocError> {
         // Inserts the null id just to see if the string is already in, and
         // if it isn't, overwrites it with the string's. Strings with the
         // same hash are told apart by their bytes, unlike in Perfetto.
@@ -274,10 +261,9 @@ impl StringPool {
         #[expect(clippy::cast_possible_truncation, reason = "ids are 32 bits too")]
         let number = self.string_index.len() as u32;
         let key = Interned { hash, id: Id::NULL, number };
-        let ((held, ()), inserted) =
-            self.string_index.insert_by(allocator, hash, equal, key, ())?;
+        let ((held, ()), inserted) = self.string_index.insert_by(env, hash, equal, key, ())?;
         if inserted {
-            held.id = self.store.insert_string(allocator, str)?;
+            held.id = self.store.insert_string(env, str)?;
         }
         Ok((held.id, held.number))
     }
@@ -340,30 +326,29 @@ impl Store {
     }
 
     #[inline(never)]
-    fn add_block(&mut self, allocator: &Global) -> Result<(), AllocError> {
+    fn add_block(&mut self, env: &Env) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
-        let block =
-            unsafe { Buffer::allocate_uninit_aligned(allocator, BLOCK_CAPACITY, BLOCK_BYTES) };
+        let block = unsafe { Buffer::allocate_uninit_aligned(env, BLOCK_CAPACITY, BLOCK_BYTES) };
         self.blocks.push(block?)?;
         self.block_end = 0;
         Ok(())
     }
 
-    fn insert_string(&mut self, allocator: &Global, str: &[u8]) -> Result<Id, AllocError> {
+    fn insert_string(&mut self, env: &Env, str: &[u8]) -> Result<Id, AllocError> {
         if str.len() >= LARGE_STRING_BYTES_MIN {
-            return self.insert_large_string(allocator, str);
+            return self.insert_large_string(env, str);
         }
         if self.block_end + str.len() + METADATA_BYTES > BLOCK_CAPACITY {
-            self.add_block(allocator)?;
+            self.add_block(env)?;
         }
         Ok(Id::block_string(self.blocks.len() - 1, self.insert_in_current_block(str)))
     }
 
     #[inline(never)]
-    fn insert_large_string(&mut self, allocator: &Global, str: &[u8]) -> Result<Id, AllocError> {
+    fn insert_large_string(&mut self, env: &Env, str: &[u8]) -> Result<Id, AllocError> {
         // Zeroed, so the nul is already there.
-        let mut buffer = Buffer::allocate(allocator, str.len() + 1)?;
+        let mut buffer = Buffer::allocate(env, str.len() + 1)?;
         at_mut!(buffer.as_mut_slice::<u8>(), ..str.len()).copy_from_slice(str);
         self.large_strings.push(buffer)?;
         Ok(Id::large_string(self.large_strings.len() - 1))
@@ -406,13 +391,13 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn interns_strings() {
-        let global = Global::current();
-        let mut pool = StringPool::new(global).unwrap();
+        let env = Env::current();
+        let mut pool = StringPool::new(env).unwrap();
         let large = alloc::vec![b'x'; LARGE_STRING_BYTES_MIN];
         let strings: [Option<&[u8]>; 7] =
             [Some(b"b"), None, Some(b""), Some(b"a"), Some(b"b"), Some(&large), Some(b"a")];
         let ids: Vec<Id> =
-            strings.iter().map(|&str| pool.intern_string(global, str).unwrap()).collect();
+            strings.iter().map(|&str| pool.intern_string(env, str).unwrap()).collect();
         assert_eq!(ids[1], Id::NULL);
         assert_eq!([ids[4], ids[6]], [ids[0], ids[3]]);
         assert!(ids[5].is_large_string() && !ids[0].is_large_string());
@@ -424,24 +409,24 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..400_000_u32 {
             let str = format!("{i:08}");
-            ids.push(pool.intern_string(global, Some(str.as_bytes())).unwrap());
+            ids.push(pool.intern_string(env, Some(str.as_bytes())).unwrap());
         }
         assert!(ids.last().unwrap().block_index() > 0);
         for (i, &id) in ids.iter().enumerate() {
             let str = format!("{i:08}");
             assert_eq!(pool.get(id), Some(str.as_bytes()));
-            assert_eq!(pool.intern_string(global, Some(str.as_bytes())).unwrap(), id);
+            assert_eq!(pool.intern_string(env, Some(str.as_bytes())).unwrap(), id);
         }
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn interns_a_batch_as_one_at_a_time() {
-        let global = Global::current();
+        let env = Env::current();
         // Small enough to intern a row at a time, then past `CACHED_SLOTS`,
         // when a batch is looked up at once.
-        let mut pool = StringPool::new(global).unwrap();
-        let mut one_at_a_time = StringPool::new(global).unwrap();
+        let mut pool = StringPool::new(env).unwrap();
+        let mut one_at_a_time = StringPool::new(env).unwrap();
         let mut ids = alloc::vec![Id::NULL; BATCH_ROWS_MAX as usize];
         for batch in 0..40_u32 {
             let strings: Vec<Option<Vec<u8>>> = (0..BATCH_ROWS_MAX)
@@ -450,10 +435,10 @@ mod tests {
                 })
                 .collect();
             let string = |i: usize| strings[i].as_deref();
-            pool.intern_strings(global, strings.len(), string, |i, id, _| ids[i] = id).unwrap();
+            pool.intern_strings(env, strings.len(), string, |i, id, _| ids[i] = id).unwrap();
             for (i, &id) in ids.iter().enumerate() {
                 assert_eq!(pool.get(id), string(i));
-                let expected = one_at_a_time.intern_string(global, string(i)).unwrap();
+                let expected = one_at_a_time.intern_string(env, string(i)).unwrap();
                 assert_eq!(pool.get(id), one_at_a_time.get(expected));
             }
         }
@@ -464,7 +449,7 @@ mod tests {
     #[test]
     fn fails_past_its_allocator() {
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let limited = unsafe { Global::new(Heap, BLOCK_BYTES + (1 << 20)) }.unwrap();
+        let limited = unsafe { Env::new(Heap, BLOCK_BYTES + (1 << 20)) }.unwrap();
         let mut pool = StringPool::new(&limited).unwrap();
         let long = alloc::vec![b'y'; LARGE_STRING_BYTES_MIN - 2];
         let ids: Vec<_> = (0..4_u8)

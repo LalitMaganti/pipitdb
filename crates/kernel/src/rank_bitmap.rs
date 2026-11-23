@@ -3,7 +3,7 @@
 
 use crate::allocator::AllocError;
 use crate::bitmap::Bitmap;
-use crate::global::Global;
+use crate::env::Env;
 use crate::slow_vec::SlowVec;
 
 /// Bits, with how many are set before each word of them.
@@ -15,15 +15,15 @@ pub struct RankBitmap {
 impl RankBitmap {
     /// `len` bits, of which those in `set` are set.
     pub fn new(
-        global: &Global,
+        env: &Env,
         len: usize,
         set: impl Iterator<Item = usize>,
     ) -> Result<RankBitmap, AllocError> {
-        let mut bits = Bitmap::new(global, len)?;
+        let mut bits = Bitmap::new(env, len)?;
         for at in set {
             bits.set(at);
         }
-        let mut before = SlowVec::fixed_from(global, bits.words().iter().map(|_| 0))?;
+        let mut before = SlowVec::fixed_from(env, bits.words().iter().map(|_| 0))?;
         let mut count = 0;
         for (before, word) in before.iter_mut().zip(bits.words()) {
             *before = count;
@@ -53,7 +53,7 @@ mod tests {
     #[test]
     fn ranks_set_bits_in_order() {
         let set = [3, 64, 65, 200];
-        let bitmap = RankBitmap::new(Global::current(), 201, set.into_iter()).unwrap();
+        let bitmap = RankBitmap::new(Env::current(), 201, set.into_iter()).unwrap();
         for (rank, &at) in set.iter().enumerate() {
             assert!(bitmap.get(at));
             assert_eq!(bitmap.rank(at) as usize, rank);

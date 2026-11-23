@@ -10,7 +10,7 @@ use pipit_file::source::FileSource;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::context::Context;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::Scannable;
 use pipit_parquet::table::ParquetTable;
@@ -18,16 +18,16 @@ use pipit_parquet_full::Codecs;
 
 #[expect(clippy::cast_possible_truncation, reason = "floats are summed roughly")]
 fn main() -> Result<(), String> {
-    let global = Global::current();
+    let env = Env::current();
     let mut files = Vec::new();
     for path in std::env::args().skip(1) {
         files.push(FileSource::open(&path).map_err(|e| format!("{path}: {e}"))?);
     }
     let sources: Vec<&dyn ByteSource> = files.iter().map(|file| file as &dyn ByteSource).collect();
-    let table = ParquetTable::open(global, &Codecs, &sources).map_err(|e| format!("{e:?}"))?;
+    let table = ParquetTable::open(env, &Codecs, &sources).map_err(|e| format!("{e:?}"))?;
     let start = Instant::now();
     for column in 0..table.column_count() {
-        let mut context = Context::new(global, None);
+        let mut context = Context::new(env, None);
         let read = [(column, Forms::FLAT)];
         let mut state = table.open(&mut context, &read).map_err(|e| format!("{e:?}"))?;
         let mut batch = RowBatch::new();

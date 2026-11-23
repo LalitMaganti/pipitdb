@@ -48,7 +48,7 @@ fn coalesce(
     let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
     // At least two, as `compile_arguments` checked.
     let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
-    let mut branches = SlowVec::fixed(compiler.allocator(), tested.len())?;
+    let mut branches = SlowVec::fixed(compiler.env(), tested.len())?;
     for &value in tested {
         branches.push((PRESENT, value))?;
     }

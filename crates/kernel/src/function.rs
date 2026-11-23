@@ -8,9 +8,9 @@ use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::column::ColumnView;
 use crate::context::Context;
+use crate::env::Env;
 use crate::erase::value_of;
 use crate::error::Error;
-use crate::global::Global;
 
 /// The most arguments a call has.
 pub const ARGUMENTS_MAX: usize = 8;
@@ -23,7 +23,7 @@ pub trait Function {
     fn run(&self, context: &mut Context, arguments: &[&ColumnView]) -> Result<ColumnView, Error>;
 }
 
-/// A `Function` of any type, owned in memory from an allocator.
+/// A `Function` of any type, owned in memory from an `Env`.
 pub struct DynFunction {
     function: ErasedBox,
     run: Run,
@@ -32,11 +32,8 @@ pub struct DynFunction {
 type Run = unsafe fn(NonNull<()>, &mut Context, &[&ColumnView]) -> Result<ColumnView, Error>;
 
 impl DynFunction {
-    pub fn new<T: Function + 'static>(
-        allocator: &Global,
-        function: T,
-    ) -> Result<DynFunction, AllocError> {
-        let function = Box::new(allocator, function)?.erase();
+    pub fn new<T: Function + 'static>(env: &Env, function: T) -> Result<DynFunction, AllocError> {
+        let function = Box::new(env, function)?.erase();
         // SAFETY: only called with this function.
         let run = |function, context: &mut Context<'_>, arguments: &[&ColumnView]| unsafe {
             value_of::<T>(function).run(context, arguments)

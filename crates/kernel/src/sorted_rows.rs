@@ -8,8 +8,8 @@ use crate::array::Array;
 use crate::bitmap::BitSlice;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_blocks::RowBlocks;
@@ -62,12 +62,12 @@ pub(crate) struct SortedRows {
 }
 
 impl SortedRows {
-    pub(crate) fn new(allocator: &Global) -> Result<SortedRows, AllocError> {
+    pub(crate) fn new(env: &Env) -> Result<SortedRows, AllocError> {
         Ok(SortedRows {
             layout: None,
-            columns: SlowVec::new(allocator, 1 << 6)?,
+            columns: SlowVec::new(env, 1 << 6)?,
             keys: None,
-            rows: RowStore::new(allocator)?,
+            rows: RowStore::new(env)?,
             decoded: 0,
             order: Sorted::Held { reverse: false, count: 0 },
             order_len: 0,
@@ -113,7 +113,7 @@ impl SortedRows {
         if count == 0 {
             return Ok(());
         }
-        let stride = self.check_keys(context.allocator(), batch, keys)?.stride() as usize;
+        let stride = self.check_keys(context.env(), batch, keys)?.stride() as usize;
         if self.rows.len() == 0 {
             for (k, key) in keys.iter().enumerate() {
                 let data_type = at!(self.columns, k).data_type;
@@ -150,7 +150,7 @@ impl SortedRows {
     /// every batch's must match, as Perfetto checks.
     pub(crate) fn check_keys(
         &mut self,
-        allocator: &Global,
+        env: &Env,
         batch: &RowBatch,
         keys: &[SortKey],
     ) -> Result<&RowLayout, Error> {
@@ -158,7 +158,7 @@ impl SortedRows {
         if self.layout.is_none() {
             // Every key is laid out as nullable, as whether a column has nulls
             // can change from batch to batch.
-            let mut columns = SlowVec::fixed(allocator, keys.len())?;
+            let mut columns = SlowVec::fixed(env, keys.len())?;
             for key in keys {
                 let (column, data_type) = (key.column, data_type(key));
                 self.columns.push(KeyColumn { column, data_type })?;
@@ -170,7 +170,7 @@ impl SortedRows {
                 let descending = key.descending;
                 columns.push(row_layout::Column { data_type, nullable: true, descending })?;
             }
-            self.layout = Some(RowLayout::new(allocator, &columns)?);
+            self.layout = Some(RowLayout::new(env, &columns)?);
         }
         if keys.iter().zip(self.columns.iter()).any(|(key, c)| data_type(key) != c.data_type) {
             return Err(Error::Unsupported);
@@ -220,7 +220,7 @@ impl SortedRows {
     /// the keys. Nulls sort as in SQLite: first ascending, last descending.
     /// Strings sort by their bytes.
     pub(crate) fn sort(&mut self, context: &mut Context) -> Result<(), Error> {
-        let allocator = context.allocator();
+        let env = context.env();
         self.order = Sorted::Held { reverse: false, count: self.rows.len() };
         self.order_len = self.rows.len();
         let (Some(layout), Some(keys)) = (&self.layout, &mut self.keys) else { return Ok(()) };
@@ -228,7 +228,7 @@ impl SortedRows {
         let stride = layout.stride() as usize;
         for (k, column) in self.columns.iter().enumerate() {
             let Some(column) = column.string() else { continue };
-            let ranks = rank_strings(allocator, &self.rows, column)?;
+            let ranks = rank_strings(env, &self.rows, column)?;
             keys.for_each_block_mut(|first, bytes| {
                 let get =
                     |i: u32| Some(*at!(ranks, (first + i) as usize)).filter(|&r| r != NULL_RANK);
@@ -237,7 +237,7 @@ impl SortedRows {
                 RowLayout::write(layout.slot(k), count, get, bytes);
             });
         }
-        self.order = sort_row_layout(allocator, keys)?;
+        self.order = sort_row_layout(env, keys)?;
         if self.decoded == 0 {
             keys.free();
         }
@@ -323,8 +323,7 @@ impl SortedRows {
         // each block let go of as soon as scatter is past its rows.
         let mut decode = None;
         if let (Some(layout), true) = (&self.layout, self.decoded != 0) {
-            let mut slots =
-                SlowVec::fixed(context.allocator(), self.decoded.count_ones() as usize)?;
+            let mut slots = SlowVec::fixed(context.env(), self.decoded.count_ones() as usize)?;
             for column in bits(self.decoded) {
                 let k = first_key(&self.columns, column);
                 let (slot, float) =
@@ -384,12 +383,12 @@ const NULL_RANK: u32 = u32::MAX;
 
 /// Each held row's rank among the strings of `column`, a string column, of
 /// the rows held: equal strings rank equally. Null rows rank `NULL_RANK`.
-fn rank_strings(allocator: &Global, rows: &RowStore, column: u32) -> Result<Array<u32>, Error> {
+fn rank_strings(env: &Env, rows: &RowStore, column: u32) -> Result<Array<u32>, Error> {
     let string = |row: &u32| rows.string(column, *row);
     #[expect(clippy::cast_possible_truncation, reason = "a row held")]
-    let mut order = Array::from_fn(allocator, rows.len() as usize, |row| row as u32)?;
-    let mut scratch = Array::<u32>::zeroed(allocator, rows.len() as usize)?;
-    msd_radix_sort(allocator, &mut order, &mut scratch, |row| string(row).unwrap_or_default())?;
+    let mut order = Array::from_fn(env, rows.len() as usize, |row| row as u32)?;
+    let mut scratch = Array::<u32>::zeroed(env, rows.len() as usize)?;
+    msd_radix_sort(env, &mut order, &mut scratch, |row| string(row).unwrap_or_default())?;
     // The sort is done with its scratch, so the ranks go there.
     let mut ranks = scratch;
     let (mut rank, mut last) = (0, None);

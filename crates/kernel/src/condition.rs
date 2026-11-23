@@ -171,8 +171,8 @@ mod tests {
 
     use super::*;
 
+    use crate::env::Env;
     use crate::filter::Comparison;
-    use crate::global::Global;
     use crate::slow_vec::SlowVec;
 
     /// A predicate on one column, to build and to evaluate by hand.
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn keeps_the_values_and_nulls_sql_does() {
         use alloc::boxed::Box;
-        let global = Global::current();
+        let env = Env::current();
         let comparisons = [
             Comparison::Equal,
             Comparison::NotEqual,
@@ -261,7 +261,7 @@ mod tests {
         let values = (-2..=8).chain([i64::MIN, i64::MAX]);
         let mut said = 0;
         for expr in leaves.iter().chain(&first).chain(&second) {
-            let mut nodes = SlowVec::new(global, 64).unwrap();
+            let mut nodes = SlowVec::new(env, 64).unwrap();
             build(expr, &mut nodes);
             let condition = Condition::new(0, &Predicate::new(nodes));
             assert_eq!(condition.nulls, reference(expr, None) == Some(true));
@@ -279,7 +279,7 @@ mod tests {
         }
         // Every comparison, and most of what's made of them, is one range.
         assert!(leaves.iter().all(|leaf| {
-            let mut nodes = SlowVec::new(global, 64).unwrap();
+            let mut nodes = SlowVec::new(env, 64).unwrap();
             build(leaf, &mut nodes);
             !matches!(Condition::new(0, &Predicate::new(nodes)).values, Values::Ranges)
         }));
@@ -288,9 +288,9 @@ mod tests {
 
     #[test]
     fn may_keep_rows_within_bounds_only_if_a_value_there_is_kept() {
-        let global = Global::current();
+        let env = Env::current();
         let condition = |expr: &Expr| {
-            let mut nodes = SlowVec::new(global, 8).unwrap();
+            let mut nodes = SlowVec::new(env, 8).unwrap();
             build(expr, &mut nodes);
             Condition::new(0, &Predicate::new(nodes))
         };
@@ -311,8 +311,8 @@ mod tests {
 
     #[test]
     fn cutoffs_skip_only_rows_that_sort_after_them() {
-        let global = Global::current();
-        let mut context = Context::new(global, None);
+        let env = Env::current();
+        let mut context = Context::new(env, None);
         let ascending = Cutoff { slot: 1, column: 0, descending: false };
         let descending = Cutoff { slot: 1, column: 0, descending: true };
         let bounds = Some(Bounds { min: 10, max: 20 });

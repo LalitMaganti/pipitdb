@@ -10,7 +10,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::context::Context;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
@@ -71,17 +71,17 @@ pub unsafe extern "C" fn run_query(
         (core::slice::from_raw_parts(tables, count), core::slice::from_raw_parts(query, query_len))
     };
     // SAFETY: everything the query allocates is dropped within `run`.
-    let Ok(global) = (unsafe { Global::new(Heap, budget) }) else { return u64::MAX };
-    run(&global, files, query).unwrap_or(u64::MAX)
+    let Ok(env) = (unsafe { Env::new(Heap, budget) }) else { return u64::MAX };
+    run(&env, files, query).unwrap_or(u64::MAX)
 }
 
-/// As `run_query`, with every allocation from `allocator`.
-fn run(allocator: &Global, files: &[TableFile], query: &[u8]) -> Option<u64> {
+/// As `run_query`, with every allocation from `env`.
+fn run(env: &Env, files: &[TableFile], query: &[u8]) -> Option<u64> {
     // The files, which their tables borrow for the query.
-    let mut sources: SlowVec<&[u8]> = SlowVec::fixed(allocator, files.len()).ok()?;
+    let mut sources: SlowVec<&[u8]> = SlowVec::fixed(env, files.len()).ok()?;
     let mut tables = Tables {
-        names: SlowVec::fixed(allocator, files.len()).ok()?,
-        tables: SlowVec::fixed(allocator, files.len()).ok()?,
+        names: SlowVec::fixed(env, files.len()).ok()?,
+        tables: SlowVec::fixed(env, files.len()).ok()?,
     };
     for file in files {
         // SAFETY: guaranteed by `run_query`'s caller.
@@ -95,15 +95,15 @@ fn run(allocator: &Global, files: &[TableFile], query: &[u8]) -> Option<u64> {
         sources.push(bytes).ok()?;
     }
     for source in sources.iter() {
-        let table = ParquetTable::open(allocator, &Uncompressed, &[source]).ok()?;
-        tables.tables.push(DynScannable::new(allocator, table).ok()?).ok()?;
+        let table = ParquetTable::open(env, &Uncompressed, &[source]).ok()?;
+        tables.tables.push(DynScannable::new(env, table).ok()?).ok()?;
     }
-    let mut plan = compile(allocator, &REGISTRY, &tables, query).ok()?;
-    optimize(allocator, &mut plan).ok()?;
-    let planned = plan_nodes(allocator, &plan).ok()?;
-    let physical = lower(allocator, &mut plan, &planned).ok()?;
-    let mut execution = physical.start(allocator).ok()?;
-    let mut context = Context::new(allocator, None);
+    let mut plan = compile(env, &REGISTRY, &tables, query).ok()?;
+    optimize(env, &mut plan).ok()?;
+    let planned = plan_nodes(env, &plan).ok()?;
+    let physical = lower(env, &mut plan, &planned).ok()?;
+    let mut execution = physical.start(env).ok()?;
+    let mut context = Context::new(env, None);
     let mut batch = RowBatch::new();
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(0x0100_0000_01b3);

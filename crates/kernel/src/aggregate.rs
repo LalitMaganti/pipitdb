@@ -4,9 +4,9 @@
 
 use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
+use crate::env::Env;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
-use crate::global::Global;
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
@@ -124,11 +124,11 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
     /// knows of its rows without reading them, if it knows enough.
-    fn answer(&mut self, allocator: &Global, child: &DynOp<'c>) -> Result<bool, AllocError> {
+    fn answer(&mut self, env: &Env, child: &DynOp<'c>) -> Result<bool, AllocError> {
         if !self.keys.is_empty() {
             return Ok(false);
         }
-        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
+        let mut values = SlowVec::fixed(env, self.aggregates.len())?;
         for aggregate in self.aggregates.iter() {
             // A summary's bounds are the least and greatest values. With no
             // rows, there are none, and MIN and MAX are null: scanned.
@@ -208,10 +208,10 @@ impl<'c> Op<'c> for AggregateOp {
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
-        let allocator = lowering.allocator();
+        let env = lowering.env();
         if let Some(answer) = &self.answer {
-            let values = SlowVec::fixed_from(allocator, answer.iter().copied())?;
-            lowering.set_source(DynSource::new(allocator, Values { values })?);
+            let values = SlowVec::fixed_from(env, answer.iter().copied())?;
+            lowering.set_source(DynSource::new(env, Values { values })?);
             return Ok(());
         }
         check!(node.children.len() == 1);
@@ -221,7 +221,7 @@ impl<'c> Op<'c> for AggregateOp {
             string_keys |= u64::from(lowering.query_rows().type_of(key) == DataType::String) << k;
         }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
-        let key_columns = SlowVec::fixed_from(allocator, keys)?;
+        let key_columns = SlowVec::fixed_from(env, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
             function: aggregate.function,
             distinct: aggregate.distinct,
@@ -230,13 +230,13 @@ impl<'c> Op<'c> for AggregateOp {
                 .input
                 .map_or(DataType::Int64, |id| lowering.query_rows().type_of(id)),
         });
-        let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
+        let aggregates = SlowVec::fixed_from(env, aggregates)?;
         let mut nullable_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
             nullable_keys |= u64::from(lowering.query_rows().nullable_of(key)) << k;
         }
         let spec = HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates };
-        let operator = hash_aggregate(allocator, spec)?;
+        let operator = hash_aggregate(env, spec)?;
         lowering.add_operator(Step::Operator(operator))
     }
 }

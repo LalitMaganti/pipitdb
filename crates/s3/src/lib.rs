@@ -314,7 +314,7 @@ mod tests {
     use rusty_s3::UrlStyle;
 
     use super::*;
-    use pipit_kernel::global::Global;
+    use pipit_kernel::env::Env;
 
     /// A store in the test bucket, made if need be, or `None` if no S3 is
     /// configured.
@@ -334,12 +334,12 @@ mod tests {
     }
 
     fn column(rows: usize) -> ColumnView {
-        let global = Global::current();
-        let mut buffer = Buffer::allocate(global, rows * 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, rows * 8).unwrap();
         for (o, v) in buffer.as_mut_slice::<i64>().iter_mut().zip(0..) {
             *o = v * 3;
         }
-        ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, None).unwrap()
+        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, None).unwrap()
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn round_trips_columns_across_parts() {
-        let global = Global::current();
+        let env = Env::current();
         let Some(store) = store(PART_BYTES_MIN) else { return };
         // A batch's columns, as the engine spills them: about 12 MiB, two
         // full parts and a last, smaller one.
@@ -368,7 +368,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(global, None), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(env, None), &store, log, spilled).unwrap();
             assert_eq!(read.int64s(), column.int64s());
         }
         // A request per part, not per column.
@@ -380,16 +380,16 @@ mod tests {
 
     #[test]
     fn logs_are_read_only_once_sealed() {
-        let global = Global::current();
+        let env = Env::current();
         let Some(store) = store(PART_BYTES_MIN) else { return };
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(10)).unwrap();
         assert_eq!(
-            read_column(&mut Context::new(global, None), &store, log, &spilled).err(),
+            read_column(&mut Context::new(env, None), &store, log, &spilled).err(),
             Some(Error::Io)
         );
         store.seal(log).unwrap();
-        assert!(read_column(&mut Context::new(global, None), &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(env, None), &store, log, &spilled).is_ok());
         store.delete(log);
     }
 

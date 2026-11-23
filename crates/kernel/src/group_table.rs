@@ -10,9 +10,9 @@ use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::prefetch;
-use crate::global::Global;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
@@ -102,7 +102,7 @@ impl GroupTable {
     /// `nullable_keys` possibly null, with `payload_words` zeroed words after
     /// each group's keys for the caller to store per-group data.
     pub(crate) fn new(
-        allocator: &Global,
+        env: &Env,
         keys: usize,
         string_keys: u64,
         nullable_keys: u64,
@@ -115,15 +115,15 @@ impl GroupTable {
         let first = usize::from(nullable != 0);
         let stride = first + keys + payload_words;
         Ok(GroupTable {
-            slots: SlowVec::new(allocator, 1)?,
-            records: Blocks::new(allocator, stride)?,
+            slots: SlowVec::new(env, 1)?,
+            records: Blocks::new(env, stride)?,
             stride,
             first,
             nullable,
             keys,
             string_keys,
-            dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
-            number_groups: SlowVec::new(allocator, 1 << 31)?,
+            dictionaries: SlowVec::fixed_from(env, (0..keys).map(|_| None))?,
+            number_groups: SlowVec::new(env, 1 << 31)?,
             frozen: false,
         })
     }
@@ -181,7 +181,7 @@ impl GroupTable {
         check!(columns.len() == self.keys);
         let count = groups.len();
         if (self.keys, self.string_keys) == (1, 1) {
-            self.records.reserve(context.allocator(), self.len() + count)?;
+            self.records.reserve(context.env(), self.len() + count)?;
             let (interned, column) = (at_mut!(self.dictionaries, 0), at!(columns, 0));
             let words = load_string_words(context, interned, column, select, count)?;
             return self.find_numbered(at!(words.as_slice(), ..count), groups);
@@ -210,7 +210,7 @@ impl GroupTable {
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         // Only a table with null words takes keys that can be null.
         check!(self.first == 1 || nulls.is_none());
-        self.grow(context.allocator(), self.len() + count)?;
+        self.grow(context.env(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
         let mut starts = context.indices_buffer(count * 4)?;
@@ -423,8 +423,8 @@ impl GroupTable {
 
     /// Doubles the slots until at most two thirds are used by `groups`
     /// groups, and puts each group back in its slot.
-    fn grow(&mut self, allocator: &Global, groups: usize) -> Result<(), Error> {
-        self.records.reserve(allocator, groups.min(GROUPS_MAX))?;
+    fn grow(&mut self, env: &Env, groups: usize) -> Result<(), Error> {
+        self.records.reserve(env, groups.min(GROUPS_MAX))?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
         while groups * 3 > capacity * 2 {
@@ -433,7 +433,7 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
-        let mut slots = SlowVec::zeroed(allocator, capacity)?;
+        let mut slots = SlowVec::zeroed(env, capacity)?;
         let mask = capacity - 1;
         // No need to hash the keys again: `slot_of` only uses bits a slot has.
         for &slot in self.slots.iter().filter(|&&slot| slot != 0) {
@@ -497,7 +497,7 @@ fn load_string_words(
     let values = column.values();
     let strings = values.strings();
     let mut words = context.values_buffer(count * 8)?;
-    let allocator = context.allocator();
+    let env = context.env();
     let pool = context.string_pool()?;
     let row_of = |i: usize| if select.is_empty() { i } else { usize::from(*at!(select, i)) };
     let out = words.as_mut_slice::<u64>();
@@ -508,14 +508,14 @@ fn load_string_words(
                 let row = row_of(i);
                 validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
             };
-            pool.intern_strings(allocator, count, string, |i, id, number| {
+            pool.intern_strings(env, count, string, |i, id, number| {
                 *at_mut!(out, i) = word(id, number);
             })?;
         }
         Form::Dictionary(indices) => {
             if !interned.as_ref().is_some_and(|interned| interned.dictionary.shares_values(column))
             {
-                let words = Array::zeroed(allocator, values.len() as usize)?;
+                let words = Array::zeroed(env, values.len() as usize)?;
                 *interned = Some(Interned { dictionary: column.clone(), words });
             }
             let Some(Interned { words: entries, .. }) = interned else { failed!() };
@@ -527,7 +527,7 @@ fn load_string_words(
                         word(Id::NULL, NO_NUMBER)
                     } else {
                         let (id, number) =
-                            pool.intern_numbered(allocator, strings.get(entry as usize))?;
+                            pool.intern_numbered(env, strings.get(entry as usize))?;
                         word(id, number)
                     };
                 }

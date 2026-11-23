@@ -22,7 +22,7 @@ pub fn compile_expr(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
-    let mut nodes = ExprBuilder::new(compiler.allocator())?;
+    let mut nodes = ExprBuilder::new(compiler.env())?;
     compile(compiler, node, 0, &mut nodes)?;
     add_expr(compiler, &nodes, node)
 }
@@ -234,7 +234,7 @@ pub fn compile_arguments(
     if count < fewest || count > most {
         return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
     }
-    let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
+    let mut values = SlowVec::fixed(compiler.env(), count as usize)?;
     for i in 1..=count {
         compile(compiler, compiler.node(node.first_child() + i), depth + 1, nodes)?;
         values.push(nodes.last())?;
@@ -263,8 +263,8 @@ pub fn call_bound(
     let count = arguments.len() as u32;
     let values = compile_arguments(compiler, (node, depth), nodes, count, count)?;
     let function = bind(compiler, node)?;
-    let allocator = compiler.allocator();
-    let Some(id) = compiler.plan.add_function(allocator, function)? else {
+    let env = compiler.env();
+    let Some(id) = compiler.plan.add_function(env, function)? else {
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
     };
     let mut first = None;
@@ -322,7 +322,7 @@ fn case(
         Some(nodes.last())
     };
     // Each `WHEN`'s condition and value.
-    let mut branches = SlowVec::fixed(compiler.allocator(), (count as usize - 2) / 2)?;
+    let mut branches = SlowVec::fixed(compiler.env(), (count as usize - 2) / 2)?;
     for i in (1..count - 1).step_by(2) {
         compile(compiler, child(compiler, i), depth + 1, nodes)?;
         let mut condition = nodes.last();
@@ -423,11 +423,11 @@ pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> 
     let quoted = compiler.bytes(node.span());
     // Between its quotes, which the lexer checked are there.
     let inside = at!(quoted, 1..quoted.len() - 1);
-    let allocator = compiler.allocator();
+    let env = compiler.env();
     if !inside.windows(2).any(|pair| pair == b"''") {
-        return Ok(compiler.plan.add_literal(allocator, inside)?);
+        return Ok(compiler.plan.add_literal(env, inside)?);
     }
-    let mut unquoted = SlowVec::fixed(allocator, inside.len())?;
+    let mut unquoted = SlowVec::fixed(env, inside.len())?;
     let mut quote = false;
     for &byte in inside {
         // The second quote of each `''` is the one kept.
@@ -436,5 +436,5 @@ pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> 
             unquoted.push(byte)?;
         }
     }
-    Ok(compiler.plan.add_literal(allocator, &unquoted)?)
+    Ok(compiler.plan.add_literal(env, &unquoted)?)
 }

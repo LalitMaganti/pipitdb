@@ -3,8 +3,8 @@
 //! source.
 
 use super::graph::{JoinEdge, JoinKind, QueryGraph};
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// The most rows an estimate reaches.
@@ -46,8 +46,8 @@ pub struct Estimator<'a> {
 }
 
 impl<'a> Estimator<'a> {
-    pub fn new(global: &Global, graph: &'a QueryGraph) -> Result<Estimator<'a>, Error> {
-        let stamps = SlowVec::zeroed(global, graph.equivalences.len().saturating_sub(64))?;
+    pub fn new(env: &Env, graph: &'a QueryGraph) -> Result<Estimator<'a>, Error> {
+        let stamps = SlowVec::zeroed(env, graph.equivalences.len().saturating_sub(64))?;
         let (divided, stamp, rows, sides, kept) = (0, 0, 0.0, [0.0; 2], None);
         Ok(Estimator { graph, divided, stamps, stamp, rows, sides, kept })
     }
@@ -103,27 +103,25 @@ impl<'a> Estimator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global::Global;
+    use crate::env::Env;
     use crate::join_planner::{EquivalenceSet, RelationSet};
 
     /// A graph with equivalence sets of domains 10 and 100, and an edge of
     /// each kind on the first.
     fn graph() -> QueryGraph {
-        let mut graph = QueryGraph::new(Global::current()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for domain in [10, 100] {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
         }
         for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
             let (left, right) = (
-                RelationSet::new(Global::current()).unwrap(),
-                RelationSet::new(Global::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
             );
             graph.edges.push(JoinEdge { left, right, kind, equivalence: 0 }).unwrap();
         }
-        let (left, right) = (
-            RelationSet::new(Global::current()).unwrap(),
-            RelationSet::new(Global::current()).unwrap(),
-        );
+        let (left, right) =
+            (RelationSet::new(Env::current()).unwrap(), RelationSet::new(Env::current()).unwrap());
         graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence: 1 }).unwrap();
         graph
     }
@@ -131,7 +129,7 @@ mod tests {
     /// The rows of joining 1000 rows to 4, by edges `edges` of `graph()`.
     fn rows(edges: &[usize], forward: bool) -> f64 {
         let graph = graph();
-        let mut estimator = Estimator::new(Global::current(), &graph).unwrap();
+        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
         estimator.start(1000.0, 4.0);
         for &edge in edges {
             estimator.apply(at!(graph.edges, edge), forward);
@@ -161,7 +159,7 @@ mod tests {
     #[test]
     fn estimates_saturate() {
         let graph = graph();
-        let mut estimator = Estimator::new(Global::current(), &graph).unwrap();
+        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
         estimator.start(ROWS_MAX, ROWS_MAX);
         assert!(estimator.finish() <= ROWS_MAX);
     }
