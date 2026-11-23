@@ -246,7 +246,7 @@ pub fn choose_by_estimates(
             // Children are added before their parents.
             inputs.push(*at!(estimates, child as usize))?;
         }
-        node.op.choose(&inputs);
+        node.op.choose(exprs, &inputs);
         estimates.push(node.op.estimate(exprs, &inputs))?;
     }
     Ok(())
@@ -612,7 +612,7 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Chooser<'_> {
-        fn choose(&mut self, _: &[Estimate]) {
+        fn choose(&mut self, _: &Exprs, _: &[Estimate]) {
             self.seen.set(Some(self.taken.get()));
         }
 
