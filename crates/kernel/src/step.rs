@@ -13,8 +13,9 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::boxed::{Box, ErasedBox};
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
@@ -301,8 +302,8 @@ impl<'a> DynSource<'a> {
     pub fn start<'s>(&'s self, context: &mut Context) -> Result<SourceRun<'s, 'a>, Error> {
         let size_bytes = self.state_layout.size().max(1);
         // SAFETY: `new_state` writes the state, and nothing reads the rest.
-        let mut memory = unsafe { Buffer::allocate_uninit(context.env(), size_bytes)? };
-        let Some(state) = NonNull::new(memory.as_mut_ptr::<u8>()) else { failed!() };
+        let memory = unsafe { Array::<u8>::uninit(context.env(), size_bytes)? };
+        let state = memory.as_non_null();
         // SAFETY: the memory has the state's size, and alignment, which
         // `new` checked is at most a buffer's.
         unsafe { (self.new_state)(self.step.as_ptr(), context, state)? };
@@ -329,7 +330,7 @@ pub struct SourceRun<'s, 'a> {
     source: &'s DynSource<'a>,
     state: NonNull<u8>,
     /// Holds the state.
-    _memory: Buffer,
+    _memory: Array<u8>,
 }
 
 impl<'a> SourceRun<'_, 'a> {
