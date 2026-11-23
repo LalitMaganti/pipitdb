@@ -58,6 +58,8 @@ pub(crate) struct SortedRows {
     order: Sorted,
     /// How many of `order` there are.
     order_len: u32,
+    /// How many rows of the order `serve` has output.
+    served: u32,
 }
 
 impl SortedRows {
@@ -70,6 +72,7 @@ impl SortedRows {
             decoded: 0,
             order: Sorted::Held { reverse: false, count: 0 },
             order_len: 0,
+            served: 0,
         })
     }
 
@@ -206,10 +209,6 @@ impl SortedRows {
     }
 
     /// How many rows the order has.
-    pub(crate) fn order_len(&self) -> u32 {
-        self.order_len
-    }
-
     /// Keeps only the first `count` rows of the order.
     pub(crate) fn truncate_order(&mut self, count: u32) {
         self.order_len = self.order_len.min(count);
@@ -245,6 +244,17 @@ impl SortedRows {
 
     /// Copies up to a batch's worth of rows into `out`, from position `at` in
     /// the order, returning how many.
+    /// Fills `out` with the next rows of the order, returning whether any
+    /// are left after them.
+    pub(crate) fn serve(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+    ) -> Result<bool, Error> {
+        self.served += self.gather(context, out, self.served)?;
+        Ok(self.served < self.order_len)
+    }
+
     pub(crate) fn gather(
         &mut self,
         context: &mut Context,

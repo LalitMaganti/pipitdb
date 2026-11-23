@@ -22,41 +22,34 @@ struct Sort {
     keys: SmallVec<SortKey>,
 }
 
-/// The rows so far, and how many have been output.
-struct Sorting {
-    rows: SortedRows,
-    emitted: u32,
-}
-
 impl Breaker for Sort {
-    type State = Sorting;
+    type State = SortedRows;
 
-    fn new_state(&self, context: &mut Context) -> Result<Sorting, Error> {
-        Ok(Sorting { rows: SortedRows::new(context.env())?, emitted: 0 })
+    fn new_state(&self, context: &mut Context) -> Result<SortedRows, Error> {
+        Ok(SortedRows::new(context.env())?)
     }
 
     fn consume(
         &self,
         context: &mut Context,
-        sorting: &mut Sorting,
+        rows: &mut SortedRows,
         input: &RowBatch,
     ) -> Result<(), Error> {
-        sorting.rows.append(context, input, &self.keys)
+        rows.append(context, input, &self.keys)
     }
 
-    fn finalize(&self, context: &mut Context, sorting: &mut Sorting) -> Result<(), Error> {
-        sorting.rows.sort(context)?;
-        sorting.rows.scatter(context)
+    fn finalize(&self, context: &mut Context, rows: &mut SortedRows) -> Result<(), Error> {
+        rows.sort(context)?;
+        rows.scatter(context)
     }
 
     fn serve(
         &self,
         context: &mut Context,
-        sorting: &mut Sorting,
+        rows: &mut SortedRows,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        sorting.emitted += sorting.rows.gather(context, output, sorting.emitted)?;
-        Ok(sorting.emitted < sorting.rows.order_len())
+        rows.serve(context, output)
     }
 }
 
