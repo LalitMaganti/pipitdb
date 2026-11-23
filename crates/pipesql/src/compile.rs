@@ -4,12 +4,12 @@
 
 #![allow(unsafe_code)]
 
-use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::Forms;
-use pipit_kernel::containers::SmallVec;
+use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::{
-    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
+    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId, ScanColumn,
+    ScanOp,
 };
 use pipit_kernel::scannable::Catalog;
 
@@ -30,15 +30,19 @@ pub struct Relation {
 /// A table alias, as `GoogleSQL`'s: a name for the columns a table had when
 /// it was named, so `t.x` is that `x` whatever stages since have done to
 /// the scope. Its columns are `alias_columns[start..end]`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct TableAlias {
     name: Name,
     start: u32,
     end: u32,
 }
 
-/// The most aliases in scope at once, one for each table joined.
-const ALIASES_MAX: usize = 64;
+/// The most aliases in scope at once, one for each table joined: as many
+/// as a plan has nodes.
+const ALIASES_MAX: usize = PLAN_NODES_MAX;
+
+/// How many aliases are held in place, as most queries have no more.
+const ALIASES_INLINE: usize = 8;
 
 /// The most columns of all aliases at once.
 const ALIAS_COLUMNS_MAX: usize = ALIASES_MAX * PLAN_COLUMNS_MAX;
@@ -59,11 +63,8 @@ pub struct Compiler<'q, 'c> {
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SmallVec<NamedColumn>,
-    /// The aliases `t.x` can name columns by, the first `alias_count`, and
-    /// their columns.
-    aliases: [TableAlias; ALIASES_MAX],
-    /// How many of `aliases` there are.
-    alias_count: usize,
+    /// The aliases `t.x` can name columns by.
+    aliases: SpillVec<'q, TableAlias, ALIASES_INLINE>,
     /// The columns of `aliases`, each alias's after the one before's.
     alias_columns: SmallVec<NamedColumn>,
 }
@@ -132,7 +133,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return self.find_named(&self.scope, text, name.span());
         };
         let (wanted, column) = (at!(text, ..dot).trim_ascii(), at!(text, dot + 1..).trim_ascii());
-        let mut found = at!(self.aliases, ..self.alias_count)
+        let mut found = self
+            .aliases
             .iter()
             .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
         let Some(alias) = found.next() else {
@@ -198,22 +200,17 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// Adds the alias `name`, a name, for `columns`.
     pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
         let name = self.plan.names.add(self.text(name.span()))?;
-        if self.alias_count == ALIASES_MAX {
-            return Err(AllocError.into());
-        }
         #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
         let start = self.alias_columns.len() as u32;
         self.alias_columns.extend_from_slice(columns)?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
         let end = self.alias_columns.len() as u32;
-        *at_mut!(self.aliases, self.alias_count) = TableAlias { name, start, end };
-        self.alias_count += 1;
-        Ok(())
+        Ok(self.aliases.push(TableAlias { name, start, end })?)
     }
 
     /// Drops every alias, as a stage that makes a new scope does.
     pub fn clear_aliases(&mut self) {
-        self.alias_count = 0;
+        self.aliases.truncate(0);
         self.alias_columns.retain(|_| false);
     }
 
@@ -250,8 +247,7 @@ pub fn compile<'c>(
         registry,
         plan: LogicalPlan::new(env)?,
         scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
-        aliases: [TableAlias::default(); ALIASES_MAX],
-        alias_count: 0,
+        aliases: SpillVec::new(env, ALIASES_MAX),
         alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
         env,
     };
@@ -599,6 +595,11 @@ mod tests {
             "FROM t AS x |> JOIN t AS y ON x.a < y.a |> WHERE x.b + y.b = 30 |> SELECT x.a";
         assert_eq!(kept(joined), [1.0]);
         assert_eq!(error("FROM t |> JOIN t ON t.a = 1"), (ErrorCode::AmbiguousColumn, 20));
+        // More tables than the 64 aliases there were room for.
+        let many: StdVec<_> =
+            (1..70).map(|i| format!(" |> JOIN ids AS a{i} ON a0.id = a{i}.id")).collect();
+        let many = format!("FROM ids AS a0{} |> SELECT a0.v, a69.v", many.concat());
+        assert_eq!(values(&many).len(), 2);
     }
 
     #[test]
