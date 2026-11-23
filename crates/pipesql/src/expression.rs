@@ -24,6 +24,16 @@ pub fn compile_expr(
 ) -> Result<(Expr, DataType), Error> {
     let mut nodes = ExprBuilder::new(compiler.allocator())?;
     compile(compiler, node, 0, &mut nodes)?;
+    add_expr(compiler, &nodes, node)
+}
+
+/// Adds the expression of `nodes`, compiled from `node`, to the plan's, and
+/// the type it computes.
+pub fn add_expr(
+    compiler: &mut Compiler<'_, '_>,
+    nodes: &ExprBuilder,
+    node: Node,
+) -> Result<(Expr, DataType), Error> {
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
     let data_type = check_expr_type(nodes.nodes(), &type_of).map_err(|error| {
         let span = compiler.span(node);
