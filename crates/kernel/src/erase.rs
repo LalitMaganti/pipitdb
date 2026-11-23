@@ -1,6 +1,8 @@
 //! Helpers for the functions a `Dyn*` stores, which take a value and its state
 //! as untyped pointers and know their types.
 
+#![allow(unsafe_code)]
+
 use core::ptr::NonNull;
 
 /// `value` as the `T` it is.

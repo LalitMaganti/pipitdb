@@ -2,6 +2,8 @@
 //! operators that group rows. A string key is grouped by its id in the
 //! run's `StringPool`.
 
+#![allow(unsafe_code)]
+
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;

@@ -1,6 +1,8 @@
 //! Errors a caller can cause, such as a bad query. They carry no text:
 //! The `diagnostics` feature turns them into messages.
 
+#![allow(unsafe_code)]
+
 use pipit_kernel::allocator::AllocError;
 
 /// The bytes `start..start + len` of the query.

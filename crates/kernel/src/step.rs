@@ -8,6 +8,8 @@
 //! A step fails, with an `Error`, if it can't allocate what it needs or
 //! read its data, which ends the run. Steps never drop rows instead.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;

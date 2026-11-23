@@ -4,6 +4,8 @@
 //! string, the last must end it, and the others are found in order between.
 //! There's no escape character, as in DuckDB by default.
 
+#![allow(unsafe_code)]
+
 use core::cell::Cell;
 
 /// Whether `text` matches `pattern`.

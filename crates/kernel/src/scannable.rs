@@ -5,6 +5,8 @@
 //! their values are, and load them later, for the rows still kept, when
 //! something reads them. The optimizer says which, and where they're loaded.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;

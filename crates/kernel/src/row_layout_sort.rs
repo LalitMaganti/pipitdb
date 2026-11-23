@@ -5,6 +5,8 @@
 //! agree on those bytes are then sorted on the next, and so on, with the
 //! same sort.
 
+#![allow(unsafe_code)]
+
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;

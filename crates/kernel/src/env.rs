@@ -8,6 +8,8 @@
 //! as long as its `OwnedEnv`, which whoever makes it promises is dropped
 //! last.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ops::Deref;

@@ -1,6 +1,8 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
 //! footer, which pipelines can scan.
 
+#![allow(unsafe_code)]
+
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
 use pipit_kernel::containers::SmallVec;

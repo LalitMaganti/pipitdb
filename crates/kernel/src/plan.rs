@@ -4,6 +4,8 @@
 //! its inputs and what it outputs, then `lower` turns it into a pipeline,
 //! asking each to lower itself, so extensions can add operations.
 
+#![allow(unsafe_code)]
+
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 

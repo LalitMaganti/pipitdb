@@ -13,6 +13,8 @@
 //! after a day. The store doesn't set them, as setting a bucket's rules
 //! replaces all of them.
 
+#![forbid(unsafe_code)]
+
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

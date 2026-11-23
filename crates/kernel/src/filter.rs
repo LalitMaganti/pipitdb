@@ -6,6 +6,8 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
+#![allow(unsafe_code)]
+
 use crate::containers::{Array, BitSlice};
 use core::cmp::Ordering;
 

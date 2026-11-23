@@ -2,6 +2,8 @@
 //! each group, and how it updates and outputs it, a batch at a time, as
 //! Perfetto's do, for the operators that aggregate.
 
+#![allow(unsafe_code)]
+
 use crate::containers::{BitSlice, Blocks, address};
 use core::cmp::Ordering;
 

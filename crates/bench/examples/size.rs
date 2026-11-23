@@ -3,6 +3,7 @@
 //! its size, built as a library as `crates/bench/check_size.sh` does, so a
 //! feature counts once SQL can reach it.
 
+#![allow(unsafe_code)]
 #![no_std]
 
 use core::alloc::{GlobalAlloc, Layout};

@@ -8,6 +8,8 @@
 //! - `Blocks`: data that grows with the rows, in blocks that never move.
 //! - `BitSlice`, `Bitmap` and `RankBitmap`: bits packed in words.
 
+#![allow(unsafe_code)]
+
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut};

@@ -1,5 +1,7 @@
 //! `ColumnView`: a range of rows over a column's buffers.
 
+#![allow(unsafe_code)]
+
 use crate::containers::BitSlice;
 use core::cell::Cell;
 use core::ptr::NonNull;

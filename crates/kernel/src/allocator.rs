@@ -2,6 +2,8 @@
 //! `Env` owns the allocator it takes memory from, and what's allocated
 //! keeps the `Env` alive, so can't outlive it.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
