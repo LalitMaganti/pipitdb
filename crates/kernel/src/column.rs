@@ -1,5 +1,8 @@
 //! `ColumnView`: a range of rows over a column's buffers.
 
+#![allow(unsafe_code)]
+
+use crate::containers::BitSlice;
 use core::cell::Cell;
 use core::ptr::NonNull;
 
@@ -24,6 +27,9 @@ impl Forms {
     pub const CONSTANT: Forms = Forms(4);
     /// Each row an index into a column of values.
     pub const DICTIONARY: Forms = Forms(8);
+    /// Each row's value its own number, from a first: an id column, stored
+    /// as nothing.
+    pub const SEQUENCE: Forms = Forms(16);
 
     /// Whether every form in `other` is in this.
     pub fn contains(self, other: Forms) -> bool {
@@ -195,7 +201,7 @@ impl GatherSource {
         self.validity.is_none_or(|bits| {
             // SAFETY: made from the view's validity, which it keeps alive.
             let bits = unsafe { bits.as_ref() };
-            *at!(bits, row / 8) >> (row % 8) & 1 != 0
+            BitSlice::of(bits).get(row)
         })
     }
 
@@ -216,6 +222,7 @@ enum Kind {
     Lazy = Forms::LAZY.0,
     Constant = Forms::CONSTANT.0,
     Dictionary = Forms::DICTIONARY.0,
+    Sequence = Forms::SEQUENCE.0,
 }
 
 /// Bounds no value is within, for when they aren't known.
@@ -230,6 +237,8 @@ pub enum Form<'a> {
     Constant,
     /// Row `i` is value `indices[i]`.
     Dictionary(&'a [u32]),
+    /// Row `i` is the integer `first + i`, with no values.
+    Sequence(i64),
 }
 
 /// The values a column's rows map to.
@@ -254,6 +263,25 @@ impl ColumnView {
             failed!();
         };
         ColumnView::flat(context, data_type, values, None, validity, len)
+    }
+
+    /// `Int64` values, each null if `None`, in buffers of their own: for
+    /// tests and tools, which make columns from values they hold.
+    pub fn from_int64s(
+        context: &mut Context,
+        values: impl ExactSizeIterator<Item = Option<i64>>,
+    ) -> Result<ColumnView, AllocError> {
+        let env = context.env();
+        let mut words = Buffer::allocate(env, values.len() * 8)?;
+        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len()))?;
+        let mut nulls = false;
+        let (out, valid) = (words.as_mut_slice::<i64>(), bits.as_mut_slice::<u8>());
+        for (row, value) in values.enumerate() {
+            *at_mut!(out, row) = value.unwrap_or(0);
+            BitSlice::of_mut(&mut *valid).set_if(row, value.is_some());
+            nulls |= value.is_none();
+        }
+        ColumnView::new(context, DataType::Int64, words, nulls.then_some(bits))
     }
 
     /// Strings as views: value `i` is the `views[2i + 1]` bytes of `bytes`
@@ -283,7 +311,7 @@ impl ColumnView {
         len: u32,
     ) -> Result<ColumnView, AllocError> {
         if let Some(validity) = &validity {
-            check!(validity.size_bytes() >= len.div_ceil(8) as usize);
+            check!(validity.size_bytes() >= BitSlice::<u8>::words_for(len as usize));
         }
         let (indices, bounds) = (None, Cell::new(UNKNOWN));
         let kind = Kind::Flat;
@@ -325,6 +353,34 @@ impl ColumnView {
         };
         // Each index is checked when it's read.
         let header = Header { kind: Kind::Dictionary, ..dictionary.shared(Some(indices)) };
+        ColumnView::with_header(context, header, row_count)
+    }
+
+    /// `row_count` integers from `first`, one more each row, such as ids:
+    /// with no values, so they cost nothing to read, and their bounds known.
+    pub fn sequence(
+        context: &mut Context,
+        first: i64,
+        row_count: u32,
+    ) -> Result<ColumnView, AllocError> {
+        let mut values = context.small_buffer(8)?;
+        *at_mut!(values.as_mut_slice::<i64>(), 0) = first;
+        let last = first.checked_add(i64::from(row_count) - 1);
+        let bounds = match last {
+            Some(last) if row_count > 0 => Bounds { min: first, max: last },
+            _ => UNKNOWN,
+        };
+        let header = Header {
+            data_type: DataType::Int64,
+            kind: Kind::Sequence,
+            values,
+            bytes: None,
+            validity: None,
+            indices: None,
+            value_start: 0,
+            len: row_count,
+            bounds: Cell::new(bounds),
+        };
         ColumnView::with_header(context, header, row_count)
     }
 
@@ -435,11 +491,16 @@ impl ColumnView {
                     start..start + self.row_count as usize
                 ))
             }
+            Kind::Sequence => {
+                let first = *at!(header.values.as_slice::<i64>(), 0);
+                Form::Sequence(first.wrapping_add(i64::from(self.start)))
+            }
             Kind::Lazy => failed!(),
         }
     }
 
-    /// The values rows map to: for a flat view, its rows' own.
+    /// The values rows map to: for a flat view, its rows' own. A sequence
+    /// has none.
     pub fn values(&self) -> Values<'_> {
         let header = self.header();
         match header.kind {
@@ -449,7 +510,7 @@ impl ColumnView {
             Kind::Constant | Kind::Dictionary => {
                 Values { header, start: header.value_start, len: header.len }
             }
-            Kind::Lazy => failed!(),
+            Kind::Lazy | Kind::Sequence => failed!(),
         }
     }
 
@@ -489,23 +550,32 @@ impl ColumnView {
     #[inline(never)]
     fn flatten(&self, context: &mut Context) -> Result<ColumnView, AllocError> {
         let form = self.form();
+        if let Form::Sequence(first) = form {
+            let mut out = context.values_buffer(self.row_count as usize * 8)?;
+            for (value, row) in out.as_mut_slice::<i64>().iter_mut().zip(0..) {
+                *value = first.wrapping_add(row);
+            }
+            let flat = ColumnView::new(context, DataType::Int64, out, None)?;
+            flat.header().bounds.set(self.header().bounds.get());
+            return Ok(flat);
+        }
         let index = |row: u32| match form {
             Form::Dictionary(indices) => *at!(indices, row as usize),
-            Form::Flat | Form::Constant => 0,
+            Form::Flat | Form::Constant | Form::Sequence(_) => 0,
         };
         let (rows, values) = (self.row_count as usize, self.values());
         let validity = match values.validity() {
             None => None,
             Some(valid) => {
-                let mut bits = context.small_buffer(rows.div_ceil(8))?;
+                let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
                 let out = bits.as_mut_slice::<u8>();
                 out.fill(0);
                 for row in 0..self.row_count {
                     let i = index(row);
                     check!(i < values.len);
                     // SAFETY: `i` is one of the values, checked just above.
-                    let bit = u8::from(unsafe { valid.is_valid_unchecked(i) });
-                    *at_mut!(out, row as usize / 8) |= bit << (row % 8);
+                    let valid = unsafe { valid.is_valid_unchecked(i) };
+                    BitSlice::of_mut(&mut *out).set_if(row as usize, valid);
                 }
                 Some(bits)
             }
@@ -576,6 +646,7 @@ impl ColumnView {
             Form::Flat => row,
             Form::Constant => 0,
             Form::Dictionary(indices) => *at!(indices, row as usize),
+            Form::Sequence(_) => return false,
         };
         self.values().is_null(value)
     }
@@ -648,7 +719,7 @@ impl<'a> Values<'a> {
         check!(value < self.len);
         let Some(validity) = &self.header.validity else { return false };
         let bit = (self.start + value) as usize;
-        at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
+        !BitSlice::of(validity.as_slice::<u8>()).get(bit)
     }
 
     fn slice_of<T: Primitive>(self) -> &'a [T] {
@@ -723,25 +794,27 @@ impl<'a> Validity<'a> {
         let bit = (self.start + row) as usize;
         // SAFETY: `ColumnView::new` checked the bitmap covers every row, and
         // `slice` keeps rows within it.
-        (unsafe { *self.bits.get_unchecked(bit / 8) } >> (bit % 8)) & 1 != 0
+        unsafe { BitSlice::of(self.bits).get_unchecked(bit) }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::context::Context;
+    use crate::env::Env;
 
     #[test]
     fn reads_values_and_nulls() {
-        let mut values = Buffer::allocate(&Heap, 4 * 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 4 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3, 4]);
-        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+        let mut validity = Buffer::allocate(env, 1).unwrap();
         validity.as_mut_slice::<u8>()[0] = 0b1011;
 
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity))
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, Some(validity))
                 .unwrap();
         assert_eq!(column.int64s(), [1, 2, 3, 4]);
         assert!(column.is_null(2));
@@ -755,8 +828,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Int64")]
     fn reading_the_wrong_type_panics() {
-        let values = Buffer::allocate(&Heap, 8).unwrap();
-        ColumnView::new(&mut Context::new(&Heap), DataType::Float64, values, None)
+        let env = Env::current();
+        let values = Buffer::allocate(env, 8).unwrap();
+        ColumnView::new(&mut Context::new(env, None), DataType::Float64, values, None)
             .unwrap()
             .int64s();
     }
@@ -800,18 +874,19 @@ mod tests {
 
     /// `values`, each a start and length into `bytes`, as views.
     fn views(bytes: &[u8], values: &[(u32, u32)], validity: Option<u8>) -> ColumnView {
-        let mut page = Buffer::allocate(&Heap, bytes.len().max(1)).unwrap();
+        let env = Env::current();
+        let mut page = Buffer::allocate(env, bytes.len().max(1)).unwrap();
         page.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(bytes);
-        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
         for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
             view.copy_from_slice(&[start, len]);
         }
         let validity = validity.map(|bits| {
-            let mut buffer = Buffer::allocate(&Heap, 1).unwrap();
+            let mut buffer = Buffer::allocate(env, 1).unwrap();
             buffer.as_mut_slice::<u8>()[0] = bits;
             buffer
         });
-        ColumnView::strings(&mut Context::new(&Heap), views, page, validity).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), views, page, validity).unwrap()
     }
 
     #[test]
@@ -832,43 +907,47 @@ mod tests {
     #[test]
     #[should_panic(expected = "has_bytes")]
     fn strings_need_their_bytes() {
+        let env = Env::current();
         let _ = ColumnView::new(
-            &mut Context::new(&Heap),
+            &mut Context::new(env, None),
             DataType::String,
-            Buffer::allocate(&Heap, 8).unwrap(),
+            Buffer::allocate(env, 8).unwrap(),
             None,
         )
         .unwrap();
     }
 
     fn int64s(values: &[i64], nulls: &[usize]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+            let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
             bits.as_mut_slice::<u8>().fill(0xff);
             for &row in nulls {
-                bits.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
+                BitSlice::of_mut(bits.as_mut_slice::<u8>()).clear(row);
             }
             bits
         });
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
+        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, validity).unwrap()
     }
 
     fn indices(indices: &[u32]) -> Buffer {
-        let mut buffer = Buffer::allocate(&Heap, indices.len() * 4).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, indices.len() * 4).unwrap();
         buffer.as_mut_slice::<u32>().copy_from_slice(indices);
         buffer
     }
 
     #[test]
     fn maps_rows_to_values_in_each_form() {
-        let mut context = crate::context::Context::new(&Heap);
+        let env = Env::current();
+        let mut context = crate::context::Context::new(env, None);
         // A dictionary of 10, 20 and a null, as Parquet's nulls point at one.
         let bounds = Bounds { min: 10, max: 20 };
         let dictionary = int64s(&[10, 20, 0], &[2]).with_bounds(bounds);
         let column = ColumnView::dictionary(
-            &mut Context::new(&Heap),
+            &mut Context::new(env, None),
             &dictionary,
             indices(&[1, 0, 2, 1, 1]),
         )
@@ -877,7 +956,7 @@ mod tests {
         assert_eq!(column.bounds(), Some(bounds));
         assert_eq!(column.slice(1, 2).flatten(&mut context).unwrap().bounds(), Some(bounds));
         assert_eq!(
-            ColumnView::constant(&mut Context::new(&Heap), &dictionary.slice(0, 1), 3)
+            ColumnView::constant(&mut Context::new(env, None), &dictionary.slice(0, 1), 3)
                 .unwrap()
                 .bounds(),
             Some(bounds)
@@ -893,17 +972,20 @@ mod tests {
         assert_eq!(sliced.int64s(), [10, 0, 20]);
 
         let constant =
-            ColumnView::constant(&mut Context::new(&Heap), &int64s(&[7], &[]), 4).unwrap();
+            ColumnView::constant(&mut Context::new(env, None), &int64s(&[7], &[]), 4).unwrap();
         assert!(matches!(constant.form(), Form::Constant));
         assert_eq!(constant.slice(1, 2).flatten(&mut context).unwrap().int64s(), [7, 7]);
-        let nulls = ColumnView::constant(&mut Context::new(&Heap), &int64s(&[0], &[0]), 3).unwrap();
+        let nulls =
+            ColumnView::constant(&mut Context::new(env, None), &int64s(&[0], &[0]), 3).unwrap();
         assert!((0..3).all(|row| nulls.is_null(row)));
     }
 
     #[test]
     fn keeps_a_lazy_views_handle() {
+        let env = Env::current();
         let column =
-            ColumnView::lazy(&mut Context::new(&Heap), DataType::Int64, &[1, 2, 3], 10).unwrap();
+            ColumnView::lazy(&mut Context::new(env, None), DataType::Int64, &[1, 2, 3], 10)
+                .unwrap();
         assert!(column.is_lazy());
         assert_eq!(column.handle(), (&[1, 2, 3][..], 0));
         let sliced = column.slice(4, 3);
@@ -914,16 +996,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "check failed")]
     fn lazy_views_have_no_values() {
-        let column = ColumnView::lazy(&mut Context::new(&Heap), DataType::Int64, &[1], 2).unwrap();
+        let env = Env::current();
+        let column =
+            ColumnView::lazy(&mut Context::new(env, None), DataType::Int64, &[1], 2).unwrap();
         let _ = column.values();
     }
 
     #[test]
     fn flattens_strings() {
-        let mut context = crate::context::Context::new(&Heap);
+        let env = Env::current();
+        let mut context = crate::context::Context::new(env, None);
         let dictionary = strings(&["ab", "cde"]);
         let column =
-            ColumnView::dictionary(&mut Context::new(&Heap), &dictionary, indices(&[1, 1, 0]))
+            ColumnView::dictionary(&mut Context::new(env, None), &dictionary, indices(&[1, 1, 0]))
                 .unwrap();
         let flat = column.flatten(&mut context).unwrap();
         let strings = flat.string_values();

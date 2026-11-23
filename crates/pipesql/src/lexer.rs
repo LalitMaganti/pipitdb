@@ -3,6 +3,8 @@
 //! Keywords come out as identifiers: the parser decides what they mean, so
 //! modules can add their own.
 
+#![allow(unsafe_code)]
+
 use crate::error::{Error, ErrorCode, Span};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

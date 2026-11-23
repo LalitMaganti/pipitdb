@@ -1,6 +1,8 @@
 //! What pipitdb needs from the operating system's files. Unlike the kernel,
 //! this uses `std`.
 
+#![forbid(unsafe_code)]
+
 pub mod source;
 pub mod spill;
 

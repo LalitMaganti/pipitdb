@@ -2,37 +2,70 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
-use pipit_kernel::allocator::Allocator;
+#![allow(unsafe_code)]
+
+use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::Forms;
+use pipit_kernel::containers::SmallVec;
+use pipit_kernel::names::Name;
 use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
 };
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
+use pipit_kernel::env::Env;
 
 /// What a query reads rows from, compiled: its plan node, and its columns, by
 /// name.
 pub struct Relation {
     pub node: PlanNodeId,
-    pub columns: SlowVec<NamedColumn>,
+    pub columns: SmallVec<NamedColumn>,
 }
+
+/// A table alias, as `GoogleSQL`'s: a name for the columns a table had when
+/// it was named, so `t.x` is that `x` whatever stages since have done to
+/// the scope. Its columns are `alias_columns[start..end]`.
+#[derive(Clone, Copy, Default)]
+struct TableAlias {
+    name: Name,
+    start: u32,
+    end: u32,
+}
+
+/// The most aliases in scope at once, one for each table joined.
+const ALIASES_MAX: usize = 64;
+
+/// The most columns of all aliases at once.
+const ALIAS_COLUMNS_MAX: usize = ALIASES_MAX * PLAN_COLUMNS_MAX;
 
 /// A plan being compiled from a query, which each stage's rule adds to.
 pub struct Compiler<'q, 'c> {
+    /// The query's text, which the tree's spans are into.
     source: &'q [u8],
+    /// The query, parsed.
     ast: &'q Ast,
+    /// The tables `FROM` can name.
     catalog: &'c dyn Catalog,
+    /// The stages' rules and the functions calls can name.
     registry: &'q Registry,
-    allocator: &'q dyn Allocator,
+    /// What the plan's memory comes from.
+    env: &'q Env,
+    /// The plan so far.
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
-    pub scope: SlowVec<NamedColumn>,
+    pub scope: SmallVec<NamedColumn>,
+    /// The aliases `t.x` can name columns by, the first `alias_count`, and
+    /// their columns.
+    aliases: [TableAlias; ALIASES_MAX],
+    /// How many of `aliases` there are.
+    alias_count: usize,
+    /// The columns of `aliases`, each alias's after the one before's.
+    alias_columns: SmallVec<NamedColumn>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -66,7 +99,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         if node.tag() != Tag::String {
             return Ok(None);
         }
-        let id = crate::condition::string(self, node)?;
+        let id = crate::expression::string(self, node)?;
         Ok(Some(self.plan.literal(id)))
     }
 
@@ -76,8 +109,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 
     /// What to make plan nodes with.
-    pub fn allocator(&self) -> &'q dyn Allocator {
-        self.allocator
+    pub fn env(&self) -> &'q Env {
+        self.env
     }
 
     /// Whether two of `columns` have one name, ignoring case: a relation's
@@ -92,17 +125,46 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// The column in scope that `name`, a `Name` node, names, ignoring ASCII
     /// case, as SQL does. Two columns may share a name, as after `SELECT a,
     /// a`, but then the name can't be used, as in Perfetto.
+    #[inline(never)]
     pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
-        let text = self.text(name.span());
-        let named = |column: &&NamedColumn| {
-            same_word(self.plan.names.get(column.name).as_bytes(), text.as_bytes())
+        let text = self.text(name.span()).as_bytes();
+        let Some(dot) = text.iter().position(|&byte| byte == b'.') else {
+            return self.find_named(&self.scope, text, name.span());
         };
-        let mut found = self.scope.iter().filter(named);
-        let Some(&column) = found.next() else {
+        let (wanted, column) = (at!(text, ..dot).trim_ascii(), at!(text, dot + 1..).trim_ascii());
+        let mut found = at!(self.aliases, ..self.alias_count)
+            .iter()
+            .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
+        let Some(alias) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
         if found.next().is_some() {
             return Err(Error::new(ErrorCode::AmbiguousColumn, name.span()));
+        }
+        let columns = at!(self.alias_columns, alias.start as usize..alias.end as usize);
+        self.find_named(columns, column, name.span())
+    }
+
+    /// The one column of `columns` that `name` names, ignoring case.
+    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
+        self.find_named(columns, self.text(name.span()).as_bytes(), name.span())
+    }
+
+    /// The one column of `columns` named `text`, ignoring case, for `span`.
+    fn find_named(
+        &self,
+        columns: &[NamedColumn],
+        text: &[u8],
+        span: Span,
+    ) -> Result<NamedColumn, Error> {
+        let named =
+            |column: &&NamedColumn| same_word(self.plan.names.get(column.name).as_bytes(), text);
+        let mut found = columns.iter().filter(named);
+        let Some(&column) = found.next() else {
+            return Err(Error::new(ErrorCode::UnknownColumn, span));
+        };
+        if found.next().is_some() {
+            return Err(Error::new(ErrorCode::AmbiguousColumn, span));
         }
         Ok(column)
     }
@@ -117,8 +179,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
         let count = table.column_count();
-        let mut reads = SlowVec::fixed(self.allocator, count as usize)?;
-        let mut columns = SlowVec::new(self.allocator, PLAN_COLUMNS_MAX)?;
+        let mut reads = SmallVec::fixed(self.env, count as usize)?;
+        let mut columns = SmallVec::new(self.env, PLAN_COLUMNS_MAX)?;
         for i in 0..count {
             let (name, data_type) = (table.column_name(i), table.column_type(i));
             let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
@@ -128,9 +190,31 @@ impl<'q, 'c> Compiler<'q, 'c> {
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
-        let node = self.plan.add_node(op, SlowVec::fixed(self.allocator, 0)?)?;
+        let op = DynOp::new(self.env, ScanOp::new(table, reads))?;
+        let node = self.plan.add_node(op, &[])?;
         Ok(Relation { node, columns })
+    }
+
+    /// Adds the alias `name`, a name, for `columns`.
+    pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
+        let name = self.plan.names.add(self.text(name.span()))?;
+        if self.alias_count == ALIASES_MAX {
+            return Err(AllocError.into());
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
+        let start = self.alias_columns.len() as u32;
+        self.alias_columns.extend_from_slice(columns)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
+        let end = self.alias_columns.len() as u32;
+        *at_mut!(self.aliases, self.alias_count) = TableAlias { name, start, end };
+        self.alias_count += 1;
+        Ok(())
+    }
+
+    /// Drops every alias, as a stage that makes a new scope does.
+    pub fn clear_aliases(&mut self) {
+        self.alias_count = 0;
+        self.alias_columns.retain(|_| false);
     }
 
     /// The value of `node`, an `Integer`.
@@ -153,20 +237,23 @@ impl<'q, 'c> Compiler<'q, 'c> {
 /// Parses `source` with the stages in `registry`, and compiles it, finding
 /// tables in `catalog`. The plan's result is the last stage's columns.
 pub fn compile<'c>(
-    allocator: &dyn Allocator,
+    env: &Env,
     registry: &Registry,
     catalog: &'c dyn Catalog,
     source: &[u8],
 ) -> Result<LogicalPlan<'c>, Error> {
-    let ast = parse_query(allocator, registry, source)?;
+    let ast = parse_query(env, registry, source)?;
     let mut compiler = Compiler {
         source,
         ast: &ast,
         catalog,
         registry,
-        plan: LogicalPlan::new(allocator)?,
-        scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
-        allocator,
+        plan: LogicalPlan::new(env)?,
+        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+        aliases: [TableAlias::default(); ALIASES_MAX],
+        alias_count: 0,
+        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+        env,
     };
     let query = ast.node(ast.root());
     for i in 0..query.child_count() {
@@ -185,13 +272,11 @@ mod tests {
     use std::format;
     use std::vec::Vec as StdVec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
-    use pipit_kernel::lower::lower;
-    use pipit_kernel::output_properties::plan_nodes;
-    use pipit_kernel::query_allocators::QueryAllocators;
+    use pipit_kernel::env::Env;
+    use pipit_kernel::lower::PhysicalPlan;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
     use pipit_kernel::selection::Kept;
@@ -205,13 +290,13 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::expression::{Bind, call_bound};
     use crate::registry::FunctionRule;
-    use crate::stages::{AGGREGATION, RELATIONAL};
+    use crate::stages::{AGGREGATION, JOINS, RELATIONAL};
 
     #[cfg(not(feature = "string-functions"))]
     static REGISTRY: Registry =
-        Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[CHOICES, HALF]);
+        Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[CHOICES, HALF]);
     #[cfg(feature = "string-functions")]
-    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]).with_functions(&[
+    static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[
         CHOICES,
         HALF,
         crate::string_functions::STRING_FUNCTIONS,
@@ -221,7 +306,7 @@ mod tests {
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
         compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Half)?);
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Half)?);
             let signature = (&[DataType::Float64][..], DataType::Float64);
             call_bound(compiler, (node, depth), nodes, signature, bind)
         },
@@ -247,7 +332,12 @@ mod tests {
 
     /// Table `t`: `a` is 1 and 2, `b` is 10 and 20, `f` is 0.5 and 2.5, `s`
     /// is `it's` and the empty string. And `dup`, of `a` and `A`.
-    struct Tables(DynScannable<'static>, DynScannable<'static>, DynScannable<'static>);
+    struct Tables(
+        DynScannable<'static>,
+        DynScannable<'static>,
+        DynScannable<'static>,
+        DynScannable<'static>,
+    );
 
     impl Catalog for Tables {
         fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
@@ -255,6 +345,7 @@ mod tests {
                 "t" => Some(&self.0),
                 "dup" => Some(&self.1),
                 "n" => Some(&self.2),
+                "ids" => Some(&self.3),
                 _ => None,
             }
         }
@@ -262,16 +353,19 @@ mod tests {
 
     fn catalog() -> Tables {
         let column = |data_type, values: [i64; 2]| {
-            let mut buffer = Buffer::allocate(&Heap, 16).unwrap();
+            let mut buffer = Buffer::allocate(Env::current(), 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-            ColumnView::new(&mut Context::new(&Heap), data_type, buffer, None).unwrap()
+            ColumnView::new(&mut Context::new(Env::current(), None), data_type, buffer, None)
+                .unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
-        let mut views = Buffer::allocate(&Heap, 16).unwrap();
+        let mut views = Buffer::allocate(Env::current(), 16).unwrap();
         views.as_mut_slice::<u32>().copy_from_slice(&[0, 4, 4, 0]);
-        let mut bytes = Buffer::allocate(&Heap, 4).unwrap();
+        let mut bytes = Buffer::allocate(Env::current(), 4).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(b"it's");
-        let strings = ColumnView::strings(&mut Context::new(&Heap), views, bytes, None).unwrap();
+        let strings =
+            ColumnView::strings(&mut Context::new(Env::current(), None), views, bytes, None)
+                .unwrap();
         let columns = [
             column(DataType::Int64, [1, 2]),
             column(DataType::Int64, [10, 20]),
@@ -284,30 +378,44 @@ mod tests {
             ("f", DataType::Float64),
             ("s", DataType::String),
         ];
-        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
+        let table = Table::new(Env::current(), &schema, &[&columns]).unwrap();
         let same = [column(DataType::Int64, [1, 2]), column(DataType::Int64, [3, 4])];
         let same_names = [("a", DataType::Int64), ("A", DataType::Int64)];
-        let same = Table::new(&Heap, &same_names, &[&same]).unwrap();
+        let same = Table::new(Env::current(), &same_names, &[&same]).unwrap();
         // `x` is 1 and null.
-        let mut values = Buffer::allocate(&Heap, 16).unwrap();
+        let mut values = Buffer::allocate(Env::current(), 16).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 0]);
-        let mut validity = Buffer::allocate(&Heap, 8).unwrap();
+        let mut validity = Buffer::allocate(Env::current(), 8).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-        let x = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity));
-        let nulls = Table::new(&Heap, &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
-        let scannable = |table| DynScannable::new(&Heap, table).unwrap();
-        Tables(scannable(table), scannable(same), scannable(nulls))
+        let x = ColumnView::new(
+            &mut Context::new(Env::current(), None),
+            DataType::Int64,
+            values,
+            Some(validity),
+        );
+        let nulls =
+            Table::new(Env::current(), &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
+        let scannable = |table| DynScannable::new(Env::current(), table).unwrap();
+        // `id` is 10, 11 and 12, stored as a sequence, and `v` 1, 2 and 3.
+        let id = ColumnView::sequence(&mut Context::new(Env::current(), None), 10, 3).unwrap();
+        let mut values = Buffer::allocate(Env::current(), 24).unwrap();
+        values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
+        let v =
+            ColumnView::new(&mut Context::new(Env::current(), None), DataType::Int64, values, None)
+                .unwrap();
+        let schema = [("id", DataType::Int64), ("v", DataType::Int64)];
+        let ids = Table::new(Env::current(), &schema, &[&[id, v]]).unwrap();
+        Tables(scannable(table), scannable(same), scannable(nulls), scannable(ids))
     }
 
     /// Runs `query`, returning each result column's name and the values of
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
+        let query = Env::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
@@ -320,6 +428,9 @@ mod tests {
             for (&c, (_, values)) in physical.columns().iter().zip(&mut columns) {
                 let column = batch.column(c.position);
                 values.extend(rows.iter().map(|&row| match column.data_type() {
+                    // A null, which no test value is.
+                    #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+                    _ if column.is_null(row as u32) => f64::NEG_INFINITY,
                     #[expect(clippy::cast_precision_loss, reason = "small test values")]
                     DataType::Int64 => column.int64s()[row] as f64,
                     DataType::Float64 => column.float64s()[row],
@@ -340,8 +451,16 @@ mod tests {
 
     fn error(query: &str) -> (ErrorCode, u32) {
         let catalog = catalog();
-        let error = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
+        let error = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
+    }
+
+    #[test]
+    fn filters_rows_wider_than_a_batch_holds_inline() {
+        // The filter computes `x0 * 2` after the 70 columns before it.
+        let items = (0..70).map(|i| format!("a + {i} AS x{i}")).collect::<StdVec<_>>().join(", ");
+        let columns = run(&format!("FROM t |> SELECT {items} |> WHERE x0 * 2 > 3"));
+        assert_eq!((columns.len(), &*columns[69].1), (70, &[71.0][..]));
     }
 
     #[test]
@@ -355,6 +474,174 @@ mod tests {
         assert_eq!(run("FROM t |> SELECT b |> SELECT b"), core::slice::from_ref(&b));
         // Names match ignoring case, and keep the case they were made with.
         assert_eq!(run("FROM t |> SELECT B"), [b]);
+    }
+
+    #[test]
+    fn joins_tables() {
+        let joined = |query| {
+            let mut columns = run(query).into_iter().map(|(_, values)| values);
+            (columns.next().unwrap(), columns.next().unwrap())
+        };
+        assert_eq!(
+            joined("FROM t |> JOIN ids ON b = id |> SELECT a, v"),
+            ([1.0].into(), [1.0].into())
+        );
+        // Pairs come out a row of the joined table at a time.
+        let less = ([1.0, 1.0, 2.0].into(), [2.0, 3.0, 3.0].into());
+        assert_eq!(joined("FROM t |> INNER JOIN ids ON a < v |> SELECT a, v"), less);
+        assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = v |> SELECT a"), [1.0]);
+        assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = 2 |> SELECT a"), []);
+        // Conditions that aren't comparisons, which have no keys. The
+        // optimizer picks the sides, so the order isn't fixed.
+        let mut all = kept("FROM t |> JOIN ids ON a |> SELECT a");
+        all.sort_by(f64::total_cmp);
+        assert_eq!(all, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+        assert_eq!(kept("FROM t |> JOIN ids ON s LIKE 'it%' |> SELECT v"), [1.0, 2.0, 3.0]);
+        let null = f64::NEG_INFINITY;
+        let left = ([10.0, 11.0, 12.0].into(), [1.0, null, null].into());
+        assert_eq!(joined("FROM ids |> LEFT JOIN t ON id = b |> SELECT id, a"), left);
+        assert_eq!(joined("FROM ids |> left outer join t ON id = b |> SELECT id, a"), left);
+        assert_eq!(
+            kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a IS NULL |> SELECT id"),
+            [11.0, 12.0]
+        );
+        // A condition never true for nulls makes the join inner.
+        assert_eq!(kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a > 0 |> SELECT id"), [10.0]);
+        // The optimizer picks a cross join's sides, so its rows' order isn't
+        // fixed.
+        let (a, id) = joined("FROM t |> CROSS JOIN ids |> SELECT a, id");
+        let mut product: StdVec<(f64, f64)> = a.into_iter().zip(id).collect();
+        product.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        let pairs = [(1.0, 10.0), (1.0, 11.0), (1.0, 12.0), (2.0, 10.0), (2.0, 11.0), (2.0, 12.0)];
+        assert_eq!(product, pairs);
+        // Of only the rows so far's columns, so no column of `ids` is held.
+        let mut a = kept("FROM t |> CROSS JOIN ids |> SELECT a");
+        a.sort_by(f64::total_cmp);
+        assert_eq!(a, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn joins_using_columns() {
+        let names = |query| run(query).into_iter().map(|(name, _)| name).collect::<StdVec<_>>();
+        // The column joined on once, first, then the rest of each side's.
+        let joined = names("FROM t |> RENAME b AS id |> JOIN ids USING (id)");
+        assert_eq!(joined, [&b"id"[..], b"a", b"f", b"s", b"v"]);
+        // A second copy of a column stays.
+        let twice = names("FROM t |> RENAME b AS id |> EXTEND a |> JOIN ids USING (id)");
+        assert_eq!(twice, [&b"id"[..], b"a", b"f", b"s", b"a", b"v"]);
+        assert_eq!(kept("FROM t |> RENAME b AS id |> JOIN ids USING (id) |> SELECT v"), [1.0]);
+        // A left join's comes from the rows so far, so is never null.
+        let null = f64::NEG_INFINITY;
+        let left = run("FROM ids |> RENAME v AS a |> LEFT JOIN t USING (a) |> SELECT a, id, b");
+        let values: StdVec<_> = left.into_iter().map(|(_, values)| values).collect();
+        assert_eq!(values, [[1.0, 2.0, 3.0], [10.0, 11.0, 12.0], [10.0, 20.0, null]]);
+        let two = "FROM t |> RENAME b AS id |> EXTEND a AS v |> JOIN ids USING (id, v) |> SELECT a";
+        assert_eq!(kept(two), [1.0]);
+        assert_eq!(
+            kept("FROM t |> RENAME b AS id, a AS v |> JOIN ids USING (v, id) |> SELECT v"),
+            [1.0]
+        );
+    }
+
+    #[test]
+    fn names_columns_by_table_aliases() {
+        // A table's name is its alias, and a column keeps its own name.
+        assert_eq!(run("FROM t |> SELECT t.a"), [(b"a".to_vec(), [1.0, 2.0].to_vec())]);
+        assert_eq!(kept("FROM t AS x |> WHERE x.a > 1 |> SELECT x.a"), [2.0]);
+        // `AS` names what a stage made.
+        assert_eq!(kept("FROM t |> SELECT a + 1 AS a |> AS s |> SELECT s.a"), [2.0, 3.0]);
+        // An alias names the columns its table had, whatever their names now.
+        assert_eq!(kept("FROM t |> RENAME a AS z |> SELECT t.a"), [1.0, 2.0]);
+        // `SELECT` makes a new table, which no alias names.
+        assert_eq!(error("FROM t |> SELECT a |> SELECT t.a"), (ErrorCode::UnknownColumn, 29));
+        assert_eq!(error("FROM t |> SELECT u.a"), (ErrorCode::UnknownColumn, 17));
+        assert_eq!(error("FROM t AS x |> SELECT t.a"), (ErrorCode::UnknownColumn, 22));
+    }
+
+    #[test]
+    fn names_joined_columns_by_table_aliases() {
+        let values =
+            |query| run(query).into_iter().map(|(_, values)| values).collect::<StdVec<_>>();
+        // A table joined to itself, told apart by aliases.
+        let selfjoin = values("FROM t AS x |> JOIN t AS y ON x.a < y.a |> SELECT x.a, y.b");
+        assert_eq!(selfjoin, [[1.0], [20.0]]);
+        let named = run("FROM t |> JOIN ids ON t.b = ids.id |> SELECT t.a, ids.v");
+        assert_eq!(named, [(b"a".to_vec(), [1.0].to_vec()), (b"v".to_vec(), [1.0].to_vec())]);
+        let renamed =
+            values("FROM t |> SELECT a + 1 AS a |> AS s |> JOIN t ON s.a = t.a |> SELECT s.a, t.b");
+        assert_eq!(renamed, [[2.0], [20.0]]);
+        let joined =
+            "FROM t AS x |> JOIN t AS y ON x.a < y.a |> WHERE x.b + y.b = 30 |> SELECT x.a";
+        assert_eq!(kept(joined), [1.0]);
+        assert_eq!(error("FROM t |> JOIN t ON t.a = 1"), (ErrorCode::AmbiguousColumn, 20));
+    }
+
+    #[test]
+    fn rejects_joins_it_cant_run() {
+        assert_eq!(error("FROM t |> JOIN ids"), (ErrorCode::ExpectedWord, 15));
+        assert_eq!(error("FROM t |> JOIN ids USING (id)"), (ErrorCode::UnknownColumn, 26));
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING (id, id)"),
+            (ErrorCode::ListedTwice, 48)
+        );
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING id"),
+            (ErrorCode::ExpectedToken, 43)
+        );
+        let both = error("FROM t |> RENAME b AS id |> JOIN ids ON a = v USING (id)");
+        assert_eq!(both, (ErrorCode::UnexpectedToken, 53));
+        // `s` is a string, and `id` an integer.
+        let types = error("FROM t |> RENAME s AS id |> JOIN ids USING (id)");
+        assert_eq!(types, (ErrorCode::ExpectedOneKind, 44));
+        assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
+        assert_eq!(error("FROM t |> LEFT JOIN ids, n ON a = id"), (ErrorCode::UnexpectedToken, 25));
+        assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
+        // Both tables have `a`.
+        assert_eq!(error("FROM t |> JOIN t ON a = 1"), (ErrorCode::AmbiguousColumn, 20));
+        assert_eq!(error("FROM t |> JOIN ids ON s"), (ErrorCode::NumberCondition, 22));
+        assert_eq!(error("FROM t |> JOIN ids ON f"), (ErrorCode::Unsupported, 22));
+    }
+
+    #[test]
+    fn computes_logic() {
+        // `AND`, `OR` and `NOT`, null only where unknown: `x` is 1, then null.
+        let null = f64::NEG_INFINITY;
+        assert_eq!(kept("FROM n |> SELECT x = 1 AND x = 1 AS y"), [1.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x = 2 AND x = 1 AS y"), [0.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x = 1 OR x IS NULL AS y"), [1.0, 1.0]);
+        assert_eq!(kept("FROM n |> SELECT x = 2 OR x = 1 AS y"), [1.0, null]);
+        assert_eq!(kept("FROM n |> SELECT x IS NULL AND x = 1 AS y"), [0.0, null]);
+        assert_eq!(kept("FROM n |> SELECT NOT x = 1 AS y"), [0.0, null]);
+        assert_eq!(error("FROM t |> SELECT s AND a = 1 AS y"), (ErrorCode::NumberCondition, 17));
+    }
+
+    #[test]
+    fn computes_in_lists() {
+        let null = f64::NEG_INFINITY;
+        assert_eq!(kept("FROM t |> SELECT a IN (2, 3) AS y"), [0.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT a + 1 IN (2, -5) AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT s IN ('it''s', 'x') AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM n |> SELECT x IN (1) AS y"), [1.0, null]);
+        // More than a filter scans, so looked up in a set.
+        assert_eq!(
+            kept(
+                "FROM t |> SELECT b IN (30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 20) AS y"
+            ),
+            [0.0, 1.0]
+        );
+        assert_eq!(kept("FROM t |> WHERE a * 10 IN (20) |> SELECT a"), [2.0]);
+        assert_eq!(error("FROM t |> SELECT a IN (1, 'x') AS y"), (ErrorCode::ExpectedOneKind, 26));
+        assert_eq!(error("FROM t |> SELECT s IN (1) AS y"), (ErrorCode::ExpectedOneKind, 17));
+    }
+
+    #[test]
+    fn filters_by_computed_conditions() {
+        // What a predicate can't test is computed.
+        assert_eq!(kept("FROM t |> WHERE a < b |> SELECT a"), [1.0, 2.0]);
+        assert_eq!(kept("FROM t |> WHERE a * 10 = b AND a > 1 |> SELECT a"), [2.0]);
+        assert_eq!(kept("FROM n |> WHERE x = x |> SELECT x"), [1.0]);
+        assert_eq!(error("FROM t |> WHERE s"), (ErrorCode::NumberCondition, 16));
+        assert_eq!(error("FROM t |> WHERE f"), (ErrorCode::Unsupported, 16));
     }
 
     #[test]
@@ -406,7 +693,7 @@ mod tests {
     fn knows_which_columns_can_be_null() {
         let catalog = catalog();
         let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
+        let plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
         let nullable = |name: &str| {
             let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
             column.unwrap().nullable
@@ -490,11 +777,10 @@ mod tests {
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
+        let query = Env::current();
+        let mut execution = physical.start(query).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
     }
@@ -552,6 +838,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_id_columns_stored_as_sequences() {
+        // A filter takes the sequence; everything else, flat values.
+        assert_eq!(kept("FROM ids |> WHERE id > 10 |> SELECT v"), [2.0, 3.0]);
+        assert_eq!(kept("FROM ids |> WHERE id = 11 OR id IS NULL |> SELECT id"), [11.0]);
+        assert_eq!(kept("FROM ids |> SELECT id + 1 AS x"), [11.0, 12.0, 13.0]);
+        assert_eq!(kept("FROM ids |> AGGREGATE sum(id)"), [33.0]);
+    }
+
+    #[test]
     fn orders_rows() {
         assert_eq!(kept("FROM t |> ORDER BY a DESC |> SELECT b"), [20.0, 10.0]);
         assert_eq!(kept("FROM t |> ORDER BY f |> SELECT s"), [4.0, 0.0]);
@@ -587,10 +882,11 @@ mod tests {
     #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
-        assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::Unsupported, 16));
-        assert_eq!(error("FROM t |> WHERE a + 1 IS NULL"), (ErrorCode::Unsupported, 16));
+        // Conditions a predicate can't test are typed as expressions.
+        assert_eq!(error("FROM t |> WHERE a = 'x'"), (ErrorCode::ExpectedOneKind, 16));
+        assert_eq!(error("FROM t |> WHERE s > 1"), (ErrorCode::ExpectedOneKind, 16));
+        assert_eq!(error("FROM t |> WHERE a LIKE 'x'"), (ErrorCode::ExpectedString, 16));
+        assert_eq!(kept("FROM t |> WHERE a + 1 IS NULL |> SELECT a"), []);
         assert_eq!(error("FROM t |> SELECT c"), (ErrorCode::UnknownColumn, 17));
         assert_eq!(run("FROM t |> SELECT a, b, a").len(), 3);
         assert_eq!(error("FROM t |> SELECT a, b, a |> SELECT A"), (ErrorCode::AmbiguousColumn, 35));
@@ -622,21 +918,24 @@ mod tests {
         let long = format!("FROM t |> SELECT a{} AS x", " + a".repeat(200));
         assert_eq!(error(&long), (ErrorCode::ExpressionTooLarge, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
-        assert_eq!(error("FROM t |> WHERE a > b"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE a + 1 > 2"), (ErrorCode::Unsupported, 16));
-        assert_eq!(error("FROM t |> WHERE a"), (ErrorCode::Unsupported, 16));
+        // Computed, as a predicate can't test them.
+        assert_eq!(kept("FROM t |> WHERE a > b |> SELECT a"), []);
+        assert_eq!(kept("FROM t |> WHERE a + 1 > 2 |> SELECT a"), [2.0]);
+        assert_eq!(kept("FROM t |> WHERE a |> SELECT a"), [1.0, 2.0]);
         assert_eq!(error("FROM t |> WHERE f > 1.5"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 16));
         assert_eq!(
             error("FROM t |> WHERE a > 9223372036854775808"),
             (ErrorCode::NumberTooLarge, 20)
         );
-        let wide = (0..40).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
+        // Past the most nodes an expression has.
+        let wide = (0..100).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
         let wide = format!("FROM t |> WHERE {wide}");
-        assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
-        assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 22));
-        assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::Unsupported, 27));
-        assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::Unsupported, 22));
+        assert_eq!(error(&wide).0, ErrorCode::ExpressionTooLarge);
+        assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 16));
+        // As `a = 'a'` is.
+        assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::ExpectedOneKind, 27));
+        assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::ExpectedOneKind, 16));
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
@@ -652,12 +951,10 @@ mod tests {
     /// result column's values.
     fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
+        let query = Env::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let values = batch.column(physical.columns()[0].position).int64s().to_vec();

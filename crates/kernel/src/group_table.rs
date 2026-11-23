@@ -2,18 +2,19 @@
 //! operators that group rows. A string key is grouped by its id in the
 //! run's `StringPool`.
 
+#![allow(unsafe_code)]
+
 use crate::aggregate_function::{gathered, is_valid};
-use crate::allocator::{AllocError, Allocator};
-use crate::array::Array;
-use crate::blocks::Blocks;
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
+use crate::containers::{Array, BitSlice, Blocks, SmallVec, address};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::prefetch;
-use crate::murmur_hash::mix;
+use crate::murmur_hash::{SEED, combine};
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::slow_vec::SlowVec;
 use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.
@@ -53,7 +54,7 @@ pub(crate) struct GroupTable {
     /// The hash table. An empty slot is 0. A used slot holds the top bits
     /// of the group's hash, then the group number plus one in the low
     /// `GROUP_BITS` bits.
-    slots: SlowVec<u64>,
+    slots: Array<u64>,
     /// Each group's null bits, then its keys, then its payload, `stride`
     /// words each. Keeping them together means comparing a group reads one
     /// cache line.
@@ -68,31 +69,31 @@ pub(crate) struct GroupTable {
     nullable: u64,
     /// How many keys there are.
     keys: usize,
-    /// Bit `k` set if key `k` is a string, stored as its id, which is 0 if
-    /// null: as in Perfetto, a null string is a key, not a null one.
+    /// Bit `k` set if key `k` is a string, stored as its word in the run's
+    /// pool: as in Perfetto, a null string is a key, not a null one.
     string_keys: u64,
     /// For each key, the last dictionary it came in, if it's a string key.
-    dictionaries: SlowVec<Option<Interned>>,
-    /// With a single key, a string, the group of each string by its number
-    /// in the run's pool, `NONE` until it has one, so a row's group is found
-    /// without hashing again.
-    number_groups: SlowVec<u32>,
-    /// With a single key, a string, the null string's group, once it has one.
-    null_group: u32,
+    dictionaries: SmallVec<Option<Interned>>,
+    /// With a single key, a string, each string's group plus one, 0 until it
+    /// has one, at its number in the run's pool plus one, and the null
+    /// string's at 0: so a row's group is found without hashing again.
+    number_groups: SmallVec<u32>,
+    /// Whether a key not found gets no group, `NONE`, rather than a new
+    /// one: a join's build side, once built.
+    frozen: bool,
 }
 
-/// No number, or no group.
-const NONE: u32 = u32::MAX;
+/// No group.
+pub(crate) const NONE: u32 = u32::MAX;
 
-/// A string key's dictionary, and the ids of its entries: kept while
+/// A string key's dictionary, and the words of its entries: kept while
 /// batches share it, as a chunk's do, so each entry is interned once.
 struct Interned {
     /// A column of the dictionary, kept so its values aren't freed, and
-    /// their address reused, while the ids are.
+    /// their address reused, while the words are.
     dictionary: ColumnView,
-    /// Each entry's id, and its number above, or 0 until a row with it is
-    /// found.
-    ids: Array<u64>,
+    /// Each entry's word, or 0 until a row with it is found.
+    words: Array<u64>,
 }
 
 impl GroupTable {
@@ -100,7 +101,7 @@ impl GroupTable {
     /// `nullable_keys` possibly null, with `payload_words` zeroed words after
     /// each group's keys for the caller to store per-group data.
     pub(crate) fn new(
-        allocator: &dyn Allocator,
+        env: &Env,
         keys: usize,
         string_keys: u64,
         nullable_keys: u64,
@@ -113,21 +114,45 @@ impl GroupTable {
         let first = usize::from(nullable != 0);
         let stride = first + keys + payload_words;
         Ok(GroupTable {
-            slots: SlowVec::new(allocator, 1)?,
-            records: Blocks::new(allocator, stride)?,
+            slots: Array::zeroed(env, 0)?,
+            records: Blocks::new(env, stride)?,
             stride,
             first,
             nullable,
             keys,
             string_keys,
-            dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
-            number_groups: SlowVec::new(allocator, 1 << 31)?,
-            null_group: NONE,
+            dictionaries: SmallVec::fixed_from(env, (0..keys).map(|_| None))?,
+            number_groups: SmallVec::new(env, 1 << 31)?,
+            frozen: false,
         })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Group `group`'s key `k`, a word: a string's id.
+    pub(crate) fn key(&self, group: u32, k: usize) -> i64 {
+        check!(k < self.keys);
+        *at!(self.records.record(group as usize), self.first + k)
+    }
+
+    /// Group `group`'s first payload word.
+    pub(crate) fn payload(&self, group: u32) -> i64 {
+        *at!(self.records.record(group as usize), self.first + self.keys)
+    }
+
+    /// Sets group `group`'s first payload word to `value`.
+    pub(crate) fn set_payload(&mut self, group: u32, value: i64) {
+        check!((group as usize) < self.len() && self.stride > self.first + self.keys);
+        // SAFETY: the group has a record, of `stride` words, checked above.
+        unsafe { *self.records.record_ptr(group as usize).add(self.first + self.keys) = value };
+    }
+
+    /// From now on, `find_or_create` finds groups only, and gives a key not
+    /// found `NONE`.
+    pub(crate) fn freeze(&mut self) {
+        self.frozen = true;
     }
 
     /// Where each block of records starts, as `Blocks::starts`, and where a
@@ -155,13 +180,10 @@ impl GroupTable {
         check!(columns.len() == self.keys);
         let count = groups.len();
         if (self.keys, self.string_keys) == (1, 1) {
-            self.records.reserve(context.allocator(), self.len() + count)?;
-            let (mut ids, mut numbers) = (None, context.indices_buffer(count * 4)?);
+            self.records.reserve(context.env(), self.len() + count)?;
             let (interned, column) = (at_mut!(self.dictionaries, 0), at!(columns, 0));
-            let out = Some(numbers.as_mut_slice());
-            load_string_ids(context, interned, column, select, count, &mut ids, out)?;
-            let Some(ids) = ids else { failed!() };
-            return self.find_numbered(ids.as_slice(), numbers.as_slice(), groups);
+            let words = load_string_words(context, interned, column, select, count)?;
+            return self.find_numbered(at!(words.as_slice(), ..count), groups);
         }
         // Each key as a word a row, 0 where null, and a word a row of which
         // keys are null, unless none are.
@@ -170,7 +192,7 @@ impl GroupTable {
         for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
             if self.string_keys >> k & 1 != 0 {
                 let interned = at_mut!(self.dictionaries, k);
-                load_string_ids(context, interned, column, select, count, copy, None)?;
+                *copy = Some(load_string_words(context, interned, column, select, count)?);
             } else {
                 let nulls = if self.nullable >> k & 1 != 0 { Some(&mut nulls) } else { None };
                 load_key_words(context, column, select, count, k, copy, nulls)?;
@@ -187,7 +209,7 @@ impl GroupTable {
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         // Only a table with null words takes keys that can be null.
         check!(self.first == 1 || nulls.is_none());
-        self.grow(context.allocator(), self.len() + count)?;
+        self.grow(context.env(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
         let mut starts = context.indices_buffer(count * 4)?;
@@ -267,7 +289,7 @@ impl GroupTable {
         let hash_of = |i: usize| hashes.get(i).copied();
         for (row, group) in groups.iter_mut().enumerate() {
             if ahead {
-                self.fetch_ahead(hash_of, row);
+                fetch_ahead(&self.slots, self.records.starts(), self.stride, hash_of, row);
             }
             let hash = *at!(hashes, row);
             let first = self.first;
@@ -283,66 +305,45 @@ impl GroupTable {
             };
             *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
+                Err(_) if self.frozen => NONE,
                 Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
         }
         Ok(())
     }
 
-    /// Fetches the slot of the row `SLOT_AHEAD` rows after row `i`, and the
-    /// record of the group in the first slot of the row `RECORD_AHEAD` after,
-    /// given each row's hash by `hash_of`. A table too big for the cache
-    /// misses it twice a row, for its slot and then its group's record.
-    #[inline]
-    fn fetch_ahead(&self, hash_of: impl Fn(usize) -> Option<u64>, i: usize) {
-        if let Some(next) = hash_of(i + SLOT_AHEAD) {
-            prefetch(self.slots.as_ptr().wrapping_add(slot_of(next, self.slots.len())));
-        }
-        if let Some(next) = hash_of(i + RECORD_AHEAD) {
-            let slot = *at!(self.slots, slot_of(next, self.slots.len()));
-            #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-            let group = (slot & !salt(slot)) as usize;
-            if group != 0 {
-                prefetch(self.records.record_ptr(group - 1).cast_const());
-            }
-        }
-    }
-
-    /// As `find_or_create`, for a single key, a string, given each row's id
-    /// and number in the run's pool: a string's group is found by its
-    /// number, without hashing it again.
+    /// As `find_or_create`, for a single key, a string, given each row's
+    /// word in the run's pool: a string's group is found by its number,
+    /// without hashing it again.
     #[inline(never)]
-    fn find_numbered(
-        &mut self,
-        ids: &[i64],
-        numbers: &[u32],
-        groups: &mut [u32],
-    ) -> Result<(), Error> {
-        for ((&id, &number), group) in ids.iter().zip(numbers).zip(groups.iter_mut()) {
-            // Other tables share the pool, so numbers can be skipped.
-            while number != NO_NUMBER && number as usize >= self.number_groups.len() {
-                self.number_groups.push(NONE)?;
-            }
-            let known = match number {
-                NO_NUMBER => self.null_group,
-                _ => *at!(self.number_groups, number as usize),
+    fn find_numbered(&mut self, words: &[i64], groups: &mut [u32]) -> Result<(), Error> {
+        // `NO_NUMBER` plus one wraps to 0, the null string's.
+        let place = |word: i64| ((word.cast_unsigned() >> 32) as u32).wrapping_add(1) as usize;
+        let most = words.iter().map(|&word| place(word)).max().unwrap_or(0);
+        // Other tables share the pool, so numbers can be skipped. Saturating,
+        // as on 32-bit targets `most` can be `usize::MAX`: past the cap,
+        // extending fails.
+        let len = most.saturating_add(1);
+        if len > self.number_groups.len() {
+            self.number_groups.extend_zeroed(len - self.number_groups.len())?;
+        }
+        for (&word, group) in words.iter().zip(groups.iter_mut()) {
+            let place = place(word);
+            *group = match at!(self.number_groups, place).checked_sub(1) {
+                Some(known) => known,
+                None if self.frozen => NONE,
+                None => self.add_numbered(place, word)?,
             };
-            *group = if known == NONE { self.add_numbered(number, id)? } else { known };
         }
         Ok(())
     }
 
-    /// Adds a group for the string with id `id` and number `number`, and
-    /// returns its number.
-    #[cold]
-    #[inline(never)]
-    fn add_numbered(&mut self, number: u32, id: i64) -> Result<u32, Error> {
-        let key = [0, id];
-        let group = self.push(at!(key, 1 - self.first..))?;
-        match number {
-            NO_NUMBER => self.null_group = group,
-            _ => *at_mut!(self.number_groups, number as usize) = group,
-        }
+    /// Adds a group for the string with word `word`, whose place in
+    /// `number_groups` is `place`, and returns its number.
+    fn add_numbered(&mut self, place: usize, word: i64) -> Result<u32, Error> {
+        // A string key is never null, so there's no null word.
+        let group = push(&mut self.records, 0, word)?;
+        *at_mut!(self.number_groups, place) = group + 1;
         Ok(group)
     }
 
@@ -360,22 +361,31 @@ impl GroupTable {
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
+        // Locals, so the loop keeps them in registers across its writes.
+        let GroupTable { slots, records, stride, frozen, .. } = self;
+        let (slots, stride): (&mut [u64], usize) = (slots, *stride);
+        // `grow` made room for every row, so no block moves while adding.
+        let starts: *const [*mut i64] = records.starts();
         for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
+            // SAFETY: as above.
+            let starts = unsafe { &*starts };
             if ahead {
-                self.fetch_ahead(hash_of, i);
+                fetch_ahead(slots, starts, stride, hash_of, i);
             }
             // A stored group is its null bits, zero here, if it has them, then
             // its key.
             // SAFETY: a group in a slot has a record, with its key.
             let equal = |group: usize| unsafe {
-                let stored = self.records.record_ptr(group).cast_const();
+                let stored = address(starts, stride, group).cast_const();
                 (first == 0 || *stored == 0) && *stored.add(first) == key
             };
-            *group = match probe(&self.slots, hash, equal) {
+            *group = match probe(slots, hash, equal) {
                 Ok(group) => group,
+                Err(_) if *frozen => NONE,
                 Err(at) => {
-                    let record = [0, key];
-                    self.add(at, hash, at!(record, 1 - first..))?
+                    let group = push(records, first, key)?;
+                    *at_mut!(slots, at) = salt(hash) | (u64::from(group) + 1);
+                    group
                 }
             };
         }
@@ -383,10 +393,7 @@ impl GroupTable {
     }
 
     /// Adds a group for row `row` of `keys`, with null word `null`, hashed as
-    /// `hash`, in slot `at`, and returns its number. Out of line, so the loops
-    /// that find groups keep what they read in registers.
-    #[cold]
-    #[inline(never)]
+    /// `hash`, in slot `at`, and returns its number.
     fn add_row(
         &mut self,
         at: usize,
@@ -413,29 +420,10 @@ impl GroupTable {
         Ok(group)
     }
 
-    /// As `add_row`, given the group's null word and keys together in `key`.
-    fn add(&mut self, at: usize, hash: u64, key: &[i64]) -> Result<u32, Error> {
-        let group = self.push(key)?;
-        *at_mut!(self.slots, at) = salt(hash) | (u64::from(group) + 1);
-        Ok(group)
-    }
-
-    /// Appends a group of `key`, its null word and keys, and returns its
-    /// number.
-    fn push(&mut self, key: &[i64]) -> Result<u32, Error> {
-        let group = self.len();
-        if group == GROUPS_MAX {
-            return Err(Error::OutOfMemory);
-        }
-        at_mut!(self.records.push(), ..key.len()).copy_from_slice(key);
-        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
-        Ok(group as u32)
-    }
-
     /// Doubles the slots until at most two thirds are used by `groups`
     /// groups, and puts each group back in its slot.
-    fn grow(&mut self, allocator: &dyn Allocator, groups: usize) -> Result<(), Error> {
-        self.records.reserve(allocator, groups.min(GROUPS_MAX))?;
+    fn grow(&mut self, env: &Env, groups: usize) -> Result<(), Error> {
+        self.records.reserve(env, groups.min(GROUPS_MAX))?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
         while groups * 3 > capacity * 2 {
@@ -444,7 +432,7 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
-        let mut slots = SlowVec::zeroed(allocator, capacity)?;
+        let mut slots = Array::zeroed(env, capacity)?;
         let mask = capacity - 1;
         // No need to hash the keys again: `slot_of` only uses bits a slot has.
         for &slot in self.slots.iter().filter(|&&slot| slot != 0) {
@@ -480,7 +468,7 @@ impl GroupTable {
         if !nulls {
             return Ok(ColumnView::new(context, DataType::Int64, values, None)?);
         }
-        let mut validity = context.small_buffer(rows.div_ceil(8))?;
+        let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         let starts = range.clone().step_by(8);
         for (bits, start) in validity.as_mut_slice::<u8>().iter_mut().zip(starts) {
             let groups = (start..range.end.min(start + 8)).enumerate();
@@ -493,28 +481,25 @@ impl GroupTable {
 }
 
 /// Loads `count` rows that `select` keeps of string key column `column`, flat
-/// or a dictionary, all if `select` is empty, to `copy` as the ids the run's
-/// string pool has for them, and their numbers to `numbers` if given, `NO_NUMBER`
-/// for null. A dictionary's entries are each interned once,
-/// when a row with it is first found, and their ids kept in `interned` while
-/// batches share the dictionary.
-fn load_string_ids(
+/// or a dictionary, all if `select` is empty, as their words in the run's
+/// string pool. A dictionary's entries are each interned once, when a row
+/// with it is first found, and their words kept in `interned` while batches
+/// share the dictionary.
+fn load_string_words(
     context: &mut Context,
     interned: &mut Option<Interned>,
     column: &ColumnView,
     select: &[u16],
     count: usize,
-    copy: &mut Option<Buffer>,
-    mut numbers: Option<&mut [u32]>,
-) -> Result<(), Error> {
+) -> Result<Buffer, Error> {
     check!(column.data_type() == DataType::String);
     let values = column.values();
     let strings = values.strings();
-    let mut ids = context.values_buffer(count * 8)?;
-    let allocator = context.allocator();
+    let mut words = context.values_buffer(count * 8)?;
+    let env = context.env();
     let pool = context.string_pool()?;
     let row_of = |i: usize| if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-    let out = ids.as_mut_slice::<i64>().iter_mut().enumerate();
+    let out = words.as_mut_slice::<u64>();
     match column.form() {
         Form::Flat => {
             let validity = column.validity();
@@ -522,66 +507,67 @@ fn load_string_ids(
                 let row = row_of(i);
                 validity.is_none_or(|validity| is_valid(validity, row)).then(|| strings.get(row))
             };
-            let ids = ids.as_mut_slice::<i64>();
-            pool.intern_strings(allocator, count, string, |i, id, number| {
-                *at_mut!(ids, i) = i64::from(id.raw_id());
-                if let Some(numbers) = numbers.as_deref_mut() {
-                    *at_mut!(numbers, i) = number;
-                }
+            pool.intern_strings(env, count, string, |i, id, number| {
+                *at_mut!(out, i) = word(id, number);
             })?;
         }
         Form::Dictionary(indices) => {
             if !interned.as_ref().is_some_and(|interned| interned.dictionary.shares_values(column))
             {
-                let ids = Array::zeroed(allocator, values.len() as usize)?;
-                *interned = Some(Interned { dictionary: column.clone(), ids });
+                let words = Array::zeroed(env, values.len() as usize)?;
+                *interned = Some(Interned { dictionary: column.clone(), words });
             }
-            let Some(Interned { ids: entries, .. }) = interned else { failed!() };
-            for (i, id) in out {
+            let Some(Interned { words: entries, .. }) = interned else { failed!() };
+            for (i, out) in at_mut!(out, ..count).iter_mut().enumerate() {
                 let entry = *at!(indices, row_of(i));
                 let known = at_mut!(entries, entry as usize);
                 if *known == 0 {
                     *known = if values.is_null(entry) {
-                        u64::from(NO_NUMBER) << 32
+                        word(Id::NULL, NO_NUMBER)
                     } else {
-                        let (found, number) =
-                            pool.intern_numbered(allocator, strings.get(entry as usize))?;
-                        u64::from(found.raw_id()) | u64::from(number) << 32
+                        let (id, number) =
+                            pool.intern_numbered(env, strings.get(entry as usize))?;
+                        word(id, number)
                     };
                 }
-                #[expect(clippy::cast_possible_truncation, reason = "the low half")]
-                let found = *known as u32;
-                *id = i64::from(found);
-                if let Some(numbers) = numbers.as_deref_mut() {
-                    *at_mut!(numbers, i) = (*known >> 32) as u32;
-                }
+                *out = *known;
             }
         }
-        Form::Constant => failed!(),
+        Form::Constant | Form::Sequence(_) => failed!(),
     }
-    *copy = Some(ids);
-    Ok(())
+    Ok(words)
 }
 
-/// The strings of `ids`, ids in the run's pool, 0 for null, as a string
-/// column.
+/// A string's word: its number in the run's pool above its id, so the word
+/// is a key on its own, and its low half is its id. Never 0.
+fn word(id: Id, number: u32) -> u64 {
+    u64::from(id.raw_id()) | u64::from(number) << 32
+}
+
+/// The strings of `ids`, ids in the run's pool in their low halves, 0 for
+/// null, as a string column.
 #[inline(never)]
 pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
     let rows = ids.len();
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);
+    let mut validity = None;
+    if (0..rows).any(|row| id(row).is_null()) {
+        let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
+        for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
+            let row = start * 8;
+            let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
+            *bits = (0..8).fold(0, |bits, i| bits | valid(i));
+        }
+        validity = Some(bits);
+    }
     let mut views = context.values_buffer(rows * 8)?;
-    let mut validity = context.small_buffer(rows.div_ceil(8))?;
-    let valid = validity.as_mut_slice::<u8>();
-    valid.fill(0);
     let (views_out, _) = views.as_mut_slice::<u32>().as_chunks_mut::<2>();
     let pool = context.string_pool()?;
-    let (mut bytes, mut nulls) = (0_u32, false);
+    let mut bytes = 0_u32;
     for (row, view) in views_out.iter_mut().enumerate() {
-        let string = pool.get(id(row));
-        nulls |= string.is_none();
-        *at_mut!(valid, row / 8) |= u8::from(string.is_some()) << (row % 8);
-        let len = u32::try_from(string.map_or(0, <[u8]>::len)).map_err(|_| Error::OutOfMemory)?;
+        let len = pool.get(id(row)).map_or(0, <[u8]>::len);
+        let len = u32::try_from(len).map_err(|_| Error::OutOfMemory)?;
         *view = [bytes, len];
         bytes = bytes.checked_add(len).ok_or(Error::OutOfMemory)?;
     }
@@ -592,7 +578,7 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         let string = pool.get(id(row)).unwrap_or_default();
         at_mut!(out, start as usize..(start + len) as usize).copy_from_slice(string);
     }
-    Ok(ColumnView::strings(context, views, stored, nulls.then_some(validity))?)
+    Ok(ColumnView::strings(context, views, stored, validity)?)
 }
 
 /// Loads `count` rows that `select` keeps of key column `column`, all if
@@ -631,6 +617,47 @@ fn load_key_words(
     Ok(())
 }
 
+/// Appends to `records` a group of a single key `key` that isn't null, at
+/// word `first`, and returns its number.
+fn push(records: &mut Blocks<i64>, first: usize, key: i64) -> Result<u32, Error> {
+    let group = records.len();
+    if group == GROUPS_MAX {
+        return Err(Error::OutOfMemory);
+    }
+    // A record starts zeroed, so its null word says the key isn't null.
+    *at_mut!(records.push(), first) = key;
+    #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+    Ok(group as u32)
+}
+
+/// Fetches the slot of the row `SLOT_AHEAD` rows after row `i`, and the
+/// record of the group in the first slot of the row `RECORD_AHEAD` after,
+/// given each row's hash by `hash_of`, and where each block of records of
+/// `stride` words starts. A table too big for the cache misses it twice a
+/// row, for its slot and then its group's record.
+#[inline]
+fn fetch_ahead(
+    slots: &[u64],
+    starts: &[*mut i64],
+    stride: usize,
+    hash_of: impl Fn(usize) -> Option<u64>,
+    i: usize,
+) {
+    if let Some(next) = hash_of(i + SLOT_AHEAD) {
+        prefetch(slots.as_ptr().wrapping_add(slot_of(next, slots.len())));
+    }
+    if let Some(next) = hash_of(i + RECORD_AHEAD) {
+        let slot = *at!(slots, slot_of(next, slots.len()));
+        #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
+        let group = (slot & !salt(slot)) as usize;
+        if group != 0 {
+            // SAFETY: a slot holds its group plus one, and a group in a slot
+            // has a record, so its block exists.
+            prefetch(unsafe { address(starts, stride, group - 1) }.cast_const());
+        }
+    }
+}
+
 /// The group `equal` says is the one hashed as `hash`, or the empty slot to
 /// put it in. `slots` are a power of two many.
 #[inline]
@@ -651,15 +678,6 @@ fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32,
         }
         at = (at + 1) & mask;
     }
-}
-
-/// What Perfetto's `MurmurHashCombiner` starts from.
-const SEED: u64 = 0xe17a_1465;
-
-/// `hash` with `word` combined in, as Perfetto's `MurmurHashCombiner` does.
-#[inline]
-fn combine(hash: u64, word: u64) -> u64 {
-    hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
 /// Writes the rows of `keys`, whose null words are `nulls` unless none are

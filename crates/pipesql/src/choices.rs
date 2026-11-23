@@ -2,8 +2,8 @@
 //! arguments, so compile to `CASE`, as SQL's does. An embedder registers
 //! them as the set `CHOICES`.
 
-use pipit_kernel::expression::{ExprStep, PRESENT};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::containers::SmallVec;
+use pipit_kernel::expression::{ExprBuilder, PRESENT};
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -30,7 +30,7 @@ pub const CHOICES: &[FunctionRule] = &[
 fn iif(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let values = compile_arguments(compiler, (node, depth), nodes, 3, 3)?;
     let branch = [(*at!(values, 0), *at!(values, 1))];
@@ -42,13 +42,13 @@ fn iif(
 fn coalesce(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     most: u32,
 ) -> Result<(), Error> {
     let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
     // At least two, as `compile_arguments` checked.
     let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
-    let mut branches = SlowVec::fixed(compiler.allocator(), tested.len())?;
+    let mut branches = SmallVec::fixed(compiler.env(), tested.len())?;
     for &value in tested {
         branches.push((PRESENT, value))?;
     }

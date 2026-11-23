@@ -1,9 +1,10 @@
 //! `Statement`: what a statement's plan holds for its runs to read, which
 //! the physical plan takes from the logical one.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::containers::SmallVec;
+use crate::env::Env;
 use crate::function::DynFunction;
-use crate::slow_vec::SlowVec;
 use crate::string_pool::{Id, StringPool};
 
 /// The most functions a statement binds.
@@ -15,22 +16,18 @@ pub struct Statement {
     /// have none.
     literals: Option<StringPool>,
     /// The functions its expressions call, by id: made with the first.
-    functions: Option<SlowVec<DynFunction>>,
+    functions: Option<SmallVec<DynFunction>>,
 }
 
 impl Statement {
-    /// Adds `literal` to its literals, allocating from `allocator`, which
+    /// Adds `literal` to its literals, allocating from `env`, which
     /// must outlive it, and returns its id there.
-    pub fn add_literal(
-        &mut self,
-        allocator: &dyn Allocator,
-        literal: &[u8],
-    ) -> Result<Id, AllocError> {
+    pub fn add_literal(&mut self, env: &Env, literal: &[u8]) -> Result<Id, AllocError> {
         let literals = match &mut self.literals {
             Some(literals) => literals,
-            None => self.literals.insert(StringPool::new(allocator)?),
+            None => self.literals.insert(StringPool::new(env)?),
         };
-        literals.intern_string(allocator, Some(literal))
+        literals.intern_string(env, Some(literal))
     }
 
     /// The strings it compares with, if it has any.
@@ -38,16 +35,16 @@ impl Statement {
         self.literals.as_ref()
     }
 
-    /// Adds `function`, allocating from `allocator`, which must outlive it,
+    /// Adds `function`, allocating from `env`, which must outlive it,
     /// and returns its id, or `None` if it has `FUNCTIONS_MAX`.
     pub fn add_function(
         &mut self,
-        allocator: &dyn Allocator,
+        env: &Env,
         function: DynFunction,
     ) -> Result<Option<u32>, AllocError> {
         let functions = match &mut self.functions {
             Some(functions) => functions,
-            None => self.functions.insert(SlowVec::new(allocator, FUNCTIONS_MAX)?),
+            None => self.functions.insert(SmallVec::new(env, FUNCTIONS_MAX)?),
         };
         if functions.len() == FUNCTIONS_MAX {
             return Ok(None);

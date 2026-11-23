@@ -4,6 +4,8 @@
 //! string, the last must end it, and the others are found in order between.
 //! There's no escape character, as in DuckDB by default.
 
+#![allow(unsafe_code)]
+
 use core::cell::Cell;
 
 /// Whether `text` matches `pattern`.
@@ -44,7 +46,9 @@ pub fn contained(pattern: &[u8]) -> Option<&[u8]> {
 /// string between: strings in order, as a page's are, are searched in one
 /// pass, not one each, as Pivot's `NeedleSearcher` does.
 pub struct Contains<'a> {
+    /// The strings' bytes.
     bytes: &'a [u8],
+    /// What it searches for.
     needle: &'a [u8],
     /// Where the last search started.
     from: Cell<usize>,

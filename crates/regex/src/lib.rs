@@ -6,11 +6,11 @@ compile_error!("pipitdb-regex needs an engine: the `lite` or `full` feature");
 
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::{ColumnView, DataType};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::expression::validity_of;
 use pipit_kernel::function::{DynFunction, Function};
-use pipit_kernel::slow_vec::SlowVec;
 use pipit_pipesql::ast::Node;
 use pipit_pipesql::compile::Compiler;
 use pipit_pipesql::error::{Error as CompileError, ErrorCode};
@@ -32,7 +32,7 @@ const STRINGS: (&[DataType], DataType) = (&[DataType::String; 3], DataType::Stri
 /// in `ClickHouse`'s and `DuckDB`'s.
 struct Replace {
     pattern: engine::Pattern,
-    replacement: SlowVec<u8>,
+    replacement: SmallVec<u8>,
     /// Whether the replacement has a backslash: if not, it's as it is, and
     /// the matches' groups, which cost more to find, needn't be.
     groups: bool,
@@ -49,14 +49,14 @@ fn bind(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<DynFunction, Comp
     let Some(pattern) = pattern.and_then(engine::compile) else {
         return Err(invalid(compiler, 2));
     };
-    let allocator = compiler.allocator();
+    let env = compiler.env();
     let Some(text) = compiler.string_literal(argument(compiler, 3))? else {
         return Err(invalid(compiler, 3));
     };
     let groups = text.contains(&b'\\');
-    let mut replacement = SlowVec::fixed(allocator, text.len())?;
+    let mut replacement = SmallVec::fixed(env, text.len())?;
     replacement.extend_from_slice(text)?;
-    Ok(DynFunction::new(allocator, Replace { pattern, replacement, groups })?)
+    Ok(DynFunction::new(env, Replace { pattern, replacement, groups })?)
 }
 
 impl Function for Replace {
@@ -66,7 +66,7 @@ impl Function for Replace {
         let validity = validity_of(context, arguments)?;
         let strings = text.string_values();
         let mut views = context.values_buffer(rows * 8)?;
-        let mut out = SlowVec::new(context.allocator(), 1 << 31)?;
+        let mut out = SmallVec::new(context.env(), 1 << 31)?;
         for (row, view) in views.as_mut_slice::<u32>().as_chunks_mut::<2>().0.iter_mut().enumerate()
         {
             let start = out.len();
@@ -87,7 +87,7 @@ impl Function for Replace {
 
 impl Replace {
     /// Appends `text`, with each match replaced, to `out`.
-    fn replace(&self, text: &[u8], out: &mut SlowVec<u8>) -> Result<(), AllocError> {
+    fn replace(&self, text: &[u8], out: &mut SmallVec<u8>) -> Result<(), AllocError> {
         let mut last = 0;
         each_match(&self.pattern, text, self.groups, |start, end, group| {
             out.extend_from_slice(at(text, last, start))?;
@@ -104,7 +104,7 @@ impl Replace {
         &self,
         group: &dyn Fn(usize) -> Option<(usize, usize)>,
         text: &[u8],
-        out: &mut SlowVec<u8>,
+        out: &mut SmallVec<u8>,
     ) -> Result<(), AllocError> {
         if !self.groups {
             return out.extend_from_slice(&self.replacement);
@@ -193,11 +193,9 @@ mod engine {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
-    use pipit_kernel::lower::lower;
-    use pipit_kernel::output_properties::plan_nodes;
-    use pipit_kernel::query_allocators::QueryAllocators;
+    use pipit_kernel::env::Env;
+    use pipit_kernel::lower::PhysicalPlan;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::{Catalog, DynScannable};
     use pipit_kernel::selection::Kept;
@@ -223,27 +221,26 @@ mod tests {
 
     fn catalog() -> Tables {
         let text = ROWS.concat();
-        let mut views = Buffer::allocate(&Heap, ROWS.len() * 8).unwrap();
+        let mut views = Buffer::allocate(Env::current(), ROWS.len() * 8).unwrap();
         let mut start = 0;
         for (view, row) in views.as_mut_slice::<u32>().chunks_mut(2).zip(ROWS) {
             view.copy_from_slice(&[start, u32::try_from(row.len()).unwrap()]);
             start += u32::try_from(row.len()).unwrap();
         }
-        let mut bytes = Buffer::allocate(&Heap, text.len()).unwrap();
+        let mut bytes = Buffer::allocate(Env::current(), text.len()).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(text.as_bytes());
-        let s = ColumnView::strings(&mut Context::new(&Heap), views, bytes, None).unwrap();
-        let table = Table::new(&Heap, &[("s", DataType::String)], &[&[s]]).unwrap();
-        Tables(DynScannable::new(&Heap, table).unwrap())
+        let s = ColumnView::strings(&mut Context::new(Env::current(), None), views, bytes, None)
+            .unwrap();
+        let table = Table::new(Env::current(), &[("s", DataType::String)], &[&[s]]).unwrap();
+        Tables(DynScannable::new(Env::current(), table).unwrap())
     }
 
     /// The strings of `query`'s one column, a null as `None`.
     fn strings(query: &str) -> Vec<Option<String>> {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
+        let mut execution = physical.start(Env::current()).unwrap();
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch).unwrap() {
@@ -260,7 +257,7 @@ mod tests {
 
     fn error(query: &str) -> (ErrorCode, u32) {
         let catalog = catalog();
-        let error = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
+        let error = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 

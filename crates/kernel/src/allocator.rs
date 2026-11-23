@@ -1,13 +1,47 @@
-//! Every allocation goes through an `Allocator` the caller passes in, by
-//! reference. What's allocated refers back to it, to free itself, so an
-//! allocator must outlive everything allocated from it.
+//! `Allocator`, what memory comes from, and `Heap`, the system's. A query's
+//! `Env` owns the allocator it takes memory from, and what's allocated
+//! keeps the `Env` alive, so can't outlive it.
+
+#![allow(unsafe_code)]
 
 use core::alloc::Layout;
-use core::cell::Cell;
 use core::ptr::NonNull;
+
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AllocError;
+
+/// 16 KB: the largest memory page among the systems we run on (Apple's
+/// are 16 KB, most others' 4 KB), so memory aligned to it starts on a page
+/// everywhere.
+pub(crate) const PAGE_BYTES: usize = 1 << 14;
+
+/// 256 KB: memory this big or bigger is aligned to a page.
+const LARGE_BYTES: usize = 1 << 18;
+
+/// 2 MB: Linux's huge page on x86 and on most ARM systems.
+const HUGE_PAGE_BYTES: usize = 1 << 21;
+
+/// The layout of `bytes` of memory that one owner holds, such as an
+/// `Array`'s or a `SmallVec`'s.
+///
+/// From `LARGE_BYTES` up, it's aligned to a page, as a hint to the
+/// allocator: a big block that one owner keeps for a long time, such as a
+/// hash table, is best taken from the system as whole pages and given back
+/// when freed, rather than kept in a heap. On Linux, from a huge page up,
+/// it's aligned to one, so the system backs it with huge pages and reading
+/// it at random doesn't also miss the TLB. Elsewhere that would only waste
+/// memory, as WebAssembly's, which is all one heap.
+pub(crate) fn layout(bytes: usize) -> Result<Layout, AllocError> {
+    let huge = cfg!(any(target_os = "linux", target_os = "android")) && bytes >= HUGE_PAGE_BYTES;
+    let align = match bytes {
+        _ if huge => HUGE_PAGE_BYTES,
+        LARGE_BYTES.. => PAGE_BYTES,
+        _ => BUFFER_ALIGNMENT_BYTES,
+    };
+    Layout::from_size_align(bytes, align).map_err(|_| AllocError)
+}
 
 /// # Safety
 ///
@@ -64,146 +98,16 @@ unsafe impl Allocator for Heap {
     }
 }
 
-/// Allocates from another allocator while the bytes allocated stay within
-/// `limit`, and fails past it, so a run under it can't use more memory than
-/// it's given. `peak` is the most it allocated at once. Like any allocator, it
-/// must outlive what's allocated from it: dropping it while anything is
-/// still allocated fails a check.
-pub struct LimitAllocator<'a> {
-    allocator: &'a dyn Allocator,
-    limit: usize,
-    used: Cell<usize>,
-    peak: Cell<usize>,
-}
-
-impl<'a> LimitAllocator<'a> {
-    pub fn new(allocator: &'a dyn Allocator, limit: usize) -> LimitAllocator<'a> {
-        LimitAllocator { allocator, limit, used: Cell::new(0), peak: Cell::new(0) }
-    }
-
-    /// The bytes allocated now.
-    pub fn used(&self) -> usize {
-        self.used.get()
-    }
-
-    /// The most bytes allocated at once.
-    pub fn peak(&self) -> usize {
-        self.peak.get()
-    }
-}
-
-impl LimitAllocator<'_> {
-    /// Allocates `layout`, zeroed if `zeroed`, if it fits within the limit,
-    /// and counts it.
-    fn charge(&self, layout: Layout, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
-        let used = self.used.get().checked_add(layout.size()).ok_or(AllocError)?;
-        if used > self.limit {
-            return Err(AllocError);
-        }
-        let ptr = if zeroed {
-            self.allocator.allocate_zeroed(layout)
-        } else {
-            self.allocator.allocate(layout)
-        }?;
-        self.used.set(used);
-        self.peak.set(self.peak.get().max(used));
-        Ok(ptr)
-    }
-}
-
-// SAFETY: forwards to the allocator it holds.
-unsafe impl Allocator for LimitAllocator<'_> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.charge(layout, false)
-    }
-
-    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.charge(layout, true)
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        // SAFETY: forwarded from the caller.
-        unsafe { self.allocator.deallocate(ptr, layout) };
-        self.used.set(self.used.get() - layout.size());
-    }
-
-    unsafe fn discard(&self, ptr: NonNull<u8>, len: usize) {
-        // SAFETY: forwarded from the caller.
-        unsafe { self.allocator.discard(ptr, len) };
-    }
-}
-
-impl Drop for LimitAllocator<'_> {
-    fn drop(&mut self) {
-        check!(self.used.get() == 0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boxed::Box;
 
     #[test]
-    fn fails_past_its_limit_and_counts_the_peak() {
-        let limit = LimitAllocator::new(&Heap, 1000);
-        let first = Box::new(&limit, [0_u8; 600]).unwrap();
-        // A box's header counts too.
-        let one = limit.used();
-        assert!(one > 600);
-        assert!(Box::new(&limit, [0_u8; 600]).is_err());
-        assert_eq!(limit.used(), one);
-
-        // What's freed can be allocated again.
-        drop(first);
-        assert_eq!(limit.used(), 0);
-        let second = Box::new(&limit, [0_u8; 800]).unwrap();
-        let two = limit.used();
-        drop(second);
-        assert_eq!((limit.used(), limit.peak()), (0, two));
-    }
-
-    #[test]
-    fn zeroed_memory_is_zero_and_counted() {
-        let limit = LimitAllocator::new(&Heap, 1000);
-        let layout = Layout::from_size_align(256, 64).unwrap();
-        let ptr = limit.allocate_zeroed(layout).unwrap();
-        // SAFETY: the allocation holds 256 bytes.
-        assert!(unsafe { core::slice::from_raw_parts(ptr.as_ptr(), 256) }.iter().all(|&b| b == 0));
-        assert_eq!(limit.used(), 256);
-        assert!(limit.allocate_zeroed(Layout::from_size_align(800, 64).unwrap()).is_err());
-        // SAFETY: allocated just above with this layout.
-        unsafe { limit.deallocate(ptr, layout) };
-        assert_eq!(limit.used(), 0);
-    }
-
-    /// Hands out one static block, so what's allocated from it can be
-    /// leaked without leaking heap memory.
-    struct Static;
-
-    #[repr(align(64))]
-    struct Block {
-        _bytes: [u8; 128],
-    }
-
-    static mut BLOCK: Block = Block { _bytes: [0; 128] };
-
-    // SAFETY: the block is valid for the life of the program; each test
-    // allocates from it once.
-    unsafe impl Allocator for Static {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-            check!(layout.size() <= 128 && layout.align() <= 64);
-            NonNull::new((&raw mut BLOCK).cast::<u8>()).ok_or(AllocError)
-        }
-
-        unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
-    }
-
-    #[test]
-    #[should_panic(expected = "used")]
-    fn checks_nothing_outlives_it() {
-        let limit = LimitAllocator::new(&Static, 1000);
-        // Leaked, so it's never freed through the dropped allocator.
-        core::mem::forget(Box::new(&limit, 7_u64).unwrap());
+    fn aligns_large_memory_to_pages() {
+        let align = |bytes| layout(bytes).unwrap().align();
+        assert_eq!(align(LARGE_BYTES - 1), BUFFER_ALIGNMENT_BYTES);
+        assert_eq!(align(LARGE_BYTES), PAGE_BYTES);
+        let huge = if cfg!(target_os = "linux") { HUGE_PAGE_BYTES } else { PAGE_BYTES };
+        assert_eq!(align(HUGE_PAGE_BYTES), huge);
     }
 }

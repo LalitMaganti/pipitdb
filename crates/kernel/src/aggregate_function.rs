@@ -2,14 +2,17 @@
 //! each group, and how it updates and outputs it, a batch at a time, as
 //! Perfetto's do, for the operators that aggregate.
 
+#![allow(unsafe_code)]
+
+use crate::containers::{BitSlice, Blocks, address};
 use core::cmp::Ordering;
 
 use crate::aggregate::Function;
-use crate::allocator::{AllocError, Allocator};
-use crate::blocks::{Blocks, address};
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, Validity};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::group_table::write_strings;
 use crate::row_batch::BATCH_ROWS_MAX;
@@ -30,13 +33,13 @@ pub(crate) struct AggregateInput<'a> {
 impl AggregateInput<'_> {
     /// Whether row `row` holds a value.
     pub(crate) fn is_valid(&self, row: usize) -> bool {
-        self.valid.is_none_or(|valid| *at!(valid, row / 64) >> (row % 64) & 1 != 0)
+        self.valid.is_none_or(|valid| BitSlice::of(valid).get(row))
     }
 
     /// How many rows hold a value.
     fn count_valid(&self) -> usize {
         let Some(valid) = self.valid else { return self.rows };
-        let words = at!(valid, ..self.rows.div_ceil(64)).iter().enumerate();
+        let words = at!(valid, ..BitSlice::<u64>::words_for(self.rows)).iter().enumerate();
         let counts = words.map(|(w, &word)| {
             let n = (self.rows - w * 64).min(64);
             let mask = if n == 64 { u64::MAX } else { (1 << n) - 1 };
@@ -87,9 +90,13 @@ pub(crate) struct GroupStates<'a> {
 }
 
 impl GroupStates<'_> {
-    /// Where `group`'s state starts. Callers pass only groups that exist.
+    /// Where `group`'s state starts.
+    ///
+    /// # Safety
+    ///
+    /// `group` must exist.
     #[inline]
-    fn state(&self, group: u32) -> *mut i64 {
+    unsafe fn state(&self, group: u32) -> *mut i64 {
         // SAFETY: the group exists, so its record does, with its state in it.
         unsafe { address(self.blocks, self.stride, group as usize).add(self.offset) }
     }
@@ -135,15 +142,15 @@ pub(crate) struct SeenBytes {
 }
 
 impl SeenBytes {
-    pub(crate) fn new(allocator: &dyn Allocator) -> Result<SeenBytes, AllocError> {
-        Ok(SeenBytes { bytes: Blocks::new(allocator, 1)?, tracking: false, groups: 0 })
+    pub(crate) fn new(env: &Env) -> Result<SeenBytes, AllocError> {
+        Ok(SeenBytes { bytes: Blocks::new(env, 1)?, tracking: false, groups: 0 })
     }
 
     /// What to pass as `GroupStates::seen` for a batch with `groups` groups
     /// in all, whose input holds nulls if `nulls`.
     pub(crate) fn get(
         &mut self,
-        allocator: &dyn Allocator,
+        env: &Env,
         groups: usize,
         nulls: bool,
     ) -> Result<Option<&[*mut u8]>, AllocError> {
@@ -152,7 +159,7 @@ impl SeenBytes {
             return Ok(None);
         }
         // New groups' bytes start zeroed.
-        self.bytes.reserve(allocator, groups)?;
+        self.bytes.reserve(env, groups)?;
         if !self.tracking {
             // Every group so far added only values.
             self.tracking = true;
@@ -224,7 +231,7 @@ pub(crate) fn finalize_to_buffer(
 ) -> Result<ColumnView, Error> {
     let rows = groups.len();
     let mut values = context.values_buffer(rows * 8)?;
-    let mut valid = context.small_buffer(rows.div_ceil(8))?;
+    let mut valid = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
     let bits = valid.as_mut_slice::<u8>();
     function.finalize(states, groups, values.as_mut_slice(), bits);
     let (whole, last) = (rows / 8, rows % 8);
@@ -262,14 +269,12 @@ fn scatter(
     let seen = states.seen.take();
     let values = if input.values.is_empty() { None } else { Some(input.values) };
     check!(groups.len() >= rows && values.is_none_or(|values| values.len() >= rows));
-    check!(input.valid.is_none_or(|valid| valid.len() >= rows.div_ceil(64)));
+    check!(input.valid.is_none_or(|valid| valid.len() >= BitSlice::<u64>::words_for(rows)));
     for row in 0..rows {
         // SAFETY: the bounds are checked above, and each number is a group's,
         // whose state is in `states`, and whose byte is in `seen`.
         unsafe {
-            let valid = input
-                .valid
-                .is_none_or(|valid| *valid.get_unchecked(row / 64) >> (row % 64) & 1 != 0);
+            let valid = input.valid.is_none_or(|valid| BitSlice::of(valid).get_unchecked(row));
             let group = *groups.get_unchecked(row);
             let value = values.map_or(0, |values| *values.get_unchecked(row));
             add(core::slice::from_raw_parts_mut(states.state(group), words), value, valid);
@@ -540,7 +545,7 @@ impl StringExtreme {
             let value = match form {
                 Form::Flat => row,
                 Form::Dictionary(indices) => *at!(indices, row) as usize,
-                Form::Constant => failed!(),
+                Form::Constant | Form::Sequence(_) => failed!(),
             };
             #[expect(clippy::cast_possible_truncation, reason = "a batch's value")]
             (!values.is_null(value as u32)).then(|| strings.get(value))
@@ -549,7 +554,7 @@ impl StringExtreme {
         let mut touched = context.indices_buffer(rows * 4)?;
         let touched = touched.as_mut_slice::<u32>();
         let mut count = 0;
-        let allocator = context.allocator();
+        let env = context.env();
         let pool = context.string_pool()?;
         for i in 0..rows {
             let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
@@ -580,8 +585,7 @@ impl StringExtreme {
         for &group in at!(touched, ..count) {
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a row")]
             let row = (states.word(group) & !BATCH_ROW) as usize;
-            *states.word_mut(group) =
-                i64::from(pool.intern_string(allocator, string(row))?.raw_id());
+            *states.word_mut(group) = i64::from(pool.intern_string(env, string(row))?.raw_id());
         }
         Ok(())
     }
@@ -693,12 +697,12 @@ fn validity(
     rows: usize,
 ) -> Result<Option<Buffer>, Error> {
     let Some(validity) = column.validity() else { return Ok(None) };
-    let mut words = context.small_buffer(rows.div_ceil(64) * 8)?;
-    let out = words.as_mut_slice::<u64>();
-    out.fill(0);
+    let mut words = context.small_buffer(BitSlice::<u64>::words_for(rows) * 8)?;
+    words.as_mut_slice::<u64>().fill(0);
+    let out = BitSlice::of_mut(words.as_mut_slice::<u64>());
     for i in 0..rows {
         let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
-        *at_mut!(out, i / 64) |= u64::from(is_valid(validity, row)) << (i % 64);
+        out.set_if(i, is_valid(validity, row));
     }
     Ok(Some(words))
 }

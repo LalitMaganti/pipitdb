@@ -8,14 +8,17 @@
 //! A step fails, with an `Error`, if it can't allocate what it needs or
 //! read its data, which ends the run. Steps never drop rows instead.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::boxed::{Box, ErasedBox};
+use crate::allocator::AllocError;
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::containers::{Array, Box, ErasedBox};
 use crate::context::Context;
+use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::RowBatch;
@@ -161,8 +164,8 @@ pub enum Step<'a> {
 impl Step<'_> {
     pub(crate) fn state_layout(&self) -> Layout {
         match self {
-            Step::Transform(transform) => transform.state_layout,
-            Step::Operator(operator) => operator.state_layout,
+            Step::Transform(transform) => transform.functions.state_layout,
+            Step::Operator(operator) => operator.functions.state_layout,
         }
     }
 
@@ -188,26 +191,30 @@ impl Step<'_> {
     /// `state` must hold this step's state, which is then dropped.
     pub(crate) unsafe fn drop_state(&self, state: NonNull<u8>) {
         let drop_state = match self {
-            Step::Transform(transform) => transform.drop_state,
-            Step::Operator(operator) => operator.drop_state,
+            Step::Transform(transform) => transform.functions.drop_state,
+            Step::Operator(operator) => operator.functions.drop_state,
         };
         // SAFETY: upheld by the caller.
         unsafe { drop_state(state) }
     }
 }
 
-/// A step of any type that lives for `'a`, owned in memory from an allocator:
-/// a pointer to it, and functions that know its type. `F` is the function a
-/// pipeline calls for each batch.
-pub struct Erased<'a, F> {
+/// A step of any type that lives for `'a`, owned in memory from an `Env`,
+/// and its type's functions.
+pub struct Erased<'a, F: 'static> {
     step: ErasedBox,
-    pub(crate) state_layout: Layout,
-    new_state: NewState,
-    pub(crate) drop_state: unsafe fn(NonNull<u8>),
-    run: F,
-    lifetime: PhantomData<&'a ()>,
+    pub(crate) functions: &'a StepFunctions<F>,
     #[cfg(test)]
     pub(crate) name: &'static str,
+}
+
+/// A step type's functions, and the layout of its state: one table for each
+/// type. `F` is what a pipeline calls for each batch.
+pub(crate) struct StepFunctions<F> {
+    pub(crate) state_layout: Layout,
+    pub(crate) new_state: NewState,
+    pub(crate) drop_state: unsafe fn(NonNull<u8>),
+    pub(crate) run: F,
 }
 
 /// Makes a step's state at the given place, or fails without making it.
@@ -240,61 +247,117 @@ pub struct OperatorFunctions {
     finish: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Executed,
 }
 
-impl<'a> DynSource<'a> {
-    /// A source from parts that already agree on its step's and state's types,
-    /// named `name` for tests to print plans.
+impl<'a, F> Erased<'a, F> {
+    /// A step from a table of functions for its type, named `name` for tests
+    /// to print plans.
     ///
     /// # Safety
     ///
-    /// The functions must take `step` and a state of `state_layout`, and the
-    /// step must live for `'a`.
+    /// The functions must take `step`, and the step must live for `'a`.
     pub(crate) unsafe fn from_parts(
         step: ErasedBox,
-        state_layout: Layout,
-        new_state: NewState,
-        drop_state: unsafe fn(NonNull<u8>),
-        next: SourceNext,
+        functions: &'a StepFunctions<F>,
         name: &'static str,
-    ) -> DynSource<'a> {
+    ) -> Erased<'a, F> {
         #[cfg(not(test))]
         let _ = name;
         Erased {
             step,
-            state_layout,
-            new_state,
-            drop_state,
-            run: next,
-            lifetime: PhantomData,
+            functions,
             #[cfg(test)]
             name,
         }
     }
+}
 
-    pub fn new<T: Source + 'a>(
-        allocator: &dyn Allocator,
-        source: T,
-    ) -> Result<DynSource<'a>, AllocError> {
-        const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
-        Ok(Erased {
-            step: Box::new(allocator, source)?.erase(),
-            state_layout: Layout::new::<T::State>(),
-            // SAFETY: only called with this source and its state, as is each below.
-            new_state: |source, context, state| unsafe {
-                let made = value_of::<T>(source).new_state(context)?;
-                write_state(state, made);
-                Ok(())
-            },
-            drop_state: drop_state::<T::State>,
+/// Holds `T`'s table.
+struct Functions<'a, T>(PhantomData<(&'a (), T)>);
+
+impl<'a, T: Source + 'a> Functions<'a, T> {
+    const SOURCE: StepFunctions<SourceNext> = StepFunctions {
+        state_layout: Layout::new::<T::State>(),
+        // SAFETY: only called with this source and its state, as is each below.
+        new_state: |source, context, state| unsafe {
+            let made = value_of::<T>(source).new_state(context)?;
+            write_state(state, made);
+            Ok(())
+        },
+        drop_state: drop_state::<T::State>,
+        // SAFETY: as above.
+        // The batch's columns may view the source, which lives for `'a`.
+        run: |source, context, state, batch| unsafe {
+            let batch = batch.cast::<RowBatch<'a>>().as_mut();
+            value_of::<T>(source).next(context, state_of::<T::State>(state), batch)
+        },
+    };
+}
+
+impl<'a, T: Transform + 'a> Functions<'a, T> {
+    const TRANSFORM: StepFunctions<TransformProcess> = StepFunctions {
+        state_layout: Layout::new::<T::State>(),
+        // SAFETY: only called with this transform and its state, as is each below.
+        new_state: |transform, context, state| unsafe {
+            let made = value_of::<T>(transform).new_state(context)?;
+            write_state(state, made);
+            Ok(())
+        },
+        drop_state: drop_state::<T::State>,
+        // SAFETY: as above.
+        run: |transform, context, state, batch| unsafe {
+            value_of::<T>(transform).process(context, state_of::<T::State>(state), batch)
+        },
+    };
+}
+
+impl<'a, T: Operator + 'a> Functions<'a, T> {
+    const OPERATOR: StepFunctions<OperatorFunctions> = StepFunctions {
+        state_layout: Layout::new::<T::State>(),
+        // SAFETY: only called with this operator and its state, as is each below.
+        new_state: |operator, context, state| unsafe {
+            let made = value_of::<T>(operator).new_state(context)?;
+            write_state(state, made);
+            Ok(())
+        },
+        drop_state: drop_state::<T::State>,
+        run: OperatorFunctions {
             // SAFETY: as above.
-            // The batch's columns may view the source, which lives for `'a`.
-            run: |source, context, state, batch| unsafe {
-                let batch = batch.cast::<RowBatch<'a>>().as_mut();
-                value_of::<T>(source).next(context, state_of::<T::State>(state), batch)
+            execute: |operator, context, state, input, output| unsafe {
+                let state = state_of::<T::State>(state);
+                value_of::<T>(operator).execute(context, state, input, output)
             },
-            lifetime: PhantomData,
+            // SAFETY: as above.
+            finish: |operator, context, state, output| unsafe {
+                value_of::<T>(operator).finish(context, state_of::<T::State>(state), output)
+            },
+        },
+    };
+}
+
+impl<'a> DynSource<'a> {
+    pub fn new<T: Source + 'a>(env: &Env, source: T) -> Result<DynSource<'a>, AllocError> {
+        const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        let step = Box::new(env, source)?.erase();
+        let functions = &Functions::<'a, T>::SOURCE;
+        Ok(Erased {
+            step,
+            functions,
             #[cfg(test)]
             name: type_name::<T>(),
         })
+    }
+
+    /// A run of this source outside a pipeline, such as of a join's build
+    /// side, which the join drains: its state, in memory from `context`'s
+    /// `Env`.
+    pub fn start<'s>(&'s self, context: &mut Context) -> Result<SourceRun<'s, 'a>, Error> {
+        let size_bytes = self.functions.state_layout.size().max(1);
+        // SAFETY: `new_state` writes the state, and nothing reads the rest.
+        let memory = unsafe { Array::<u8>::uninit(context.env(), size_bytes)? };
+        let state = memory.as_non_null();
+        // SAFETY: the memory has the state's size, and alignment, which
+        // `new` checked is at most a buffer's.
+        unsafe { (self.functions.new_state)(self.step.as_ptr(), context, state)? };
+        Ok(SourceRun { source: self, state, _memory: memory })
     }
 
     /// # Safety
@@ -306,61 +369,47 @@ impl<'a> DynSource<'a> {
         state: NonNull<u8>,
         batch: &mut RowBatch<'a>,
     ) -> Result<bool, Error> {
+        let batch = NonNull::from(batch).cast();
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
-        unsafe { (self.run)(self.step.as_ptr(), context, state, NonNull::from(batch).cast()) }
+        unsafe { (self.functions.run)(self.step.as_ptr(), context, state, batch) }
+    }
+}
+
+/// A run of a source outside a pipeline, from `DynSource::start`.
+pub struct SourceRun<'s, 'a> {
+    /// The source it runs.
+    source: &'s DynSource<'a>,
+    /// The source's state, in `_memory`.
+    state: NonNull<u8>,
+    /// Holds the state.
+    _memory: Array<u8>,
+}
+
+impl<'a> SourceRun<'_, 'a> {
+    /// Fills `batch` with the next batch, or returns false when none are
+    /// left.
+    pub fn next(&mut self, context: &mut Context, batch: &mut RowBatch<'a>) -> Result<bool, Error> {
+        // SAFETY: `start` made the state.
+        unsafe { self.source.next(context, self.state, batch) }
+    }
+}
+
+impl Drop for SourceRun<'_, '_> {
+    fn drop(&mut self) {
+        // SAFETY: `start` made the state, which is dropped once.
+        unsafe { (self.source.functions.drop_state)(self.state) }
     }
 }
 
 impl<'a> DynTransform<'a> {
-    /// A transform from parts that already agree on its step's and state's
-    /// types, named `name` for tests to print plans.
-    ///
-    /// # Safety
-    ///
-    /// As for `DynSource::from_parts`.
-    pub(crate) unsafe fn from_parts(
-        step: ErasedBox,
-        state_layout: Layout,
-        new_state: NewState,
-        drop_state: unsafe fn(NonNull<u8>),
-        process: TransformProcess,
-        name: &'static str,
-    ) -> DynTransform<'a> {
-        #[cfg(not(test))]
-        let _ = name;
-        Erased {
-            step,
-            state_layout,
-            new_state,
-            drop_state,
-            run: process,
-            lifetime: PhantomData,
-            #[cfg(test)]
-            name,
-        }
-    }
-
-    pub fn new<T: Transform + 'a>(
-        allocator: &dyn Allocator,
-        transform: T,
-    ) -> Result<DynTransform<'a>, AllocError> {
+    pub fn new<T: Transform + 'a>(env: &Env, transform: T) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        let step = Box::new(env, transform)?.erase();
+        let functions = &Functions::<'a, T>::TRANSFORM;
         Ok(Erased {
-            step: Box::new(allocator, transform)?.erase(),
-            state_layout: Layout::new::<T::State>(),
-            // SAFETY: only called with this transform and its state, as is each below.
-            new_state: |transform, context, state| unsafe {
-                let made = value_of::<T>(transform).new_state(context)?;
-                write_state(state, made);
-                Ok(())
-            },
-            drop_state: drop_state::<T::State>,
-            // SAFETY: as above.
-            run: |transform, context, state, batch| unsafe {
-                value_of::<T>(transform).process(context, state_of::<T::State>(state), batch)
-            },
-            lifetime: PhantomData,
+            step,
+            functions,
             #[cfg(test)]
             name: type_name::<T>(),
         })
@@ -376,38 +425,18 @@ impl<'a> DynTransform<'a> {
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run)(self.step.as_ptr(), context, state, batch) }
+        unsafe { (self.functions.run)(self.step.as_ptr(), context, state, batch) }
     }
 }
 
 impl<'a> DynOperator<'a> {
-    pub fn new<T: Operator + 'a>(
-        allocator: &dyn Allocator,
-        operator: T,
-    ) -> Result<DynOperator<'a>, AllocError> {
+    pub fn new<T: Operator + 'a>(env: &Env, operator: T) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
+        let step = Box::new(env, operator)?.erase();
+        let functions = &Functions::<'a, T>::OPERATOR;
         Ok(Erased {
-            step: Box::new(allocator, operator)?.erase(),
-            state_layout: Layout::new::<T::State>(),
-            // SAFETY: only called with this operator and its state, as is each below.
-            new_state: |operator, context, state| unsafe {
-                let made = value_of::<T>(operator).new_state(context)?;
-                write_state(state, made);
-                Ok(())
-            },
-            drop_state: drop_state::<T::State>,
-            run: OperatorFunctions {
-                // SAFETY: as above.
-                execute: |operator, context, state, input, output| unsafe {
-                    let state = state_of::<T::State>(state);
-                    value_of::<T>(operator).execute(context, state, input, output)
-                },
-                // SAFETY: as above.
-                finish: |operator, context, state, output| unsafe {
-                    value_of::<T>(operator).finish(context, state_of::<T::State>(state), output)
-                },
-            },
-            lifetime: PhantomData,
+            step,
+            functions,
             #[cfg(test)]
             name: type_name::<T>(),
         })
@@ -424,7 +453,7 @@ impl<'a> DynOperator<'a> {
         output: &mut RowBatch,
     ) -> Executed {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.execute)(self.step.as_ptr(), context, state, input, output) }
+        unsafe { (self.functions.run.execute)(self.step.as_ptr(), context, state, input, output) }
     }
 
     /// # Safety
@@ -437,7 +466,7 @@ impl<'a> DynOperator<'a> {
         output: &mut RowBatch,
     ) -> Executed {
         // SAFETY: as in `DynSource::next`.
-        unsafe { (self.run.finish)(self.step.as_ptr(), context, state, output) }
+        unsafe { (self.functions.run.finish)(self.step.as_ptr(), context, state, output) }
     }
 }
 
@@ -454,7 +483,7 @@ impl<F> Erased<'_, F> {
     ) -> Result<(), Error> {
         // SAFETY: `new_state` matches `step`'s type, and the caller upholds
         // the rest.
-        unsafe { (self.new_state)(self.step.as_ptr(), context, state) }
+        unsafe { (self.functions.new_state)(self.step.as_ptr(), context, state) }
     }
 }
 

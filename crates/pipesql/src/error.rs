@@ -1,6 +1,8 @@
 //! Errors a caller can cause, such as a bad query. They carry no text:
 //! The `diagnostics` feature turns them into messages.
 
+#![allow(unsafe_code)]
+
 use pipit_kernel::allocator::AllocError;
 
 /// The bytes `start..start + len` of the query.
@@ -15,21 +17,33 @@ pub struct Span {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u16)]
 pub enum ErrorCode {
+    /// A query too large to parse: its text past 4 GiB, or more nodes than
+    /// its tree can hold.
     QueryTooLarge = 1,
+    /// A character no token starts with.
     UnexpectedCharacter = 2,
+    /// A string with no closing quote.
     UnterminatedString = 3,
+    /// A token longer than a leaf can hold, 16 MiB.
     TokenTooLong = 4,
+    /// An expression isn't next where one is needed.
     ExpectedExpression = 5,
+    /// A token where none of its kind can go.
     UnexpectedToken = 6,
     /// `detail` is the `TokenKind` that was expected.
     ExpectedToken = 7,
+    /// An expression nested too deeply, or a call with too many arguments,
+    /// for the parser's stack.
     NestingTooDeep = 8,
+    /// An allocation failed.
     OutOfMemory = 9,
+    /// A stage's keyword names no rule in the registry.
     UnknownStage = 10,
     /// A query must start with a source, like `FROM`.
     ExpectedSource = 11,
     /// A source, like `FROM`, can only start a query.
     UnexpectedSource = 12,
+    /// A list of more than `LIST_MAX` items.
     ListTooLong = 13,
     /// `FROM` names a table the catalog doesn't have.
     UnknownTable = 14,
@@ -112,13 +126,19 @@ pub enum Unsupported {
     GroupKey = 8,
     /// An `ORDER BY` key that isn't a column.
     OrderBy = 9,
+    /// A join, which can't be run yet.
+    Join = 10,
+    /// A condition that's a double, not a comparison or an integer.
+    DoubleCondition = 11,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Error {
+    /// What went wrong.
     pub code: ErrorCode,
     /// Depends on `code`.
     pub detail: u16,
+    /// Where in the query it went wrong.
     pub span: Span,
 }
 

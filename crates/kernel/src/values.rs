@@ -2,15 +2,15 @@
 //! known without reading any rows.
 
 use crate::column::{ColumnView, DataType};
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::slow_vec::SlowVec;
 use crate::step::Source;
 
 /// Outputs one row: each column's `Int64`.
 pub struct Values {
-    pub values: SlowVec<i64>,
+    pub values: SmallVec<i64>,
 }
 
 impl Source for Values {

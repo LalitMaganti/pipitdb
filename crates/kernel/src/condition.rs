@@ -45,10 +45,11 @@ impl Condition {
 
 /// A column of a scannable a `TopK` above its scan sorts by first, and
 /// whether descending: once the `TopK` holds enough rows, it publishes the
-/// first key of the last it keeps in the run's `Context`, and rows which
-/// sort after that can be skipped.
+/// first key of the last it keeps in the run's `Context`, in `slot`, and
+/// rows which sort after that can be skipped.
 #[derive(Clone, Copy)]
 pub struct Cutoff {
+    pub slot: u32,
     pub column: u32,
     pub descending: bool,
 }
@@ -59,7 +60,9 @@ impl Cutoff {
     /// later keys can break the tie. Nulls sort first, so before any cutoff
     /// ascending and after it descending.
     pub fn may_keep(self, context: &Context, bounds: Option<Bounds>, nulls: Option<u64>) -> bool {
-        let (Some(cutoff), Some(bounds)) = (context.cutoff(), bounds) else { return true };
+        let (Some(cutoff), Some(bounds)) = (context.cutoff(self.slot), bounds) else {
+            return true;
+        };
         if self.descending {
             bounds.max >= cutoff
         } else {
@@ -167,9 +170,10 @@ mod tests {
     use alloc::vec::Vec as StdVec;
 
     use super::*;
-    use crate::allocator::Heap;
+
+    use crate::containers::SmallVec;
+    use crate::env::Env;
     use crate::filter::Comparison;
-    use crate::slow_vec::SlowVec;
 
     /// A predicate on one column, to build and to evaluate by hand.
     #[derive(Clone)]
@@ -207,7 +211,7 @@ mod tests {
         }
     }
 
-    fn build(expr: &Expr, nodes: &mut SlowVec<Node>) -> u32 {
+    fn build(expr: &Expr, nodes: &mut SmallVec<Node>) -> u32 {
         let node = match expr {
             &Expr::Compare(comparison, value) => {
                 Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
@@ -224,6 +228,7 @@ mod tests {
     #[test]
     fn keeps_the_values_and_nulls_sql_does() {
         use alloc::boxed::Box;
+        let env = Env::current();
         let comparisons = [
             Comparison::Equal,
             Comparison::NotEqual,
@@ -256,7 +261,7 @@ mod tests {
         let values = (-2..=8).chain([i64::MIN, i64::MAX]);
         let mut said = 0;
         for expr in leaves.iter().chain(&first).chain(&second) {
-            let mut nodes = SlowVec::new(&Heap, 64).unwrap();
+            let mut nodes = SmallVec::new(env, 64).unwrap();
             build(expr, &mut nodes);
             let condition = Condition::new(0, &Predicate::new(nodes));
             assert_eq!(condition.nulls, reference(expr, None) == Some(true));
@@ -274,7 +279,7 @@ mod tests {
         }
         // Every comparison, and most of what's made of them, is one range.
         assert!(leaves.iter().all(|leaf| {
-            let mut nodes = SlowVec::new(&Heap, 64).unwrap();
+            let mut nodes = SmallVec::new(env, 64).unwrap();
             build(leaf, &mut nodes);
             !matches!(Condition::new(0, &Predicate::new(nodes)).values, Values::Ranges)
         }));
@@ -283,8 +288,9 @@ mod tests {
 
     #[test]
     fn may_keep_rows_within_bounds_only_if_a_value_there_is_kept() {
+        let env = Env::current();
         let condition = |expr: &Expr| {
-            let mut nodes = SlowVec::new(&Heap, 8).unwrap();
+            let mut nodes = SmallVec::new(env, 8).unwrap();
             build(expr, &mut nodes);
             Condition::new(0, &Predicate::new(nodes))
         };
@@ -305,20 +311,25 @@ mod tests {
 
     #[test]
     fn cutoffs_skip_only_rows_that_sort_after_them() {
-        let mut context = Context::new(&Heap);
-        let (ascending, descending) =
-            (Cutoff { column: 0, descending: false }, Cutoff { column: 0, descending: true });
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let ascending = Cutoff { slot: 1, column: 0, descending: false };
+        let descending = Cutoff { slot: 1, column: 0, descending: true };
         let bounds = Some(Bounds { min: 10, max: 20 });
         // Until one is published, nothing is skipped.
         assert!(ascending.may_keep(&context, bounds, Some(0)));
-        context.set_cutoff(Some(5));
+        context.reserve_cutoff(1).unwrap();
+        context.set_cutoff(1, Some(5));
         assert!(!ascending.may_keep(&context, bounds, Some(0)));
         // Nulls come first ascending, and a tie may win on later keys.
         assert!(ascending.may_keep(&context, bounds, None));
-        context.set_cutoff(Some(10));
+        context.set_cutoff(1, Some(10));
         assert!(ascending.may_keep(&context, bounds, Some(0)));
-        context.set_cutoff(Some(25));
+        context.set_cutoff(1, Some(25));
         assert!(!descending.may_keep(&context, bounds, None));
         assert!(descending.may_keep(&context, None, Some(0)));
+        // A cutoff in another slot is another `TopK`'s, for another scan.
+        let other = Cutoff { slot: 0, ..ascending };
+        assert!(other.may_keep(&context, bounds, Some(0)));
     }
 }

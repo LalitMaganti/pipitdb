@@ -1,5 +1,12 @@
-//! Helpers for the functions a `Dyn*` stores, which take a value and its state
-//! as untyped pointers and know their types.
+//! A `Dyn*` holds a value of any type behind an untyped pointer, and a table
+//! of functions that know that type: one table for each type, whose
+//! functions take the value, and its state if it has one, as untyped
+//! pointers. These are helpers for those functions.
+//!
+//! TODO: make the tables `#[repr(C)]`, with `extern "C"` functions over C
+//! types, so code in other languages can implement these interfaces.
+
+#![allow(unsafe_code)]
 
 use core::ptr::NonNull;
 

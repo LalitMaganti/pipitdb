@@ -5,8 +5,8 @@ use std::hint::black_box;
 
 use gungraun::prelude::*;
 use pipit_file::source::FileSource;
-use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
+use pipit_kernel::join_planner::QueryGraph;
 use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::scannable::{Catalog, DynScannable};
@@ -55,6 +55,29 @@ fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
 
 library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
 
+// Planning the joins of 2 to 16 tables, as a star and as a chain. Most
+// queries join few tables, so planning them has to be cheap.
+#[library_benchmark]
+#[bench::star_2(pipitdb_bench::join_planner::join_graph(true, 2))]
+#[bench::star_3(pipitdb_bench::join_planner::join_graph(true, 3))]
+#[bench::star_5(pipitdb_bench::join_planner::join_graph(true, 5))]
+#[bench::star_8(pipitdb_bench::join_planner::join_graph(true, 8))]
+#[bench::star_12(pipitdb_bench::join_planner::join_graph(true, 12))]
+#[bench::star_13(pipitdb_bench::join_planner::join_graph(true, 13))]
+#[bench::star_16(pipitdb_bench::join_planner::join_graph(true, 16))]
+#[bench::chain_2(pipitdb_bench::join_planner::join_graph(false, 2))]
+#[bench::chain_3(pipitdb_bench::join_planner::join_graph(false, 3))]
+#[bench::chain_5(pipitdb_bench::join_planner::join_graph(false, 5))]
+#[bench::chain_8(pipitdb_bench::join_planner::join_graph(false, 8))]
+#[bench::chain_12(pipitdb_bench::join_planner::join_graph(false, 12))]
+#[bench::chain_13(pipitdb_bench::join_planner::join_graph(false, 13))]
+#[bench::chain_16(pipitdb_bench::join_planner::join_graph(false, 16))]
+fn join_planner(graph: QueryGraph) -> usize {
+    black_box(pipitdb_bench::join_planner::plan_joins(black_box(&graph)))
+}
+
+library_benchmark_group!(name = join_planner_group, benchmarks = [join_planner]);
+
 // Perfetto's `filter_benchmark.cc`, on the same 2^20 rows, planned first.
 #[library_benchmark]
 #[bench::eq_uint32(pipitdb_bench::perfetto_filter_plan(0))]
@@ -96,8 +119,20 @@ library_benchmark_group!(
 #[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
 #[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
 #[bench::operators(pipitdb_bench::pass_pipeline(1000, 4, true))]
+#[bench::nested(pipitdb_bench::nested_pipeline(1000))]
 fn pipeline(pipeline: Pipeline<'static>) -> u64 {
     black_box(pipitdb_bench::run(black_box(&pipeline)))
+}
+
+// 64K slices joined to 4K threads by id: stored as a sequence, shuffled, or
+// spread far apart, against scanning the slices alone.
+#[library_benchmark]
+#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::No))]
+#[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Ids))]
+#[bench::shuffled(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Shuffled))]
+#[bench::spread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Spread))]
+fn join(plan: PhysicalPlan<'static>) -> u64 {
+    black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
 
 #[library_benchmark]
@@ -148,8 +183,16 @@ fn string_pool_get(
 
 library_benchmark_group!(
     name = pipeline_group,
-    benchmarks =
-        [pipeline, scan, filter, predicate, flat_hash_map, string_pool_intern, string_pool_get]
+    benchmarks = [
+        pipeline,
+        scan,
+        join,
+        filter,
+        predicate,
+        flat_hash_map,
+        string_pool_intern,
+        string_pool_get
+    ]
 );
 
 /// The table `hits`, over ClickBench's first file.
@@ -180,8 +223,9 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
     let file: &'static FileSource =
         Box::leak(Box::new(FileSource::open(&path).expect("clickbench/fetch.sh fetched it")));
     let sources: &'static [&dyn ByteSource] = Box::leak(Box::new([file as &dyn ByteSource]));
-    let table = ParquetTable::open(&Heap, &Codecs, sources).expect("a Parquet file");
-    let hits = Hits(DynScannable::new(&Heap, table).expect("allocates"));
+    let env = pipitdb_bench::env();
+    let table = ParquetTable::open(env, &Codecs, sources).expect("a Parquet file");
+    let hits = Hits(DynScannable::new(env, table).expect("allocates"));
     let query = pipitdb_bench::real::clickbench_query(name).expect("a query pipitdb runs");
     Some(pipitdb_bench::plan(Box::leak(Box::new(hits)), query).expect("compiles"))
 }
@@ -224,6 +268,7 @@ main!(
     library_benchmark_groups = lexer_group,
     parser_group,
     small_group,
+    join_planner_group,
     perfetto_filter_group,
     pipeline_group,
     clickbench_group

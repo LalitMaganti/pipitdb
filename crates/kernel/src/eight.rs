@@ -1,7 +1,8 @@
 //! Comparisons of eight values at once, with each target's vector
-//! instructions, answering as the bits of a byte: bit `j` for the value at
-//! `at + j`. Where a target has none, `EIGHT_AT_A_TIME` is false and filters
-//! don't call them.
+//! instructions, answering as `Halves`. Where a target has none,
+//! `EIGHT_AT_A_TIME` is false and filters don't call them.
+
+#![allow(unsafe_code)]
 
 /// Whether this target compares eight values at once.
 pub(crate) const EIGHT_AT_A_TIME: bool = cfg!(any(
@@ -10,6 +11,12 @@ pub(crate) const EIGHT_AT_A_TIME: bool = cfg!(any(
     all(target_arch = "wasm32", target_feature = "simd128"),
 ));
 
+/// Which of eight values a comparison is true for: the first four's as the
+/// low four bits of one byte, bit `j` for the value at `at + j`, and the
+/// last four's of the other. Selections write each four's rows apart, so
+/// they're never packed into one byte only to be split again.
+pub(crate) type Halves = (u8, u8);
+
 /// Which of the eight `cells` from `at` are in `lo..=lo + span`, taken as
 /// `(cell - lo) as u64 <= span`.
 ///
@@ -17,7 +24,7 @@ pub(crate) const EIGHT_AT_A_TIME: bool = cfg!(any(
 ///
 /// `cells` must have a cell at `at + 7`.
 #[inline]
-pub(crate) unsafe fn in_range(cells: &[i64], at: usize, lo: i64, span: u64) -> u8 {
+pub(crate) unsafe fn in_range(cells: &[i64], at: usize, lo: i64, span: u64) -> Halves {
     // SAFETY: as the caller promises.
     unsafe { imp::in_range(cells.as_ptr().add(at), lo, span) }
 }
@@ -28,7 +35,7 @@ pub(crate) unsafe fn in_range(cells: &[i64], at: usize, lo: i64, span: u64) -> u
 ///
 /// `indices` must have an index at `at + 7`.
 #[inline]
-pub(crate) unsafe fn equal(indices: &[u32], at: usize, index: u32) -> u8 {
+pub(crate) unsafe fn equal(indices: &[u32], at: usize, index: u32) -> Halves {
     // SAFETY: as the caller promises.
     unsafe { imp::equal(indices.as_ptr().add(at), index) }
 }
@@ -43,8 +50,14 @@ mod imp {
         _mm256_set1_epi64x, _mm256_sub_epi64, _mm256_xor_si256,
     };
 
+    /// The halves of `byte`, the bits of eight values.
     #[inline]
-    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> u8 {
+    fn halves(byte: u8) -> super::Halves {
+        (byte & 15, byte >> 4)
+    }
+
+    #[inline]
+    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> super::Halves {
         // SAFETY: the build has AVX2, and the caller that the cells are there.
         unsafe {
             let top = _mm256_set1_epi64x(i64::MIN);
@@ -56,14 +69,14 @@ mod imp {
                 let offsets = _mm256_xor_si256(_mm256_sub_epi64(keys, lo), top);
                 _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(offsets, span)))
             };
-            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
-            let outside = (outside(cells) | outside(cells.add(4)) << 4) as u8;
-            !outside
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "4 bits")]
+            let inside = |cells| (outside(cells) ^ 15) as u8;
+            (inside(cells), inside(cells.add(4)))
         }
     }
 
     #[inline]
-    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> u8 {
+    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> super::Halves {
         // SAFETY: the build has AVX2, and the caller that the indices are there.
         unsafe {
             #[expect(clippy::cast_ptr_alignment, reason = "an unaligned load")]
@@ -71,7 +84,7 @@ mod imp {
             let equal = _mm256_cmpeq_epi32(eight, _mm256_set1_epi32(index.cast_signed()));
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "8 bits")]
             let byte = _mm256_movemask_ps(_mm256_castsi256_ps(equal)) as u8;
-            byte
+            halves(byte)
         }
     }
 }
@@ -87,6 +100,12 @@ mod imp {
         vmovn_u64, vreinterpretq_u64_s64, vsubq_s64,
     };
 
+    /// The halves of `byte`, the bits of eight values.
+    #[inline]
+    fn halves(byte: u8) -> super::Halves {
+        (byte & 15, byte >> 4)
+    }
+
     /// Bit `j` in byte `j`.
     static BITS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
@@ -98,7 +117,7 @@ mod imp {
     }
 
     #[inline]
-    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> u8 {
+    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> super::Halves {
         // SAFETY: NEON is part of aarch64, and the caller says the cells are
         // there.
         unsafe {
@@ -109,18 +128,18 @@ mod imp {
                 vmovn_u64(vcleq_u64(offsets, span))
             };
             let four = |at: usize| vmovn_u32(vcombine_u32(two(at), two(at + 2)));
-            bits(vmovn_u16(vcombine_u16(four(0), four(4))))
+            halves(bits(vmovn_u16(vcombine_u16(four(0), four(4)))))
         }
     }
 
     #[inline]
-    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> u8 {
+    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> super::Halves {
         // SAFETY: NEON is part of aarch64, and the caller says the indices are
         // there.
         unsafe {
             let index = vdupq_n_u32(index);
             let four = |at: usize| vmovn_u32(vceqq_u32(vld1q_u32(indices.add(at)), index));
-            bits(vmovn_u16(vcombine_u16(four(0), four(4))))
+            halves(bits(vmovn_u16(vcombine_u16(four(0), four(4)))))
         }
     }
 }
@@ -135,7 +154,7 @@ mod imp {
     };
 
     #[inline]
-    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> u8 {
+    pub(super) unsafe fn in_range(cells: *const i64, lo: i64, span: u64) -> super::Halves {
         let top = i64x2_splat(i64::MIN);
         let lo = i64x2_splat(lo);
         let span = v128_xor(i64x2_splat(span.cast_signed()), top);
@@ -146,11 +165,11 @@ mod imp {
             let offsets = v128_xor(i64x2_sub(keys, lo), top);
             i64x2_bitmask(v128_not(i64x2_gt(offsets, span)))
         };
-        two(0) | two(2) << 2 | two(4) << 4 | two(6) << 6
+        (two(0) | two(2) << 2, two(4) | two(6) << 2)
     }
 
     #[inline]
-    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> u8 {
+    pub(super) unsafe fn equal(indices: *const u32, index: u32) -> super::Halves {
         let index = i32x4_splat(index.cast_signed());
         let four = |at: usize| {
             // SAFETY: the caller says the indices are there.
@@ -158,7 +177,7 @@ mod imp {
             let eight = unsafe { v128_load(indices.add(at).cast::<v128>()) };
             i32x4_bitmask(i32x4_eq(eight, index))
         };
-        four(0) | four(4) << 4
+        (four(0), four(4))
     }
 }
 
@@ -170,11 +189,11 @@ mod imp {
     all(target_arch = "wasm32", target_feature = "simd128"),
 )))]
 mod imp {
-    pub(super) unsafe fn in_range(_: *const i64, _: i64, _: u64) -> u8 {
+    pub(super) unsafe fn in_range(_: *const i64, _: i64, _: u64) -> super::Halves {
         failed!()
     }
 
-    pub(super) unsafe fn equal(_: *const u32, _: u32) -> u8 {
+    pub(super) unsafe fn equal(_: *const u32, _: u32) -> super::Halves {
         failed!()
     }
 }

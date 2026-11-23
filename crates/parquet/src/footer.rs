@@ -1,12 +1,12 @@
 //! `ParquetFile`: a file's footer, read once: its columns, and each row
 //! group's size and column chunks.
 
-use pipit_kernel::allocator::Allocator;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::DataType;
+use pipit_kernel::containers::SmallVec;
+use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};
-use pipit_kernel::slow_vec::SlowVec;
 
 use crate::Error;
 use crate::thrift::{Cursor, STRUCT, Value};
@@ -90,11 +90,11 @@ pub struct ParquetFile {
     /// The columns' names.
     names: Names,
     /// The columns, in order.
-    columns: SlowVec<Column>,
+    columns: SmallVec<Column>,
     /// How many rows each row group has.
-    group_rows: SlowVec<u64>,
+    group_rows: SmallVec<u64>,
     /// Row group by row group, a chunk for each column.
-    chunks: SlowVec<Chunk>,
+    chunks: SmallVec<Chunk>,
 }
 
 /// The magic bytes at the start and end of every Parquet file.
@@ -106,8 +106,8 @@ const GROUPS_MAX: usize = 1 << 20;
 const CHUNKS_MAX: usize = 1 << 24;
 
 impl ParquetFile {
-    /// Reads `source`'s footer, with memory from `allocator`.
-    pub fn open(allocator: &dyn Allocator, source: &dyn ByteSource) -> Result<ParquetFile, Error> {
+    /// Reads `source`'s footer, with memory from `env`.
+    pub fn open(env: &Env, source: &dyn ByteSource) -> Result<ParquetFile, Error> {
         // The footer, then its length and the magic bytes again.
         let mut tail = [0; 8];
         let len = source.len();
@@ -117,9 +117,9 @@ impl ParquetFile {
             return Err(Error::Corrupt);
         }
         let size = usize::try_from(footer_len).map_err(|_| Error::Corrupt)?;
-        let mut footer = Buffer::allocate(allocator, size)?;
+        let mut footer = Buffer::allocate(env, size)?;
         source.read(len - 8 - footer_len, footer.as_mut_slice::<u8>())?;
-        parse(allocator, footer.as_slice::<u8>()).ok_or(Error::Corrupt)?
+        parse(env, footer.as_slice::<u8>()).ok_or(Error::Corrupt)?
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -145,12 +145,12 @@ impl ParquetFile {
 
 /// The footer's `FileMetaData`: `None` if it's damaged, and an error if it
 /// can't be read.
-fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
+fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     let (Ok(mut names), Ok(mut columns), Ok(mut group_rows), Ok(mut chunks)) = (
-        Names::new(allocator, 1 << 16),
-        SlowVec::new(allocator, COLUMNS_MAX),
-        SlowVec::new(allocator, GROUPS_MAX),
-        SlowVec::new(allocator, CHUNKS_MAX),
+        Names::new(env, 1 << 16),
+        SmallVec::new(env, COLUMNS_MAX),
+        SmallVec::new(env, GROUPS_MAX),
+        SmallVec::new(env, CHUNKS_MAX),
     ) else {
         return Some(Err(Error::OutOfMemory));
     };
@@ -205,7 +205,7 @@ fn parse(allocator: &dyn Allocator, footer: &[u8]) -> Option<Result<ParquetFile,
 fn schema(
     c: &mut Cursor<'_>,
     names: &mut Names,
-    columns: &mut SlowVec<Column>,
+    columns: &mut SmallVec<Column>,
 ) -> Option<Result<(), Error>> {
     let (_, len) = c.list()?;
     // `SchemaElement`s: its type, repetition, name, children's count, and
@@ -352,7 +352,6 @@ fn integer(bytes: &[u8], column: Column) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use pipit_file::source::FileSource;
-    use pipit_kernel::allocator::Heap;
 
     use super::*;
 
@@ -361,7 +360,8 @@ mod tests {
     const SMALL: &[u8] = include_bytes!("../tests/data/small.parquet");
 
     fn small() -> ParquetFile {
-        ParquetFile::open(&Heap, &SMALL).unwrap()
+        let env = Env::current();
+        ParquetFile::open(env, &SMALL).unwrap()
     }
 
     extern crate std;
@@ -402,14 +402,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri can't use real files")]
     fn reads_through_a_file() {
+        let env = Env::current();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/small.parquet");
-        let file = ParquetFile::open(&Heap, &FileSource::open(path).unwrap()).unwrap();
+        let file = ParquetFile::open(env, &FileSource::open(path).unwrap()).unwrap();
         assert_eq!(file.row_groups(), 3);
     }
 
     #[test]
     fn rejects_what_isnt_parquet() {
+        let env = Env::current();
         let bytes: &[u8] = b"not parquet at all";
-        assert_eq!(ParquetFile::open(&Heap, &bytes).err(), Some(Error::Corrupt));
+        assert_eq!(ParquetFile::open(env, &bytes).err(), Some(Error::Corrupt));
     }
 }

@@ -44,6 +44,9 @@ debug = "line-tables-only"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# Each file that needs unsafe says so with `#![allow(unsafe_code)]`, so the
+# code soundness rests on is listed, and the rest can be checked without it.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -7,10 +7,12 @@ use crate::aggregate_function::{
     AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, StringExtreme,
     finalize_to_buffer, make_aggregate_function,
 };
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms};
+use crate::containers::SmallVec;
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::group_table::{GroupTable, KEYS_MAX};
@@ -18,16 +20,15 @@ use crate::murmur_hash;
 use crate::plan::PLAN_COLUMNS_MAX;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::slow_vec::SlowVec;
 use crate::step::{Breaker, DynOperator};
 use crate::string_pool::CACHED_SLOTS;
 
 /// The breaker that aggregates by `spec`.
 pub fn hash_aggregate<'a>(
-    allocator: &dyn Allocator,
+    env: &Env,
     spec: HashAggregateSpec,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, HashAggregate::new(spec))
+    DynOperator::new(env, HashAggregate::new(spec))
 }
 
 /// Groups rows by their keys and outputs a row for each group: its keys,
@@ -37,6 +38,7 @@ pub fn hash_aggregate<'a>(
 /// each aggregate, which is stored next to the group's keys, so memory grows
 /// with the groups, not the rows.
 struct HashAggregate {
+    /// Its keys and aggregates.
     spec: HashAggregateSpec,
     /// How many words of state a group keeps: each aggregate's, one after
     /// another.
@@ -47,18 +49,18 @@ struct State {
     /// The groups, by their keys.
     groups: GroupTable,
     /// With no keys, the state of the single group.
-    total: SlowVec<i64>,
+    total: SmallVec<i64>,
     /// Whether any input row was read.
     consumed: bool,
     /// For each aggregate, which groups have seen a value.
-    seen: SlowVec<SeenBytes>,
+    seen: SmallVec<SeenBytes>,
     /// For each `DISTINCT` aggregate, the values of each group it's read.
-    distinct: SlowVec<Option<FlatHashMap<GroupValue, ()>>>,
+    distinct: SmallVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
     /// A place for a flat copy of each column of the batches read, by
     /// position, for `Flat`.
-    copies: SlowVec<Option<ColumnView>>,
+    copies: SmallVec<Option<ColumnView>>,
 }
 
 impl HashAggregate {
@@ -161,9 +163,7 @@ fn first_values(
             set.prefetch(GroupValue { group: group_of(row + SLOT_AHEAD), value: next }.hash());
         }
         let group = group_of(row);
-        if input.is_valid(row)
-            && set.insert(context.allocator(), GroupValue { group, value }, ())?.1
-        {
+        if input.is_valid(row) && set.insert(context.env(), GroupValue { group, value }, ())?.1 {
             *at_mut!(kept_values, kept) = value;
             *at_mut!(kept_groups, kept) = group;
             kept += 1;
@@ -228,28 +228,28 @@ impl Breaker for HashAggregate {
     type State = State;
 
     fn new_state(&self, context: &mut Context) -> Result<State, Error> {
-        let allocator = context.allocator();
+        let env = context.env();
         let groups = GroupTable::new(
-            allocator,
+            env,
             self.spec.key_columns.len(),
             self.spec.string_keys,
             self.spec.nullable_keys,
             self.state_words,
         )?;
-        let mut total = SlowVec::new(allocator, self.state_words.next_power_of_two().max(1))?;
+        let mut total = SmallVec::new(env, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
-        let mut seen = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
+        let mut seen = SmallVec::fixed(env, self.spec.aggregates.len())?;
         for _ in 0..self.spec.aggregates.len() {
-            seen.push(SeenBytes::new(allocator)?)?;
+            seen.push(SeenBytes::new(env)?)?;
         }
-        let mut distinct = SlowVec::fixed(allocator, self.spec.aggregates.len())?;
+        let mut distinct = SmallVec::fixed(env, self.spec.aggregates.len())?;
         for call in self.spec.aggregates.iter() {
             check!(!call.distinct || call.function != Function::CountStar);
             check!(!call.distinct || string_extreme(*call).is_none());
-            let set = if call.distinct { Some(FlatHashMap::for_len(allocator, 0)?) } else { None };
+            let set = if call.distinct { Some(FlatHashMap::for_len(env, 0)?) } else { None };
             distinct.push(set)?;
         }
-        let copies = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+        let copies = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
         Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0, copies })
     }
 
@@ -304,7 +304,7 @@ impl Breaker for HashAggregate {
                 loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
             }
             let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(context.allocator(), group_count, loaded.valid.is_some())?
+                at_mut!(seen, a).get(context.env(), group_count, loaded.valid.is_some())?
             } else {
                 None
             };
@@ -373,7 +373,7 @@ impl Breaker for HashAggregate {
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
             let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(context.allocator(), groups, !*consumed)?
+                at_mut!(seen, a).get(context.env(), groups, !*consumed)?
             } else {
                 None
             };
@@ -390,29 +390,23 @@ impl Breaker for HashAggregate {
 
 #[cfg(test)]
 mod tests {
+    use crate::containers::BitSlice;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::DataType;
+    use crate::env::Env;
     use crate::pipeline::Pipeline;
-    use crate::query_allocators::QueryAllocators;
     use crate::step::{DynSource, Source, Step};
 
     /// An `Int64` column of `values`, null where `None`.
     fn column(values: &[Option<i64>]) -> ColumnView {
-        let mut words = Buffer::allocate(&Heap, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
-        bits.as_mut_slice::<u8>().fill(0);
-        for (i, value) in values.iter().enumerate() {
-            words.as_mut_slice::<i64>()[i] = value.unwrap_or(0);
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
-        }
-        let validity = values.iter().any(Option::is_none).then_some(bits);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, words, validity).unwrap()
+        let context = &mut Context::new(Env::current(), None);
+        ColumnView::from_int64s(context, values.iter().copied()).unwrap()
     }
 
     /// Batches of a key `k` and a value `x`, each a list of rows, keeping
@@ -449,8 +443,9 @@ mod tests {
 
     /// A string column of `values`, null where `None`.
     fn strings(values: &[Option<String>]) -> ColumnView {
-        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+        let env = Env::current();
+        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
+        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
         let mut bytes = Vec::new();
         for (i, value) in values.iter().enumerate() {
             let value = value.as_deref().unwrap_or_default();
@@ -459,12 +454,12 @@ mod tests {
             bytes.extend_from_slice(value.as_bytes());
         }
         for (i, value) in values.iter().enumerate() {
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
+            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, value.is_some());
         }
-        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
         let validity = values.iter().any(Option::is_none).then_some(bits);
-        ColumnView::strings(&mut Context::new(&Heap), views, stored, validity).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), views, stored, validity).unwrap()
     }
 
     /// `Rows`, with its key `k` as a string column, of each key's digits:
@@ -484,6 +479,7 @@ mod tests {
             i: &mut usize,
             batch: &mut RowBatch<'s>,
         ) -> Result<bool, Error> {
+            let env = Env::current();
             if !self.0.next(context, i, batch)? {
                 return Ok(false);
             }
@@ -503,7 +499,7 @@ mod tests {
                         && entries.values().strings().get(e as usize) == text.as_bytes()
                 }
             };
-            let mut indices = Buffer::allocate(&Heap, texts.len() * 4).unwrap();
+            let mut indices = Buffer::allocate(env, texts.len() * 4).unwrap();
             for (index, text) in indices.as_mut_slice::<u32>().iter_mut().zip(&texts) {
                 *index = (0..entries.row_count()).find(|&e| found(text, e)).unwrap();
             }
@@ -515,6 +511,7 @@ mod tests {
     /// By the columns at `keys`, `COUNT(*)`, then `COUNT`, `SUM`, `MIN` and
     /// `MAX` of the column at 1.
     fn spec(keys: &[u32]) -> HashAggregateSpec {
+        let env = Env::current();
         let functions =
             [Function::CountStar, Function::Count, Function::Sum, Function::Min, Function::Max];
         let aggregates = functions.into_iter().map(|function| AggregateCall {
@@ -524,10 +521,10 @@ mod tests {
             input_type: DataType::Int64,
         });
         HashAggregateSpec {
-            key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+            key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
             string_keys: 0,
             nullable_keys: u64::MAX,
-            aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
+            aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
         }
     }
 
@@ -537,11 +534,12 @@ mod tests {
         rows: S,
         spec: HashAggregateSpec,
     ) -> Result<Vec<Vec<Option<i64>>>, Error> {
-        let mut steps = SlowVec::new(&Heap, 1).unwrap();
-        assert!(steps.push(Step::Operator(hash_aggregate(&Heap, spec).unwrap())).is_ok());
-        let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query, None)?;
+        let env = Env::current();
+        let mut steps = SmallVec::new(env, 1).unwrap();
+        assert!(steps.push(Step::Operator(hash_aggregate(env, spec).unwrap())).is_ok());
+        let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
+        let query = Env::current();
+        let mut execution = pipeline.start(query, None)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {
@@ -675,6 +673,7 @@ mod tests {
 
     #[test]
     fn finds_the_least_and_greatest_strings_by_their_bytes() {
+        let env = Env::current();
         // By the integer at 1, `MIN` and `MAX` of the string at 0, the
         // digits of the integer there, so "100" is less than "9".
         let rows = || Rows {
@@ -697,10 +696,10 @@ mod tests {
                 input_type: DataType::String,
             });
             HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
+                aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
             }
         };
         let digits = ["9", "10", "5", "100", "7"].map(|text| Some(String::from(text)));
@@ -723,8 +722,9 @@ mod tests {
 
     #[test]
     fn tables_sharing_a_pool_number_their_own_groups() {
-        let mut context = Context::new(&Heap);
-        let mut tables = [(); 2].map(|()| GroupTable::new(&Heap, 1, 1, u64::MAX, 0).unwrap());
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut tables = [(); 2].map(|()| GroupTable::new(env, 1, 1, u64::MAX, 0).unwrap());
         let column = |texts: &[Option<&str>]| {
             strings(&texts.iter().map(|text| text.map(String::from)).collect::<Vec<_>>())
         };
@@ -770,6 +770,7 @@ mod tests {
 
     #[test]
     fn averages_exactly_past_int64() {
+        let env = Env::current();
         // Keyed and not, with a null, a dropped row, and a sum past `Int64`
         // whose mean isn't.
         let big = i64::MAX - 1;
@@ -789,10 +790,10 @@ mod tests {
                 input_type: DataType::Int64,
             });
             let spec = HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(&Heap, aggregates).unwrap(),
+                aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
             };
             let out = run(rows, spec).unwrap();
             let mean = out[0][keys.len()].map(|bits| f64::from_bits(bits.cast_unsigned()));
@@ -809,16 +810,17 @@ mod tests {
             input_type: DataType::Int64,
         };
         let spec = HashAggregateSpec {
-            key_columns: SlowVec::fixed_from(&Heap, [].into_iter()).unwrap(),
+            key_columns: SmallVec::fixed_from(env, [].into_iter()).unwrap(),
             string_keys: 0,
             nullable_keys: u64::MAX,
-            aggregates: SlowVec::fixed_from(&Heap, [call].into_iter()).unwrap(),
+            aggregates: SmallVec::fixed_from(env, [call].into_iter()).unwrap(),
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
     }
 
     #[test]
     fn reads_each_groups_distinct_values() {
+        let env = Env::current();
         // `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, `COUNT(*)` and `SUM(x)`, by
         // the key and not.
         let calls = [
@@ -835,10 +837,10 @@ mod tests {
                 input_type: DataType::Int64,
             });
             HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(&Heap, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(&Heap, calls.into_iter()).unwrap(),
+                aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
             }
         };
         // Repeats within and across batches, a null, row 3 of each batch

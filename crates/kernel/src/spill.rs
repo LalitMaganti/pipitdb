@@ -6,7 +6,9 @@
 //! Calls block. A store that's remote does its uploads and fetches on its
 //! own threads, behind them.
 
+use crate::bytes::ByteRange;
 use crate::column::{ColumnView, DataType, Strings, Validity};
+use crate::containers::BitSlice;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::BATCH_ROWS_MAX;
@@ -15,33 +17,26 @@ use crate::row_batch::BATCH_ROWS_MAX;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LogId(pub u64);
 
-/// Where bytes appended to a log are.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Block {
-    pub offset: u64,
-    pub len: u64,
-}
-
 pub trait SpillStore {
     /// A new, empty log.
     fn create(&self) -> Result<LogId, Error>;
 
     /// Appends `bytes` to `log`, which isn't sealed. Each block starts where
     /// the one before ended.
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error>;
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error>;
 
     /// Ends writing to `log`. Only a sealed log can be read.
     fn seal(&self, log: LogId) -> Result<(), Error>;
 
     /// Says `blocks` of `log` will be read soon, so a remote store can fetch
     /// them together. By default, nothing is done.
-    fn prefetch(&self, log: LogId, blocks: &[Block]) {
+    fn prefetch(&self, log: LogId, blocks: &[ByteRange]) {
         let _ = (log, blocks);
     }
 
     /// Reads `block` of `log`, which is sealed, into `into`, which is its
     /// length.
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error>;
+    fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error>;
 
     /// Deletes `log`, sealed or not.
     fn delete(&self, log: LogId);
@@ -50,14 +45,16 @@ pub trait SpillStore {
 /// A column written to a log: what's needed to read it back.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SpilledColumn {
+    /// What type its values are.
     pub data_type: DataType,
+    /// How many rows it has.
     pub row_count: u32,
     /// Its values, or if its type has bytes, views into them.
-    pub values: Block,
+    pub values: ByteRange,
     /// If its type has bytes, them, one string after another.
-    pub bytes: Option<Block>,
+    pub bytes: Option<ByteRange>,
     /// Its null bitmap, if it may have nulls.
-    pub validity: Option<Block>,
+    pub validity: Option<ByteRange>,
 }
 
 /// How many rows' null bits, or strings' views, `write_column` appends at
@@ -89,9 +86,13 @@ pub fn write_column(
 
 /// Appends `validity`'s bits from the first row, shifted a chunk at a time
 /// if the view starts mid-byte, so they need no memory.
-fn write_validity(store: &dyn SpillStore, log: LogId, validity: Validity) -> Result<Block, Error> {
+fn write_validity(
+    store: &dyn SpillStore,
+    log: LogId,
+    validity: Validity,
+) -> Result<ByteRange, Error> {
     let (bits, shift) = validity.bits();
-    let len = validity.row_count().div_ceil(8) as usize;
+    let len = BitSlice::<u8>::words_for(validity.row_count() as usize);
     let mut chunk = [0_u8; CHUNK_BYTES];
     let mut block = None;
     for first in (0..len).step_by(CHUNK_BYTES) {
@@ -115,7 +116,7 @@ fn write_strings(
     store: &dyn SpillStore,
     log: LogId,
     strings: Strings<'_>,
-) -> Result<(Block, Option<Block>), Error> {
+) -> Result<(ByteRange, Option<ByteRange>), Error> {
     let mut chunk = [0_u8; CHUNK_ROWS as usize * 8];
     let (mut views, mut filled, mut start) = (None, 0, 0_u32);
     for row in 0..strings.len() {
@@ -151,10 +152,10 @@ fn write_strings(
 }
 
 /// `appended` added to `block`, which it follows.
-fn grow(block: Option<Block>, appended: Block) -> Block {
+fn grow(block: Option<ByteRange>, appended: ByteRange) -> ByteRange {
     match block {
         None => appended,
-        Some(block) => Block { offset: block.offset, len: block.len + appended.len },
+        Some(block) => ByteRange { offset: block.offset, len: block.len + appended.len },
     }
 }
 
@@ -182,9 +183,9 @@ pub fn read_column(
     let validity = match spilled.validity {
         None => None,
         Some(block) => {
-            let len = spilled.row_count.div_ceil(8);
-            check!(block.len == u64::from(len));
-            let mut bits = context.small_buffer(len as usize)?;
+            let len = BitSlice::<u8>::words_for(spilled.row_count as usize);
+            check!(block.len == len as u64);
+            let mut bits = context.small_buffer(len)?;
             store.read(log, block, bits.as_mut_slice::<u8>())?;
             Some(bits)
         }
@@ -204,9 +205,10 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::context::Context;
+    use crate::env::Env;
 
     /// Behaves as S3 does, in memory: appends are uploaded in parts of at
     /// least `PART` bytes, except the last; nothing can be read before its
@@ -244,7 +246,7 @@ mod tests {
             Ok(LogId(logs.len() as u64 - 1))
         }
 
-        fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
+        fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error> {
             let mut logs = self.logs.borrow_mut();
             let log = logs[index(log)].as_mut().ok_or(Error::Io)?;
             assert!(!log.sealed);
@@ -253,7 +255,7 @@ mod tests {
             if log.pending.len() >= PART {
                 self.upload(log);
             }
-            Ok(Block { offset, len: bytes.len() as u64 })
+            Ok(ByteRange { offset, len: bytes.len() as u64 })
         }
 
         fn seal(&self, log: LogId) -> Result<(), Error> {
@@ -266,7 +268,7 @@ mod tests {
             Ok(())
         }
 
-        fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+        fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error> {
             let logs = self.logs.borrow();
             let log = logs[index(log)].as_ref().ok_or(Error::Io)?;
             if !log.sealed {
@@ -284,17 +286,9 @@ mod tests {
     }
 
     fn column(values: &[i64], nulls: &[u32]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
-        buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
-            bits.as_mut_slice::<u8>().fill(0xff);
-            for &row in nulls {
-                bits.as_mut_slice::<u8>()[row as usize / 8] &= !(1 << (row % 8));
-            }
-            bits
-        });
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
+        let null = |row: usize| nulls.iter().any(|&null| null as usize == row);
+        let cells = values.iter().enumerate().map(|(row, &value)| (!null(row)).then_some(value));
+        ColumnView::from_int64s(&mut Context::new(Env::current(), None), cells).unwrap()
     }
 
     fn rows(column: &ColumnView) -> StdVec<Option<i64>> {
@@ -304,6 +298,7 @@ mod tests {
 
     #[test]
     fn columns_come_back_as_they_were_written() {
+        let env = Env::current();
         let store = Strict::default();
         let values: StdVec<i64> = (0..1000).collect();
         let whole = column(&values, &[3, 500, 999]);
@@ -315,7 +310,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(env, None), &store, log, spilled).unwrap();
             assert_eq!(rows(&read), rows(column));
         }
         store.delete(log);
@@ -323,11 +318,12 @@ mod tests {
 
     #[test]
     fn string_columns_come_back_as_they_were_written() {
+        let env = Env::current();
         let store = Strict::default();
         let words: StdVec<StdVec<u8>> =
             (0..700).map(|i| alloc::format!("word{i}").into_bytes()).collect();
-        let mut views = Buffer::allocate(&Heap, words.len() * 8).unwrap();
-        let mut bytes = Buffer::allocate(&Heap, words.iter().map(StdVec::len).sum()).unwrap();
+        let mut views = Buffer::allocate(env, words.len() * 8).unwrap();
+        let mut bytes = Buffer::allocate(env, words.iter().map(StdVec::len).sum()).unwrap();
         let mut at = 0;
         for (i, word) in words.iter().enumerate() {
             bytes.as_mut_slice::<u8>()[at..at + word.len()].copy_from_slice(word);
@@ -336,10 +332,10 @@ mod tests {
                 .copy_from_slice(&[u32::try_from(at).unwrap(), len]);
             at += word.len();
         }
-        let mut validity = Buffer::allocate(&Heap, words.len().div_ceil(8)).unwrap();
+        let mut validity = Buffer::allocate(env, BitSlice::<u8>::words_for(words.len())).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1110_1111);
-        let whole =
-            ColumnView::strings(&mut Context::new(&Heap), views, bytes, Some(validity)).unwrap();
+        let whole = ColumnView::strings(&mut Context::new(env, None), views, bytes, Some(validity))
+            .unwrap();
         let columns = [whole.clone(), whole.slice(3, 600)];
 
         let log = store.create().unwrap();
@@ -347,7 +343,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(env, None), &store, log, spilled).unwrap();
             let (got, want) = (read.string_values(), column.string_values());
             assert_eq!(got.len(), want.len());
             for row in 0..read.row_count() {
@@ -359,23 +355,24 @@ mod tests {
 
     #[test]
     fn strings_come_back_with_only_their_bytes() {
+        let env = Env::current();
         let store = Strict::default();
         // Longer than a chunk of appends, so they're written in parts.
         let text: StdVec<u8> =
             (0..3000_u32).map(|i| b'a' + u8::try_from(i % 26).unwrap()).collect();
-        let mut page = Buffer::allocate(&Heap, text.len()).unwrap();
+        let mut page = Buffer::allocate(env, text.len()).unwrap();
         page.as_mut_slice::<u8>().copy_from_slice(&text);
         let spans: StdVec<(u32, u32)> = (0..600).map(|i| (i * 3 % 2000, i % 7)).collect();
-        let mut views = Buffer::allocate(&Heap, spans.len() * 8).unwrap();
+        let mut views = Buffer::allocate(env, spans.len() * 8).unwrap();
         for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&spans) {
             view.copy_from_slice(&[start, len]);
         }
-        let column = ColumnView::strings(&mut Context::new(&Heap), views, page, None).unwrap();
+        let column = ColumnView::strings(&mut Context::new(env, None), views, page, None).unwrap();
 
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column).unwrap();
         store.seal(log).unwrap();
-        let read = read_column(&mut Context::new(&Heap), &store, log, &spilled).unwrap();
+        let read = read_column(&mut Context::new(env, None), &store, log, &spilled).unwrap();
         let (got, want) = (read.string_values(), column.string_values());
         // The strings overlapped, from a buffer of 3,000 bytes; written out,
         // each has its own.
@@ -388,15 +385,16 @@ mod tests {
 
     #[test]
     fn logs_are_read_only_once_sealed() {
+        let env = Env::current();
         let store = Strict::default();
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(&[1, 2, 3], &[1])).unwrap();
         assert_eq!(
-            read_column(&mut Context::new(&Heap), &store, log, &spilled).err(),
+            read_column(&mut Context::new(env, None), &store, log, &spilled).err(),
             Some(Error::Io)
         );
         store.seal(log).unwrap();
-        assert!(read_column(&mut Context::new(&Heap), &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(env, None), &store, log, &spilled).is_ok());
     }
 
     #[test]

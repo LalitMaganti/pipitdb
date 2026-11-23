@@ -3,14 +3,17 @@
 //! `Parser` is the cursor over tokens that every part of the grammar uses, and
 //! writes the tree.
 
-use crate::ast::{Ast, BLOCK_BYTES, DATA_MAX, Node, Nodes, Operator, Tag};
+#![allow(unsafe_code)]
+
+use core::mem::MaybeUninit;
+
+use crate::ast::{Ast, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use pipit_kernel::allocator::Allocator;
-use pipit_kernel::buffer::Buffer;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::containers::SmallVec;
+use pipit_kernel::env::Env;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
@@ -24,49 +27,41 @@ pub const LIST_MAX: usize = pipit_kernel::plan::PLAN_COLUMNS_MAX;
 pub const IN_LIST_MAX: usize = 1 << 16;
 
 /// Parses `source` as a query, with the stages in `registry`.
-pub fn parse_query(
-    allocator: &dyn Allocator,
-    registry: &Registry,
-    source: &[u8],
-) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
-    let root = parser.query(registry)?;
-    let current = parser.current();
-    if current.kind != TokenKind::End {
-        return Err(Error::new(ErrorCode::UnexpectedToken, current.span));
-    }
+pub fn parse_query(env: &Env, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
+    let mut parser = Parser::new(env, source)?;
+    let root = parser.query(registry).and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
 /// Parses `source` as a single expression.
-pub fn parse_expression(allocator: &dyn Allocator, source: &[u8]) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
-    let root = parser.expression()?;
-    let current = parser.current();
-    if current.kind != TokenKind::End {
-        return Err(Error::new(ErrorCode::UnexpectedToken, current.span));
-    }
+pub fn parse_expression(env: &Env, source: &[u8]) -> Result<Ast, Error> {
+    let mut parser = Parser::new(env, source)?;
+    let root = parser.expression().and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
 pub(crate) struct Parser<'a> {
     /// What lists too long for the stack are gathered with.
-    allocator: &'a dyn Allocator,
+    env: &'a Env,
+    /// The query's text.
     source: &'a [u8],
+    /// The tokens of `source`.
     lexer: Lexer<'a>,
+    /// The token the parser is on.
     current: Token,
+    /// The tree's nodes so far.
     nodes: Nodes,
-    failed: Option<ErrorCode>,
+    /// The first error found, once there is one.
+    failed: Option<Error>,
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(allocator: &'a dyn Allocator, source: &'a [u8]) -> Result<Parser<'a>, Error> {
+    pub(crate) fn new(env: &'a Env, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
-        // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
+        let nodes = Nodes::new(env)
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { allocator, source, lexer, current, nodes: Nodes::new(first), failed: None })
+        Ok(Parser { env, source, lexer, current, nodes, failed: None })
     }
 
     /// The token the parser is on.
@@ -76,9 +71,6 @@ impl<'a> Parser<'a> {
 
     /// Moves to the next token and returns the one it was on.
     pub(crate) fn advance(&mut self) -> Result<Token, Error> {
-        if let Some(code) = self.failed {
-            return Err(Error::new(code, self.current.span));
-        }
         let token = self.current;
         self.current = self.lexer.next_token()?;
         Ok(token)
@@ -117,23 +109,35 @@ impl<'a> Parser<'a> {
         self.nodes.len()
     }
 
-    /// Writes `root` to the tree, last, and returns the tree.
-    pub(crate) fn finish(mut self, root: Node) -> Result<Ast, Error> {
-        self.push(root);
-        if let Some(code) = self.failed {
-            return Err(Error::new(code, self.current.span));
+    /// Returns `root` if the parser is at the end of the source.
+    fn end(&self, root: Node) -> Result<Node, Error> {
+        if self.current.kind != TokenKind::End {
+            return Err(Error::new(ErrorCode::UnexpectedToken, self.current.span));
         }
+        Ok(root)
+    }
+
+    /// Writes `root` to the tree, last, and returns the tree. Running out of
+    /// memory comes first, as the parse went on past it.
+    pub(crate) fn finish(mut self, root: Result<Node, Error>) -> Result<Ast, Error> {
+        if let Ok(root) = root {
+            self.push(root);
+        }
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        root?;
         Ok(Ast::new(self.nodes))
     }
 
     /// If the next block can't be had, later nodes overwrite the last block,
-    /// which is safe as `failed` stops the parse before the tree is read.
+    /// which is safe as `finish` then fails, so the tree is never read.
     fn push(&mut self, node: Node) {
         self.nodes.push(node);
         if self.nodes.needs_block()
             && let Err(code) = self.nodes.grow()
         {
-            self.failed = Some(code);
+            self.failed.get_or_insert(Error::new(code, self.current.span));
         }
     }
 }
@@ -156,7 +160,7 @@ const NEGATE: u8 = 13;
 const TOKEN_KIND_COUNT: usize = TokenKind::End as usize + 1;
 
 /// The binary operator each token kind stands for, and its binding power.
-/// `AND` and `OR` are identifiers, so they are handled separately.
+/// Keywords, such as `AND`, are identifiers, so they have their own table.
 static INFIX: [Option<(Operator, u8)>; TOKEN_KIND_COUNT] = infix();
 
 const fn infix() -> [Option<(Operator, u8)>; TOKEN_KIND_COUNT] {
@@ -175,6 +179,22 @@ const fn infix() -> [Option<(Operator, u8)>; TOKEN_KIND_COUNT] {
     infix
 }
 
+const KEYWORD_COUNT: usize = Keyword::End as usize + 1;
+
+/// The operator each keyword after an operand stands for, and its binding
+/// power. `IS` stands for `IsNull`, as it starts `IS [NOT] NULL`.
+static KEYWORD_INFIX: [Option<(Operator, u8)>; KEYWORD_COUNT] = keyword_infix();
+
+const fn keyword_infix() -> [Option<(Operator, u8)>; KEYWORD_COUNT] {
+    let mut infix = [None; KEYWORD_COUNT];
+    infix[Keyword::And as usize] = Some((Operator::And, AND));
+    infix[Keyword::Or as usize] = Some((Operator::Or, OR));
+    infix[Keyword::Like as usize] = Some((Operator::Like, COMPARISON));
+    infix[Keyword::Is as usize] = Some((Operator::IsNull, COMPARISON));
+    infix[Keyword::In as usize] = Some((Operator::In, COMPARISON));
+    infix
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Keyword {
     None,
@@ -182,6 +202,8 @@ enum Keyword {
     Or,
     Not,
     Like,
+    Is,
+    In,
     Distinct,
     Case,
     When,
@@ -192,10 +214,15 @@ enum Keyword {
 
 #[derive(Clone, Copy)]
 enum Pending {
+    /// A unary operator, waiting for its operand.
     Unary(Operator),
+    /// A binary operator and its left operand, waiting for its right.
     Binary(Operator, Node),
+    /// A `(`, waiting for the expression in it and its `)`.
     Parenthesis,
+    /// A call's name, waiting for its first argument.
     Call(Node),
+    /// An argument of a call, waiting for the next, or the `)`.
     Argument(Node),
     /// A `CASE`, its parts on the frames above it.
     Case,
@@ -229,19 +256,37 @@ struct Frame {
 }
 
 /// The frames waiting for operands. Bounded, as the parser doesn't recurse.
+/// Frames from `depth` up are unwritten, so making one costs nothing.
 struct Stack {
-    frames: [Frame; NESTING_MAX],
+    frames: [MaybeUninit<Frame>; NESTING_MAX],
     depth: usize,
 }
 
 impl Stack {
+    fn new() -> Stack {
+        Stack { frames: [const { MaybeUninit::uninit() }; NESTING_MAX], depth: 0 }
+    }
+
     fn push(&mut self, pending: Pending, min_power: u8, token: Token) -> Result<(), Error> {
         if self.depth == NESTING_MAX {
             return Err(Error::new(ErrorCode::NestingTooDeep, token.span));
         }
-        *at_mut!(self.frames, self.depth) = Frame { pending, min_power };
+        at_mut!(self.frames, self.depth).write(Frame { pending, min_power });
         self.depth += 1;
         Ok(())
+    }
+
+    /// The frames, bottom first.
+    fn frames(&self) -> &[Frame] {
+        // SAFETY: `push` keeps `depth` within `frames`, the first `depth` were
+        // written, and `MaybeUninit<Frame>` is laid out as `Frame`.
+        unsafe { core::slice::from_raw_parts(self.frames.as_ptr().cast(), self.depth) }
+    }
+
+    /// Keeps the bottom `depth` frames.
+    fn truncate(&mut self, depth: usize) {
+        check!(depth <= self.depth);
+        self.depth = depth;
     }
 }
 
@@ -249,8 +294,7 @@ impl Parser<'_> {
     /// Parses an expression, stopping at the first token that can't continue
     /// it. Returns its root, which is not in the tree yet.
     pub(crate) fn expression(&mut self) -> Result<Node, Error> {
-        let empty = Frame { pending: Pending::Parenthesis, min_power: 0 };
-        let mut stack = Stack { frames: [empty; NESTING_MAX], depth: 0 };
+        let mut stack = Stack::new();
         let mut min_power = 0;
         'operand: loop {
             let token = self.advance()?;
@@ -263,26 +307,22 @@ impl Parser<'_> {
                 }
             };
             loop {
-                if COMPARISON > min_power && self.at_word("is") {
-                    operand = self.is_null(operand)?;
-                    continue;
-                }
-                if COMPARISON > min_power && self.at_word("in") {
-                    operand = self.in_list(operand)?;
-                    continue;
-                }
                 if let Some((operator, power)) = self.infix(self.current())
                     && power > min_power
                 {
-                    let token = self.advance()?;
-                    stack.push(Pending::Binary(operator, operand), min_power, token)?;
-                    min_power = power + 1;
-                    continue 'operand;
+                    operand = match operator {
+                        Operator::IsNull => self.is_null(operand)?,
+                        Operator::In => self.in_list(operand)?,
+                        _ => {
+                            let token = self.advance()?;
+                            stack.push(Pending::Binary(operator, operand), min_power, token)?;
+                            min_power = power + 1;
+                            continue 'operand;
+                        }
+                    };
+                    continue;
                 }
-                if stack.depth == 0 {
-                    return Ok(operand);
-                }
-                let frame = *at!(stack.frames, stack.depth - 1);
+                let Some(&frame) = stack.frames().last() else { return Ok(operand) };
                 match self.end_part(&mut stack, frame, operand)? {
                     Ended::Next => {
                         min_power = 0;
@@ -294,7 +334,7 @@ impl Parser<'_> {
                     }
                     Ended::No => {}
                 }
-                stack.depth -= 1;
+                stack.truncate(stack.depth - 1);
                 min_power = frame.min_power;
                 operand = match frame.pending {
                     Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand]),
@@ -322,7 +362,7 @@ impl Parser<'_> {
     fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
         self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let mut items = SlowVec::new(self.allocator, IN_LIST_MAX)?;
+        let mut items = SmallVec::new(self.env, IN_LIST_MAX)?;
         loop {
             let negative = self.current().kind == TokenKind::Minus;
             if negative {
@@ -371,11 +411,13 @@ impl Parser<'_> {
     /// argument, and writes them to the tree. Returns the call and the binding
     /// power to go back to.
     fn call(&mut self, stack: &mut Stack, last: Node) -> (Node, u8) {
-        let mut call = stack.depth - 1;
-        while let Pending::Argument(_) = at!(stack.frames, call).pending {
+        let frames = stack.frames();
+        let mut call = frames.len() - 1;
+        while let Pending::Argument(_) = at!(frames, call).pending {
             call -= 1;
         }
-        let frames = at!(stack.frames, call..stack.depth);
+        let power = at!(frames, call).min_power;
+        let frames = at!(frames, call..);
         let first_child = self.node_count();
         for frame in frames {
             if let Pending::Call(node) | Pending::Argument(node) = frame.pending {
@@ -383,9 +425,8 @@ impl Parser<'_> {
             }
         }
         self.write(&[last]);
-        stack.depth = call;
-        let node = Node::list(Tag::Call, self.node_count() - first_child, first_child);
-        (node, at!(stack.frames, call).min_power)
+        stack.truncate(call);
+        (Node::list(Tag::Call, self.node_count() - first_child, first_child), power)
     }
 
     /// Pushes `pending`, from `token`, going back to `min_power` once it has
@@ -398,7 +439,7 @@ impl Parser<'_> {
         token: Token,
     ) -> Result<(), Error> {
         // `DISTINCT` only starts a call's argument.
-        let top = stack.depth.checked_sub(1).map(|top| at!(stack.frames, top).pending);
+        let top = stack.frames().last().map(|top| top.pending);
         if let Pending::Unary(Operator::Distinct) = pending
             && !matches!(top, Some(Pending::Call(_) | Pending::Argument(_)))
         {
@@ -422,11 +463,7 @@ impl Parser<'_> {
         match frame.pending {
             Pending::Case | Pending::CasePart(..) => {
                 let token = self.advance()?;
-                let keyword = if token.kind == TokenKind::Identifier {
-                    self.keyword(token)
-                } else {
-                    Keyword::None
-                };
+                let keyword = self.keyword(token);
                 // What may end this part, by what ended the one before: the
                 // subject, a condition, a value, or what `ELSE` gives.
                 let before = match frame.pending {
@@ -473,12 +510,14 @@ impl Parser<'_> {
     /// its `ELSE`'s value, an empty node for one it hasn't. Returns the `CASE`
     /// and the binding power to go back to.
     fn case(&mut self, stack: &mut Stack, last: Node, before: Keyword) -> (Node, u8) {
-        let mut case = stack.depth - 1;
-        while let Pending::CasePart(..) = at!(stack.frames, case).pending {
+        let frames = stack.frames();
+        let mut case = frames.len() - 1;
+        while let Pending::CasePart(..) = at!(frames, case).pending {
             case -= 1;
         }
         let first_child = self.node_count();
-        for frame in at!(stack.frames, case + 1..stack.depth) {
+        let power = at!(frames, case).min_power;
+        for frame in at!(frames, case + 1..) {
             if let Pending::CasePart(node, _) = frame.pending {
                 self.write(&[node]);
             }
@@ -487,15 +526,13 @@ impl Parser<'_> {
         if before != Keyword::Else {
             self.write(&[Node::empty()]);
         }
-        stack.depth = case;
-        let node = Node::list(Tag::Case, self.node_count() - first_child, first_child);
-        (node, at!(stack.frames, case).min_power)
+        stack.truncate(case);
+        (Node::list(Tag::Case, self.node_count() - first_child, first_child), power)
     }
 
     /// Whether the current token is the keyword `keyword`.
     fn at_keyword(&self, keyword: Keyword) -> bool {
-        let token = self.current();
-        token.kind == TokenKind::Identifier && self.keyword(token) == keyword
+        self.keyword(self.current()) == keyword
     }
 
     /// What `token`, in operand position, does.
@@ -507,7 +544,10 @@ impl Parser<'_> {
             TokenKind::Minus => Step::Push(Pending::Unary(Operator::Negate), NEGATE),
             TokenKind::LeftParen => Step::Push(Pending::Parenthesis, 0),
             TokenKind::Identifier => match self.keyword(token) {
-                Keyword::None if self.current().kind == TokenKind::LeftParen => {
+                // `IS` and `IN` are only keywords after an operand.
+                Keyword::None | Keyword::Is | Keyword::In
+                    if self.current().kind == TokenKind::LeftParen =>
+                {
                     self.advance()?;
                     let name = leaf(token)?;
                     if self.current().kind == TokenKind::RightParen {
@@ -517,7 +557,15 @@ impl Parser<'_> {
                         Step::Push(Pending::Call(name), 0)
                     }
                 }
-                Keyword::None => Step::Operand(leaf(token)?),
+                // `t.x`, a column of alias `t`, as one name.
+                Keyword::None if self.current().kind == TokenKind::Dot => {
+                    self.advance()?;
+                    let column = self.expect(TokenKind::Identifier)?;
+                    let len = column.span.start + column.span.len - token.span.start;
+                    let span = Span { start: token.span.start, len };
+                    Step::Operand(leaf(Token { kind: token.kind, span })?)
+                }
+                Keyword::None | Keyword::Is | Keyword::In => Step::Operand(leaf(token)?),
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
                 // Over all that follows, as in `count(DISTINCT a)`.
                 Keyword::Distinct => Step::Push(Pending::Unary(Operator::Distinct), 0),
@@ -540,40 +588,51 @@ impl Parser<'_> {
         if token.kind != TokenKind::Identifier {
             return *at!(INFIX, token.kind as usize);
         }
-        match self.keyword(token) {
-            Keyword::And => Some((Operator::And, AND)),
-            Keyword::Or => Some((Operator::Or, OR)),
-            Keyword::Like => Some((Operator::Like, COMPARISON)),
-            Keyword::Not
-            | Keyword::Distinct
-            | Keyword::None
-            | Keyword::Case
-            | Keyword::When
-            | Keyword::Then
-            | Keyword::Else
-            | Keyword::End => None,
-        }
+        *at!(KEYWORD_INFIX, self.keyword(token) as usize)
     }
 
+    /// The keyword `token` is, if it's one.
     fn keyword(&self, token: Token) -> Keyword {
-        check!(token.kind == TokenKind::Identifier);
+        if token.kind != TokenKind::Identifier {
+            return Keyword::None;
+        }
         let text = self.text(token);
-        let first = text.first().map_or(0, u8::to_ascii_lowercase);
+        if text.len() > 8 {
+            return Keyword::None;
+        }
+        // Setting the bit only case changes lowers a letter, and keywords are
+        // only letters.
+        let word = text.iter().rev().fold(0, |word, &byte| word << 8 | u64::from(byte | 0x20));
+        #[expect(clippy::cast_possible_truncation, reason = "the first letter")]
+        let first = word as u8;
         let keyword = match (text.len(), first) {
-            (2, _) => (Keyword::Or, b"or".as_slice()),
-            (3, b'a') => (Keyword::And, b"and".as_slice()),
-            (3, b'e') => (Keyword::End, b"end".as_slice()),
-            (3, _) => (Keyword::Not, b"not".as_slice()),
-            (4, b'c') => (Keyword::Case, b"case".as_slice()),
-            (4, b'w') => (Keyword::When, b"when".as_slice()),
-            (4, b't') => (Keyword::Then, b"then".as_slice()),
-            (4, b'e') => (Keyword::Else, b"else".as_slice()),
-            (4, _) => (Keyword::Like, b"like".as_slice()),
-            (8, _) => (Keyword::Distinct, b"distinct".as_slice()),
+            (2, b'o') => (Keyword::Or, const { packed(b"or") }),
+            (2, _) if word >> 8 == u64::from(b's') => (Keyword::Is, const { packed(b"is") }),
+            (2, _) => (Keyword::In, const { packed(b"in") }),
+            (3, b'a') => (Keyword::And, const { packed(b"and") }),
+            (3, b'e') => (Keyword::End, const { packed(b"end") }),
+            (3, _) => (Keyword::Not, const { packed(b"not") }),
+            (4, b'c') => (Keyword::Case, const { packed(b"case") }),
+            (4, b'w') => (Keyword::When, const { packed(b"when") }),
+            (4, b't') => (Keyword::Then, const { packed(b"then") }),
+            (4, b'e') => (Keyword::Else, const { packed(b"else") }),
+            (4, _) => (Keyword::Like, const { packed(b"like") }),
+            (8, _) => (Keyword::Distinct, const { packed(b"distinct") }),
             _ => return Keyword::None,
         };
-        if same_word(text, keyword.1) { keyword.0 } else { Keyword::None }
+        if word == keyword.1 { keyword.0 } else { Keyword::None }
     }
+}
+
+/// A word of at most 8 bytes, as a number, its first byte lowest.
+const fn packed(text: &[u8]) -> u64 {
+    let mut word = 0;
+    let mut i = text.len();
+    while i > 0 {
+        i -= 1;
+        word = word << 8 | text[i] as u64;
+    }
+    word
 }
 
 fn leaf(token: Token) -> Result<Node, Error> {
@@ -596,7 +655,7 @@ fn leaf(token: Token) -> Result<Node, Error> {
 impl Parser<'_> {
     /// Parses a query, returning its root, which is not in the tree yet.
     pub(crate) fn query(&mut self, registry: &Registry) -> Result<Node, Error> {
-        let mut stages = SlowVec::new(self.allocator, LIST_MAX)?;
+        let mut stages = SmallVec::new(self.env, LIST_MAX)?;
         loop {
             if stages.len() == LIST_MAX {
                 return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
@@ -638,6 +697,13 @@ impl Parser<'_> {
                 Item::List(shared) => self.list_of(shared)?,
                 Item::Clause(words, shared) => self.clause(words, shared, false)?,
                 Item::After(words, shared) => self.clause(words, shared, true)?,
+                Item::Parenthesized(words, shared) => self.parenthesized(words, shared)?,
+                Item::Optional(word) => {
+                    if self.at_word(word) {
+                        self.advance()?;
+                    }
+                    self.list(Tag::List, &[])
+                }
             };
         }
         let first_child = self.write(at!(children, ..rule.items.len()));
@@ -687,7 +753,7 @@ impl Parser<'_> {
 
     /// One or more `shared`, separated by commas.
     fn list_of(&mut self, shared: Shared) -> Result<Node, Error> {
-        let mut items = SlowVec::new(self.allocator, LIST_MAX)?;
+        let mut items = SmallVec::new(self.env, LIST_MAX)?;
         loop {
             if items.len() == LIST_MAX {
                 return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
@@ -720,6 +786,24 @@ impl Parser<'_> {
         self.list_of(shared)
     }
 
+    /// As `clause`, not required, with the list in parentheses.
+    fn parenthesized(&mut self, words: &[&str], shared: Shared) -> Result<Node, Error> {
+        let Some(first) = words.first() else { pipit_kernel::failed!() };
+        if !self.at_word(first) {
+            return Ok(self.list(Tag::List, &[]));
+        }
+        for word in words {
+            if !self.at_word(word) {
+                return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+            }
+            self.advance()?;
+        }
+        self.expect(TokenKind::LeftParen)?;
+        let list = self.list_of(shared)?;
+        self.expect(TokenKind::RightParen)?;
+        Ok(list)
+    }
+
     /// Whether the current token is `word`, ignoring case.
     fn at_word(&self, word: &str) -> bool {
         let current = self.current();
@@ -735,6 +819,7 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::ast::BLOCK_BYTES;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
@@ -771,13 +856,25 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_expression(&Heap, source.as_bytes()).unwrap();
+        let env = Env::current();
+        let ast = parse_expression(env, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_expression(&Heap, source.as_bytes()).err().unwrap();
+        let env = Env::current();
+        let error = parse_expression(env, source.as_bytes()).err().unwrap();
         (error.code, error.span.start)
+    }
+
+    #[test]
+    fn running_out_of_memory_comes_before_later_errors() {
+        // The first block and the slot table, but not a second block.
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let env = unsafe { Env::new(Heap, 2 * BLOCK_BYTES) }.unwrap();
+        let source = format!("{}+)", "1+".repeat(BLOCK_BYTES / 8));
+        let error = parse_expression(&env, source.as_bytes()).err().unwrap();
+        assert_eq!(error.code, ErrorCode::OutOfMemory);
     }
 
     #[test]
@@ -806,6 +903,8 @@ mod tests {
         assert_eq!(error("a IN (-'x')"), (ErrorCode::ExpectedExpression, 7));
         assert_eq!(error("a IN (1 2)"), (ErrorCode::ExpectedToken, 8));
         assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
+        // `IN` and `IS` are only keywords after an operand.
+        assert_eq!(parse("in IN (1) OR is IS NULL"), "(Or (In in (List 1)) (IsNull is))");
     }
 
     #[test]
@@ -831,8 +930,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn parses_past_the_first_block() {
+        let env = Env::current();
         let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        let ast = parse_expression(&Heap, long.as_bytes()).unwrap();
+        let ast = parse_expression(env, long.as_bytes()).unwrap();
         assert_eq!(ast.node_count() as usize, 2 * crate::ast::BLOCK_NODES - 1);
     }
 

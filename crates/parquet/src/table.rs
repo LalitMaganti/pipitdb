@@ -1,9 +1,10 @@
 //! `ParquetTable`: Parquet files with the same columns, scanned as one table.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
+use pipit_kernel::allocator::AllocError;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::condition::{Condition, Cutoff};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::filter::{
     self,
@@ -14,12 +15,12 @@ use pipit_kernel::plan::PLAN_COLUMNS_MAX;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Scannable, Summary};
 use pipit_kernel::selection::{Kept, Selection};
-use pipit_kernel::slow_vec::SlowVec;
 use pipit_kernel::step::{DynSource, Source};
 
 use crate::chunk::ChunkReader;
 use crate::footer::ParquetFile;
 use crate::{Codec, Error, bounds};
+use pipit_kernel::env::Env;
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
@@ -32,7 +33,7 @@ const KEPT_FEW: usize = 8;
 const ROW_GROUPS_MAX: usize = 1 << 24;
 
 pub struct ParquetTable<'a> {
-    files: SlowVec<File<'a>>,
+    files: SmallVec<File<'a>>,
     codecs: &'a dyn Codec,
 }
 
@@ -54,7 +55,7 @@ pub struct ScanState<'a> {
 /// column read, which for a lazy column only counts its rows, how many rows
 /// are left, and which file and row group it is, for lazy columns' handles.
 struct Rows<'a> {
-    readers: SlowVec<ChunkReader<'a>>,
+    readers: SmallVec<ChunkReader<'a>>,
     started: bool,
     left: u64,
     file: u32,
@@ -62,8 +63,8 @@ struct Rows<'a> {
 }
 
 impl<'a> Rows<'a> {
-    fn new(allocator: &dyn Allocator, columns: usize) -> Result<Rows<'a>, Error> {
-        let readers = SlowVec::fixed(allocator, columns)?;
+    fn new(env: &Env, columns: usize) -> Result<Rows<'a>, Error> {
+        let readers = SmallVec::fixed(env, columns)?;
         Ok(Rows { readers, started: false, left: 0, file: 0, group: 0 })
     }
 
@@ -77,12 +78,18 @@ impl<'a> Rows<'a> {
         group: usize,
     ) -> Result<(), Error> {
         let (index, file) = (file, at!(table.files, file));
-        for &(column, _) in columns {
+        // Each column's reader from the last row group, if there was one,
+        // keeps its buffers.
+        for (i, &(column, _)) in columns.iter().enumerate() {
             let c = column as usize;
             let chunk = file.footer.chunk(group, c);
             let column = *at!(file.footer.columns(), c);
-            let reader = ChunkReader::new(file.source, table.codecs, column, chunk)?;
-            self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
+            if let Some(reader) = self.readers.get_mut(i) {
+                reader.restart(file.source, table.codecs, column, chunk)?;
+            } else {
+                let reader = ChunkReader::new(file.source, table.codecs, column, chunk)?;
+                self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
+            }
         }
         (self.started, self.left) = (true, file.footer.group_rows(group));
         self.file = u32::try_from(index).map_err(|_| Error::Unsupported)?;
@@ -112,7 +119,6 @@ impl<'a> Rows<'a> {
                 if self.left > 0 {
                     return Err(Error::Corrupt);
                 }
-                self.readers.retain(|_| false);
                 self.started = false;
                 return Ok(false);
             }
@@ -120,8 +126,10 @@ impl<'a> Rows<'a> {
             batch.reset(rows);
             // The cutoff's column is read flat, even if it could be lazy, to
             // test its rows.
-            let tested = match (cutoff, context.cutoff()) {
-                (Some((c, cutoff)), Some(value)) => {
+            let published =
+                cutoff.and_then(|(c, cutoff)| Some((c, cutoff, context.cutoff(cutoff.slot)?)));
+            let mut tested = match published {
+                Some((c, cutoff, value)) => {
                     let values =
                         at_mut!(self.readers, c).read(context, rows as usize, Forms::FLAT)?;
                     // Nulls sort first ascending, so they're kept, which
@@ -155,9 +163,9 @@ impl<'a> Rows<'a> {
             }
             for (i, (reader, &(column, forms))) in self.readers.iter_mut().zip(columns).enumerate()
             {
-                let view = match &tested {
-                    Some((c, view)) if *c == i => view.clone(),
-                    _ if forms.contains(Forms::LAZY) => {
+                let view = match tested.take_if(|(c, _)| *c == i) {
+                    Some((_, view)) => view,
+                    None if forms.contains(Forms::LAZY) => {
                         // Where its rows are, for `load`: only counted here, so
                         // no page body is read.
                         let (header, row) = reader.place();
@@ -167,7 +175,7 @@ impl<'a> Rows<'a> {
                         reader.pass(rows as usize);
                         ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
                     }
-                    _ => reader.read(context, rows as usize, forms)?,
+                    None => reader.read(context, rows as usize, forms)?,
                 };
                 let Ok(()) = batch.push_column(view) else {
                     pipit_kernel::failed!();
@@ -181,9 +189,12 @@ impl<'a> Rows<'a> {
 /// A scan of a `ParquetTable` that reads only `groups`, by file and row
 /// group in it: those whose statistics don't rule out the values kept.
 struct Pruned<'a> {
+    /// The table it scans.
     table: &'a ParquetTable<'a>,
-    columns: SlowVec<(u32, Forms)>,
-    groups: SlowVec<(usize, usize)>,
+    /// The columns it reads, and the forms each may take.
+    columns: SmallVec<(u32, Forms)>,
+    /// The row groups it reads, as a file and a row group in it.
+    groups: SmallVec<(usize, usize)>,
     /// What a `TopK` above publishes a cutoff on, if anything: a row group
     /// whose rows all sort after it is skipped as it's reached.
     cutoff: Option<Cutoff>,
@@ -194,7 +205,7 @@ impl<'a> Source for Pruned<'a> {
     type State = (usize, Rows<'a>);
 
     fn new_state(&self, context: &mut Context) -> Result<(usize, Rows<'a>), Error> {
-        Ok((0, Rows::new(context.allocator(), self.columns.len())?))
+        Ok((0, Rows::new(context.env(), self.columns.len())?))
     }
 
     fn next<'s>(
@@ -234,13 +245,13 @@ impl<'a> ParquetTable<'a> {
     /// order, of types the kernel has. Their pages are decompressed with
     /// `codecs`.
     pub fn open(
-        allocator: &dyn Allocator,
+        env: &Env,
         codecs: &'a dyn Codec,
         sources: &[&'a dyn ByteSource],
     ) -> Result<ParquetTable<'a>, Error> {
-        let mut files: SlowVec<File<'a>> = SlowVec::new(allocator, FILES_MAX)?;
+        let mut files: SmallVec<File<'a>> = SmallVec::new(env, FILES_MAX)?;
         for &source in sources {
-            let footer = ParquetFile::open(allocator, source)?;
+            let footer = ParquetFile::open(env, source)?;
             if let Some(first) = files.first() {
                 check_same_columns(&first.footer, &footer)?;
             } else if footer.columns().iter().any(|column| column.data_type().is_none()) {
@@ -307,7 +318,7 @@ impl Handle {
 /// What loading lazy columns keeps between batches: a reader for each
 /// column loaded, with the file and row group it reads.
 pub struct Loader<'a> {
-    readers: SlowVec<((u32, u32, u32), ChunkReader<'a>)>,
+    readers: SmallVec<((u32, u32, u32), ChunkReader<'a>)>,
 }
 
 impl<'a> Scannable for ParquetTable<'a> {
@@ -354,7 +365,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     }
 
     fn new_loader(&self, context: &mut Context) -> Result<Loader<'a>, Error> {
-        Ok(Loader { readers: SlowVec::new(context.allocator(), PLAN_COLUMNS_MAX)? })
+        Ok(Loader { readers: SmallVec::new(context.env(), PLAN_COLUMNS_MAX)? })
     }
 
     /// Reads the rows of `lazy` `selection` keeps, keeping a reader for each
@@ -382,17 +393,20 @@ impl<'a> Scannable for ParquetTable<'a> {
                 }
                 let column = *at!(file.footer.columns(), c);
                 let chunk = file.footer.chunk(group, c);
-                let mut reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
-                // Past the dictionary page, if any, so data pages can be
-                // gone to.
-                reader.page_left(context)?;
-                if let Some(at) = found {
-                    *at_mut!(loader.readers, at) = (key, reader);
+                let at = if let Some(at) = found {
+                    let (was, reader) = at_mut!(loader.readers, at);
+                    reader.restart(file.source, self.codecs, column, chunk)?;
+                    *was = key;
                     at
                 } else {
+                    let reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
                     loader.readers.push((key, reader)).map_err(|_| Error::OutOfMemory)?;
                     loader.readers.len() - 1
-                }
+                };
+                // Past the dictionary page, if any, so data pages can be
+                // gone to.
+                at_mut!(loader.readers, at).1.page_left(context)?;
+                at
             }
         };
         let reader = &mut at_mut!(loader.readers, at).1;
@@ -412,7 +426,7 @@ impl<'a> Scannable for ParquetTable<'a> {
         columns: &'s [(u32, Forms)],
     ) -> Result<ScanState<'s>, Error> {
         check!(columns.iter().all(|&(column, _)| column < self.column_count()));
-        let rows = Rows::new(context.allocator(), columns.len())?;
+        let rows = Rows::new(context.env(), columns.len())?;
         Ok(ScanState { columns, file: 0, group: 0, rows })
     }
 
@@ -464,7 +478,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     /// and, as it reaches them, those that sort after the cutoff.
     fn scan_within<'s>(
         &'s self,
-        allocator: &dyn Allocator,
+        env: &Env,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
@@ -477,7 +491,7 @@ impl<'a> Scannable for ParquetTable<'a> {
                 bounds.is_none_or(|bounds| condition.may_keep(bounds))
             })
         };
-        let mut groups = SlowVec::new(allocator, ROW_GROUPS_MAX)?;
+        let mut groups = SmallVec::new(env, ROW_GROUPS_MAX)?;
         let mut skipped = false;
         for (f, file) in self.files.iter().enumerate() {
             for group in 0..file.footer.row_groups() {
@@ -491,8 +505,8 @@ impl<'a> Scannable for ParquetTable<'a> {
         if !skipped && cutoff.is_none() {
             return Ok(None);
         }
-        let columns = SlowVec::fixed_from(allocator, columns.iter().copied())?;
-        Ok(Some(DynSource::new(allocator, Pruned { table: self, columns, groups, cutoff })?))
+        let columns = SmallVec::fixed_from(env, columns.iter().copied())?;
+        Ok(Some(DynSource::new(env, Pruned { table: self, columns, groups, cutoff })?))
     }
 }
 
@@ -503,11 +517,10 @@ mod tests {
     use std::string::{String, ToString};
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
+    use pipit_kernel::env::Env;
     use pipit_kernel::filter::{Comparison, Value};
     use pipit_kernel::pipeline::Pipeline;
     use pipit_kernel::predicate::{Leaf, Node, Predicate};
-    use pipit_kernel::query_allocators::QueryAllocators;
     use pipit_kernel::scannable::DynScannable;
 
     use super::*;
@@ -518,7 +531,8 @@ mod tests {
 
     /// Every batch's rows of `columns`: each row's `id`s, or -1 for nulls.
     fn scan(table: &ParquetTable, columns: &[u32]) -> (usize, Vec<i64>) {
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let mut context = Context::new(env, None);
         let read: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
         let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
@@ -554,8 +568,9 @@ mod tests {
 
     #[test]
     fn loads_lazy_columns_as_read_eagerly() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
+        let mut context = Context::new(env, None);
         let batches = |forms: Forms, context: &mut Context| {
             let read = [(2, forms), (0, forms), (1, forms)];
             let mut state = table.open(context, &read).unwrap();
@@ -586,16 +601,18 @@ mod tests {
 
     #[test]
     fn knows_columns_without_nulls_from_their_statistics() {
+        let env = Env::current();
         // Both files' columns are optional; only `NULLS` counts any nulls.
-        let none = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let none = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
         assert!((0..3).all(|column| !none.column_nullable(column)));
-        let some = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS]).unwrap();
+        let some = ParquetTable::open(env, &Uncompressed, &[&NULLS]).unwrap();
         assert!((0..3).all(|column| some.column_nullable(column)));
     }
 
     #[test]
     fn scans_files_as_one_table() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
         assert_eq!(table.column_count(), 3);
         assert_eq!(table.column_name(2), "name");
         assert!(table.column_type(2) == DataType::String);
@@ -609,7 +626,8 @@ mod tests {
 
     #[test]
     fn files_must_have_the_same_columns() {
-        let opened = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &SMALL]);
+        let env = Env::current();
+        let opened = ParquetTable::open(env, &Uncompressed, &[&NULLS, &SMALL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 
@@ -622,8 +640,9 @@ mod tests {
 
     #[test]
     fn bounds_columns_by_their_row_groups_statistics() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&TYPES]).unwrap();
+        let mut context = Context::new(env, None);
         let read = [(0, Forms::FLAT), (1, Forms::FLAT), (2, Forms::FLAT)];
         let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
@@ -636,8 +655,9 @@ mod tests {
 
     #[test]
     fn reads_unsigned_integers_above_31_bits() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&TYPES]).unwrap();
+        let mut context = Context::new(env, None);
         let mut state = table.open(&mut context, &[(1, Forms::FLAT)]).unwrap();
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
@@ -651,12 +671,14 @@ mod tests {
 
     #[test]
     fn doesnt_read_decimals_as_integers() {
-        let opened = ParquetTable::open(&Heap, &Uncompressed, &[&DECIMAL]);
+        let env = Env::current();
+        let opened = ParquetTable::open(env, &Uncompressed, &[&DECIMAL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 
     /// `min <= column 0 AND column 0 <= max`.
     fn between(min: i64, max: i64) -> Predicate {
+        let env = Env::current();
         let compare = |comparison, value| {
             Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
         };
@@ -665,23 +687,24 @@ mod tests {
             compare(Comparison::LessEqual, max),
             Node::And(0, 1),
         ];
-        Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap())
+        Predicate::new(SmallVec::fixed_from(env, nodes.into_iter()).unwrap())
     }
 
     #[test]
     fn skips_row_groups_statistics_rule_out() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-        let table = DynScannable::new(&Heap, table).unwrap();
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let table = DynScannable::new(env, table).unwrap();
         // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
         // to 4999.
         let ids = |min, max| {
             // Not exact: it only skips.
             let conditions = [Condition::new(0, &between(min, max))];
             let source =
-                table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
-            let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
-            let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query, None).unwrap();
+                table.scan(env, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
+            let pipeline = Pipeline::new(source, SmallVec::fixed(env, 0).unwrap());
+            let query = Env::current();
+            let mut execution = pipeline.start(query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let column = batch.column(0);
@@ -713,27 +736,28 @@ mod tests {
 
     #[test]
     fn keeps_only_rows_before_a_top_k_cutoff() {
+        let env = Env::current();
         // The first 3 by `id` of two files whose row groups each hold `id`s 0
         // to 2047, 2048 to 4095 and 4096 to 4999, and how many rows the scan
         // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
         // the third is skipped, and of the second file only 0, 1 and 2 kept.
-        let first = |publish: bool| {
+        let first = |publish: Option<u32>| {
             use pipit_kernel::step::{DynTransform, Step};
-            let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-            let table = DynScannable::new(&Heap, table).unwrap();
-            let cutoff = publish.then_some(Cutoff { column: 0, descending: false });
-            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
+            let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+            let table = DynScannable::new(env, table).unwrap();
+            let cutoff = publish.map(|slot| Cutoff { slot, column: 0, descending: false });
+            let source = table.scan(env, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
             let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
-            let keys = SlowVec::fixed_from(&Heap, keys.into_iter()).unwrap();
+            let keys = SmallVec::fixed_from(env, keys.into_iter()).unwrap();
             let kept = core::cell::Cell::new(0);
             let steps = [
-                Step::Transform(DynTransform::new(&Heap, Rows(&kept)).unwrap()),
-                Step::Operator(pipit_kernel::top_k::top_k(&Heap, keys, 3, publish).unwrap()),
+                Step::Transform(DynTransform::new(env, Rows(&kept)).unwrap()),
+                Step::Operator(pipit_kernel::top_k::top_k(env, keys, 3, publish).unwrap()),
             ];
-            let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).unwrap();
+            let steps = SmallVec::fixed_from(env, steps.into_iter()).unwrap();
             let pipeline = Pipeline::new(source, steps);
-            let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query, None).unwrap();
+            let query = Env::current();
+            let mut execution = pipeline.start(query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let (selection, column) = (batch.selection(), batch.column(0));
@@ -743,13 +767,14 @@ mod tests {
             drop(execution);
             (ids, kept.get())
         };
-        assert_eq!(first(false), ([0, 0, 1].into(), 10000));
-        assert_eq!(first(true), ([0, 0, 1].into(), 4096 + 3));
+        assert_eq!(first(None), ([0, 0, 1].into(), 10000));
+        assert_eq!(first(Some(2)), ([0, 0, 1].into(), 4096 + 3));
     }
 
     #[test]
     fn summarizes_from_statistics() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
         let summary =
             |column| table.summary(column).map(|s| (s.rows, s.bounds.map(|b| (b.min, b.max))));
         assert_eq!(summary(None), Some((10000, None)));
@@ -762,11 +787,12 @@ mod tests {
     #[test]
     fn makes_dictionaries_where_allowed() {
         const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&DICT]).unwrap();
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&DICT]).unwrap();
         // `name`, a string column of dictionary pages.
         assert!(table.forms(2).contains(Forms::DICTIONARY));
         let first = |forms: Forms| {
-            let mut context = Context::new(&Heap);
+            let mut context = Context::new(env, None);
             let read = [(2, forms)];
             let mut state = table.open(&mut context, &read).unwrap();
             let mut batch = RowBatch::new();

@@ -2,76 +2,68 @@
 //! `core/exec/sort` does. Nulls sort as in SQLite: first ascending, last
 //! descending.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::slow_vec::SlowVec;
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
 use crate::step::{Breaker, DynOperator};
 
 /// The breaker that sorts rows by `keys`, the first first, which must be
 /// columns of numbers.
-pub fn sort<'a>(
-    allocator: &dyn Allocator,
-    keys: SlowVec<SortKey>,
-) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, Sort { keys })
+pub fn sort<'a>(env: &Env, keys: SmallVec<SortKey>) -> Result<DynOperator<'a>, AllocError> {
+    DynOperator::new(env, Sort { keys })
 }
 
 struct Sort {
-    keys: SlowVec<SortKey>,
-}
-
-/// The rows so far, and how many have been output.
-struct Sorting {
-    rows: SortedRows,
-    emitted: u32,
+    keys: SmallVec<SortKey>,
 }
 
 impl Breaker for Sort {
-    type State = Sorting;
+    type State = SortedRows;
 
-    fn new_state(&self, context: &mut Context) -> Result<Sorting, Error> {
-        Ok(Sorting { rows: SortedRows::new(context.allocator())?, emitted: 0 })
+    fn new_state(&self, context: &mut Context) -> Result<SortedRows, Error> {
+        Ok(SortedRows::new(context.env())?)
     }
 
     fn consume(
         &self,
         context: &mut Context,
-        sorting: &mut Sorting,
+        rows: &mut SortedRows,
         input: &RowBatch,
     ) -> Result<(), Error> {
-        sorting.rows.append(context, input, &self.keys)
+        rows.append(context, input, &self.keys)
     }
 
-    fn finalize(&self, context: &mut Context, sorting: &mut Sorting) -> Result<(), Error> {
-        sorting.rows.sort(context)?;
-        sorting.rows.scatter(context)
+    fn finalize(&self, context: &mut Context, rows: &mut SortedRows) -> Result<(), Error> {
+        rows.sort(context)?;
+        rows.scatter(context)
     }
 
     fn serve(
         &self,
         context: &mut Context,
-        sorting: &mut Sorting,
+        rows: &mut SortedRows,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        sorting.emitted += sorting.rows.gather(context, output, sorting.emitted)?;
-        Ok(sorting.emitted < sorting.rows.order_len())
+        rows.serve(context, output)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::containers::BitSlice;
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
+    use crate::env::Env;
     use crate::pipeline::Pipeline;
-    use crate::query_allocators::QueryAllocators;
     use crate::selection::Kept;
     use crate::step::{DynSource, Source, Step};
     use crate::top_k::top_k;
@@ -82,22 +74,23 @@ mod tests {
     fn batch_of(rows: &[Row], batch: &mut RowBatch) {
         let n = rows.len();
         batch.reset(u32::try_from(n).unwrap());
-        let mut context = Context::new(&Heap);
-        let mut keys = Buffer::allocate(&Heap, n * 8).unwrap();
-        let mut bits = Buffer::allocate(&Heap, n.div_ceil(8)).unwrap();
-        let mut values = Buffer::allocate(&Heap, n * 8).unwrap();
-        let mut views = Buffer::allocate(&Heap, n * 8).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut keys = Buffer::allocate(env, n * 8).unwrap();
+        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(n)).unwrap();
+        let mut values = Buffer::allocate(env, n * 8).unwrap();
+        let mut views = Buffer::allocate(env, n * 8).unwrap();
         let mut bytes = Vec::new();
         for (i, &(key, value, name)) in rows.iter().enumerate() {
             keys.as_mut_slice::<i64>()[i] = key.unwrap_or(0);
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(key.is_some()) << (i % 8);
+            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, key.is_some());
             values.as_mut_slice::<i64>()[i] = value;
             let start = u32::try_from(bytes.len()).unwrap();
             views.as_mut_slice::<u32>()[2 * i..2 * i + 2]
                 .copy_from_slice(&[start, u32::try_from(name.len()).unwrap()]);
             bytes.extend_from_slice(name.as_bytes());
         }
-        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
         let keys = ColumnView::new(&mut context, DataType::Int64, keys, Some(bits)).unwrap();
         let values = ColumnView::new(&mut context, DataType::Int64, values, None).unwrap();
@@ -137,9 +130,10 @@ mod tests {
     }
 
     /// Keys of `(column, descending)`.
-    fn by(keys: &[(u32, bool)]) -> SlowVec<SortKey> {
+    fn by(keys: &[(u32, bool)]) -> SmallVec<SortKey> {
+        let env = Env::current();
         let keys = keys.iter().map(|&(column, descending)| SortKey { column, descending });
-        SlowVec::fixed_from(&Heap, keys).unwrap()
+        SmallVec::fixed_from(env, keys).unwrap()
     }
 
     /// By the key ascending, then the value descending.
@@ -147,11 +141,12 @@ mod tests {
 
     /// Each row out of `step`, in order.
     fn run(rows: Rows, step: DynOperator<'static>) -> Vec<(Option<i64>, i64, Vec<u8>)> {
-        let mut steps = SlowVec::new(&Heap, 1).unwrap();
+        let env = Env::current();
+        let mut steps = SmallVec::new(env, 1).unwrap();
         assert!(steps.push(Step::Operator(step)).is_ok());
-        let pipeline = Pipeline::new(DynSource::new(&Heap, rows).unwrap(), steps);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query, None).unwrap();
+        let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
+        let query = Env::current();
+        let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch).unwrap() {
@@ -168,6 +163,7 @@ mod tests {
 
     #[test]
     fn sorts_by_keys_with_nulls_first() {
+        let env = Env::current();
         let rows = Rows {
             batches: alloc::vec![
                 alloc::vec![(Some(2), 1, "a"), (None, 5, "n"), (Some(1), 1, "b")],
@@ -175,7 +171,7 @@ mod tests {
             ],
             drop: None,
         };
-        let sorted = run(rows, sort(&Heap, by(KEY_THEN_VALUE)).unwrap());
+        let sorted = run(rows, sort(env, by(KEY_THEN_VALUE)).unwrap());
         let names: Vec<Vec<u8>> = sorted.into_iter().map(|row| row.2).collect();
         // Nulls first, `5` before `3`; `b` and `e` tie and stay in order.
         assert_eq!(
@@ -193,15 +189,16 @@ mod tests {
 
     #[test]
     fn fails_if_a_key_changes_type() {
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let mut context = Context::new(env, None);
         let keys = [SortKey { column: 0, descending: false }];
-        let mut held = SortedRows::new(&Heap).unwrap();
+        let mut held = SortedRows::new(env).unwrap();
         let mut batch = RowBatch::new();
         batch_of(&[(Some(1), 1, "a")], &mut batch);
         assert!(held.append(&mut context, &batch, &keys).is_ok());
         let mut floats = RowBatch::new();
         floats.reset(1);
-        let mut values = Buffer::allocate(&Heap, 8).unwrap();
+        let mut values = Buffer::allocate(env, 8).unwrap();
         values.as_mut_slice::<f64>()[0] = 1.0;
         let column = ColumnView::new(&mut context, DataType::Float64, values, None).unwrap();
         assert!(floats.push_column(column).is_ok());
@@ -229,15 +226,16 @@ mod tests {
                 .collect();
             let batches: Vec<Vec<Row>> = rows.chunks(2048).map(<[Row]>::to_vec).collect();
             let rows = || Rows { batches: batches.clone(), drop: Some(5) };
-            let sorted = run(rows(), sort(&Heap, by(KEY_THEN_VALUE)).unwrap());
+            let env = Env::current();
+            let sorted = run(rows(), sort(env, by(KEY_THEN_VALUE)).unwrap());
             assert!(sorted.windows(2).all(|w| (w[0].0, -w[0].1) <= (w[1].0, -w[1].1)));
-            let sorted = run(rows(), sort(&Heap, by(&[(2, false)])).unwrap());
+            let sorted = run(rows(), sort(env, by(&[(2, false)])).unwrap());
             // By name, then in the order rows came, as their values are.
             assert!(sorted.windows(2).all(|w| (&w[0].2, w[0].1) < (&w[1].2, w[1].1)));
             for keys in [KEY_THEN_VALUE, &[(0, false)], &[(2, false)], &[(2, true), (0, false)]] {
-                let all = run(rows(), sort(&Heap, by(keys)).unwrap());
+                let all = run(rows(), sort(env, by(keys)).unwrap());
                 for count in [0, 1, 100, 3000, u32::MAX] {
-                    let top = run(rows(), top_k(&Heap, by(keys), count, false).unwrap());
+                    let top = run(rows(), top_k(env, by(keys), count, None).unwrap());
                     assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
                 }
             }

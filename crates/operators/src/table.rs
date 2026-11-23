@@ -1,29 +1,30 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
 //! footer, which pipelines can scan.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
-use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::allocator::AllocError;
+use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::scannable::Scannable;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::scannable::{Key, Scannable, Summary};
 
+use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};
 
 /// Each column has a name, a type, and the forms its row groups store it
 /// in, which, with flat, are the forms a scan can make it in.
 pub struct Table {
     names: Names,
-    columns: SlowVec<(Name, DataType, Forms)>,
-    row_groups: SlowVec<RowGroup>,
+    columns: SmallVec<(Name, DataType, Forms)>,
+    row_groups: SmallVec<RowGroup>,
 }
 
 /// Rows stored together, at most a batch's: a column of each of the
 /// table's types. A scan reads each as one batch.
 pub struct RowGroup {
     row_count: u32,
-    columns: SlowVec<ColumnView>,
+    columns: SmallVec<ColumnView>,
 }
 
 impl Table {
@@ -31,12 +32,12 @@ impl Table {
     /// `row_groups` of a column each, with the same number of rows, at most
     /// `BATCH_ROWS_MAX`. The columns' buffers are shared, not copied.
     pub fn new(
-        allocator: &dyn Allocator,
+        env: &Env,
         columns: &[(&str, DataType)],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
         check!(u32::try_from(columns.len()).is_ok());
-        let mut groups = SlowVec::fixed(allocator, row_groups.len())?;
+        let mut groups = SmallVec::fixed(env, row_groups.len())?;
         for &views in row_groups {
             check!(views.len() == columns.len());
             let row_count = views.first().map_or(0, ColumnView::row_count);
@@ -44,12 +45,12 @@ impl Table {
             for (view, &(_, data_type)) in views.iter().zip(columns) {
                 check!(view.data_type() == data_type && view.row_count() == row_count);
             }
-            let views = SlowVec::fixed_from(allocator, views.iter().cloned())?;
+            let views = SmallVec::fixed_from(env, views.iter().cloned())?;
             groups.push(RowGroup { row_count, columns: views })?;
         }
         let name_bytes = columns.iter().map(|(name, _)| name.len()).sum();
-        let mut names = Names::fixed(allocator, name_bytes)?;
-        let mut schema = SlowVec::fixed(allocator, columns.len())?;
+        let mut names = Names::fixed(env, name_bytes)?;
+        let mut schema = SmallVec::fixed(env, columns.len())?;
         for (i, &(name, data_type)) in columns.iter().enumerate() {
             let stored = groups.iter().map(|group| at!(group.columns, i).forms());
             schema.push((names.add(name)?, data_type, stored.fold(Forms::FLAT, Forms::union)))?;
@@ -111,12 +112,39 @@ impl Scannable for Table {
 
     fn column_nullable(&self, column: u32) -> bool {
         let views = self.row_groups.iter().map(|group| at!(group.columns, column as usize));
-        // A view of any form holds a null if its values, or itself, can.
-        views.into_iter().any(|view| view.has_nulls() || view.values().validity().is_some())
+        // A view of any form holds a null if its values, or itself, can. A
+        // sequence has no values, and no nulls.
+        let nullable = |view: &ColumnView| {
+            !view.is_in(Forms::SEQUENCE) && (view.has_nulls() || view.values().validity().is_some())
+        };
+        views.into_iter().any(nullable)
     }
 
     fn forms(&self, column: u32) -> Forms {
         at!(self.columns, column as usize).2
+    }
+
+    /// Its rows, which it knows. Not a column's bounds, which it would have
+    /// to read every value for.
+    fn summary(&self, column: Option<u32>) -> Option<Summary> {
+        let rows = self.row_groups.iter().map(|group| i64::from(group.row_count)).sum();
+        column.is_none().then_some(Summary { rows, bounds: None })
+    }
+
+    /// An id, if every row group stores the column as a sequence, each
+    /// continuing where the previous one ended.
+    fn column_key(&self, column: u32) -> Key {
+        let mut next = None;
+        for group in self.row_groups.iter() {
+            let Form::Sequence(first) = at!(group.columns, column as usize).form() else {
+                return Key::None;
+            };
+            if next.is_some_and(|next| next != first) {
+                return Key::None;
+            }
+            next = first.checked_add(i64::from(group.row_count));
+        }
+        Key::Id
     }
 
     fn open<'s>(
@@ -146,18 +174,11 @@ impl Scannable for Table {
             if at.lend {
                 // Borrowed: the table outlives the batch.
                 let views: &[ColumnView] = &row_group.columns;
-                batch.push_borrowed(at.columns.iter().map(|&(i, _)| {
-                    // SAFETY: `open` checked `i` is one of the table's
-                    // columns, and `new` that each row group has a view of
-                    // each.
-                    unsafe { views.get_unchecked(i as usize) }
-                }));
+                batch.push_borrowed(at.columns.iter().map(|&(i, _)| at!(views, i as usize)));
                 return Ok(true);
             }
             for &(i, forms) in at.columns {
-                // SAFETY: `open` checked `i` is one of the table's columns,
-                // and `new` that each row group has a view of each.
-                let view = unsafe { row_group.columns.get_unchecked(i as usize) };
+                let view = at!(row_group.columns, i as usize);
                 if view.is_in(forms) {
                     // Borrowed: the table outlives the batch.
                     batch.push_borrowed([view]);
@@ -182,7 +203,6 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::Form;
 
@@ -190,14 +210,15 @@ mod tests {
 
     fn int64s(values: impl Iterator<Item = i64>) -> ColumnView {
         let values: Vec<i64> = values.collect();
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let mut buffer = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
+        ColumnView::new(&mut Context::new(Env::current(), None), DataType::Int64, buffer, None)
+            .unwrap()
     }
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(Env::current(), None);
         let columns: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
         let mut state = table.open(&mut context, &columns).unwrap();
         let mut batch = RowBatch::new();
@@ -215,7 +236,7 @@ mod tests {
         let empty = [int64s(0..0), int64s(0..0)];
         let second = [int64s(2048..2548), int64s((2048..2548).map(|i| -i))];
         let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
-        let table = Table::new(&Heap, &columns, &[&first, &empty, &second]).unwrap();
+        let table = Table::new(Env::current(), &columns, &[&first, &empty, &second]).unwrap();
 
         let expected = [(2048, vec![0, 0]), (500, vec![-2048, 2048])];
         assert_eq!(scan(&table, &[1, 0]), expected);
@@ -224,7 +245,8 @@ mod tests {
     #[test]
     fn counts_rows_without_columns() {
         let (first, second) = ([int64s(0..2048)], [int64s(0..904)]);
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
+        let table =
+            Table::new(Env::current(), &[("a", DataType::Int64)], &[&first, &second]).unwrap();
         let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
         assert_eq!(counts, [2048, 904]);
     }
@@ -233,21 +255,21 @@ mod tests {
     #[should_panic(expected = "BATCH_ROWS_MAX")]
     fn checks_row_groups_fit_in_a_batch() {
         let columns = [int64s(0..2049)];
-        let _ = Table::new(&Heap, &[("a", DataType::Int64)], &[&columns]);
+        let _ = Table::new(Env::current(), &[("a", DataType::Int64)], &[&columns]);
     }
 
     #[test]
     #[should_panic(expected = "data_type")]
     fn checks_column_types() {
         let columns = [int64s(0..1)];
-        let _ = Table::new(&Heap, &[("a", DataType::Float64)], &[&columns]);
+        let _ = Table::new(Env::current(), &[("a", DataType::Float64)], &[&columns]);
     }
 
     #[test]
     fn finds_columns_by_name() {
         let columns = [int64s(0..1), int64s(0..1)];
         let schema = [("ts", DataType::Int64), ("dur", DataType::Int64)];
-        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
+        let table = Table::new(Env::current(), &schema, &[&columns]).unwrap();
         assert_eq!((table.find_column("dur"), table.find_column("name")), (Some(1), None));
         assert_eq!(table.column_name(0), "ts");
     }
@@ -255,17 +277,33 @@ mod tests {
     #[test]
     #[should_panic(expected = "column_count")]
     fn checks_columns_read_when_opened() {
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
-        let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
+        let table =
+            Table::new(Env::current(), &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
+        let _ = table.open(&mut Context::new(Env::current(), None), &[(1, Forms::FLAT)]);
+    }
+
+    #[test]
+    fn knows_ids_stored_as_one_sequence() {
+        let mut context = Context::new(Env::current(), None);
+        let mut sequence = |first, rows| ColumnView::sequence(&mut context, first, rows).unwrap();
+        let schema = [("id", DataType::Int64)];
+        let key = |groups: &[&[ColumnView]]| {
+            Table::new(Env::current(), &schema, groups).unwrap().column_key(0)
+        };
+        let (first, next, gap) = (sequence(0, 4), sequence(4, 2), sequence(7, 2));
+        assert_eq!(key(&[core::slice::from_ref(&first), &[next]]), Key::Id);
+        assert_eq!(key(&[&[first], &[gap]]), Key::None);
+        assert_eq!(key(&[&[int64s(0..4)]]), Key::None);
     }
 
     #[test]
     fn keeps_stored_forms_only_where_allowed() {
-        let mut context = Context::new(&Heap);
-        let mut indices = Buffer::allocate(&Heap, 3 * 4).unwrap();
+        let mut context = Context::new(Env::current(), None);
+        let mut indices = Buffer::allocate(Env::current(), 3 * 4).unwrap();
         indices.as_mut_slice::<u32>().copy_from_slice(&[1, 0, 1]);
         let dictionary = ColumnView::dictionary(&mut context, &int64s(5..7), indices).unwrap();
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
+        let table =
+            Table::new(Env::current(), &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
         // Its dictionary's entries hold no nulls.
         assert!(!table.column_nullable(0));
         for forms in [Forms::FLAT | Forms::DICTIONARY, Forms::FLAT] {

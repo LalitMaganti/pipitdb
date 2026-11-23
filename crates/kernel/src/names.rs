@@ -1,14 +1,17 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
-use crate::allocator::{AllocError, Allocator};
-use crate::slow_vec::SlowVec;
+#![allow(unsafe_code)]
+
+use crate::allocator::AllocError;
+use crate::containers::SmallVec;
+use crate::env::Env;
 
 pub struct Names {
-    bytes: SlowVec<u8>,
+    bytes: SmallVec<u8>,
 }
 
 /// Where a name is in its `Names`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Name {
     start: u32,
     len: u32,
@@ -16,13 +19,13 @@ pub struct Name {
 
 impl Names {
     /// Room for up to `max_bytes` of names, a power of two.
-    pub fn new(allocator: &dyn Allocator, max_bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: SlowVec::new(allocator, max_bytes)? })
+    pub fn new(env: &Env, max_bytes: usize) -> Result<Names, AllocError> {
+        Ok(Names { bytes: SmallVec::new(env, max_bytes)? })
     }
 
     /// Room for exactly `bytes` of names, which never grows.
-    pub fn fixed(allocator: &dyn Allocator, bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: SlowVec::fixed(allocator, bytes)? })
+    pub fn fixed(env: &Env, bytes: usize) -> Result<Names, AllocError> {
+        Ok(Names { bytes: SmallVec::fixed(env, bytes)? })
     }
 
     /// Copies `name` in.
@@ -58,13 +61,13 @@ impl Names {
 
 #[cfg(test)]
 mod tests {
-    use crate::allocator::Heap;
 
     use super::*;
 
     #[test]
     fn keeps_names() {
-        let mut names = Names::new(&Heap, 16).unwrap();
+        let env = Env::current();
+        let mut names = Names::new(env, 16).unwrap();
         let a = names.add("ts").unwrap();
         let b = names.add("dur").unwrap();
         assert_eq!((names.get(a), names.get(b)), ("ts", "dur"));

@@ -11,17 +11,17 @@
 //! `QUERY` runs only that query, `REPEAT` runs each that many times and times
 //! the last, and `QUIET` doesn't print rows.
 
+#![allow(unsafe_code)]
+
 use std::cell::Cell;
 use std::time::Instant;
 
 use pipit_file::source::FileSource;
-use pipit_kernel::allocator::{Heap, LimitAllocator};
+use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
-use pipit_kernel::lower::lower;
-use pipit_kernel::optimize::optimize;
-use pipit_kernel::output_properties::plan_nodes;
-use pipit_kernel::query_allocators::QueryAllocators;
+use pipit_kernel::env::Env;
+use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Kept;
@@ -31,13 +31,16 @@ use pipit_parquet_full::Codecs;
 use pipit_pipesql::compile::compile;
 use pipit_pipesql::registry::Registry;
 
-static REGISTRY: Registry =
-    Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION])
-        .with_functions(&[
-            pipit_pipesql::choices::CHOICES,
-            pipit_pipesql::string_functions::STRING_FUNCTIONS,
-            pipit_regex::REGEX_FUNCTIONS,
-        ]);
+static REGISTRY: Registry = Registry::new(&[
+    pipit_pipesql::stages::RELATIONAL,
+    pipit_pipesql::stages::AGGREGATION,
+    pipit_pipesql::stages::JOINS,
+])
+.with_functions(&[
+    pipit_pipesql::choices::CHOICES,
+    pipit_pipesql::string_functions::STRING_FUNCTIONS,
+    pipit_regex::REGEX_FUNCTIONS,
+]);
 
 /// ClickBench's queries: each one's name, PipeSQL, if pipitdb can run it yet,
 /// and SQL, a line each.
@@ -134,11 +137,12 @@ fn main() -> Result<(), String> {
         }
         let repeat = std::env::var("REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
         for _ in 1..repeat {
-            run(&open_tables(&codecs, &sources, false)?, query, &QueryAllocators::new(&Heap))?;
+            run(&open_tables(&codecs, &sources, false)?, query, pipitdb_bench::env())?;
         }
-        let limit = LimitAllocator::new(&Heap, usize::MAX);
         // Counts what the query holds at its peak, for the report.
-        let allocators = QueryAllocators::new(&limit);
+        // SAFETY: `run` drops all it allocates, but the columns it returns,
+        // which hold none of it.
+        let env = unsafe { Env::new(Heap, usize::MAX) }.map_err(|e| format!("{e:?}"))?;
         codecs.pages.set(0);
         codecs.bytes.set(0);
         // Each query opens its tables, reading their footers, as other
@@ -146,7 +150,7 @@ fn main() -> Result<(), String> {
         let start = Instant::now();
         let tables = open_tables(&codecs, &sources, first)?;
         first = false;
-        match run(&tables, query, &allocators) {
+        match run(&tables, query, &env) {
             Ok(columns) => {
                 // Timed up to the results, as other engines' times are; turning
                 // them into text isn't.
@@ -158,7 +162,7 @@ fn main() -> Result<(), String> {
                     println!("{number}\t{}", row.join("\t"));
                 }
                 #[expect(clippy::cast_precision_loss, reason = "a report")]
-                let peak = limit.peak() as f64 / 1e6;
+                let peak = env.peak() as f64 / 1e6;
                 #[expect(clippy::cast_precision_loss, reason = "a report")]
                 let read = codecs.bytes.get() as f64 / 1e6;
                 let pages = codecs.pages.get();
@@ -181,9 +185,10 @@ fn open_tables<'a>(
 ) -> Result<Tables<'a>, String> {
     let mut tables = Vec::new();
     for (name, sources) in sources {
-        match ParquetTable::open(&Heap, codecs, sources) {
+        match ParquetTable::open(pipitdb_bench::env(), codecs, sources) {
             Ok(table) => {
-                let table = DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?;
+                let table =
+                    DynScannable::new(pipitdb_bench::env(), table).map_err(|e| format!("{e:?}"))?;
                 tables.push(((*name).to_string(), table));
             }
             Err(error) if report => eprintln!("{name}: {error:?}"),
@@ -229,11 +234,16 @@ impl Output {
         self.data_type = column.data_type();
         let null = column.is_null(row);
         self.nulls.push(null);
+        if let Form::Sequence(first) = column.form() {
+            self.words.push(first + i64::from(row));
+            return;
+        }
         let values = column.values();
         let value = match column.form() {
             Form::Flat => row as usize,
             Form::Constant => 0,
             Form::Dictionary(indices) => indices[row as usize] as usize,
+            Form::Sequence(_) => unreachable!(),
         };
         match self.data_type {
             DataType::Int64 => self.words.push(if null { 0 } else { values.int64s()[value] }),
@@ -265,13 +275,11 @@ impl Output {
 
 /// The result of `query`: a column of its kept rows for each it outputs,
 /// built as each batch comes, as other engines build theirs.
-fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec<Output>, String> {
+fn run(tables: &Tables, query: &str, env: &Env) -> Result<Vec<Output>, String> {
     let mut plan =
-        compile(&Heap, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
-    optimize(&Heap, &mut plan).map_err(|e| format!("{e:?}"))?;
-    let planned = plan_nodes(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
-    let physical = lower(&Heap, &mut plan, &planned).map_err(|e| format!("{e:?}"))?;
-    let mut execution = physical.start(allocators).map_err(|e| format!("{e:?}"))?;
+        compile(env, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    let physical = PhysicalPlan::from_logical(env, &mut plan).map_err(|e| format!("{e:?}"))?;
+    let mut execution = physical.start(env).map_err(|e| format!("{e:?}"))?;
     let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
     let mut batch = RowBatch::new();
     while execution.next(&mut batch).map_err(|e| format!("{e:?}"))? {

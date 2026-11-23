@@ -5,6 +5,7 @@
 //! in a compact form, `pipit:E0007:2+0:5` (code, span start and length,
 //! detail), and explained later against the query.
 
+#![forbid(unsafe_code)]
 #![no_std]
 
 extern crate alloc;

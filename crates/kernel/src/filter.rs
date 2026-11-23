@@ -6,12 +6,15 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
+#![allow(unsafe_code)]
+
+use crate::containers::{Array, BitSlice};
 use core::cmp::Ordering;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::array::Array;
-use crate::column::{ColumnView, DataType, Form, Values};
+use crate::allocator::AllocError;
+use crate::column::{ColumnView, DataType, Form, Forms, Values};
 use crate::eight;
+use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::murmur_hash;
 use crate::selection::Selection;
@@ -28,7 +31,7 @@ pub enum Comparison {
 
 impl Comparison {
     /// Whether it holds for a cell ordered `order` against the value.
-    fn holds(self, order: Ordering) -> bool {
+    pub(crate) fn holds(self, order: Ordering) -> bool {
         match self {
             Comparison::Equal => order.is_eq(),
             Comparison::NotEqual => order.is_ne(),
@@ -36,6 +39,29 @@ impl Comparison {
             Comparison::LessEqual => order.is_le(),
             Comparison::Greater => order.is_gt(),
             Comparison::GreaterEqual => order.is_ge(),
+        }
+    }
+    /// The comparison with its sides swapped.
+    pub fn flipped(self) -> Comparison {
+        match self {
+            Comparison::Less => Comparison::Greater,
+            Comparison::LessEqual => Comparison::GreaterEqual,
+            Comparison::Greater => Comparison::Less,
+            Comparison::GreaterEqual => Comparison::LessEqual,
+            Comparison::Equal | Comparison::NotEqual => self,
+        }
+    }
+
+    /// The comparison true for exactly the non-null rows this is false for.
+    /// Floats are ordered totally, so this holds for them too.
+    pub fn negated(self) -> Comparison {
+        match self {
+            Comparison::Equal => Comparison::NotEqual,
+            Comparison::NotEqual => Comparison::Equal,
+            Comparison::Less => Comparison::GreaterEqual,
+            Comparison::LessEqual => Comparison::Greater,
+            Comparison::Greater => Comparison::LessEqual,
+            Comparison::GreaterEqual => Comparison::Less,
         }
     }
 }
@@ -65,39 +91,63 @@ pub fn compare(
         return drop_all(selection, dropped);
     };
     match value {
-        Value::Int64(_) => {
-            check!(column.data_type() == DataType::Int64);
-            let cells = column.values().int64s();
-            if eight::EIGHT_AT_A_TIME
-                && dropped.is_none()
-                && matches!(column.form(), Form::Flat)
-                && selection.is_prefix()
-            {
-                let cells = at!(cells, ..selection.len() as usize);
-                let validity = column.validity();
-                let valid = validity.map(crate::column::Validity::bits);
-                // SAFETY: `keep_prefix` asks for eights below `len()`, which
-                // `cells` has a cell for each of.
-                let kept = |at| unsafe { eight::in_range(cells, at, range.lo, range.span) };
-                #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
-                let one = |row: usize| {
-                    // SAFETY: `row` is below `len()`, a row of `column`.
-                    let valid = validity
-                        .is_none_or(|validity| unsafe { validity.is_valid_unchecked(row as u32) });
-                    valid & range.contains(*at!(cells, row))
-                };
-                let Some((bits, shift)) = valid else {
-                    return selection.keep_prefix(kept, one);
-                };
-                return selection.keep_prefix(|at| kept(at) & eight_valid(bits, shift, at), one);
-            }
-            compare_form(column, cells, |cell| cell, range, selection, dropped);
-        }
+        Value::Int64(_) => keep_within(column, range, selection, dropped),
         Value::Float64(_) => {
             check!(column.data_type() == DataType::Float64);
             compare_form(column, column.values().float64s(), float_key, range, selection, dropped);
         }
     }
+}
+
+/// Narrows `selection` to the rows of `column`, an integer column, within
+/// `range`, writing the rows it drops to `dropped`, if given.
+pub(crate) fn keep_within(
+    column: &ColumnView,
+    range: Range,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    check!(column.data_type() == DataType::Int64);
+    if column.is_in(Forms::SEQUENCE) {
+        return keep_sequence(column, range, selection, dropped);
+    }
+    let cells = column.values().int64s();
+    if eight::EIGHT_AT_A_TIME
+        && dropped.is_none()
+        && matches!(column.form(), Form::Flat)
+        && selection.is_prefix()
+    {
+        let cells = at!(cells, ..selection.len() as usize);
+        let validity = column.validity();
+        let valid = validity.map(crate::column::Validity::bits);
+        // SAFETY: `keep_prefix` asks for eights below `len()`, which
+        // `cells` has a cell for each of.
+        let kept = |at| unsafe { eight::in_range(cells, at, range.lo, range.span) };
+        #[expect(clippy::cast_possible_truncation, reason = "a batch's row")]
+        let one = |row: usize| {
+            // SAFETY: `row` is below `len()`, a row of `column`.
+            let valid =
+                validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(row as u32) });
+            valid & range.contains(*at!(cells, row))
+        };
+        let Some((bits, shift)) = valid else {
+            return selection.keep_prefix(kept, one);
+        };
+        // Every row has a bit, so each eight's bits are in the bitmap: in
+        // one byte unless they start partway through one.
+        check!(bits.len() * 8 >= cells.len() + shift as usize);
+        // Each half kept and not null.
+        let both = |(low, high): eight::Halves, valid: u8| (low & valid, high & valid >> 4);
+        if shift == 0 {
+            // SAFETY: as checked.
+            let valid = |at: usize| unsafe { *bits.get_unchecked(at / 8) };
+            return selection.keep_prefix(|at| both(kept(at), valid(at)), one);
+        }
+        // SAFETY: as checked.
+        let valid = |at| unsafe { eight_valid(bits, shift, at) };
+        return selection.keep_prefix(|at| both(kept(at), valid(at)), one);
+    }
+    compare_form(column, cells, |cell| cell, range, selection, dropped);
 }
 
 /// The most values an `IN` list can have for each row to be compared with
@@ -143,8 +193,9 @@ pub fn is_in(
             return keep_all(selection, dropped);
         }
         Form::Constant => return drop_all(selection, dropped),
-        // Only string conditions take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // Only string conditions take dictionaries, and only comparisons
+        // sequences: see `FilterOp::accepts`.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
     // One loop for each case, which keeps rows: those dropped are found from
     // what's left.
@@ -294,8 +345,8 @@ fn keep_strings(
         }
         Form::Constant => return drop_all(selection, dropped),
         // Only string conditions take dictionaries, which they test by entry:
-        // see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // see `FilterOp::accepts`. Sequences are integers.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
     let valid = valid_rows(column);
     retain(selection, dropped, |row| valid(row) && holds(strings.get(usize::from(row))));
@@ -342,7 +393,7 @@ impl Entries {
     /// its entries, unless found already.
     pub fn find(
         &mut self,
-        allocator: &dyn Allocator,
+        env: &Env,
         column: &ColumnView,
         want: bool,
         set: &dyn Fn(Values<'_>, &mut [u64]),
@@ -351,7 +402,7 @@ impl Entries {
             && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));
         if !found {
             let values = column.values();
-            let mut bits = Array::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
+            let mut bits = Array::zeroed(env, BitSlice::<u64>::words_for(values.len() as usize))?;
             set(values, &mut bits);
             self.matched = bits.iter().map(|word| word.count_ones()).sum();
             if self.matched == 1 {
@@ -384,7 +435,7 @@ pub fn compare_string_bits(
 fn set(bits: &mut [u64], values: Values<'_>, test: impl Fn(u32) -> bool) {
     for e in 0..values.len() {
         let passes = !values.is_null(e) && test(e);
-        *at_mut!(bits, e as usize / 64) |= u64::from(passes) << (e % 64);
+        BitSlice::of_mut(&mut *bits).set_if(e as usize, passes);
     }
 }
 
@@ -425,7 +476,7 @@ pub fn keep_entries(
             return e == entries.only;
         }
         // An index past the entries fails the check, as when read anywhere.
-        (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
+        BitSlice::of(bits).get(e as usize)
     });
 }
 
@@ -450,8 +501,33 @@ fn compare_form<T: Copy>(
             }
         }
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
-        Form::Dictionary(_) => failed!(),
+        // `compare` takes sequences before reading values.
+        Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
+}
+
+/// Narrows `selection` to the rows of `column`, a sequence from `first`,
+/// whose values are in `range`, writing the rows it drops to `dropped`, if given. Each
+/// row's value is its number from `first`, so no value is read, and when
+/// every row is kept and `range` doesn't wrap, those kept are one run of
+/// them, kept at once, as Perfetto keeps a range of ids.
+#[inline(never)]
+fn keep_sequence(
+    column: &ColumnView,
+    range: Range,
+    selection: &mut Selection,
+    dropped: Option<&mut Selection>,
+) {
+    let Form::Sequence(first) = column.form() else { failed!() };
+    let (lo, hi) = (i128::from(range.lo), i128::from(range.lo) + i128::from(range.span));
+    if dropped.is_none() && selection.is_prefix() && hi <= i128::from(i64::MAX) {
+        let rows = i128::from(selection.len());
+        let start = (lo - i128::from(first)).clamp(0, rows);
+        let end = (hi - i128::from(first) + 1).clamp(start, rows);
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "rows")]
+        return selection.keep_range(start as u32, (end - start) as u32);
+    }
+    retain(selection, dropped, move |row| range.contains(first.wrapping_add(i64::from(row))));
 }
 
 /// Narrows `selection` to the null rows if `nulls`, or else to the others,
@@ -468,6 +544,9 @@ pub fn is_null(
         // One value for every row: kept or dropped together.
         Form::Constant if column.is_null(0) == nulls => return keep_all(selection, dropped),
         Form::Constant => return drop_all(selection, dropped),
+        // A sequence has no nulls.
+        Form::Sequence(_) if nulls => return drop_all(selection, dropped),
+        Form::Sequence(_) => return keep_all(selection, dropped),
         // Only string comparisons take dictionaries: see `FilterOp::accepts`.
         Form::Dictionary(_) => failed!(),
     }
@@ -520,14 +599,14 @@ impl Range {
 }
 
 /// Which of the eight rows from `at` aren't null, as the bits of a byte, from
-/// a bitmap whose first row is bit `shift` of its first byte.
-fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
-    let low = *at!(bits, at / 8);
-    if shift == 0 {
-        return low;
-    }
-    // Rows past the first byte's are in the next, which covers them.
-    let high = *at!(bits, at / 8 + 1);
+/// a bitmap whose first row is bit `shift`, above 0, of its first byte.
+///
+/// # Safety
+///
+/// `bits` must have a byte at `at / 8 + 1`.
+unsafe fn eight_valid(bits: &[u8], shift: u32, at: usize) -> u8 {
+    // SAFETY: as the caller promises.
+    let (low, high) = unsafe { (*bits.get_unchecked(at / 8), *bits.get_unchecked(at / 8 + 1)) };
     #[expect(clippy::cast_possible_truncation, reason = "8 bits")]
     let eight = ((u16::from(low) | u16::from(high) << 8) >> shift) as u8;
     eight
@@ -639,25 +718,27 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
+    use crate::column::Forms;
     use crate::context::Context;
     use crate::selection::Kept;
 
     /// `0, 1, ..., 9`, with rows in `nulls` null.
     fn int64s(nulls: &[u16]) -> ColumnView {
-        let mut values = Buffer::allocate(&Heap, 80).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 80).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut validity = Buffer::allocate(&Heap, 2).unwrap();
+            let mut validity = Buffer::allocate(env, 2).unwrap();
             for row in 0..10_u16 {
                 if !nulls.contains(&row) {
-                    validity.as_mut_slice::<u8>()[row as usize / 8] |= 1 << (row % 8);
+                    BitSlice::of_mut(validity.as_mut_slice::<u8>()).set(row as usize);
                 }
             }
             validity
         });
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+        ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, validity).unwrap()
     }
 
     /// The rows `filter` keeps of all ten.
@@ -665,7 +746,8 @@ mod tests {
         let mut selection = Selection::all(10);
         filter(&mut selection);
         match selection.kept() {
-            Kept::Prefix => (0..10).collect(),
+            #[expect(clippy::cast_possible_truncation, reason = "at most 10")]
+            Kept::Prefix => (0..selection.len() as u16).collect(),
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.to_vec(),
         }
@@ -683,16 +765,42 @@ mod tests {
         assert_eq!(rows(Comparison::GreaterEqual), [6, 7, 8, 9]);
     }
 
+    #[test]
+    fn compares_sequences_by_their_rows() {
+        let env = Env::current();
+        let context = &mut Context::new(env, None);
+        let (flat, sequence) = (int64s(&[]), ColumnView::sequence(context, 0, 10).unwrap());
+        for comparison in [
+            Comparison::Equal,
+            Comparison::NotEqual,
+            Comparison::Less,
+            Comparison::LessEqual,
+            Comparison::Greater,
+            Comparison::GreaterEqual,
+        ] {
+            let rows = |column| kept(|s| compare(column, comparison, Value::Int64(6), s, None));
+            assert_eq!(rows(&sequence), rows(&flat));
+        }
+        // Row 0 of a slice from row 3 of one from 100 is 103.
+        let from = ColumnView::sequence(context, 100, 13).unwrap().slice(3, 10);
+        assert_eq!(kept(|s| compare(&from, Comparison::Less, Value::Int64(105), s, None)), [0, 1]);
+        assert!(kept(|s| is_null(&from, true, s, None)).is_empty());
+        let mut flat = from.clone();
+        flat.make_in(context, Forms::FLAT).unwrap();
+        assert_eq!(flat.int64s(), [103, 104, 105, 106, 107, 108, 109, 110, 111, 112]);
+    }
+
     /// Whether a comparison holds, as Rust's operators say.
     type Holds = fn(&i64, &i64) -> bool;
 
     #[test]
     fn compares_at_the_ends_of_the_range() {
+        let env = Env::current();
         let cells = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
-        let mut values = Buffer::allocate(&Heap, 56).unwrap();
+        let mut values = Buffer::allocate(env, 56).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&cells);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, None).unwrap();
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
             (Comparison::NotEqual, i64::ne),
@@ -731,6 +839,7 @@ mod tests {
 
     #[test]
     fn compares_eight_rows_at_a_time() {
+        let env = Env::current();
         // Groups of eight and the rows after them, with the ends of the range
         // among values spread over it, and every third row null.
         let ends = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
@@ -741,17 +850,19 @@ mod tests {
             })
             .collect();
         let column = |nulls: bool| {
-            let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
+            let mut values = Buffer::allocate(env, cells.len() * 8).unwrap();
             values.as_mut_slice::<i64>().copy_from_slice(&cells);
             let validity = nulls.then(|| {
-                let mut validity = Buffer::allocate(&Heap, cells.len().div_ceil(8)).unwrap();
+                let mut validity =
+                    Buffer::allocate(env, BitSlice::<u8>::words_for(cells.len())).unwrap();
                 validity.as_mut_slice::<u8>().fill(0);
                 for row in (0..cells.len()).filter(|row| !row.is_multiple_of(3)) {
-                    validity.as_mut_slice::<u8>()[row / 8] |= 1 << (row % 8);
+                    BitSlice::of_mut(validity.as_mut_slice::<u8>()).set(row);
                 }
                 validity
             });
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, validity)
+                .unwrap()
         };
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
@@ -792,11 +903,12 @@ mod tests {
 
     #[test]
     fn compares_floats_as_duckdb_does() {
-        let mut values = Buffer::allocate(&Heap, 48).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 48).unwrap();
         let cells = [-1.5, -0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
         values.as_mut_slice::<f64>().copy_from_slice(&cells);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Float64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Float64, values, None).unwrap();
         let rows = |comparison, value| {
             let mut selection = Selection::all(6);
             compare(&column, comparison, Value::Float64(value), &mut selection, None);
@@ -839,21 +951,24 @@ mod tests {
 
     #[test]
     fn filters_constants_once() {
-        let mut values = Buffer::allocate(&Heap, 2 * 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 2 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[20, 0]);
-        let mut bits = Buffer::allocate(&Heap, 1).unwrap();
+        let mut bits = Buffer::allocate(env, 1).unwrap();
         bits.as_mut_slice::<u8>()[0] = 0b01;
         let values =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(bits)).unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, Some(bits))
+                .unwrap();
         let compare_on = |column: &ColumnView, value| {
             let mut selection = Selection::all(column.row_count());
             compare(column, Comparison::GreaterEqual, Value::Int64(value), &mut selection, None);
             selection.len()
         };
         let twenties =
-            ColumnView::constant(&mut Context::new(&Heap), &values.slice(0, 1), 4).unwrap();
+            ColumnView::constant(&mut Context::new(env, None), &values.slice(0, 1), 4).unwrap();
         assert_eq!((compare_on(&twenties, 15), compare_on(&twenties, 25)), (4, 0));
-        let nulls = ColumnView::constant(&mut Context::new(&Heap), &values.slice(1, 1), 4).unwrap();
+        let nulls =
+            ColumnView::constant(&mut Context::new(env, None), &values.slice(1, 1), 4).unwrap();
         assert_eq!(compare_on(&nulls, -100), 0);
         let mut selection = Selection::all(4);
         is_null(&nulls, true, &mut selection, None);
@@ -867,8 +982,9 @@ mod tests {
         [b"", b"a", b"ab", b"", b"B", "é".as_bytes(), b"ab", b"abc", b"\0", b"zz"];
 
     fn strings() -> ColumnView {
+        let env = Env::current();
         let bytes: Vec<u8> = STRINGS.concat();
-        let mut views = Buffer::allocate(&Heap, 10 * 8).unwrap();
+        let mut views = Buffer::allocate(env, 10 * 8).unwrap();
         let mut start = 0;
         for (row, string) in STRINGS.iter().enumerate() {
             let len = u32::try_from(string.len()).unwrap();
@@ -876,11 +992,11 @@ mod tests {
             views.as_mut_slice::<u32>()[2 * row..2 * row + 2].copy_from_slice(&view);
             start += len;
         }
-        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-        let mut validity = Buffer::allocate(&Heap, 2).unwrap();
+        let mut validity = Buffer::allocate(env, 2).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[!(1 << 3), 0b11]);
-        ColumnView::strings(&mut Context::new(&Heap), views, stored, Some(validity)).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), views, stored, Some(validity)).unwrap()
     }
 
     #[test]
@@ -908,11 +1024,12 @@ mod tests {
 
     #[test]
     fn filters_constant_strings_once() {
-        let mut views = Buffer::allocate(&Heap, 8).unwrap();
+        let env = Env::current();
+        let mut views = Buffer::allocate(env, 8).unwrap();
         views.as_mut_slice::<u32>().copy_from_slice(&[0, 2]);
-        let mut bytes = Buffer::allocate(&Heap, 2).unwrap();
+        let mut bytes = Buffer::allocate(env, 2).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(b"ab");
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(env, None);
         let value = ColumnView::strings(&mut context, views, bytes, None).unwrap();
         let column = ColumnView::constant(&mut context, &value, 10).unwrap();
         let equal = kept(|s| compare_string(&column, Comparison::Equal, b"ab", s, None));

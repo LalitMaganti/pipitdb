@@ -206,7 +206,7 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
     match detail {
         what if what == Unsupported::SelectExpression as u16 => {
             (
-                "only arithmetic and comparisons of columns, integers, strings and `NULL` can be computed yet"
+                "only arithmetic, comparisons, `IN` lists and `AND`, `OR` and `NOT` of columns, integers, strings and `NULL` can be computed yet"
                     .into(),
                 "can't compute this yet".into(),
             )
@@ -242,6 +242,13 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             "only integer and string columns can be grouped by yet".into(),
             "not an integer or string column".into(),
         ),
+        what if what == Unsupported::DoubleCondition as u16 => (
+            "only comparisons and integers can be conditions yet".into(),
+            "a double".into(),
+        ),
+        what if what == Unsupported::Join as u16 => {
+            ("joins can't be run yet".into(), "a join".into())
+        }
         _ => ("not supported yet".into(), "this can't be run yet".into()),
     }
 }
@@ -275,7 +282,7 @@ fn token(kind: TokenKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
+    use pipit_kernel::env::Env;
 
     use crate::parser::parse_expression;
 
@@ -284,7 +291,7 @@ mod tests {
     #[test]
     fn renders_a_parse_error() {
         let source = "a +\n  (b * c";
-        let error = parse_expression(&Heap, source.as_bytes()).unwrap_err();
+        let error = parse_expression(Env::current(), source.as_bytes()).unwrap_err();
         assert_eq!(
             render(source, "query", &error),
             "error[E0007]: expected `)`, found the end of the query\n \
@@ -294,7 +301,7 @@ mod tests {
 
     #[test]
     fn compact_round_trips() {
-        let error = parse_expression(&Heap, b"a b").unwrap_err();
+        let error = parse_expression(Env::current(), b"a b").unwrap_err();
         let text = compact(&error);
         assert_eq!(text, "pipit:E0006:2+1:0");
         assert_eq!(parse_compact(&text), Some(error));

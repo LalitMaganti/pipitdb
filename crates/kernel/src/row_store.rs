@@ -1,15 +1,18 @@
 //! `RowStore`: the rows a breaker holds on to, to hand back later in any
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
-use crate::allocator::{AllocError, Allocator};
+#![allow(unsafe_code)]
+
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
+use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::plan::PLAN_COLUMNS_MAX;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::slow_vec::SlowVec;
 use core::ops::Range;
 
 /// The bits of a row's place that say which row of its batch it is.
@@ -51,7 +54,7 @@ const POSITION_MASK: u64 = (1 << POSITION_SHIFT) - 1;
 /// whole buffers alive.
 pub(crate) struct RowStore {
     /// Each batch held, by its columns.
-    held: SlowVec<GatherSource>,
+    held: SmallVec<GatherSource>,
     /// How many batches are held.
     batches: u32,
     /// How many columns each batch held has.
@@ -61,10 +64,10 @@ pub(crate) struct RowStore {
     dense: u32,
     /// Where each row held after the `dense` ones is: its batch, shifted up
     /// `ROW_BITS`, and its row in it.
-    places: SlowVec<u32>,
+    places: SmallVec<u32>,
     /// By column, the rows being packed, until there are a batch's worth or a
     /// batch is shared after them.
-    packing: SlowVec<Packing>,
+    packing: SmallVec<Packing>,
     /// How many rows are being packed.
     packed: u32,
     /// By column, a bit for whether any batch held has nulls in it; the
@@ -75,29 +78,29 @@ pub(crate) struct RowStore {
     dropped: u64,
     /// By column dropped, a batch's worth of words never read, held in its
     /// place.
-    placeholders: SlowVec<ColumnView>,
+    placeholders: SmallVec<ColumnView>,
     /// By column, a bit for whether `scatter` copied it.
     scattered: u64,
     /// The columns `scatter` copied, in output order: by column copied, a
     /// view of each batch's worth.
-    copies: SlowVec<ColumnView>,
+    copies: SmallVec<ColumnView>,
 }
 
 impl RowStore {
-    pub(crate) fn new(allocator: &dyn Allocator) -> Result<RowStore, AllocError> {
+    pub(crate) fn new(env: &Env) -> Result<RowStore, AllocError> {
         Ok(RowStore {
-            held: SlowVec::new(allocator, 1 << 31)?,
+            held: SmallVec::new(env, 1 << 31)?,
             batches: 0,
             width: 0,
             dense: 0,
-            places: SlowVec::new(allocator, 1 << 31)?,
-            packing: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            places: SmallVec::new(env, 1 << 31)?,
+            packing: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
             packed: 0,
             nullable: 0,
             dropped: 0,
-            placeholders: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            placeholders: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
             scattered: 0,
-            copies: SlowVec::new(allocator, 1 << 24)?,
+            copies: SmallVec::new(env, 1 << 24)?,
         })
     }
 
@@ -211,7 +214,7 @@ impl RowStore {
         }
         let mut batch = RowBatch::new();
         #[expect(clippy::cast_possible_truncation, reason = "a column of a batch each")]
-        batch.reserve(context.allocator(), self.packing.len() as u32)?;
+        batch.reserve(context.env(), self.packing.len() as u32)?;
         batch.reset(self.packed);
         for packing in self.packing.iter() {
             let Ok(()) = batch.push_column(packing.take(context)?) else { failed!() };
@@ -242,21 +245,25 @@ impl RowStore {
         out: &mut RowBatch,
         rows: &[u32],
         at: u32,
-        mut given: impl FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
+        given: &mut dyn FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
     ) -> Result<u32, Error> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         let count = rows.len().min(BATCH_ROWS_MAX as usize) as u32;
         let rows = at!(rows, ..count as usize);
-        out.reserve(context.allocator(), self.width)?;
+        out.reserve(context.env(), self.width)?;
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
-        // Found once for every column.
-        let mut places = [0_u32; BATCH_ROWS_MAX as usize];
-        for (found, &row) in places.iter_mut().zip(rows) {
-            *found = self.place(row);
-        }
-        let places = at!(places, ..count as usize);
+        // Found once for every column: a row held whole is its own place.
+        let mut found = [0_u32; BATCH_ROWS_MAX as usize];
+        let places = if self.places.is_empty() {
+            rows
+        } else {
+            for (found, &row) in found.iter_mut().zip(rows) {
+                *found = self.place(row);
+            }
+            at!(found, ..count as usize)
+        };
         let first_place = *at!(places, 0);
         let (held, start) = self.find(first_place);
         let scattered = |c: usize| self.copied(c, at, count);
@@ -295,6 +302,18 @@ impl RowStore {
         Ok(count)
     }
 
+    /// As `gather`, of a store that dropped no column: one copy, which
+    /// the joins share.
+    #[inline(never)]
+    pub(crate) fn gather_held(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+        rows: &[u32],
+    ) -> Result<u32, Error> {
+        self.gather(context, out, rows, 0, &mut |_, _| failed!())
+    }
+
     /// Column `column`'s `count` values from `at` in the order `scatter` was
     /// given, if it copied the column.
     #[inline(never)]
@@ -328,7 +347,7 @@ impl RowStore {
     ) -> Result<(), Error> {
         self.flush(context)?;
         let (width, rows) = (self.width as usize, words.len());
-        let allocator = context.allocator();
+        let env = context.env();
         // A bit for each column to copy, and each column's type.
         let (mut copy, mut types) = (0_u64, [DataType::Int64; 63]);
         for c in 0..width.min(63) {
@@ -353,7 +372,7 @@ impl RowStore {
         // 0. Columns decoded from the words, in order already: a bit for
         // each of the columns copied.
         let moved = copy | dropped;
-        let mut copies = Copies::new(allocator, moved.count_ones() as usize, rows)?;
+        let mut copies = Copies::new(env, moved.count_ones() as usize, rows)?;
         let mut in_order = 0_u64;
         if let Some(decode) = decode.as_mut() {
             for (k, c) in columns(moved).enumerate().filter(|&(_, c)| decoded >> c & 1 != 0) {
@@ -404,7 +423,7 @@ impl RowStore {
             }
         }
         // 3. Each region in order.
-        copies.put_in_order(allocator, words, in_order)?;
+        copies.put_in_order(env, words, in_order)?;
         self.copies = copies.views(context, columns(moved).map(|c| *at!(types, c)))?;
         self.scattered = moved;
         Ok(())
@@ -435,15 +454,15 @@ fn mark_positions(words: &mut [u64], row_of: impl Fn(u64) -> u32) {
 /// What `scatter` copies columns into: by column copied, then batch of
 /// output rows, a buffer once its first row is taken.
 struct Copies {
-    buffers: SlowVec<Option<Buffer>>,
+    buffers: SmallVec<Option<Buffer>>,
     rows: usize,
     batches: usize,
 }
 
 impl Copies {
-    fn new(allocator: &dyn Allocator, columns: usize, rows: usize) -> Result<Copies, Error> {
+    fn new(env: &Env, columns: usize, rows: usize) -> Result<Copies, Error> {
         let batches = rows.div_ceil(BATCH_ROWS_MAX as usize);
-        let buffers = SlowVec::fixed_from(allocator, (0..columns * batches).map(|_| None))?;
+        let buffers = SmallVec::fixed_from(env, (0..columns * batches).map(|_| None))?;
         Ok(Copies { buffers, rows, batches })
     }
 
@@ -501,13 +520,8 @@ impl Copies {
     /// in cache: each slot's word in `words` says where in its region the
     /// value that arrived in it goes.
     /// Columns with a bit in `in_order` are left as they are.
-    fn put_in_order(
-        &self,
-        allocator: &dyn Allocator,
-        words: &[u64],
-        in_order: u64,
-    ) -> Result<(), Error> {
-        let mut values = SlowVec::<i64>::zeroed(allocator, 1 << REGION_BITS)?;
+    fn put_in_order(&self, env: &Env, words: &[u64], in_order: u64) -> Result<(), Error> {
+        let mut values = Array::<i64>::zeroed(env, 1 << REGION_BITS)?;
         for first in (0..self.rows).step_by(1 << REGION_BITS) {
             let end = self.rows.min(first + (1 << REGION_BITS));
             for k in (0..self.buffers.len() / self.batches).filter(|k| in_order >> k & 1 == 0) {
@@ -528,8 +542,8 @@ impl Copies {
         &mut self,
         context: &mut Context,
         types: impl Iterator<Item = DataType>,
-    ) -> Result<SlowVec<ColumnView>, Error> {
-        let mut views = SlowVec::fixed(context.allocator(), self.buffers.len())?;
+    ) -> Result<SmallVec<ColumnView>, Error> {
+        let mut views = SmallVec::fixed(context.env(), self.buffers.len())?;
         for (data_type, buffers) in types.zip(self.buffers.chunks_mut(self.batches)) {
             for buffer in buffers {
                 let Some(buffer) = buffer.take() else { failed!() };
@@ -558,13 +572,16 @@ fn shares(batch: &RowBatch) -> bool {
 
 /// A column being packed: its values, up to a batch's, and nulls.
 struct Packing {
+    /// What type the column is.
     data_type: DataType,
     /// Each row's value: a word, or a string's view into `bytes`.
     values: Buffer,
+    /// A bit for each row, set if it isn't null.
     validity: Buffer,
+    /// Whether any row is null.
     nulls: bool,
     /// The strings' bytes, for a string column.
-    bytes: Option<SlowVec<u8>>,
+    bytes: Option<SmallVec<u8>>,
     /// How many rows are packed.
     rows: u32,
 }
@@ -572,13 +589,11 @@ struct Packing {
 impl Packing {
     fn new(context: &mut Context, data_type: DataType) -> Result<Packing, AllocError> {
         let values = context.values_buffer(BATCH_ROWS_MAX as usize * 8)?;
-        let mut validity = context.small_buffer(BATCH_ROWS_MAX.div_ceil(8) as usize)?;
+        let mut validity =
+            context.small_buffer(BitSlice::<u8>::words_for(BATCH_ROWS_MAX as usize))?;
         validity.as_mut_slice::<u8>().fill(0);
-        let bytes = if data_type.has_bytes() {
-            Some(SlowVec::new(context.allocator(), 1 << 31)?)
-        } else {
-            None
-        };
+        let bytes =
+            if data_type.has_bytes() { Some(SmallVec::new(context.env(), 1 << 31)?) } else { None };
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
     }
 
@@ -589,7 +604,7 @@ impl Packing {
             let row = kept.row(i);
             let at = self.rows as usize;
             let valid = !values.is_null(row);
-            *at_mut!(self.validity.as_mut_slice::<u8>(), at / 8) |= u8::from(valid) << (at % 8);
+            BitSlice::of_mut(self.validity.as_mut_slice::<u8>()).set_if(at, valid);
             self.nulls |= !valid;
             match &mut self.bytes {
                 None => {
@@ -654,14 +669,14 @@ fn gather(
     let mut values = context.values_buffer(rows * 8)?;
     let mut validity = None;
     if nullable {
-        let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+        let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         let bits = buffer.as_mut_slice::<u8>();
         bits.fill(0);
         let mut nulls = false;
         for (r, &place) in places.iter().enumerate() {
             let (source, row) = found(place);
             let valid = source.is_valid(row);
-            *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
+            BitSlice::of_mut(&mut *bits).set_if(r, valid);
             nulls |= !valid;
         }
         validity = nulls.then_some(buffer);
@@ -697,7 +712,6 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
 
     /// The value row `row` of the batch from `base` holds, `None` if null.
     fn value(base: i64, row: u32) -> Option<i64> {
@@ -709,15 +723,14 @@ mod tests {
     fn batch(context: &mut Context, base: i64, keep: impl FnMut(u16) -> bool) -> RowBatch<'static> {
         let rows = BATCH_ROWS_MAX;
         let mut ints = context.values_buffer(rows as usize * 8).unwrap();
-        let mut validity = context.small_buffer(rows.div_ceil(8) as usize).unwrap();
+        let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows as usize)).unwrap();
         validity.as_mut_slice::<u8>().fill(0);
         let mut text = String::new();
         let mut views = context.values_buffer(rows as usize * 8).unwrap();
         for row in 0..rows {
             let value = value(base, row);
             ints.as_mut_slice::<i64>()[row as usize] = value.unwrap_or(0);
-            validity.as_mut_slice::<u8>()[row as usize / 8] |=
-                u8::from(value.is_some()) << (row % 8);
+            BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row as usize, value.is_some());
             let string = format!("v{}", value.unwrap_or(0));
             let start = u32::try_from(text.len()).unwrap();
             views.as_mut_slice::<u32>()[2 * row as usize..2 * row as usize + 2]
@@ -778,8 +791,9 @@ mod tests {
 
     #[test]
     fn hands_back_rows_shared_and_packed_in_any_order() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         // Shared, packed, shared after packed rows, and packed again.
         let keeps: [(i64, Keep); 4] = [
             (0, |_| true),
@@ -805,7 +819,8 @@ mod tests {
         let mut got = Vec::new();
         for chunk in all.chunks(BATCH_ROWS_MAX as usize) {
             assert_eq!(
-                store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap() as usize,
+                store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap()
+                    as usize,
                 chunk.len()
             );
             if chunk[0] == 0 {
@@ -819,7 +834,7 @@ mod tests {
         let backwards: Vec<u32> = (0..store.len()).rev().step_by(3).collect();
         let mut got = Vec::new();
         for chunk in backwards.chunks(BATCH_ROWS_MAX as usize) {
-            store.gather(&mut context, &mut out, chunk, 0, |_, _| failed!()).unwrap();
+            store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap();
             got.extend(read(&out));
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
@@ -828,8 +843,9 @@ mod tests {
 
     #[test]
     fn gathers_across_batches_with_and_without_nulls() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         let with = batch(&mut context, 0, |_| true);
         store.append(&mut context, &with).unwrap();
         let without = batch_without_nulls(&mut context, 10_000);
@@ -838,7 +854,7 @@ mod tests {
         let last = BATCH_ROWS_MAX * 2 - 1;
         let rows = [last, 3, BATCH_ROWS_MAX, 0];
         let mut out = RowBatch::new();
-        store.gather(&mut context, &mut out, &rows, 0, |_, _| failed!()).unwrap();
+        store.gather(&mut context, &mut out, &rows, 0, &mut |_, _| failed!()).unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let null = (None, b"v0".to_vec());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
@@ -848,8 +864,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn scatters_columns_into_an_order() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
         let batches = 40;
         for b in 0..batches {
             let mut batch = batch_without_nulls(&mut context, i64::from(b) * 10_000);
@@ -885,7 +902,7 @@ mod tests {
         for (chunk, at) in
             rows.chunks(BATCH_ROWS_MAX as usize).zip((0..).step_by(BATCH_ROWS_MAX as usize))
         {
-            store.gather(&mut context, &mut out, chunk, at, |_, _| failed!()).unwrap();
+            store.gather(&mut context, &mut out, chunk, at, &mut |_, _| failed!()).unwrap();
             for (r, &row) in chunk.iter().enumerate() {
                 assert_eq!(out.column(0).int64s()[r], value(row));
                 assert_eq!(out.column(2).int64s()[r], value(row) * 10 + 1);

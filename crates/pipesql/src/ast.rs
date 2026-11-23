@@ -4,9 +4,16 @@
 //! index of its first child. Leaves store their token's span instead. See
 //! <https://jhwlr.io/super-flat-ast/>.
 
+#![allow(unsafe_code)]
+
 use crate::error::{ErrorCode, Span};
 use crate::settings::build_setting;
-use pipit_kernel::buffer::{Buffer, Primitive};
+use core::ptr::NonNull;
+
+use pipit_kernel::allocator::AllocError;
+use pipit_kernel::buffer::Primitive;
+use pipit_kernel::containers::{Array, SmallVec};
+use pipit_kernel::env::Env;
 
 /// Leaves come first, so `tag < Unary` tells them apart.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -14,8 +21,11 @@ use pipit_kernel::buffer::{Buffer, Primitive};
 pub enum Tag {
     /// A column or function name. A leaf.
     Name,
+    /// An integer literal. A leaf.
     Integer,
+    /// A float literal. A leaf.
     Float,
+    /// A string literal. A leaf.
     String,
     /// `*`, as in `count(*)`. A leaf.
     Star,
@@ -48,23 +58,41 @@ pub enum Tag {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Operator {
+    /// `-a`.
     Negate,
+    /// `NOT a`.
     Not,
+    /// `a OR b`.
     Or,
+    /// `a AND b`.
     And,
+    /// `a = b`.
     Equal,
+    /// `a != b` or `a <> b`.
     NotEqual,
+    /// `a < b`.
     Less,
+    /// `a <= b`.
     LessEqual,
+    /// `a > b`.
     Greater,
+    /// `a >= b`.
     GreaterEqual,
+    /// `a + b`.
     Add,
+    /// `a - b`.
     Subtract,
+    /// `a * b`.
     Multiply,
+    /// `a / b`.
     Divide,
+    /// `a % b`.
     Modulo,
+    /// `a LIKE b`.
     Like,
+    /// `a IS NULL`.
     IsNull,
+    /// `a IS NOT NULL`.
     IsNotNull,
     /// `a IN (1, 2)`: its second child is a `List` of literals.
     In,
@@ -235,26 +263,27 @@ impl core::fmt::Debug for Ast {
     }
 }
 
-/// The tree's nodes, in equal-sized blocks. Block 0 is held directly, so
-/// reading it is the fast path. Later blocks are `Buffer`s kept in `rest`, a
-/// slot table allocated with the second block. Only nodes below `count`, and
-/// slots below `rest_count`, have been written.
+/// The tree's nodes, in equal-sized blocks. Only nodes below `count` have
+/// been written.
 pub(crate) struct Nodes {
-    first: Buffer,
-    rest: Option<Buffer>,
-    rest_count: usize,
+    /// The first block, held directly, so reading it is the fast path.
+    first: Array<Node>,
+    /// The blocks after the first.
+    rest: SmallVec<Array<Node>>,
     /// The block being filled. Always a whole block, so writes through it
     /// stay in bounds even if `grow` fails.
-    current: *mut Node,
+    current: NonNull<Node>,
+    /// How many nodes there are.
     count: u32,
 }
 
 impl Nodes {
-    /// `first` must come from `Buffer::allocate_uninit` with `BLOCK_BYTES`.
-    pub(crate) fn new(mut first: Buffer) -> Nodes {
-        check!(first.size_bytes() == BLOCK_BYTES);
-        let current = first.as_mut_ptr::<Node>();
-        Nodes { first, rest: None, rest_count: 0, current, count: 0 }
+    pub(crate) fn new(env: &Env) -> Result<Nodes, AllocError> {
+        // SAFETY: nodes are read only below `count`, once written.
+        let first = unsafe { Array::uninit(env, BLOCK_NODES)? };
+        let current = first.as_non_null();
+        let rest = SmallVec::new(env, (BLOCK_SLOTS - 1).max(1).next_power_of_two())?;
+        Ok(Nodes { first, rest, current, count: 0 })
     }
 
     pub(crate) fn len(&self) -> u32 {
@@ -273,76 +302,41 @@ impl Nodes {
         self.count as usize & BLOCK_MASK == 0
     }
 
-    /// Allocates the next block, and the slot table with the second block,
-    /// from the allocator the first block came from.
+    /// Allocates the next block, from the `Env` the first block came from.
     #[cold]
     pub(crate) fn grow(&mut self) -> Result<(), ErrorCode> {
-        if self.rest_count == BLOCK_SLOTS - 1 {
+        if self.rest.len() == BLOCK_SLOTS - 1 {
             return Err(ErrorCode::QueryTooLarge);
         }
-        if self.rest.is_none() {
-            let size_bytes = (BLOCK_SLOTS - 1) * size_of::<Buffer>();
-            // SAFETY: slots are read only once written.
-            let table = unsafe { self.first.allocate_uninit_like(size_bytes) };
-            self.rest = Some(table.map_err(|_| ErrorCode::OutOfMemory)?);
-        }
-        // SAFETY: nodes are read only once written.
-        let mut block = unsafe { self.first.allocate_uninit_like(BLOCK_BYTES) }
+        // SAFETY: nodes are read only below `count`, once written.
+        let block = unsafe { Array::uninit(self.first.env(), BLOCK_NODES) }
             .map_err(|_| ErrorCode::OutOfMemory)?;
-        self.current = block.as_mut_ptr::<Node>();
-        let Some(table) = &self.rest else { pipit_kernel::failed!() };
-        // SAFETY: `rest_count` is below the table's length, this slot hasn't
-        // been written, and the table is only reachable through `self`.
-        unsafe { slots(table).cast_mut().add(self.rest_count).write(block) };
-        self.rest_count += 1;
+        let current = block.as_non_null();
+        self.rest.push(block).map_err(|_| ErrorCode::OutOfMemory)?;
+        self.current = current;
         Ok(())
     }
 
     pub(crate) fn get(&self, index: u32) -> Node {
         check!(index < self.count);
         let index = index as usize;
-        if index < BLOCK_NODES {
-            // SAFETY: nodes below `count` have been written.
-            return unsafe { self.first.as_ptr::<Node>().add(index).read() };
-        }
-        let slot = (index >> BLOCK_SHIFT) - 1;
-        check!(slot < self.rest_count);
-        let Some(table) = &self.rest else { pipit_kernel::failed!() };
-        // SAFETY: slots below `rest_count`, and nodes below `count`, have been
-        // written.
-        unsafe {
-            let block = &*slots(table).add(slot);
-            block.as_ptr::<Node>().add(index & BLOCK_MASK).read()
-        }
+        let block = match index >> BLOCK_SHIFT {
+            0 => &self.first,
+            block => at!(self.rest, block - 1),
+        };
+        // SAFETY: nodes below `count` have been written.
+        unsafe { block.as_non_null().add(index & BLOCK_MASK).read() }
     }
-}
-
-impl Drop for Nodes {
-    fn drop(&mut self) {
-        let Some(table) = &self.rest else { return };
-        let blocks = core::ptr::slice_from_raw_parts_mut(slots(table).cast_mut(), self.rest_count);
-        // SAFETY: the first `rest_count` slots hold blocks, dropped once here.
-        unsafe { core::ptr::drop_in_place(blocks) };
-    }
-}
-
-/// The slot table's slots, which hold `Buffer`s. Read through `i64`, which is
-/// aligned at least as `Buffer` is.
-fn slots(table: &Buffer) -> *const Buffer {
-    const { assert!(align_of::<Buffer>() <= align_of::<i64>()) };
-    table.as_ptr::<i64>().cast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pipit_kernel::allocator::Heap;
 
     #[test]
     fn nodes_span_blocks() {
-        // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(&Heap, BLOCK_BYTES) }.unwrap();
-        let mut nodes = Nodes::new(first);
+        let env = Env::current();
+        let mut nodes = Nodes::new(env).unwrap();
         let count = u32::try_from(2 * BLOCK_NODES + 1).unwrap();
         for i in 0..count {
             nodes.push(Node::leaf(Tag::Name, Span { start: i, len: 1 }));

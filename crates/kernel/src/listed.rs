@@ -2,6 +2,8 @@
 //! each target's vector instructions. Left to itself, the compiler vectorizes
 //! the comparison or not depending on what it's inlined into.
 
+#![allow(unsafe_code)]
+
 /// Whether `cell` is one of `list`, whose length is a multiple of 4.
 #[inline]
 pub(crate) fn listed<const N: usize>(list: &[i64; N], cell: i64) -> bool {

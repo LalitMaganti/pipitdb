@@ -5,15 +5,17 @@
 //! agree on those bytes are then sorted on the next, and so on, with the
 //! same sort.
 
+#![allow(unsafe_code)]
+
 use core::cmp::Ordering;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::array::Array;
+use crate::allocator::AllocError;
+use crate::containers::{Array, SmallVec};
+use crate::env::Env;
 use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::Slot;
-use crate::slow_vec::SlowVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
 /// rather than sorted.
@@ -36,11 +38,14 @@ impl<'a> Rows<'a> {
 
 /// The order rows are already in, as far as it helps.
 struct ExistingOrder {
+    /// Whether the rows are sorted already.
     sorted: bool,
+    /// Whether each row sorts before the one before it.
     strictly_descending: bool,
     /// Where each ascending run starts, then the row count, if there are few:
     /// the first `runs_len`.
     runs: [u32; MAX_MERGED_RUNS + 2],
+    /// How many of `runs` there are.
     runs_len: usize,
 }
 
@@ -78,9 +83,9 @@ fn find_existing_order(rows: Rows) -> ExistingOrder {
 }
 
 /// The positions of the bytes which differ between any two rows.
-fn find_varying_bytes(allocator: &dyn Allocator, rows: Rows) -> Result<SlowVec<u32>, AllocError> {
+fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SmallVec<u32>, AllocError> {
     let stride = rows.stride;
-    let mut differs = SlowVec::<u8>::zeroed(allocator, stride)?;
+    let mut differs = Array::<u8>::zeroed(env, stride)?;
     if stride >= 8 {
         // A word at a time, the last of which may overlap the one before it.
         let words = stride.div_ceil(8);
@@ -91,7 +96,7 @@ fn find_varying_bytes(allocator: &dyn Allocator, rows: Rows) -> Result<SlowVec<u
             u64::from_ne_bytes(bytes)
         };
         let first = rows.get(0);
-        let mut diff = SlowVec::<u64>::zeroed(allocator, words)?;
+        let mut diff = Array::<u64>::zeroed(env, words)?;
         // XOR each row with the first and gather the differences. A byte is
         // the same in every row exactly when none of its bits are set.
         for r in 0..rows.count {
@@ -113,7 +118,7 @@ fn find_varying_bytes(allocator: &dyn Allocator, rows: Rows) -> Result<SlowVec<u
         }
     }
     let count = differs.iter().filter(|&&d| d != 0).count();
-    let mut varying = SlowVec::fixed(allocator, count)?;
+    let mut varying = SmallVec::fixed(env, count)?;
     for (b, &d) in differs.iter().enumerate() {
         if d != 0 {
             #[expect(clippy::cast_possible_truncation, reason = "a stride is at most 65,535")]
@@ -233,7 +238,7 @@ pub(crate) enum Sorted {
     /// Each row's word, in order. If they hold every byte that varies, at
     /// `varying`, `fixed` is the bytes of the first row, as every other byte
     /// is in every row.
-    Words { words: Array<u64>, packing: Words, varying: SlowVec<u32>, fixed: Option<SlowVec<u8>> },
+    Words { words: Array<u64>, packing: Words, varying: SmallVec<u32>, fixed: Option<SmallVec<u8>> },
 }
 
 impl Sorted {
@@ -260,20 +265,24 @@ impl Sorted {
 /// key they hold: its bytes are `fixed`'s, but for those the word's key
 /// holds.
 pub(crate) struct SlotInWords {
+    /// How the varying bytes of each row are packed in its words.
     packing: Words,
+    /// The slot it reads.
     slot: Slot,
+    /// Whether the slot holds a float.
     float: bool,
-    /// The value's bytes, big-endian, where the key doesn't hold them, and
-    /// its flag's.
+    /// The value's bytes, big-endian, where the key doesn't hold them.
     value: u64,
+    /// The flag's byte, where the key doesn't hold it.
     flag: u8,
-    /// Where the flag is in the key, and its bits there: none if it doesn't
-    /// vary.
+    /// Where the flag is in the key: none if it doesn't vary.
     flag_shift: u32,
+    /// The flag's bits at `flag_shift`: none if it doesn't vary.
     flag_mask: u8,
     /// Each run of the value's bytes the key holds: where it is in the key,
     /// where in the value, and its bits.
     runs: [(u32, u32, u64); 8],
+    /// How many of `runs` there are.
     len: usize,
 }
 
@@ -384,10 +393,7 @@ impl SlotInWords {
 
 /// Stably sorts the rows laid out in `row_layout`. Frees them once sorting
 /// no longer needs them, before the memory the rest of the sort takes.
-pub(crate) fn sort_row_layout(
-    allocator: &dyn Allocator,
-    row_layout: &mut RowBlocks,
-) -> Result<Sorted, AllocError> {
+pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<Sorted, AllocError> {
     let count = row_layout.len();
     let rows = Rows { blocks: row_layout, stride: row_layout.stride(), count };
     // 1. Reuse the order the rows are already in, where it helps: keep where
@@ -401,7 +407,7 @@ pub(crate) fn sort_row_layout(
     // 2. Pack the varying bytes a word holds above each row's number, so
     // sorting them doesn't read rows through their offsets again and again,
     // and the words of rows with equal bytes are in order.
-    let varying = find_varying_bytes(allocator, rows)?;
+    let varying = find_varying_bytes(env, rows)?;
     let packing = Words::of(count);
     let first = at!(varying, ..varying.len().min(packing.key_bytes));
     // If every byte that orders the rows is in their words, the rows aren't
@@ -409,26 +415,29 @@ pub(crate) fn sort_row_layout(
     let in_words = varying.len() <= packing.key_bytes;
     let mut fixed = None;
     if in_words {
-        fixed = Some(SlowVec::fixed_from(allocator, rows.get(0).iter().copied())?);
+        fixed = Some(SmallVec::fixed_from(env, rows.get(0).iter().copied())?);
     }
     let batch = BATCH_ROWS_MAX as usize;
-    let mut words = Array::from_chunks(allocator, count as usize, batch, |start, out| {
-        #[expect(clippy::cast_possible_truncation, reason = "below `count`")]
-        let (from, to) = (start as u32, (start + out.len()) as u32);
-        for (out, r) in out.iter_mut().zip(from..to) {
-            out.write(packing.word(row_layout.get(r), first, r));
-        }
-        if in_words {
-            row_layout.let_go_below(to, true);
-        }
-    })?;
+    // SAFETY: each of `out` is written, as `from..to` is as long.
+    let mut words = unsafe {
+        Array::from_chunks(env, count as usize, batch, |start, out| {
+            #[expect(clippy::cast_possible_truncation, reason = "below `count`")]
+            let (from, to) = (start as u32, (start + out.len()) as u32);
+            for (out, r) in out.iter_mut().zip(from..to) {
+                out.write(packing.word(row_layout.get(r), first, r));
+            }
+            if in_words {
+                row_layout.let_go_below(to, true);
+            }
+        })?
+    };
     if in_words {
         row_layout.free();
     }
-    let mut scratch = Scratch::new(allocator, count as usize)?;
+    let mut scratch = Scratch::new(env, count as usize)?;
     // 3. Merge the runs, or sort.
     if existing.runs_len > 0 {
-        let mut other = Array::zeroed(allocator, count as usize)?;
+        let mut other = Array::zeroed(env, count as usize)?;
         if merge_runs(&mut words, &mut other, &mut existing) {
             words = other;
         }
@@ -449,7 +458,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::context::Context;
 
     /// `count` rows of `stride` bytes, of a few values so many tie, with
@@ -471,7 +480,8 @@ mod tests {
     fn expect_sorted(rows: &[u8], stride: usize) {
         let count = u32::try_from(rows.len() / stride).unwrap();
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
-        let mut context = Context::new(&Heap);
+        let env = Env::current();
+        let mut context = Context::new(env, None);
         let mut row_layout = RowBlocks::new(&context, stride).unwrap();
         row_layout
             .extend(&mut context, count, |first, bytes| {
@@ -479,7 +489,7 @@ mod tests {
                 bytes.copy_from_slice(&rows[at..at + bytes.len()]);
             })
             .unwrap();
-        let sorted = sort_row_layout(&Heap, &mut row_layout).unwrap();
+        let sorted = sort_row_layout(env, &mut row_layout).unwrap();
         let indices: Vec<u32> = (0..count).map(|i| sorted.row(i)).collect();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));

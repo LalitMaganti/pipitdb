@@ -10,9 +10,17 @@ pub(crate) fn mix(word: u64) -> u64 {
     h ^ h >> 33
 }
 
+/// What a hash starts from, before any bytes or words are put in.
+pub(crate) const SEED: u64 = 0xe17a_1465;
+
+/// `hash` with `word` combined in, as Perfetto's `MurmurHashCombiner` does.
+#[inline]
+pub(crate) fn combine(hash: u64, word: u64) -> u64 {
+    hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
+}
+
 /// Murmur hash 2's 64-bit hash of `bytes`: Perfetto's hash of a string.
 pub(crate) fn bytes(bytes: &[u8]) -> u64 {
-    const SEED: u64 = 0xe17a_1465;
     const MULTIPLY: u64 = 0xc6a4_a793_5bd1_e995;
     const SHIFT: u32 = 47;
     let mut h = SEED ^ (bytes.len() as u64).wrapping_mul(MULTIPLY);

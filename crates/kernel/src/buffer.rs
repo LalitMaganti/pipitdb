@@ -1,10 +1,13 @@
 //! `Buffer`: a refcounted block of bytes, aligned to 64 bytes or more.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::env::{Env, MemoryKind};
 
 pub const BUFFER_ALIGNMENT_BYTES: usize = 64;
 
@@ -26,8 +29,8 @@ unsafe impl Primitive for i64 {}
 // SAFETY: as above.
 unsafe impl Primitive for f64 {}
 
-/// Cloning shares the bytes; the last drop frees them, through the allocator
-/// they came from, which must outlive them.
+/// Cloning shares the bytes; the last drop frees them, through the `Env`
+/// they came from, which outlives them.
 ///
 /// It's one pointer, to the bytes: what else it needs is in a header right
 /// in front of them, so columns, which hold a few, stay small.
@@ -38,24 +41,37 @@ pub struct Buffer {
 /// Sits in front of the bytes, in the same allocation.
 #[repr(C, align(64))]
 struct Header {
+    /// How many `Buffer`s share the bytes.
     references: Cell<u32>,
-    alignment: u32,
+    /// How many bytes there are.
     size_bytes: usize,
-    allocator: NonNull<dyn Allocator>,
+    /// What the bytes came from.
+    env: NonNull<Env>,
+    /// Which of its allocators that is.
+    kind: MemoryKind,
 }
 
 pub(crate) const HEADER_BYTES: usize = size_of::<Header>();
 
 impl Buffer {
-    /// Allocates `size_bytes` zeroed bytes from `allocator`, which must
-    /// outlive the buffer and its clones.
+    /// Allocates `size_bytes` zeroed bytes from `env`'s base allocator.
     #[inline(never)]
-    pub fn allocate(allocator: &dyn Allocator, size_bytes: usize) -> Result<Buffer, AllocError> {
-        // SAFETY: the bytes come zeroed.
-        unsafe { Buffer::allocate_with(allocator, size_bytes, true, BUFFER_ALIGNMENT_BYTES) }
+    pub fn allocate(env: &Env, size_bytes: usize) -> Result<Buffer, AllocError> {
+        Buffer::allocate_in(env, MemoryKind::Base, size_bytes)
     }
 
-    /// Allocates `size_bytes` bytes without zeroing them.
+    /// As `allocate`, from `env`'s allocator of `kind`.
+    pub fn allocate_in(
+        env: &Env,
+        kind: MemoryKind,
+        size_bytes: usize,
+    ) -> Result<Buffer, AllocError> {
+        // SAFETY: the bytes come zeroed.
+        unsafe { Buffer::allocate_with((env, kind), size_bytes, true) }
+    }
+
+    /// Allocates `size_bytes` bytes from `env`'s allocator of `kind`, without
+    /// zeroing them.
     ///
     /// # Safety
     ///
@@ -63,81 +79,44 @@ impl Buffer {
     /// written.
     #[inline(never)]
     pub unsafe fn allocate_uninit(
-        allocator: &dyn Allocator,
+        env: &Env,
+        kind: MemoryKind,
         size_bytes: usize,
     ) -> Result<Buffer, AllocError> {
         // SAFETY: upheld by the caller.
-        unsafe { Buffer::allocate_with(allocator, size_bytes, false, BUFFER_ALIGNMENT_BYTES) }
+        unsafe { Buffer::allocate_with((env, kind), size_bytes, false) }
     }
 
-    /// As `allocate_uninit`, with the header and bytes together starting at
-    /// a multiple of `alignment`, a power of two of at least
-    /// `BUFFER_ALIGNMENT_BYTES`: so `alignment - HEADER_BYTES` bytes fill an
-    /// aligned block of `alignment`, such as a huge page.
-    ///
-    /// # Safety
-    ///
-    /// As for `allocate_uninit`.
-    pub unsafe fn allocate_uninit_aligned(
-        allocator: &dyn Allocator,
-        size_bytes: usize,
-        alignment: usize,
-    ) -> Result<Buffer, AllocError> {
-        // SAFETY: upheld by the caller.
-        unsafe { Buffer::allocate_with(allocator, size_bytes, false, alignment) }
-    }
-
-    /// Allocates `size_bytes` bytes, zeroed if `zeroed`, aligned as
-    /// `allocate_uninit_aligned`'s.
+    /// Allocates `size_bytes` bytes, zeroed if `zeroed`, laid out with the
+    /// header in front by `allocator::layout`.
     ///
     /// # Safety
     ///
     /// As for `allocate_uninit` unless `zeroed`.
-    #[inline(never)]
     unsafe fn allocate_with(
-        allocator: &dyn Allocator,
+        (env, kind): (&Env, MemoryKind),
         size_bytes: usize,
         zeroed: bool,
-        alignment: usize,
     ) -> Result<Buffer, AllocError> {
         const { assert!(align_of::<Header>() == BUFFER_ALIGNMENT_BYTES) };
-        check!(alignment >= BUFFER_ALIGNMENT_BYTES);
-        let Ok(alignment) = u32::try_from(alignment) else { failed!() };
-        let layout = layout(size_bytes, alignment)?;
+        let layout = layout(size_bytes)?;
+        let allocator = env.allocator(kind);
         let header =
             if zeroed { allocator.allocate_zeroed(layout) } else { allocator.allocate(layout) }?
                 .cast::<Header>();
-        // The allocator outlives the buffer, as its callers promise, so its
-        // lifetime can be forgotten.
-        // SAFETY: only the lifetime changes.
-        let allocator = unsafe {
-            core::mem::transmute::<NonNull<dyn Allocator + '_>, NonNull<dyn Allocator>>(
-                NonNull::from(allocator),
-            )
-        };
         // SAFETY: the allocation fits a header followed by `size_bytes` bytes.
         let data = unsafe {
-            header.write(Header { references: Cell::new(1), alignment, size_bytes, allocator });
+            let env = NonNull::from(env);
+            header.write(Header { references: Cell::new(1), size_bytes, env, kind });
             header.cast::<u8>().add(HEADER_BYTES)
         };
         Ok(Buffer { data })
     }
 
-    /// Allocates `size_bytes` bytes, without zeroing them, from the allocator
-    /// `self` came from.
-    ///
-    /// # Safety
-    ///
-    /// As for `allocate_uninit`.
-    pub unsafe fn allocate_uninit_like(&self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        // SAFETY: the allocator outlives `self`; the caller upholds the rest.
-        unsafe { Buffer::allocate_uninit(self.allocator(), size_bytes) }
-    }
-
-    /// The allocator the bytes came from.
-    pub fn allocator(&self) -> &dyn Allocator {
-        // SAFETY: the allocator outlives every buffer from it.
-        unsafe { self.header().allocator.as_ref() }
+    /// What the bytes came from.
+    pub fn env(&self) -> &Env {
+        // SAFETY: an `Env` outlives what's allocated from it.
+        unsafe { self.header().env.as_ref() }
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -167,7 +146,7 @@ impl Buffer {
     }
 
     /// The first byte, for writing values that aren't `Primitive`, such as a
-    /// `SlowVec`'s or a `Box`'s.
+    /// `SmallVec`'s or a `Box`'s.
     pub fn as_mut_non_null(&mut self) -> NonNull<u8> {
         check!(self.header().references.get() == 1);
         self.data
@@ -191,7 +170,7 @@ impl Buffer {
     }
 
     /// Whether this is the only reference to the bytes.
-    pub(crate) fn is_unique(&self) -> bool {
+    pub fn is_unique(&self) -> bool {
         self.header().references.get() == 1
     }
 
@@ -206,8 +185,9 @@ impl Buffer {
     pub(crate) fn discard(self) {
         if self.is_unique() {
             let header = self.header();
+            let allocator = self.env().allocator(header.kind);
             // SAFETY: the bytes are in the allocation, which isn't freed yet.
-            unsafe { header.allocator.as_ref().discard(self.data, header.size_bytes) };
+            unsafe { allocator.discard(self.data, header.size_bytes) };
         }
     }
 }
@@ -230,17 +210,17 @@ unsafe fn header<'a>(data: NonNull<u8>) -> &'a Header {
 unsafe fn deallocate(data: NonNull<u8>) {
     // SAFETY: upheld by the caller.
     let header = unsafe { header(data) };
-    let Ok(layout) = layout(header.size_bytes, header.alignment) else { failed!() };
+    let Ok(layout) = layout(header.size_bytes) else { failed!() };
+    // SAFETY: an `Env` outlives what's allocated from it.
+    let allocator = unsafe { header.env.as_ref() }.allocator(header.kind);
     // SAFETY: the header and bytes were allocated together with this layout,
-    // from this allocator, which outlives them.
-    unsafe { header.allocator.as_ref().deallocate(data.sub(HEADER_BYTES), layout) };
+    // from this allocator.
+    unsafe { allocator.deallocate(data.sub(HEADER_BYTES), layout) };
 }
 
-/// A header and `size_bytes` bytes after it, starting at a multiple of
-/// `alignment`.
-fn layout(size_bytes: usize, alignment: u32) -> Result<Layout, AllocError> {
-    let total_bytes = HEADER_BYTES.checked_add(size_bytes).ok_or(AllocError)?;
-    Layout::from_size_align(total_bytes, alignment as usize).map_err(|_| AllocError)
+/// A header and `size_bytes` bytes after it.
+fn layout(size_bytes: usize) -> Result<Layout, AllocError> {
+    crate::allocator::layout(HEADER_BYTES.checked_add(size_bytes).ok_or(AllocError)?)
 }
 
 impl Clone for Buffer {
@@ -269,39 +249,8 @@ impl Drop for Buffer {
 
 #[cfg(test)]
 mod tests {
-    use alloc::rc::Rc;
-
     use super::*;
     use crate::allocator::Heap;
-
-    #[derive(Clone)]
-    struct Counting(Rc<Cell<u32>>);
-
-    // SAFETY: forwards to `Heap`.
-    unsafe impl Allocator for Counting {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-            self.0.set(self.0.get() + 1);
-            Heap.allocate(layout)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            self.0.set(self.0.get() - 1);
-            // SAFETY: forwarded from the caller.
-            unsafe { Heap.deallocate(ptr, layout) }
-        }
-    }
-
-    #[derive(Clone)]
-    struct Refusing;
-
-    // SAFETY: never hands out memory.
-    unsafe impl Allocator for Refusing {
-        fn allocate(&self, _: Layout) -> Result<NonNull<u8>, AllocError> {
-            Err(AllocError)
-        }
-
-        unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
-    }
 
     #[test]
     fn is_one_pointer() {
@@ -312,29 +261,16 @@ mod tests {
 
     #[test]
     fn allocate_is_zeroed_and_aligned() {
-        let buffer = Buffer::allocate(&Heap, 100).unwrap();
+        let env = Env::current();
+        let buffer = Buffer::allocate(env, 100).unwrap();
         assert_eq!(buffer.as_slice::<u8>(), [0; 100]);
         assert!(buffer.as_slice::<u8>().as_ptr().addr().is_multiple_of(BUFFER_ALIGNMENT_BYTES));
     }
 
-    /// The header and bytes start at the alignment, and are freed with it.
-    #[test]
-    fn allocates_aligned() {
-        let live = Rc::new(Cell::new(0));
-        let counting = Counting(live.clone());
-        // SAFETY: the bytes aren't read.
-        let buffer =
-            unsafe { Buffer::allocate_uninit_aligned(&counting, 4096 - HEADER_BYTES, 4096) };
-        let buffer = buffer.unwrap();
-        let start = buffer.as_ptr::<u8>().addr() - HEADER_BYTES;
-        assert!(start.is_multiple_of(4096));
-        drop(buffer);
-        assert_eq!(live.get(), 0);
-    }
-
     #[test]
     fn clone_shares_bytes() {
-        let mut buffer = Buffer::allocate(&Heap, 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, 8).unwrap();
         buffer.as_mut_slice::<i64>()[0] = -7;
         let clone = buffer.clone();
         assert_eq!(clone.as_slice::<i64>(), [-7]);
@@ -343,44 +279,34 @@ mod tests {
 
     #[test]
     fn last_drop_frees() {
-        let live = Rc::new(Cell::new(0));
-        let counting = Counting(live.clone());
-        let buffer = Buffer::allocate(&counting, 8).unwrap();
+        let env = Env::current();
+        let empty = env.used();
+        let buffer = Buffer::allocate(env, 8).unwrap();
         let clone = buffer.clone();
         drop(buffer);
-        assert_eq!(live.get(), 1);
+        assert!(env.used() > empty);
         drop(clone);
-        assert_eq!(live.get(), 0);
+        assert_eq!(env.used(), empty);
     }
 
     #[test]
-    fn allocates_like_another_buffer() {
-        let live = Rc::new(Cell::new(0));
-        let counting = Counting(live.clone());
-        let buffer = Buffer::allocate(&counting, 8).unwrap();
-        // SAFETY: the bytes aren't read.
-        let other = unsafe { buffer.allocate_uninit_like(16) }.unwrap();
-        assert_eq!(other.size_bytes(), 16);
-        assert_eq!(live.get(), 2);
-        drop(buffer);
-        drop(other);
-        assert_eq!(live.get(), 0);
-    }
-
-    #[test]
-    fn refused_allocation_fails() {
-        assert_eq!(Buffer::allocate(&Refusing, 8).err(), Some(AllocError));
+    fn allocation_past_the_budget_fails() {
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let env = unsafe { Env::new(Heap, 1000) }.unwrap();
+        assert_eq!(Buffer::allocate(&env, 1000).err(), Some(AllocError));
     }
 
     #[test]
     fn oversized_allocation_fails() {
-        assert_eq!(Buffer::allocate(&Heap, usize::MAX).err(), Some(AllocError));
+        let env = Env::current();
+        assert_eq!(Buffer::allocate(env, usize::MAX).err(), Some(AllocError));
     }
 
     #[test]
     #[should_panic(expected = "references")]
     fn writing_shared_bytes_panics() {
-        let mut buffer = Buffer::allocate(&Heap, 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, 8).unwrap();
         let _clone = buffer.clone();
         buffer.as_mut_slice::<u8>();
     }

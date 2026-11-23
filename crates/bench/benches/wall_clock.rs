@@ -4,7 +4,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
+use pipitdb_bench::{Joined, count_nodes, count_tokens, expression, long_text, typical_queries};
 
 fn lexer(c: &mut Criterion) {
     let mut group = c.benchmark_group("lexer");
@@ -72,6 +72,24 @@ fn scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan");
     group.throughput(Throughput::Elements(100 * 20_480));
     group.bench_function("table", |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
+    group.finish();
+}
+
+/// 1M slices joined to 64K threads by id: ids stored as a sequence, shuffled,
+/// or spread far apart, against scanning the slices alone.
+fn join(c: &mut Criterion) {
+    let mut group = c.benchmark_group("join");
+    group.throughput(Throughput::Elements(1 << 20));
+    let joins = [
+        ("scan", Joined::No),
+        ("slice_thread", Joined::Ids),
+        ("shuffled", Joined::Shuffled),
+        ("spread", Joined::Spread),
+    ];
+    for (name, joined) in joins {
+        let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
+        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
+    }
     group.finish();
 }
 
@@ -184,6 +202,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, slices, filter, perfetto_filter, perfetto_expression, string_pool
+    targets = lexer, parser, query, small, pipeline, scan, join, slices, filter, perfetto_filter, perfetto_expression, string_pool
 }
 criterion_main!(benches);

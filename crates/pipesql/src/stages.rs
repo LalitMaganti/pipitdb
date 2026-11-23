@@ -3,26 +3,29 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
-use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
+use pipit_kernel::containers::SmallVec;
+use pipit_kernel::expression::{
+    ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, expr_can_be_null,
+};
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
-use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::Compiler;
-use crate::condition::compile_condition;
+use crate::compile::{Compiler, Relation};
 use crate::error::{Error, ErrorCode, Unsupported};
-use crate::expression::{compile_expr, is_null};
+use crate::expression::{add_expr, compile_expr, is_null};
 use crate::keywords::same_word;
+use crate::parser::LIST_MAX;
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
     keyword: "from",
     point: Point::Source,
-    items: &[Item::One(Shared::Name)],
+    items: &[Item::One(Shared::Name), Item::Clause(&["as"], Shared::Name)],
     compile: compile_from,
 };
 
@@ -89,11 +92,66 @@ pub const ORDER_BY: Rule = Rule {
     compile: compile_order_by,
 };
 
+pub const AS: Rule = Rule {
+    keyword: "as",
+    point: Point::Stage,
+    items: &[Item::One(Shared::Name)],
+    compile: compile_as,
+};
+
+pub const JOIN: Rule = Rule {
+    keyword: "join",
+    point: Point::Stage,
+    items: &[
+        Item::One(Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
+    compile: compile_inner_join,
+};
+
+pub const INNER_JOIN: Rule = Rule {
+    keyword: "inner",
+    point: Point::Stage,
+    items: &[
+        Item::After(&["join"], Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
+    compile: compile_inner_join,
+};
+
+pub const LEFT_JOIN: Rule = Rule {
+    keyword: "left",
+    point: Point::Stage,
+    items: &[
+        Item::Optional("outer"),
+        Item::After(&["join"], Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
+    compile: compile_left_join,
+};
+
+pub const CROSS_JOIN: Rule = Rule {
+    keyword: "cross",
+    point: Point::Stage,
+    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["as"], Shared::Name)],
+    compile: compile_cross_join,
+};
+
 /// Selecting and filtering rows.
-pub const RELATIONAL: &[Rule] = &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT];
+pub const RELATIONAL: &[Rule] =
+    &[FROM, WHERE, SELECT, EXTEND, DROP, RENAME, SET, ORDER_BY, LIMIT, AS];
 
 /// Aggregating rows, apart, so a registry without it doesn't pay for it.
 pub const AGGREGATION: &[Rule] = &[AGGREGATE];
+
+/// Joining tables, apart, so a registry without it doesn't pay for it.
+pub const JOINS: &[Rule] = &[JOIN, INNER_JOIN, LEFT_JOIN, CROSS_JOIN];
 
 /// The aggregate functions, by name.
 const FUNCTIONS: [(&str, Function); 5] = [
@@ -109,22 +167,186 @@ pub(crate) fn aggregate(name: &[u8]) -> Option<(&'static str, Function)> {
     FUNCTIONS.iter().find(|(f, _)| same_word(f.as_bytes(), name)).copied()
 }
 
-/// `FROM t`: scans the table `t`, whose columns are then in scope.
+/// `FROM t [AS a]`: scans the table `t`, whose columns are then in scope,
+/// and named by alias `a`, or else `t`.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let relation = compiler.compile_relation(compiler.node(stage.first_child()))?;
+    let table = compiler.node(stage.first_child());
+    let relation = compiler.compile_relation(table)?;
+    let alias = alias_or(compiler, compiler.node(stage.first_child() + 1), table)?;
+    compiler.add_alias(alias, &relation.columns)?;
     compiler.scope = relation.columns;
     Ok(())
 }
 
+/// `AS a`: the columns in scope, named by alias `a`, the only one.
+fn compile_as(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    compiler.clear_aliases();
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
+    scope.extend_from_slice(&compiler.scope)?;
+    compiler.add_alias(compiler.node(stage.first_child()), &scope)
+}
+
+/// The alias in the list `alias`, `AS`'s, or `table` if it's empty.
+fn alias_or(compiler: &Compiler<'_, '_>, alias: Node, table: Node) -> Result<Node, Error> {
+    if alias.child_count() == 0 { Ok(table) } else { only(compiler, alias) }
+}
+
+/// The condition `node`, `ON`'s or `WHERE`'s: an integer, true where it
+/// isn't 0, as a comparison is.
+fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, Error> {
+    let (condition, data_type) = compile_expr(compiler, node)?;
+    match data_type {
+        DataType::Int64 => Ok(condition),
+        DataType::String => Err(Error::new(ErrorCode::NumberCondition, compiler.span(node))),
+        DataType::Float64 => {
+            Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(node)))
+        }
+    }
+}
+
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let condition = compiler.node(stage.first_child());
-    let predicate = compile_condition(compiler, condition)?;
-    let allocator = compiler.allocator();
-    let filter = DynOp::new(allocator, FilterOp { predicate })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(filter, children)?;
+    let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
+    let env = compiler.env();
+    let filter = DynOp::new(env, FilterOp::new(env, &compiler.plan.exprs, condition)?)?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(filter, &children)?;
     Ok(())
+}
+
+/// `[INNER] JOIN t ON c`: each pair of a row so far and a row of table `t`
+/// that condition `c` is true for, with the columns of both. Or `USING (k)`,
+/// as `ON k = t.k`, with `k` once.
+fn compile_inner_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    let condition = (compiler.node(first + 2), compiler.node(first + 3));
+    let (table, alias) = (compiler.node(first), compiler.node(first + 1));
+    join(compiler, table, alias, JoinKind::Inner, Some(condition))
+}
+
+/// `LEFT [OUTER] JOIN t ON c`: as `JOIN`, and each row so far that `c` is
+/// true for with no row of `t`, with nulls for `t`'s columns.
+fn compile_left_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    let condition = (compiler.node(first + 3), compiler.node(first + 4));
+    let (table, alias) = (compiler.node(first + 1), compiler.node(first + 2));
+    join(compiler, table, alias, JoinKind::Left, Some(condition))
+}
+
+/// `CROSS JOIN t`: each pair of a row so far and a row of table `t`.
+fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    join(compiler, compiler.node(first), compiler.node(first + 1), JoinKind::Inner, None)
+}
+
+/// Joins the rows so far to table `table`, a name or a list of one, named by
+/// the alias in the list `alias` or else its own name, of `kind`, on a
+/// condition given as the lists of an `ON` and a `USING`, one of them
+/// empty, or on none. The scope is `USING`'s columns, then the rest of both
+/// sides', so another name in both is ambiguous.
+fn join(
+    compiler: &mut Compiler<'_, '_>,
+    mut table: Node,
+    alias: Node,
+    kind: JoinKind,
+    condition: Option<(Node, Node)>,
+) -> Result<(), Error> {
+    let probe = compiler.plan.root;
+    let env = compiler.env();
+    let probe_columns = SmallVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
+    if table.tag() == Tag::List {
+        table = only(compiler, table)?;
+    }
+    let build = compiler.compile_relation(table)?;
+    compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
+    if kind == JoinKind::Left {
+        for column in build.columns.iter() {
+            at_mut!(compiler.plan.columns, column.id as usize).nullable = true;
+        }
+    }
+    let condition = match condition {
+        Some((on, using)) if on.child_count() == 0 && using.child_count() == 0 => {
+            return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
+        }
+        Some((on, using)) if on.child_count() != 0 && using.child_count() != 0 => {
+            return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using)));
+        }
+        Some((_, using)) if using.child_count() != 0 => {
+            Some(using_columns(compiler, &build, using)?)
+        }
+        Some((on, _)) => {
+            compiler.scope.extend_from_slice(&build.columns)?;
+            Some(condition_expr(compiler, only(compiler, on)?)?)
+        }
+        None => {
+            compiler.scope.extend_from_slice(&build.columns)?;
+            None
+        }
+    };
+    let env = compiler.env();
+    let build_columns = SmallVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
+    let columns = [probe_columns, build_columns];
+    let conjuncts = match condition {
+        Some(condition) => conjuncts_of(env, &compiler.plan.exprs, condition)?,
+        None => SmallVec::fixed(env, 0)?,
+    };
+    let op = DynOp::new(env, JoinOp::new(kind, conjuncts, columns))?;
+    let children = [probe, build.node];
+    compiler.plan.add_node(op, &children)?;
+    Ok(())
+}
+
+/// `USING`'s condition, that each column of the list `using` is equal on
+/// both sides, and its scope: those columns, the rows so far's, then the
+/// rest of `build`'s.
+fn using_columns(
+    compiler: &mut Compiler<'_, '_>,
+    build: &Relation,
+    using: Node,
+) -> Result<Expr, Error> {
+    let env = compiler.env();
+    let mut nodes = ExprBuilder::new(env)?;
+    let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
+    // Each build column joined on, one for each name in the list.
+    let mut joined = [0; LIST_MAX];
+    for i in 0..using.child_count() {
+        let name = listed_once(compiler, using, i, 0)?;
+        let (left, right) = (compiler.find_column(name)?, compiler.find_in(&build.columns, name)?);
+        let before = (i > 0).then(|| nodes.last());
+        let (a, b) = (nodes.column(left.id)?, nodes.column(right.id)?);
+        let equal = nodes.node(ExprOp::Eq, a, b)?;
+        if let Some(before) = before {
+            nodes.node(ExprOp::And, before, equal)?;
+        }
+        scope.push(left)?;
+        *at_mut!(joined, i as usize) = right.id;
+    }
+    // The rest of the rows so far's, even another name for a column joined
+    // on, or a second copy of one.
+    let joined_on = scope.len();
+    for column in compiler.scope.iter() {
+        let named = |joined: &NamedColumn| (joined.name, joined.id) == (column.name, column.id);
+        if !at!(scope, ..joined_on).iter().any(named) {
+            scope.push(*column)?;
+        }
+    }
+    for column in build.columns.iter() {
+        if !at!(joined, ..using.child_count() as usize).contains(&column.id) {
+            scope.push(*column)?;
+        }
+    }
+    let (expr, _) = add_expr(compiler, &nodes, using)?;
+    compiler.scope = scope;
+    Ok(expr)
+}
+
+/// The one item of `list`.
+fn only(compiler: &Compiler<'_, '_>, list: Node) -> Result<Node, Error> {
+    if list.child_count() != 1 {
+        let second = compiler.node(list.first_child() + 1);
+        return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(second)));
+    }
+    Ok(compiler.node(list.first_child()))
 }
 
 // These stages change which columns are in scope and what they're called,
@@ -145,12 +367,12 @@ fn compile_extend(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
 /// The column of each item of `stage`'s list, under its alias if it has
 /// one, after the scope's columns if `extend`, are the new scope.
 fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result<(), Error> {
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     if extend {
         scope.extend_from_slice(&compiler.scope)?;
     }
     let list = compiler.node(stage.first_child());
-    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
+    let mut computed = SmallVec::fixed(compiler.env(), list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let name = match alias {
@@ -161,6 +383,10 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     }
     add_compute(compiler, computed)?;
     compiler.scope = scope;
+    // A new table, as GoogleSQL's `SELECT` makes, which no alias names.
+    if !extend {
+        compiler.clear_aliases();
+    }
     Ok(())
 }
 
@@ -186,7 +412,7 @@ fn named(
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
 fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
     for i in 0..list.child_count() {
         let name = listed_once(compiler, list, i, 0)?;
@@ -228,9 +454,9 @@ fn change_in_place(
     renames: bool,
 ) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
-    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
+    let mut computed = SmallVec::fixed(compiler.env(), list.child_count() as usize)?;
     let target = u32::from(!renames);
     for i in 0..list.child_count() {
         let found = compiler.find_column(listed_once(compiler, list, i, target)?)?;
@@ -279,7 +505,7 @@ fn value_of(
     compiler: &mut Compiler<'_, '_>,
     value: Node,
     name: Option<Name>,
-    computed: &mut SlowVec<ComputeItem>,
+    computed: &mut SmallVec<ComputeItem>,
 ) -> Result<NamedColumn, Error> {
     if value.tag() == Tag::Name && !is_null(compiler, value) {
         let column = compiler.find_column(value)?;
@@ -289,8 +515,8 @@ fn value_of(
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
     let (expr, data_type) = compile_expr(compiler, value)?;
-    let columns = &compiler.plan.columns;
-    let nullable = expr_can_be_null(&expr, &|column| at!(columns, column as usize).nullable);
+    let (columns, nodes) = (&compiler.plan.columns, compiler.plan.exprs.nodes(expr));
+    let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
     let column = compiler.plan.add_named_column(name, data_type, nullable)?;
     computed.push(ComputeItem { output: column.id, expr })?;
     Ok(column)
@@ -299,15 +525,15 @@ fn value_of(
 /// Adds the `ComputeOp` for a stage's `computed` columns, if it has any.
 fn add_compute(
     compiler: &mut Compiler<'_, '_>,
-    computed: SlowVec<ComputeItem>,
+    computed: SmallVec<ComputeItem>,
 ) -> Result<(), Error> {
     if computed.is_empty() {
         return Ok(());
     }
-    let allocator = compiler.allocator();
-    let compute = DynOp::new(allocator, ComputeOp { items: computed })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(compute, children)?;
+    let env = compiler.env();
+    let compute = DynOp::new(env, ComputeOp { items: computed })?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(compute, &children)?;
     Ok(())
 }
 
@@ -315,8 +541,8 @@ fn add_compute(
 /// stably. Keys are columns.
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let allocator = compiler.allocator();
-    let mut keys = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    let env = compiler.env();
+    let mut keys = SmallVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let key = compiler.node(list.first_child() + i);
         let column = compiler.node(key.first_child());
@@ -327,9 +553,9 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         let column = compiler.find_column(column)?.id;
         keys.push(SortKey { column, descending: key.descending() })?;
     }
-    let order_by = DynOp::new(allocator, OrderByOp { keys })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(order_by, children)?;
+    let order_by = DynOp::new(env, OrderByOp { keys })?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(order_by, &children)?;
     Ok(())
 }
 
@@ -346,10 +572,10 @@ fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
             return Err(Error::unsupported(Unsupported::Limit, compiler.span(second)));
         }
     };
-    let allocator = compiler.allocator();
-    let limit = DynOp::new(allocator, LimitOp { count, offset })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(limit, children)?;
+    let env = compiler.env();
+    let limit = DynOp::new(env, LimitOp { count, offset })?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(limit, &children)?;
     Ok(())
 }
 
@@ -367,9 +593,9 @@ fn count(compiler: &Compiler<'_, '_>, node: Node) -> Result<u64, Error> {
 fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let by = compiler.node(stage.first_child() + 1);
-    let allocator = compiler.allocator();
-    let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
-    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    let env = compiler.env();
+    let mut keys = SmallVec::fixed(env, by.child_count() as usize)?;
+    let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         if key.tag() != Tag::Name {
@@ -383,7 +609,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         keys.push(column.id)?;
         scope.push(named(compiler, column, alias)?)?;
     }
-    let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    let mut aggregates = SmallVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (item, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let span = compiler.span(item);
@@ -425,10 +651,11 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
-    let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates, answer: None })?;
-    let children = SlowVec::fixed_from(allocator, [compiler.plan.root].into_iter())?;
-    compiler.plan.add_node(aggregate, children)?;
+    let aggregate = DynOp::new(env, AggregateOp { keys, aggregates, answer: None })?;
+    let children = [compiler.plan.root];
+    compiler.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
+    compiler.clear_aliases();
     Ok(())
 }
 
@@ -455,9 +682,9 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::parser::parse_query;
     use crate::registry::Registry;
-    use pipit_kernel::allocator::Heap;
 
     use super::*;
+    use pipit_kernel::env::Env;
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
 
@@ -488,53 +715,63 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap();
+        let env = Env::current();
+        let ast = parse_query(env, &REGISTRY, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap_err();
+        let env = Env::current();
+        let error = parse_query(env, &REGISTRY, source.as_bytes()).unwrap_err();
         (error.code, error.span.start)
     }
 
     #[test]
     fn parses_queries() {
-        assert_eq!(parse("from t"), "(Query (FROM t))");
+        assert_eq!(parse("from t"), "(Query (FROM t (List )))");
         assert_eq!(
             parse("FROM slice |> WHERE dur > 1000 |> SELECT name, dur / 1000, count(*)"),
-            "(Query (FROM slice) (WHERE (Greater dur 1000)) \
+            "(Query (FROM slice (List )) (WHERE (Greater dur 1000)) \
              (SELECT (List name (Divide dur 1000) (Call count *))))"
         );
         assert_eq!(
             parse("FROM t |> WHERE url LIKE '%x%' AND a = 1"),
-            "(Query (FROM t) (WHERE (And (Like url '%x%') (Equal a 1))))"
+            "(Query (FROM t (List )) (WHERE (And (Like url '%x%') (Equal a 1))))"
         );
         assert_eq!(
             parse("FROM t |> WHERE a IS NULL OR NOT b is not null"),
-            "(Query (FROM t) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
+            "(Query (FROM t (List )) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
         );
-        assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
-        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
+        assert_eq!(
+            parse("FROM t |> LIMIT 10 offset 5"),
+            "(Query (FROM t (List )) (LIMIT 10 (List 5)))"
+        );
+        // A qualified name is one name, spaces and all.
+        assert_eq!(
+            parse("FROM t |> WHERE t.a > u . b"),
+            "(Query (FROM t (List )) (WHERE (Greater t.a u . b)))"
+        );
+        assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t (List )) (LIMIT 1 (List )))");
         assert_eq!(
             parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10"),
-            "(Query (FROM t) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
+            "(Query (FROM t (List )) (ORDER (List (ASC a) (DESC (Add b 1)))) (LIMIT 10 (List )))"
         );
         assert_eq!(
             parse("FROM t |> SELECT a AS b, c |> RENAME b as d |> SET a = b"),
-            "(Query (FROM t) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
+            "(Query (FROM t (List )) (SELECT (List (Named a b) c)) (RENAME (List (Named b d))) \
              (SET (List (Named b a))))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*), sum(x) group by a, b"),
-            "(Query (FROM t) (AGGREGATE (List (Call count *) (Call sum x)) (List a b)))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Call count *) (Call sum x)) (List a b)))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*)"),
-            "(Query (FROM t) (AGGREGATE (List (Call count *)) (List )))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Call count *)) (List )))"
         );
         assert_eq!(
             parse("FROM t |> AGGREGATE count(*) AS n GROUP BY a AS k"),
-            "(Query (FROM t) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
+            "(Query (FROM t (List )) (AGGREGATE (List (Named (Call count *) n)) (List (Named a k))))"
         );
     }
 

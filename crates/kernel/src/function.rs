@@ -2,12 +2,16 @@
 //! frontend binds one to a statement, with what it needs computed once, such
 //! as a compiled pattern, and fixes the types it takes and gives.
 
+#![allow(unsafe_code)]
+
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::boxed::{Box, ErasedBox};
+use crate::allocator::AllocError;
 use crate::column::ColumnView;
+use crate::containers::{Box, ErasedBox};
 use crate::context::Context;
+use crate::env::Env;
 use crate::erase::value_of;
 use crate::error::Error;
 
@@ -22,25 +26,36 @@ pub trait Function {
     fn run(&self, context: &mut Context, arguments: &[&ColumnView]) -> Result<ColumnView, Error>;
 }
 
-/// A `Function` of any type, owned in memory from an allocator.
+/// A `Function` of any type, owned in memory from an `Env`, and its type's
+/// functions.
 pub struct DynFunction {
     function: ErasedBox,
+    functions: &'static FunctionFunctions,
+}
+
+/// A function type's functions: one table for each type.
+struct FunctionFunctions {
     run: Run,
 }
 
 type Run = unsafe fn(NonNull<()>, &mut Context, &[&ColumnView]) -> Result<ColumnView, Error>;
 
-impl DynFunction {
-    pub fn new<T: Function + 'static>(
-        allocator: &dyn Allocator,
-        function: T,
-    ) -> Result<DynFunction, AllocError> {
-        let function = Box::new(allocator, function)?.erase();
+/// Holds `T`'s table.
+struct Functions<T>(PhantomData<T>);
+
+impl<T: Function + 'static> Functions<T> {
+    const TABLE: FunctionFunctions = FunctionFunctions {
         // SAFETY: only called with this function.
-        let run = |function, context: &mut Context<'_>, arguments: &[&ColumnView]| unsafe {
+        run: |function, context, arguments| unsafe {
             value_of::<T>(function).run(context, arguments)
-        };
-        Ok(DynFunction { function, run })
+        },
+    };
+}
+
+impl DynFunction {
+    pub fn new<T: Function + 'static>(env: &Env, function: T) -> Result<DynFunction, AllocError> {
+        let function = Box::new(env, function)?.erase();
+        Ok(DynFunction { function, functions: &Functions::<T>::TABLE })
     }
 
     pub fn run(
@@ -48,7 +63,7 @@ impl DynFunction {
         context: &mut Context,
         arguments: &[&ColumnView],
     ) -> Result<ColumnView, Error> {
-        // SAFETY: `run` was made for the function's type.
-        unsafe { (self.run)(self.function.as_ptr(), context, arguments) }
+        // SAFETY: the function matches the function's type.
+        unsafe { (self.functions.run)(self.function.as_ptr(), context, arguments) }
     }
 }

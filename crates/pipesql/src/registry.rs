@@ -4,8 +4,7 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
-use pipit_kernel::expression::ExprStep;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::expression::ExprBuilder;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -24,7 +23,9 @@ pub const ITEMS_MAX: usize = 8;
 /// Where a stage can go: first in a query, or after `|>`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Point {
+    /// First in a query, as `FROM`.
     Source,
+    /// After `|>`.
     Stage,
 }
 
@@ -32,6 +33,7 @@ pub enum Point {
 /// node, in order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Item {
+    /// Exactly one.
     One(Shared),
     /// One or more, separated by commas, under a `List` node.
     List(Shared),
@@ -40,12 +42,20 @@ pub enum Item {
     Clause(&'static [&'static str], Shared),
     /// These words, then a list, as `List` does: `Clause`, but required.
     After(&'static [&'static str], Shared),
+    /// This word, if the query has it next, as `OUTER` in `LEFT OUTER JOIN`:
+    /// an empty `List` either way.
+    Optional(&'static str),
+    /// If the query has these words next, a list, as `List` does, in
+    /// parentheses, as `USING (a, b)`; if not, an empty `List`.
+    Parenthesized(&'static [&'static str], Shared),
 }
 
 /// The pieces of grammar stages are built from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shared {
+    /// A name, as a `Name`.
     Name,
+    /// An expression.
     Expr,
     /// An expression, then maybe `AS` and its name: a `Named` if there is
     /// one.
@@ -60,8 +70,11 @@ pub enum Shared {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rule {
+    /// The word a stage starts with, matched ignoring case.
     pub keyword: &'static str,
+    /// Where the stage can go.
     pub point: Point,
+    /// What comes after the keyword.
     pub items: &'static [Item],
     /// Adds the stage, whose node is passed, to the plan being compiled.
     pub compile: fn(&mut Compiler<'_, '_>, Node) -> Result<(), Error>,
@@ -76,15 +89,17 @@ pub struct FunctionRule {
     /// `depth` deep, its result last: steps the kernel has, as `iif`'s
     /// `CASE`, or a call of a function bound to the statement, which
     /// `call_bound` appends.
-    pub compile:
-        fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>,
+    pub compile: fn(&mut Compiler<'_, '_>, Node, usize, &mut ExprBuilder) -> Result<(), Error>,
 }
 
 /// Rules, found by keyword, and functions, found by name. A rule's id is
 /// `set << 8 | index in set`.
 pub struct Registry {
+    /// The rules, in sets.
     sets: &'static [&'static [Rule]],
+    /// Each rule's id, by its keyword.
     keywords: KeywordTable<STAGE_SLOTS>,
+    /// The functions, in sets.
     functions: &'static [&'static [FunctionRule]],
     /// Compiles a call of a function, which only a registry with functions
     /// can: so one without doesn't pay for the code.

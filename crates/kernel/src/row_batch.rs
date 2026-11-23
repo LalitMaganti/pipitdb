@@ -1,12 +1,15 @@
 //! `RowBatch`: up to `BATCH_ROWS_MAX` rows, as columns of the same length.
 
+#![allow(unsafe_code)]
+
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::ColumnView;
+use crate::containers::{Array, SmallVec};
+use crate::env::Env;
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
 
 pub const BATCH_ROWS_MAX: u32 = 2048;
 /// The columns a batch holds without allocating. A pipeline whose batches
@@ -36,8 +39,8 @@ pub struct RowBatch<'a> {
 
 /// Room for more columns than a batch holds without allocating.
 struct Wide {
-    columns: SlowVec<MaybeUninit<ColumnView>>,
-    borrowed: SlowVec<u64>,
+    columns: SmallVec<MaybeUninit<ColumnView>>,
+    borrowed: Array<u64>,
 }
 
 impl<'a> RowBatch<'a> {
@@ -53,25 +56,25 @@ impl<'a> RowBatch<'a> {
         }
     }
 
-    /// Makes room for `columns` columns, from `allocator`, which must outlive
-    /// the batch, if it has less: so that it does, it's emptied, as it is
-    /// before it's filled.
+    /// Makes room for `columns` columns, from `env`, if it has less: so that
+    /// it does, it's emptied, as it is before it's filled.
     #[inline]
-    pub fn reserve(&mut self, allocator: &dyn Allocator, columns: u32) -> Result<(), AllocError> {
+    pub fn reserve(&mut self, env: &Env, columns: u32) -> Result<(), AllocError> {
         if columns <= self.capacity() {
             return Ok(());
         }
-        self.grow(allocator, columns)
+        self.grow(env, columns)
     }
 
     #[cold]
     #[inline(never)]
-    fn grow(&mut self, allocator: &dyn Allocator, columns: u32) -> Result<(), AllocError> {
+    fn grow(&mut self, env: &Env, columns: u32) -> Result<(), AllocError> {
         self.drop_columns();
         let count = columns as usize;
-        let columns = SlowVec::uninit(allocator, count)?;
+        let mut columns = SmallVec::fixed(env, count)?;
+        columns.extend_within(core::iter::repeat_with(MaybeUninit::uninit).take(count));
         // Every bit is clear, as every bit past the columns is.
-        let borrowed = SlowVec::zeroed(allocator, count.div_ceil(64))?;
+        let borrowed = Array::zeroed(env, count.div_ceil(64))?;
         self.wide = Some(Wide { columns, borrowed });
         Ok(())
     }
@@ -215,6 +218,21 @@ impl<'a> RowBatch<'a> {
         unsafe { at!(self.slots().0, index as usize).assume_init_ref() }
     }
 
+    /// Drops the last column.
+    pub fn pop_column(&mut self) {
+        check!(self.column_count > 0);
+        self.column_count -= 1;
+        let index = self.column_count as usize;
+        let (slots, bits) = self.slots_mut();
+        let (word, bit) = (at_mut!(bits, index / 64), 1 << (index % 64));
+        if *word & bit == 0 {
+            // SAFETY: the column was initialized, and the count no longer
+            // covers it, so it's dropped once.
+            unsafe { at_mut!(slots, index).assume_init_drop() };
+        }
+        *word &= !bit;
+    }
+
     /// Replaces column `index` with `column`, of as many rows.
     pub fn set_column(&mut self, index: u32, column: ColumnView) {
         check!(index < self.column_count && column.row_count() == self.row_count);
@@ -267,17 +285,19 @@ impl Drop for RowBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::DataType;
     use crate::context::Context;
+    use crate::env::Env;
 
     #[test]
     fn holds_columns_of_the_same_length() {
-        let mut values = Buffer::allocate(&Heap, 3 * 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 3 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, None).unwrap();
 
         let mut batch = RowBatch::new();
         batch.reset(3);
@@ -291,10 +311,11 @@ mod tests {
 
     #[test]
     fn holds_more_columns_once_it_has_room() {
-        let mut values = Buffer::allocate(&Heap, 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[7]);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, None).unwrap();
         let borrowed = [column.clone(), column.clone()];
         let mut batch = RowBatch::new();
         batch.reset(1);
@@ -304,7 +325,7 @@ mod tests {
         }
         assert!(batch.push_column(column.clone()).is_err());
         // Making room empties it.
-        batch.reserve(&Heap, inline + 100).unwrap();
+        batch.reserve(env, inline + 100).unwrap();
         assert_eq!(batch.column_count(), 0);
         for _ in 0..inline {
             assert!(batch.push_column(column.clone()).is_ok());

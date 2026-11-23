@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# A push to a pull request cancels its run before, which it supersedes. Each
+# push to main gets its own, so every commit there is checked.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Pinned so Miri's standard library build can be cached.

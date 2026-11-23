@@ -13,14 +13,17 @@
 //! after a day. The store doesn't set them, as setting a bucket's rules
 //! replaces all of them.
 
+#![forbid(unsafe_code)]
+
 use std::io::Read;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pipit_file::spill::FileSpill;
+use pipit_kernel::bytes::ByteRange;
 use pipit_kernel::error::Error;
-use pipit_kernel::spill::{Block, LogId, SpillStore};
+use pipit_kernel::spill::{LogId, SpillStore};
 use rusty_s3::actions::{CreateMultipartUpload, S3Action};
 use rusty_s3::{Bucket, Credentials};
 
@@ -31,8 +34,11 @@ pub const PART_BYTES_MIN: u64 = 5 << 20;
 const SIGNED_FOR: Duration = Duration::from_mins(15);
 
 pub struct S3Spill {
+    /// What requests are sent with.
     agent: ureq::Agent,
+    /// Where the logs are.
     bucket: Bucket,
+    /// What requests are signed with.
     credentials: Credentials,
     /// What each log's key starts with: the prefix given, and a UUID made
     /// for this store, so no other store, on any machine, uses its keys.
@@ -41,18 +47,24 @@ pub struct S3Spill {
     next: AtomicU64,
     /// Where parts are staged before they're uploaded.
     staging: FileSpill,
+    /// How many bytes a part has at least, but the last of a log.
     part_bytes: u64,
+    /// Each log, by its number; `None` once deleted.
     logs: Mutex<Vec<Option<Log>>>,
 }
 
 struct Log {
+    /// Its object's key.
     key: String,
+    /// Its multipart upload.
     upload_id: String,
     /// Each part uploaded's `ETag`, in order.
     etags: Vec<String>,
     /// The part being staged, and its length so far.
     staged: Option<(LogId, u64)>,
+    /// How many bytes were appended.
     len: u64,
+    /// Whether it's sealed, and so can be read but not appended to.
     sealed: bool,
     /// What reads fetched of the sealed log, kept until it's deleted.
     fetched: Vec<Fetched>,
@@ -200,7 +212,7 @@ impl SpillStore for S3Spill {
         Ok(LogId(logs.len() as u64 - 1))
     }
 
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error> {
         self.with(log, |log| {
             if log.sealed {
                 return Err(Error::Io);
@@ -210,7 +222,7 @@ impl SpillStore for S3Spill {
                 None => (self.staging.create()?, 0),
             };
             self.staging.append(staged, bytes)?;
-            let block = Block { offset: log.len, len: bytes.len() as u64 };
+            let block = ByteRange { offset: log.len, len: bytes.len() as u64 };
             log.len += block.len;
             log.staged = Some((staged, len + block.len));
             if len + block.len >= self.part_bytes {
@@ -232,7 +244,7 @@ impl SpillStore for S3Spill {
         })
     }
 
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+    fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error> {
         self.with(log, |log| {
             let fits = block.offset.checked_add(block.len).is_some_and(|end| end <= log.len);
             if !log.sealed || !fits || block.len != into.len() as u64 {
@@ -251,7 +263,7 @@ impl SpillStore for S3Spill {
                 log.fetched.push(fetched);
                 fetched
             };
-            let staged = Block { offset: block.offset - fetched.offset, len: block.len };
+            let staged = ByteRange { offset: block.offset - fetched.offset, len: block.len };
             self.staging.read(fetched.staged, staged, into)
         })
     }
@@ -293,7 +305,7 @@ struct Staged<'s> {
 impl Read for Staged<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let n = (self.len - self.offset).min(out.len() as u64);
-        let block = Block { offset: self.offset, len: n };
+        let block = ByteRange { offset: self.offset, len: n };
         let n = usize::try_from(n).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         self.store.read(self.log, block, &mut out[..n]).map_err(|_| std::io::ErrorKind::Other)?;
         self.offset += block.len;
@@ -305,7 +317,7 @@ impl Read for Staged<'_> {
 /// `PIPIT_S3_ENDPOINT`, `PIPIT_S3_KEY` and `PIPIT_S3_SECRET` are set.
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
+
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
@@ -314,6 +326,7 @@ mod tests {
     use rusty_s3::UrlStyle;
 
     use super::*;
+    use pipit_kernel::env::Env;
 
     /// A store in the test bucket, made if need be, or `None` if no S3 is
     /// configured.
@@ -333,11 +346,12 @@ mod tests {
     }
 
     fn column(rows: usize) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, rows * 8).unwrap();
+        let env = Env::current();
+        let mut buffer = Buffer::allocate(env, rows * 8).unwrap();
         for (o, v) in buffer.as_mut_slice::<i64>().iter_mut().zip(0..) {
             *o = v * 3;
         }
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
+        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, None).unwrap()
     }
 
     #[test]
@@ -356,6 +370,7 @@ mod tests {
 
     #[test]
     fn round_trips_columns_across_parts() {
+        let env = Env::current();
         let Some(store) = store(PART_BYTES_MIN) else { return };
         // A batch's columns, as the engine spills them: about 12 MiB, two
         // full parts and a last, smaller one.
@@ -365,7 +380,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(env, None), &store, log, spilled).unwrap();
             assert_eq!(read.int64s(), column.int64s());
         }
         // A request per part, not per column.
@@ -377,15 +392,16 @@ mod tests {
 
     #[test]
     fn logs_are_read_only_once_sealed() {
+        let env = Env::current();
         let Some(store) = store(PART_BYTES_MIN) else { return };
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(10)).unwrap();
         assert_eq!(
-            read_column(&mut Context::new(&Heap), &store, log, &spilled).err(),
+            read_column(&mut Context::new(env, None), &store, log, &spilled).err(),
             Some(Error::Io)
         );
         store.seal(log).unwrap();
-        assert!(read_column(&mut Context::new(&Heap), &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(env, None), &store, log, &spilled).is_ok());
         store.delete(log);
     }
 

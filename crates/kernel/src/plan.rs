@@ -4,22 +4,30 @@
 //! its inputs and what it outputs, then `lower` turns it into a pipeline,
 //! asking each to lower itself, so extensions can add operations.
 
+#![allow(unsafe_code)]
+
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::boxed::{Box, ErasedBox};
+use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
+use crate::containers::{Box, ErasedBox, InlineVec, SmallVec};
+use crate::env::Env;
 use crate::erase::{value_mut_of, value_of};
+use crate::estimate::{Estimate, RowEstimate};
+use crate::expression::{
+    Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, Exprs, columns_of, conjuncts,
+    mark_expr_columns, type_expr,
+};
 use crate::function::DynFunction;
+use crate::join::JoinOp;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
-use crate::predicate::{Filter, Predicate};
-use crate::scannable::{DynScannable, Summary};
-use crate::slow_vec::SlowVec;
+use crate::predicate::{Filter, Predicate, compared_with};
+use crate::scannable::{DynScannable, Key, Summary};
 use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
 use crate::string_pool::Id;
@@ -44,7 +52,9 @@ pub struct SortKey {
 }
 
 pub struct ColumnSchema {
+    /// What queries call it.
     pub name: Name,
+    /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,
@@ -79,8 +89,8 @@ pub trait Op<'c> {
     /// or adding to a set do, and not where it costs about as much, as
     /// comparing an integer does (ClickBench's integer filters were 11-63%
     /// slower through dictionaries).
-    fn accepts(&self, column: ColumnId) -> Forms {
-        let _ = column;
+    fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
+        let _ = (exprs, column);
         Forms::FLAT
     }
 
@@ -106,11 +116,36 @@ pub trait Op<'c> {
     /// passes on other rows, so nothing below can use its condition.
     fn give_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        let _ = (allocator, column);
+        let _ = (exprs, env, column);
         Ok(Given::Stop)
+    }
+
+    /// Which input, if any, a condition from above on `column` can be
+    /// applied to instead, with the same result. For example, a condition on
+    /// a column one side of a join makes can be applied to that side. By
+    /// default, none.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        let _ = column;
+        None
+    }
+
+    /// For an op that drops rows by a condition, as a filter does: splits off
+    /// the parts of the condition that `below`, its child, can apply to one
+    /// of its inputs instead (see `moves_condition`), returning them as new
+    /// filters, one per input, and keeping the rest. By default, nothing is
+    /// split off.
+    fn split_below(
+        &mut self,
+        exprs: &Exprs,
+        env: &Env,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        let _ = (exprs, env, below);
+        Ok(Moved::none())
     }
 
     /// Whether this makes `column` and takes conditions on it. By default,
@@ -124,11 +159,12 @@ pub trait Op<'c> {
     /// `column`: pushdown. Only called if `takes_condition` says so.
     fn take_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
-        condition: Predicate,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
-        let _ = (allocator, column, condition);
+        let _ = (exprs, env, column, condition);
         failed!()
     }
 
@@ -137,10 +173,10 @@ pub trait Op<'c> {
     /// `allow` said it would make lazy.
     fn materialize(
         &self,
-        allocator: &dyn Allocator,
-        columns: SlowVec<(ColumnId, Forms)>,
+        env: &Env,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
-        let _ = (allocator, columns);
+        let _ = (env, columns);
         failed!()
     }
 
@@ -155,9 +191,30 @@ pub trait Op<'c> {
     /// Whether this now makes its rows from what `child`, its one child,
     /// says of its own in `summary`, without reading them. By default, it
     /// can't.
-    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
-        let _ = (allocator, child);
+    fn answer(&mut self, env: &Env, child: &DynOp<'c>) -> Result<bool, AllocError> {
+        let _ = (env, child);
         Ok(false)
+    }
+
+    /// The estimate of the rows this will make, worked out from its inputs'
+    /// estimates, or `None` for the default. The default is at most as many
+    /// rows as the first input, with that input's keys that this passes
+    /// through, none of them a sequence any more, since this may drop rows.
+    fn estimate(&self, exprs: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
+        let _ = (exprs, inputs);
+        None
+    }
+
+    /// This, if it's a join: what the join planner reorders. By default,
+    /// it isn't.
+    fn as_join(&self) -> Option<&JoinOp> {
+        None
+    }
+
+    /// Makes the choices that depend on its inputs' estimates, such as which
+    /// side of a join to build. By default, there are none.
+    fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
+        let _ = (exprs, inputs);
     }
 
     /// What this needs of the rows of input `input`. By default, nothing.
@@ -176,6 +233,20 @@ pub trait Op<'c> {
     -> Result<(), LowerError>;
 }
 
+/// The filters split off an op's condition, one for each input of the op
+/// below, and whether nothing of the condition is left.
+pub struct Moved<'c> {
+    pub filters: [Option<DynOp<'c>>; 2],
+    pub emptied: bool,
+}
+
+impl<'c> Moved<'c> {
+    /// Nothing split off.
+    pub fn none() -> Moved<'c> {
+        Moved { filters: [None, None], emptied: false }
+    }
+}
+
 /// What an op gives up of its condition on a column.
 pub enum Given {
     /// It passes on other rows than its child's: nothing below can apply a
@@ -184,24 +255,28 @@ pub enum Given {
     /// It passes on its child's rows: a copy of the part of its condition
     /// that reads only the column, if any, and any above may give theirs
     /// too.
-    Passed(Option<Predicate>),
+    Passed(Option<Conjuncts>),
 }
 
-type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
+/// The parts of a condition, all of which must be true: the top-level
+/// conjuncts of an expression, or of several.
+pub type Conjuncts = SmallVec<Expr>;
+
+type GiveCondition = unsafe fn(NonNull<()>, &Exprs, &Env, ColumnId) -> Result<Given, AllocError>;
 
 type TakeCondition =
-    unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Predicate) -> Result<(), AllocError>;
+    unsafe fn(NonNull<()>, &Exprs, &Env, ColumnId, Conjuncts) -> Result<(), AllocError>;
 
-type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
+type Answer<'c> = unsafe fn(NonNull<()>, &Env, &DynOp<'c>) -> Result<bool, AllocError>;
 
-type Materialize<'c> = unsafe fn(
-    NonNull<()>,
-    &dyn Allocator,
-    SlowVec<(ColumnId, Forms)>,
-) -> Result<DynOp<'c>, AllocError>;
+type SplitBelow<'c> =
+    unsafe fn(NonNull<()>, &Exprs, &Env, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
+
+type Materialize<'c> =
+    unsafe fn(NonNull<()>, &Env, SmallVec<(ColumnId, Forms)>) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
-/// allocator, and the functions that know its type.
+/// `Env`, and the functions that know its type.
 pub struct DynOp<'c> {
     op: ErasedBox,
     functions: &'c OpFunctions<'c>,
@@ -211,7 +286,7 @@ pub struct DynOp<'c> {
 struct OpFunctions<'c> {
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
-    accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
+    accepts: unsafe fn(NonNull<()>, &Exprs, ColumnId) -> Forms,
     passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
     give_condition: GiveCondition,
@@ -220,6 +295,11 @@ struct OpFunctions<'c> {
     materialize: Materialize<'c>,
     summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
     answer: Answer<'c>,
+    moves_condition: unsafe fn(NonNull<()>, ColumnId) -> Option<u32>,
+    split_below: SplitBelow<'c>,
+    estimate: unsafe fn(NonNull<()>, &Exprs, &[Estimate]) -> Option<Estimate>,
+    choose: unsafe fn(NonNull<()>, &Exprs, &[Estimate]),
+    as_join: unsafe fn(NonNull<()>) -> Option<NonNull<JoinOp>>,
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -243,29 +323,39 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         // SAFETY: only called with this op.
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
         // SAFETY: as for `reads`.
-        accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
+        accepts: |op, exprs, column| unsafe { value_of::<T>(op).accepts(exprs, column) },
         // SAFETY: as for `reads`.
         passes_through: |op, column| unsafe { value_of::<T>(op).passes_through(column) },
         // SAFETY: as for `prune`.
         allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
         // SAFETY: as for `prune`.
-        give_condition: |op, allocator, column| unsafe {
-            value_mut_of::<T>(op).give_condition(allocator, column)
+        give_condition: |op, exprs, env, column| unsafe {
+            value_mut_of::<T>(op).give_condition(exprs, env, column)
         },
         // SAFETY: as for `reads`.
         takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
         // SAFETY: as for `prune`.
-        take_condition: |op, allocator, column, condition| unsafe {
-            value_mut_of::<T>(op).take_condition(allocator, column, condition)
+        take_condition: |op, exprs, env, column, condition| unsafe {
+            value_mut_of::<T>(op).take_condition(exprs, env, column, condition)
         },
         // SAFETY: as for `reads`.
-        materialize: |op, allocator, columns| unsafe {
-            value_of::<T>(op).materialize(allocator, columns)
-        },
+        materialize: |op, env, columns| unsafe { value_of::<T>(op).materialize(env, columns) },
         // SAFETY: as for `reads`.
         summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
         // SAFETY: as for `prune`.
-        answer: |op, allocator, child| unsafe { value_mut_of::<T>(op).answer(allocator, child) },
+        answer: |op, env, child| unsafe { value_mut_of::<T>(op).answer(env, child) },
+        // SAFETY: as for `reads`.
+        moves_condition: |op, column| unsafe { value_of::<T>(op).moves_condition(column) },
+        // SAFETY: as for `prune`.
+        split_below: |op, exprs, env, below| unsafe {
+            value_mut_of::<T>(op).split_below(exprs, env, below)
+        },
+        // SAFETY: as for `reads`.
+        estimate: |op, exprs, inputs| unsafe { value_of::<T>(op).estimate(exprs, inputs) },
+        // SAFETY: as for `prune`.
+        choose: |op, exprs, inputs| unsafe { value_mut_of::<T>(op).choose(exprs, inputs) },
+        // SAFETY: as for `reads`.
+        as_join: |op| unsafe { value_of::<T>(op).as_join().map(NonNull::from) },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -276,8 +366,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
 }
 
 impl<'c> DynOp<'c> {
-    pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
-        let op = Box::new(allocator, op)?.erase();
+    pub fn new<T: Op<'c> + 'c>(env: &Env, op: T) -> Result<DynOp<'c>, AllocError> {
+        let op = Box::new(env, op)?.erase();
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
     }
 
@@ -292,9 +382,9 @@ impl<'c> DynOp<'c> {
         unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
     }
 
-    pub(crate) fn accepts(&self, column: ColumnId) -> Forms {
+    pub(crate) fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.accepts)(self.op.as_ptr(), column) }
+        unsafe { (self.functions.accepts)(self.op.as_ptr(), exprs, column) }
     }
 
     pub(crate) fn passes_through(&self, column: ColumnId) -> bool {
@@ -310,12 +400,13 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn give_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.give_condition)(self.op.as_ptr(), allocator, column) }
+        unsafe { (self.functions.give_condition)(self.op.as_ptr(), exprs, env, column) }
     }
 
     pub(crate) fn takes_condition(&self, column: ColumnId) -> bool {
@@ -325,22 +416,40 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn take_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
-        condition: Predicate,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
+        let op = self.op.as_ptr();
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.take_condition)(self.op.as_ptr(), allocator, column, condition) }
+        unsafe { (self.functions.take_condition)(op, exprs, env, column, condition) }
     }
 
     pub(crate) fn materialize(
         &self,
-        allocator: &dyn Allocator,
-        columns: SlowVec<(ColumnId, Forms)>,
+        env: &Env,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.materialize)(self.op.as_ptr(), allocator, columns) }
+        unsafe { (self.functions.materialize)(self.op.as_ptr(), env, columns) }
+    }
+
+    pub(crate) fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.moves_condition)(self.op.as_ptr(), column) }
+    }
+
+    pub(crate) fn split_below(
+        &mut self,
+        exprs: &Exprs,
+        env: &Env,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.split_below)(self.op.as_ptr(), exprs, env, below) }
     }
 
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
@@ -348,13 +457,38 @@ impl<'c> DynOp<'c> {
         unsafe { (self.functions.summary)(self.op.as_ptr(), column) }
     }
 
-    pub(crate) fn answer(
-        &mut self,
-        allocator: &dyn Allocator,
-        child: &DynOp<'c>,
-    ) -> Result<bool, AllocError> {
+    /// The op's estimate, or the default estimate if it gives none.
+    pub(crate) fn estimate(&self, exprs: &Exprs, inputs: &[Estimate]) -> Estimate {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.answer)(self.op.as_ptr(), allocator, child) }
+        let estimate = unsafe { (self.functions.estimate)(self.op.as_ptr(), exprs, inputs) };
+        if let Some(estimate) = estimate {
+            return estimate;
+        }
+        let Some(input) = inputs.first() else { return Estimate::UNKNOWN };
+        let mut out = Estimate::of(input.rows);
+        for &(column, key) in input.known_keys() {
+            if self.passes_through(column) {
+                out.add_key(column, key.min(Key::Unique));
+            }
+        }
+        out
+    }
+
+    pub(crate) fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
+        // SAFETY: the function matches the op's type, which `self` holds
+        // mutably.
+        unsafe { (self.functions.choose)(self.op.as_ptr(), exprs, inputs) }
+    }
+
+    pub(crate) fn as_join(&self) -> Option<&JoinOp> {
+        // SAFETY: the function matches the op's type, and the join it
+        // returns is the op, which lives as long as `self`.
+        unsafe { (self.functions.as_join)(self.op.as_ptr()).map(|join| join.as_ref()) }
+    }
+
+    pub(crate) fn answer(&mut self, env: &Env, child: &DynOp<'c>) -> Result<bool, AllocError> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.answer)(self.op.as_ptr(), env, child) }
     }
 
     pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
@@ -383,45 +517,50 @@ impl<'c> DynOp<'c> {
 /// An operation, and the nodes whose rows it reads.
 pub struct PlanNode<'c> {
     pub op: DynOp<'c>,
-    pub children: SlowVec<PlanNodeId>,
+    pub children: Children,
 }
+
+/// The most nodes a node reads, as a join does.
+pub const CHILDREN_MAX: usize = 2;
+
+/// The nodes a node reads, in order.
+pub type Children = InlineVec<PlanNodeId, CHILDREN_MAX>;
 
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
     /// The columns' names.
     pub names: Names,
     /// Indexed by `ColumnId`.
-    pub columns: SlowVec<ColumnSchema>,
+    pub columns: SmallVec<ColumnSchema>,
     /// Indexed by `PlanNodeId`.
-    pub nodes: SlowVec<PlanNode<'c>>,
+    pub nodes: SmallVec<PlanNode<'c>>,
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
     /// The columns of the result, in order.
-    pub output: SlowVec<NamedColumn>,
+    pub output: SmallVec<NamedColumn>,
+    /// The nodes of its expressions.
+    pub exprs: Exprs,
     /// What its runs read through their context, such as its literals.
     statement: Statement,
 }
 
 impl<'c> LogicalPlan<'c> {
-    pub fn new(allocator: &dyn Allocator) -> Result<LogicalPlan<'c>, AllocError> {
+    pub fn new(env: &Env) -> Result<LogicalPlan<'c>, AllocError> {
         Ok(LogicalPlan {
-            names: Names::new(allocator, PLAN_NAME_BYTES_MAX)?,
-            columns: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
-            nodes: SlowVec::new(allocator, PLAN_NODES_MAX)?,
+            names: Names::new(env, PLAN_NAME_BYTES_MAX)?,
+            columns: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+            nodes: SmallVec::new(env, PLAN_NODES_MAX)?,
             root: 0,
-            output: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            output: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+            exprs: Exprs::new(env)?,
             statement: Statement::default(),
         })
     }
 
-    /// Adds `literal` to its literals, allocating from `allocator`, which
+    /// Adds `literal` to its literals, allocating from `env`, which
     /// must outlive the plan, and returns its id there.
-    pub fn add_literal(
-        &mut self,
-        allocator: &dyn Allocator,
-        literal: &[u8],
-    ) -> Result<Id, AllocError> {
-        self.statement.add_literal(allocator, literal)
+    pub fn add_literal(&mut self, env: &Env, literal: &[u8]) -> Result<Id, AllocError> {
+        self.statement.add_literal(env, literal)
     }
 
     /// The literal whose id is `id`.
@@ -431,15 +570,15 @@ impl<'c> LogicalPlan<'c> {
         literal
     }
 
-    /// Binds `function` to it, allocating from `allocator`, which must
+    /// Binds `function` to it, allocating from `env`, which must
     /// outlive the plan, and returns its id, or `None` if it has the most it
     /// can.
     pub fn add_function(
         &mut self,
-        allocator: &dyn Allocator,
+        env: &Env,
         function: DynFunction,
     ) -> Result<Option<u32>, AllocError> {
-        self.statement.add_function(allocator, function)
+        self.statement.add_function(env, function)
     }
 
     /// What its runs read, which lowering gives the physical plan.
@@ -477,10 +616,10 @@ impl<'c> LogicalPlan<'c> {
     pub fn add_node(
         &mut self,
         op: DynOp<'c>,
-        children: SlowVec<PlanNodeId>,
+        children: &[PlanNodeId],
     ) -> Result<PlanNodeId, AllocError> {
         let id = self.nodes.len() as PlanNodeId;
-        self.nodes.push(PlanNode { op, children })?;
+        self.nodes.push(PlanNode { op, children: Children::from_slice(children)? })?;
         self.root = id;
         Ok(id)
     }
@@ -502,14 +641,14 @@ pub struct ScanOp<'c> {
     /// What it reads.
     scannable: &'c DynScannable<'c>,
     /// The scannable's columns it reads, and what each is bound to.
-    columns: SlowVec<ScanColumn>,
+    columns: SmallVec<ScanColumn>,
     /// Conditions the plan pushed down from filters above, if any, which the
     /// scannable may use to skip: the filters still test every row.
-    conditions: Option<SlowVec<Condition>>,
+    conditions: Option<SmallVec<Condition>>,
 }
 
 impl<'c> ScanOp<'c> {
-    pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
+    pub fn new(scannable: &'c DynScannable<'c>, columns: SmallVec<ScanColumn>) -> ScanOp<'c> {
         ScanOp { scannable, columns, conditions: None }
     }
 }
@@ -559,27 +698,51 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     fn take_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
-        condition: Predicate,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
         let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
             failed!();
         };
-        let condition = Condition::new(scanned.column, &condition);
-        let conditions = match &mut self.conditions {
-            Some(conditions) => conditions,
-            None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
-        };
-        conditions.push(condition).map_err(|_| AllocError)
+        let data_type = self.scannable.column_type(scanned.column);
+        let column = |_| (scanned.column, data_type);
+        for conjunct in condition.iter() {
+            // Only what a predicate tests as leaves says which values it
+            // keeps, and an `IN` list doesn't say.
+            if exprs.nodes(*conjunct).iter().any(|node| node.op == ExprOp::In) {
+                continue;
+            }
+            let mut computed = SmallVec::new(env, EXPR_NODES_MAX)?;
+            let predicate = Predicate::from_expr(
+                env,
+                exprs,
+                core::slice::from_ref(conjunct),
+                None,
+                &column,
+                0,
+                &mut computed,
+            )?;
+            if !computed.is_empty() {
+                continue;
+            }
+            let condition = Condition::new(scanned.column, &predicate);
+            let conditions = match &mut self.conditions {
+                Some(conditions) => conditions,
+                None => self.conditions.insert(SmallVec::new(env, CONDITIONS_MAX)?),
+            };
+            conditions.push(condition).map_err(|_| AllocError)?;
+        }
+        Ok(())
     }
 
     fn materialize(
         &self,
-        allocator: &dyn Allocator,
-        columns: SlowVec<(ColumnId, Forms)>,
+        env: &Env,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
-        DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
+        DynOp::new(env, MaterializeOp { scannable: self.scannable, columns })
     }
 
     /// Its scannable's.
@@ -591,13 +754,30 @@ impl<'c> Op<'c> for ScanOp<'c> {
         self.scannable.summary(scanned)
     }
 
+    /// The table's row count, and which of the columns read are keys. If the
+    /// scan took pushed-down conditions, it may skip rows, so no key is
+    /// known to be a sequence. It doesn't reduce its row count for those
+    /// conditions: the filters they were copied from already do.
+    fn estimate(&self, _: &Exprs, _: &[Estimate]) -> Option<Estimate> {
+        let summary = self.scannable.summary(None);
+        let rows = summary.and_then(|summary| u64::try_from(summary.rows).ok());
+        let mut out = Estimate::of(rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly));
+        for scanned in self.columns.iter() {
+            out.add_key(scanned.binding.id, self.scannable.column_key(scanned.column));
+        }
+        if self.conditions.as_ref().is_some_and(|conditions| !conditions.is_empty()) {
+            out.demote_ids();
+        }
+        Some(out)
+    }
+
     /// Its columns, in order, and each order the scannable says its rows
     /// are in, as far as the columns it sorts by are read: a sort by one
     /// that isn't says nothing of the order by those after it.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(c.allocator(), c.column_of(column.binding.id))?;
+            out.push_column(c.env(), c.column_of(column.binding.id))?;
         }
         out.scan = Some(c.node());
         let read = |&(column, descending): &(u32, bool)| {
@@ -624,13 +804,13 @@ impl<'c> Op<'c> for ScanOp<'c> {
     ) -> Result<(), LowerError> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
-        let cutoff = lowering.query_cutoff(node).map(|key| {
+        let cutoff = lowering.query_cutoff(node).map(|(key, slot)| {
             let Some(scanned) = self.columns.iter().find(|c| c.binding.id == key.column) else {
                 failed!()
             };
-            Cutoff { column: scanned.column, descending: key.descending }
+            Cutoff { slot, column: scanned.column, descending: key.descending }
         });
-        let source = self.scannable.scan(lowering.allocator(), read, conditions, cutoff)?;
+        let source = self.scannable.scan(lowering.env(), read, conditions, cutoff)?;
         lowering.set_source(source);
         Ok(())
     }
@@ -640,7 +820,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
 /// made lazy, for the rows each keeps, each in one of the forms with it.
 pub struct MaterializeOp<'c> {
     scannable: &'c DynScannable<'c>,
-    columns: SlowVec<(ColumnId, Forms)>,
+    columns: SmallVec<(ColumnId, Forms)>,
 }
 
 impl<'c> Op<'c> for MaterializeOp<'c> {
@@ -666,47 +846,168 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
         let positions = self.columns.iter().map(|&(column, _)| lowering.query_position(column));
-        let positions = SlowVec::fixed_from(lowering.allocator(), positions)?;
+        let positions = SmallVec::fixed_from(lowering.env(), positions)?;
         let forms = self.columns.iter().map(|&(_, forms)| forms);
-        let forms = SlowVec::fixed_from(lowering.allocator(), forms)?;
-        let transform = self.scannable.materialize(lowering.allocator(), positions, forms)?;
+        let forms = SmallVec::fixed_from(lowering.env(), forms)?;
+        let transform = self.scannable.materialize(lowering.env(), positions, forms)?;
         lowering.add_operator(Step::Transform(transform))
     }
 }
 
-/// Keeps the rows of its one child that `predicate` is true for, as `WHERE`
-/// does. The predicate reads columns by `ColumnId`, and each comparison's
-/// value has its column's type.
+/// Keeps the rows of its one child that each of `conjuncts` is true for, as
+/// `WHERE` does: neither false nor null. Their columns are `ColumnId`s.
 pub struct FilterOp {
-    pub predicate: Predicate,
+    pub conjuncts: Conjuncts,
+}
+
+impl FilterOp {
+    /// The filter of `condition`, of `exprs`: its top-level conjuncts.
+    pub fn new(env: &Env, exprs: &Exprs, condition: Expr) -> Result<FilterOp, AllocError> {
+        Ok(FilterOp { conjuncts: conjuncts_of(env, exprs, condition)? })
+    }
+}
+
+/// The top-level conjuncts of `condition`, of `exprs`: what its `AND`s join.
+pub fn conjuncts_of(env: &Env, exprs: &Exprs, condition: Expr) -> Result<Conjuncts, AllocError> {
+    let mut count = 0;
+    conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
+    let mut parts = SmallVec::fixed(env, count)?;
+    conjuncts(exprs.nodes(condition), condition.root, &mut |root| {
+        parts.extend_within(core::iter::once(Expr { root, ..condition }));
+    });
+    Ok(parts)
+}
+
+/// The conjuncts of `conjuncts` that `keep` is true for, or `None` if none.
+/// Out of line: each caller's `keep` differs, and inlining one copy each
+/// costs more than calling it.
+#[inline(never)]
+fn kept(
+    env: &Env,
+    conjuncts: &[Expr],
+    keep: &dyn Fn(Expr) -> bool,
+) -> Result<Option<Conjuncts>, AllocError> {
+    let count = conjuncts.iter().filter(|&&conjunct| keep(conjunct)).count();
+    if count == 0 {
+        return Ok(None);
+    }
+    let kept = conjuncts.iter().copied().filter(|&conjunct| keep(conjunct));
+    let mut parts = SmallVec::fixed(env, count)?;
+    parts.extend_within(kept);
+    Ok(Some(parts))
 }
 
 impl<'c> Op<'c> for FilterOp {
-    /// Its predicate's columns.
+    /// Its conditions' columns.
     fn reads(&self, reads: &mut Needed) {
-        for column in self.predicate.columns() {
-            reads.need(column);
+        for &conjunct in self.conjuncts.iter() {
+            mark_expr_columns(conjunct, reads);
         }
     }
 
-    /// Constants, which it tests once, and dictionaries of columns it only
-    /// compares with strings, whose entries it tests once each: see
-    /// `Op::accepts`.
-    fn accepts(&self, column: ColumnId) -> Forms {
-        if self.predicate.compares_only_strings(column) {
-            Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY
-        } else {
-            Forms::FLAT | Forms::CONSTANT
+    /// Constants, which it tests once; dictionaries of columns it only
+    /// compares with strings, whose entries it tests once each; and
+    /// sequences of columns it only compares with integers, whose rows it
+    /// keeps by their numbers: see `Op::accepts`.
+    fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
+        match compared_with(exprs, &self.conjuncts, column) {
+            Some(DataType::String) => Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY,
+            Some(DataType::Int64) => Forms::FLAT | Forms::CONSTANT | Forms::SEQUENCE,
+            _ => Forms::FLAT | Forms::CONSTANT,
         }
     }
 
-    /// A copy of the conjuncts of its predicate that read only `column`.
+    /// Splits off the conjuncts that `below` can apply to an input instead:
+    /// those whose columns are all in one of its inputs.
+    fn split_below(
+        &mut self,
+        exprs: &Exprs,
+        env: &Env,
+        below: &DynOp<'c>,
+    ) -> Result<Moved<'c>, AllocError> {
+        // Where `conjunct` goes: 0 to stay, or 1 more than the input all its
+        // columns are in.
+        let part = |conjunct: Expr| {
+            // `None` before any column, then the input all are in, if one.
+            let mut place = None;
+            columns_of(exprs.nodes(conjunct), conjunct.root, &mut |column| {
+                let input = below.moves_condition(column).filter(|&input| input < 2);
+                place = Some(match place {
+                    Some(placed) if placed != input => None,
+                    _ => input,
+                });
+            });
+            match place {
+                Some(Some(input)) => 1 + input,
+                _ => 0,
+            }
+        };
+        // Each conjunct's place, found once.
+        let mut places = SmallVec::fixed(env, self.conjuncts.len())?;
+        places.extend_within(self.conjuncts.iter().map(|&conjunct| part(conjunct)));
+        let place = |conjunct: Expr| {
+            let at = self.conjuncts.iter().position(|&c| c == conjunct).unwrap_or(0);
+            *at!(places, at)
+        };
+        let moves = |to| kept(env, &self.conjuncts, &|conjunct| place(conjunct) == to);
+        let (first, second) = (moves(1)?, moves(2)?);
+        if first.is_none() && second.is_none() {
+            return Ok(Moved::none());
+        }
+        let stay = moves(0)?;
+        let filter = |part: Option<Conjuncts>| {
+            part.map(|conjuncts| DynOp::new(env, FilterOp { conjuncts })).transpose()
+        };
+        let filters = [filter(first)?, filter(second)?];
+        let emptied = stay.is_none();
+        if let Some(stay) = stay {
+            self.conjuncts = stay;
+        }
+        Ok(Moved { filters, emptied })
+    }
+
+    /// Its conjuncts that read only `column`.
     fn give_condition(
         &mut self,
-        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        env: &Env,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        Ok(Given::Passed(self.predicate.conjuncts_on(allocator, column)?))
+        let reads_only = |conjunct: Expr| {
+            let (mut read, mut other) = (false, false);
+            columns_of(exprs.nodes(conjunct), conjunct.root, &mut |read_column| {
+                read |= read_column == column;
+                other |= read_column != column;
+            });
+            read && !other
+        };
+        Ok(Given::Passed(kept(env, &self.conjuncts, &reads_only)?))
+    }
+
+    /// Its input's estimate, less the rows its conjuncts are expected to
+    /// drop, by the rules Perfetto's dataframe planner uses for its filters.
+    fn estimate(&self, exprs: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
+        let mut out = *inputs.first()?;
+        out.demote_ids();
+        for &conjunct in self.conjuncts.iter() {
+            let nodes = exprs.nodes(conjunct);
+            let node = at!(nodes, conjunct.root as usize);
+            let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column);
+            let constant = |i: u32| nodes.get(i as usize).is_some_and(|n| n.op == ExprOp::Constant);
+            match node.op {
+                ExprOp::Eq => match (column(node.a), column(node.b)) {
+                    (Some(c), None) if constant(node.b) => out.keep_equal(c.a),
+                    (None, Some(c)) if constant(node.a) => out.keep_equal(c.a),
+                    _ => out.keep_some(),
+                },
+                ExprOp::In => match column(node.a) {
+                    Some(c) => out.keep_in(c.a, u64::from(node.c)),
+                    None => out.keep_some(),
+                },
+                _ => out.keep_some(),
+            }
+        }
+        Some(out)
     }
 
     /// Its input's, less some rows.
@@ -716,6 +1017,8 @@ impl<'c> Op<'c> for FilterOp {
         Ok(out)
     }
 
+    /// A filter of a predicate, which tests what it can of the conditions
+    /// itself, first computing the rest.
     fn lower(
         &self,
         node: &PlanNode<'c>,
@@ -723,8 +1026,49 @@ impl<'c> Op<'c> for FilterOp {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
-        let allocator = lowering.allocator();
-        let predicate = self.predicate.renumbered(allocator, |id| lowering.query_position(id))?;
-        lowering.add_operator(Step::Transform(DynTransform::new(allocator, Filter { predicate })?))
+        let (env, exprs, values) = (lowering.env(), lowering.exprs(), lowering.expr_values());
+        let rows = lowering.query_rows();
+        let column = |column| {
+            let Some(position) = rows.position_of(column) else { failed!() };
+            (position, rows.type_of(column))
+        };
+        let mut computed = SmallVec::new(env, EXPR_NODES_MAX)?;
+        let at = rows.column_count();
+        let conjuncts = &self.conjuncts;
+        let predicate = Predicate::from_expr(
+            env,
+            exprs,
+            conjuncts,
+            values.clone(),
+            &column,
+            at,
+            &mut computed,
+        )?;
+        if at as usize + computed.len() > PLAN_COLUMNS_MAX {
+            return Err(LowerError::TooManyColumns);
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
+        lowering.widen(at + computed.len() as u32);
+        let mut compute = None;
+        if !computed.is_empty() {
+            let mut programs = SmallVec::fixed(env, computed.len())?;
+            for &part in computed.iter() {
+                let nodes = exprs.nodes(part);
+                let program = match type_expr(env, rows, nodes, values.clone(), true) {
+                    Ok(program) => program,
+                    Err(ExprError::OutOfMemory) => return Err(LowerError::OutOfMemory),
+                    // Named by the first column it reads.
+                    Err(_) => {
+                        let mut first = None;
+                        columns_of(nodes, part.root, &mut |column| _ = first.get_or_insert(column));
+                        return Err(LowerError::WrongType(first.unwrap_or(0)));
+                    }
+                };
+                programs.push(program)?;
+            }
+            compute = Some(Compute { programs });
+        }
+        let filter = Filter { compute, predicate };
+        lowering.add_operator(Step::Transform(DynTransform::new(env, filter)?))
     }
 }

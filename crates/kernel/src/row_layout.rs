@@ -3,15 +3,18 @@
 //! After Arrow's row format:
 //! <https://arrow.apache.org/blog/2022/11/07/multi-column-sorts-in-arrow-rust-part-2/>
 
-use crate::allocator::{AllocError, Allocator};
-use crate::slow_vec::SlowVec;
+use crate::allocator::AllocError;
+use crate::containers::SmallVec;
+use crate::env::Env;
 
 /// What a slot holds.
 #[derive(Clone, Copy)]
 pub(crate) enum Type {
     /// A string's rank among the strings sorted.
     Uint32,
+    /// An integer.
     Int64,
+    /// A float.
     Float64,
 }
 
@@ -38,16 +41,13 @@ pub(crate) struct Slot {
 /// starts with 0xFF if the row has a value and 0 if not; a descending slot's
 /// bits are inverted.
 pub(crate) struct RowLayout {
-    slots: SlowVec<Slot>,
+    slots: SmallVec<Slot>,
     stride: u32,
 }
 
 impl RowLayout {
-    pub(crate) fn new(
-        allocator: &dyn Allocator,
-        columns: &[Column],
-    ) -> Result<RowLayout, AllocError> {
-        let mut slots = SlowVec::fixed(allocator, columns.len())?;
+    pub(crate) fn new(env: &Env, columns: &[Column]) -> Result<RowLayout, AllocError> {
+        let mut slots = SmallVec::fixed(env, columns.len())?;
         let mut stride = 0_u32;
         for column in columns {
             let Ok(offset) = u16::try_from(stride) else { return Err(AllocError) };
@@ -85,11 +85,9 @@ impl RowLayout {
         for i in 0..count {
             let to = at_mut!(rows, i as usize * stride + offset..);
             if slot.nullable {
-                let value = get(i);
-                #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
-                let byte = u8::from(value.is_some()).wrapping_neg() ^ invert as u8;
-                *at_mut!(to, 0) = byte;
-                let bits = value.map_or(0, |value| value.encode() ^ invert).to_be_bytes();
+                let (flag, bits) = encode_nullable(slot, get(i));
+                *at_mut!(to, 0) = flag;
+                let bits = bits.to_be_bytes();
                 at_mut!(to, 1..=T::SIZE).copy_from_slice(at!(bits, 8 - T::SIZE..));
             } else {
                 let Some(value) = get(i) else { failed!() };
@@ -98,6 +96,15 @@ impl RowLayout {
             }
         }
     }
+}
+
+/// The flag and value bits `write` lays out in `slot`, a nullable slot, for
+/// `value`: as a pair, they order as the bytes do.
+pub(crate) fn encode_nullable<T: Encode>(slot: Slot, value: Option<T>) -> (u8, u64) {
+    let invert = if slot.descending { u64::MAX } else { 0 };
+    #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
+    let flag = u8::from(value.is_some()).wrapping_neg() ^ invert as u8;
+    (flag, value.map_or(0, |value| value.encode() ^ invert))
 }
 
 /// The word `write` laid out in `slot` of `row`, an integer or, if `float`,
@@ -190,13 +197,13 @@ mod tests {
     use core::cmp::Ordering;
 
     use super::*;
-    use crate::allocator::Heap;
 
     fn expect_ordered<T: Encode>(data_type: Type, ascending: &[Option<T>], nullable: bool) {
+        let env = Env::current();
         let count = u32::try_from(ascending.len()).unwrap();
         for (descending, expected) in [(false, Ordering::Less), (true, Ordering::Greater)] {
             let layout =
-                RowLayout::new(&Heap, &[Column { data_type, nullable, descending }]).unwrap();
+                RowLayout::new(env, &[Column { data_type, nullable, descending }]).unwrap();
             let mut rows = alloc::vec![0; layout.stride() as usize * ascending.len()];
             RowLayout::write(layout.slot(0), count, |i| ascending[i as usize], &mut rows);
             let rows: Vec<_> = rows.chunks(layout.stride() as usize).collect();
@@ -219,12 +226,13 @@ mod tests {
 
     #[test]
     fn slots_sit_one_after_another() {
+        let env = Env::current();
         let columns = [
             Column { data_type: Type::Int64, nullable: false, descending: false },
             Column { data_type: Type::Float64, nullable: true, descending: false },
             Column { data_type: Type::Int64, nullable: true, descending: true },
         ];
-        let layout = RowLayout::new(&Heap, &columns).unwrap();
+        let layout = RowLayout::new(env, &columns).unwrap();
         assert_eq!(layout.slot(0).offset, 0);
         assert_eq!(layout.slot(1).offset, 8);
         assert_eq!(layout.slot(2).offset, 17);
@@ -234,11 +242,12 @@ mod tests {
 
     #[test]
     fn decodes_what_it_lays_out() {
+        let env = Env::current();
         let values = [Some(-3.5_f64), None, Some(0.0), Some(f64::MAX), Some(-0.0)];
         for (descending, float) in [(false, true), (true, true), (false, false), (true, false)] {
             let data_type = if float { Type::Float64 } else { Type::Int64 };
             let column = Column { data_type, nullable: true, descending };
-            let layout = RowLayout::new(&Heap, &[column]).unwrap();
+            let layout = RowLayout::new(env, &[column]).unwrap();
             let stride = layout.stride() as usize;
             #[expect(clippy::cast_possible_truncation, reason = "whole numbers, or floats' bits")]
             let bits = |i: u32| {
@@ -250,6 +259,8 @@ mod tests {
             RowLayout::write(layout.slot(0), 5, get, &mut rows);
             for (i, row) in (0..).zip(rows.chunks(stride)) {
                 assert_eq!(decode(layout.slot(0), row, float), bits(i), "{i}");
+                let (flag, value) = encode_nullable(layout.slot(0), get(i));
+                assert_eq!((row[0], &row[1..]), (flag, &value.to_be_bytes()[..]), "{i}");
             }
         }
     }

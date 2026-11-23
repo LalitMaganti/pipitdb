@@ -1,16 +1,20 @@
 //! `Selection`: which rows of a batch are kept.
 
+#![allow(unsafe_code)]
+
 use core::mem::MaybeUninit;
 
+use crate::eight::Halves;
 use crate::row_batch::BATCH_ROWS_MAX;
 
 /// For each 4 bits, the positions of those set, from the lowest, then zeros,
-/// each in 16 bits: where the rows of four that they keep are. Adding a
-/// group's first row to each lane at once gives the rows.
-static POSITIONS: [u64; 16] = positions();
+/// each in 16 bits: where the rows of four that they keep are, for the first
+/// four of eight, then for the last, 4 more. Adding the eight's first row to
+/// each lane at once gives the rows.
+static POSITIONS: [u64; 32] = positions();
 
-const fn positions() -> [u64; 16] {
-    let mut table = [0; 16];
+const fn positions() -> [u64; 32] {
+    let mut table = [0; 32];
     let mut bits = 0;
     while bits < 16 {
         let (mut bit, mut set) = (0, 0);
@@ -21,6 +25,7 @@ const fn positions() -> [u64; 16] {
             }
             bit += 1;
         }
+        table[16 + bits] = table[bits] + 0x0004_0004_0004_0004;
         bits += 1;
     }
     table
@@ -35,9 +40,9 @@ pub struct Selection {
     prefix: bool,
     /// How many rows the batch has: every kept row is below it.
     rows: u32,
-    // Unless `prefix`, the first `len` are the kept rows, in increasing order;
-    // only those are written. Kept whatever the state, so narrowing never
-    // sets it up again.
+    /// Unless `prefix`, the first `len` are the kept rows, in increasing
+    /// order; only those are written. Kept whatever the state, so narrowing
+    /// never sets it up again.
     indices: [MaybeUninit<u16>; BATCH_ROWS_MAX as usize],
 }
 
@@ -46,6 +51,7 @@ pub struct Selection {
 pub enum Kept<'a> {
     /// The first `len()` rows.
     Prefix,
+    /// No rows.
     None,
     /// These rows, in increasing order.
     Select(&'a [u16]),
@@ -137,26 +143,27 @@ impl Selection {
     }
 
     /// As `retain`, for a prefix: `eight(at)` says which of the eight rows
-    /// from `at` to keep, as the bits of a byte, and `one(row)` whether to keep
+    /// from `at` to keep, as `Halves`, and `one(row)` whether to keep
     /// each row after the last eight. Each eight's kept rows are written
     /// together, at a cost that doesn't depend on how many are kept.
     #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
-    pub fn keep_prefix(&mut self, eight: impl Fn(usize) -> u8, one: impl Fn(usize) -> bool) {
+    #[expect(clippy::inline_always, reason = "its loop compiles 12% better in its caller")]
+    #[inline(always)]
+    pub fn keep_prefix(&mut self, eight: impl Fn(usize) -> Halves, one: impl Fn(usize) -> bool) {
         check!(self.prefix);
         let len = self.len as usize;
         let indices = self.indices.as_mut_ptr().cast::<u16>();
         let mut kept = 0;
         let full = len - len % 8;
         for at in (0..full).step_by(8) {
-            let byte = eight(at);
-            for half in [0, 4] {
-                let bits = byte >> half & 15;
-                // The first row in each 16-bit lane: rows are below 2^11 and
-                // positions below 4, so no lane carries into the next.
-                let first = (at + half) as u64 * 0x0001_0001_0001_0001;
-                let rows = at!(POSITIONS, usize::from(bits)) + first;
-                // SAFETY: `kept` is at most `at + half`, so the four are below
-                // `at + half + 4`, at most `len`.
+            let (low, high) = eight(at);
+            // The eight's first row in each 16-bit lane: rows are below 2^11
+            // and positions below 8, so no lane carries into the next.
+            let first = at as u64 * 0x0001_0001_0001_0001;
+            for (half, bits) in [(0, low), (16, high)] {
+                let rows = at!(POSITIONS, half + usize::from(bits)) + first;
+                // SAFETY: `kept` is at most `at`, or `at + 4` for the last
+                // four, so the four are below `at + 8`, at most `len`.
                 unsafe { indices.add(kept).cast::<u64>().write_unaligned(rows.to_le()) };
                 kept += bits.count_ones() as usize;
             }

@@ -1,0 +1,8 @@
+ids	FROM orders |> JOIN customer ON o_custkey = c_custkey |> AGGREGATE count(*), sum(c_nationkey)	SELECT count(*), sum(c_nationkey) FROM orders JOIN customer ON o_custkey = c_custkey
+ids_big	FROM lineitem |> JOIN part ON l_partkey = p_partkey |> AGGREGATE count(*), sum(p_size)	SELECT count(*), sum(p_size) FROM lineitem JOIN part ON l_partkey = p_partkey
+unique	FROM lineitem |> JOIN orders ON l_orderkey = o_orderkey |> AGGREGATE count(*), sum(o_custkey)	SELECT count(*), sum(o_custkey) FROM lineitem JOIN orders ON l_orderkey = o_orderkey
+repeats	FROM customer |> JOIN orders ON c_custkey = o_custkey |> AGGREGATE count(*), sum(o_custkey)	SELECT count(*), sum(o_custkey) FROM customer JOIN orders ON c_custkey = o_custkey
+two_keys	FROM lineitem |> JOIN partsupp ON l_partkey = ps_partkey AND l_suppkey = ps_suppkey |> AGGREGATE count(*), sum(ps_availqty)	SELECT count(*), sum(ps_availqty) FROM lineitem JOIN partsupp ON l_partkey = ps_partkey AND l_suppkey = ps_suppkey
+left	FROM customer |> LEFT JOIN orders ON c_custkey = o_custkey |> WHERE o_orderkey IS NULL |> AGGREGATE count(*)	SELECT count(*) FROM customer LEFT JOIN orders ON c_custkey = o_custkey WHERE o_orderkey IS NULL
+nested	FROM part |> JOIN nation ON p_size < n_nationkey |> AGGREGATE count(*)	SELECT count(*) FROM part JOIN nation ON p_size < n_nationkey
+key_and_less	FROM orders |> JOIN lineitem ON o_orderkey = l_orderkey AND l_suppkey < o_custkey |> AGGREGATE count(*)	SELECT count(*) FROM orders JOIN lineitem ON o_orderkey = l_orderkey AND l_suppkey < o_custkey

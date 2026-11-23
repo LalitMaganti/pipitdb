@@ -2,15 +2,19 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
+use crate::containers::SmallVec;
+use crate::env::Env;
+use crate::estimate::{Estimate, RowEstimate};
+use crate::expression::Exprs;
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
-use crate::slow_vec::SlowVec;
+use crate::scannable::Key;
 use crate::step::DynSource;
 use crate::step::Step;
 use crate::values::Values;
@@ -70,12 +74,12 @@ pub struct Aggregate {
 /// a row even if there are none.
 pub struct AggregateOp {
     /// The `Int64` and string columns rows are grouped by.
-    pub keys: SlowVec<ColumnId>,
+    pub keys: SmallVec<ColumnId>,
     /// What each group's rows make, from the columns each function reads.
-    pub aggregates: SlowVec<Aggregate>,
+    pub aggregates: SmallVec<Aggregate>,
     /// Each aggregate's value, once known without reading any rows: then it
     /// has no child, and outputs one row of them.
-    pub answer: Option<SlowVec<i64>>,
+    pub answer: Option<SmallVec<i64>>,
 }
 
 impl<'c> Op<'c> for AggregateOp {
@@ -108,7 +112,7 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// Its keys in dictionaries too: a string key's entries are each
     /// interned once, rather than each row's. Only strings come in them.
-    fn accepts(&self, column: ColumnId) -> Forms {
+    fn accepts(&self, _: &Exprs, column: ColumnId) -> Forms {
         if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
     }
 
@@ -120,11 +124,11 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
     /// knows of its rows without reading them, if it knows enough.
-    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+    fn answer(&mut self, env: &Env, child: &DynOp<'c>) -> Result<bool, AllocError> {
         if !self.keys.is_empty() {
             return Ok(false);
         }
-        let mut values = SlowVec::fixed(allocator, self.aggregates.len())?;
+        let mut values = SmallVec::fixed(env, self.aggregates.len())?;
         for aggregate in self.aggregates.iter() {
             // A summary's bounds are the least and greatest values. With no
             // rows, there are none, and MIN and MAX are null: scanned.
@@ -140,6 +144,25 @@ impl<'c> Op<'c> for AggregateOp {
         }
         self.answer = Some(values);
         Ok(true)
+    }
+
+    /// A condition on a group key can be applied to the input rows instead:
+    /// a group passes it exactly when its rows do.
+    fn moves_condition(&self, column: ColumnId) -> Option<u32> {
+        (self.answer.is_none() && self.keys.contains(&column)).then_some(0)
+    }
+
+    /// With no keys, it makes one row. With one key, it makes a row per
+    /// value of the key, so the key is unique in its output.
+    fn estimate(&self, _: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
+        let input = inputs.first().map_or(RowEstimate::UNKNOWN, |input| input.rows);
+        let mut out = Estimate::of(input);
+        match *self.keys {
+            [] => out.rows = RowEstimate::exactly(1),
+            [key] => out.add_key(key, Key::Unique),
+            _ => {}
+        }
+        Some(out)
     }
 
     /// A row per group: its keys, then its aggregates. Groups are output in
@@ -166,10 +189,10 @@ impl<'c> Op<'c> for AggregateOp {
         }
         let mut out = OutputProperties::NONE;
         for &key in self.keys.iter() {
-            out.push_column(c.allocator(), c.column_of(key))?;
+            out.push_column(c.env(), c.column_of(key))?;
         }
         for aggregate in self.aggregates.iter() {
-            out.push_column(c.allocator(), c.column_of(aggregate.binding.id))?;
+            out.push_column(c.env(), c.column_of(aggregate.binding.id))?;
         }
         if self.answer.is_none() {
             let sorted = c.input(0).sorted_by(&self.keys);
@@ -185,10 +208,10 @@ impl<'c> Op<'c> for AggregateOp {
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
-        let allocator = lowering.allocator();
+        let env = lowering.env();
         if let Some(answer) = &self.answer {
-            let values = SlowVec::fixed_from(allocator, answer.iter().copied())?;
-            lowering.set_source(DynSource::new(allocator, Values { values })?);
+            let values = SmallVec::fixed_from(env, answer.iter().copied())?;
+            lowering.set_source(DynSource::new(env, Values { values })?);
             return Ok(());
         }
         check!(node.children.len() == 1);
@@ -198,7 +221,7 @@ impl<'c> Op<'c> for AggregateOp {
             string_keys |= u64::from(lowering.query_rows().type_of(key) == DataType::String) << k;
         }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
-        let key_columns = SlowVec::fixed_from(allocator, keys)?;
+        let key_columns = SmallVec::fixed_from(env, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
             function: aggregate.function,
             distinct: aggregate.distinct,
@@ -207,13 +230,13 @@ impl<'c> Op<'c> for AggregateOp {
                 .input
                 .map_or(DataType::Int64, |id| lowering.query_rows().type_of(id)),
         });
-        let aggregates = SlowVec::fixed_from(allocator, aggregates)?;
+        let aggregates = SmallVec::fixed_from(env, aggregates)?;
         let mut nullable_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
             nullable_keys |= u64::from(lowering.query_rows().nullable_of(key)) << k;
         }
         let spec = HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates };
-        let operator = hash_aggregate(allocator, spec)?;
+        let operator = hash_aggregate(env, spec)?;
         lowering.add_operator(Step::Operator(operator))
     }
 }
@@ -223,7 +246,7 @@ impl<'c> Op<'c> for AggregateOp {
 pub struct HashAggregateSpec {
     /// Where the keys are in batches. With none, all rows are one group,
     /// output even if there are no rows.
-    pub key_columns: SlowVec<u32>,
+    pub key_columns: SmallVec<u32>,
     /// Bit `k` set if key `k` is a string, rather than an `Int64`. Perfetto
     /// learns this from the first batch, but a group-by here serves a batch
     /// with its keys' types even if none came.
@@ -232,7 +255,7 @@ pub struct HashAggregateSpec {
     /// keeps no null bits.
     pub nullable_keys: u64,
     /// Each aggregate.
-    pub aggregates: SlowVec<AggregateCall>,
+    pub aggregates: SmallVec<AggregateCall>,
 }
 
 /// One aggregate a breaker computes, as Perfetto's `AggregateCall`.

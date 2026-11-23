@@ -3,11 +3,14 @@
 //! needs of its inputs' rows, the steps that meet those needs are chosen, and
 //! the node derives what it outputs from that.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::DataType;
+use crate::containers::SmallVec;
+use crate::context::CUTOFFS_MAX;
+use crate::env::Env;
+use crate::expression::Exprs;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PLAN_COLUMNS_MAX, PlanNodeId, SortKey};
-use crate::slow_vec::SlowVec;
 
 /// A layout known to hold for rows: grouped by the columns of its first
 /// `grouped` keys, none meaning one group, and each group sorted by the
@@ -89,7 +92,9 @@ impl Arrangements {
 /// A column of a batch, and what it holds here.
 #[derive(Clone, Copy)]
 pub struct Column {
+    /// Which column it is.
     pub id: ColumnId,
+    /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,
@@ -101,7 +106,6 @@ pub struct Column {
 pub struct OpenSort {
     pub node: PlanNodeId,
     pub input: u32,
-    pub step: usize,
 }
 
 /// Whether `a` holds the same columns as `b`, as often each.
@@ -115,7 +119,7 @@ fn is_permutation(a: &[ColumnId], b: &[ColumnId]) -> bool {
 /// needs.
 pub struct OutputProperties {
     /// The columns of a batch, in order: made with the first.
-    columns: Option<SlowVec<Column>>,
+    columns: Option<SmallVec<Column>>,
     /// Every layout known to hold.
     pub arrangements: Arrangements,
     /// Set while a sort can still be undone.
@@ -135,11 +139,11 @@ impl OutputProperties {
         scan: None,
     };
 
-    /// A copy, its columns allocated from `allocator`.
-    pub fn clone_in(&self, allocator: &dyn Allocator) -> Result<OutputProperties, AllocError> {
+    /// A copy, its columns allocated from `env`.
+    pub fn clone_in(&self, env: &Env) -> Result<OutputProperties, AllocError> {
         let columns = match &self.columns {
             Some(columns) => {
-                let mut copy = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+                let mut copy = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
                 copy.extend_from_slice(columns)?;
                 Some(copy)
             }
@@ -149,15 +153,11 @@ impl OutputProperties {
     }
 
     /// Adds `column` at the next position in batches, allocating from
-    /// `allocator`. Batches hold at most as many columns as a plan has.
-    pub fn push_column(
-        &mut self,
-        allocator: &dyn Allocator,
-        column: Column,
-    ) -> Result<(), LowerError> {
+    /// `env`. Batches hold at most as many columns as a plan has.
+    pub fn push_column(&mut self, env: &Env, column: Column) -> Result<(), LowerError> {
         let columns = match &mut self.columns {
             Some(columns) => columns,
-            None => self.columns.insert(SlowVec::new(allocator, PLAN_COLUMNS_MAX)?),
+            None => self.columns.insert(SmallVec::new(env, PLAN_COLUMNS_MAX)?),
         };
         if columns.len() == PLAN_COLUMNS_MAX {
             return Err(LowerError::TooManyColumns);
@@ -174,6 +174,18 @@ impl OutputProperties {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
         let count = self.columns().len() as u32;
         count
+    }
+
+    /// Makes every column one that can hold a null.
+    pub(crate) fn make_nullable(&mut self) {
+        for column in self.columns.iter_mut().flat_map(|columns| columns.iter_mut()) {
+            column.nullable = true;
+        }
+    }
+
+    /// The types of a batch's columns, in order.
+    pub(crate) fn types(&self) -> impl Iterator<Item = DataType> + '_ {
+        self.columns().iter().map(|column| column.data_type)
     }
 
     /// The position of `column` in a batch, if it has one.
@@ -291,9 +303,9 @@ pub enum InputStep {
     /// for a scan below to skip by. `unsorted` and `scan` are what was known
     /// of the rows before it, to undo it.
     Sort {
-        keys: SlowVec<SortKey>,
+        keys: SmallVec<SortKey>,
         keep: Option<u32>,
-        publish: bool,
+        publish: Option<u32>,
         unsorted: Arrangements,
         scan: Option<PlanNodeId>,
     },
@@ -301,46 +313,49 @@ pub enum InputStep {
 
 /// One input of a node, once planned.
 pub struct PlannedInput {
-    /// What runs on the input, in order, before the node reads it.
-    pub steps: SlowVec<InputStep>,
-    /// What is known of the rows after `steps`.
+    /// What runs on the input before the node reads it: only a sort, so
+    /// far.
+    pub step: Option<InputStep>,
+    /// What is known of the rows after `step`.
     pub rows: OutputProperties,
 }
 
 /// What is decided about a node before it is lowered.
 pub struct PlannedNode {
     /// Each input's steps, and what is known of its rows after them.
-    pub inputs: SlowVec<PlannedInput>,
+    pub inputs: SmallVec<PlannedInput>,
     /// What is known of the rows it outputs.
     pub output: OutputProperties,
     /// For a scan: the column, and whether descending, a `TopK` above sorts
-    /// by first and publishes a cutoff on.
-    pub cutoff: Option<SortKey>,
+    /// by first and publishes a cutoff on, and the slot it publishes in.
+    pub cutoff: Option<(SortKey, u32)>,
 }
 
 /// By node, what's decided about it.
-pub type Planned = SlowVec<PlannedNode>;
-
-/// The most steps planned for one input: only a sort, so far.
-const INPUT_STEPS_MAX: usize = 1;
+pub type Planned = SmallVec<PlannedNode>;
 
 /// What an op derives its output from.
 pub struct DeriveContext<'p, 'c> {
     plan: &'p LogicalPlan<'c>,
     planned: &'p mut Planned,
     self_: PlanNodeId,
-    allocator: &'p dyn Allocator,
+    env: &'p Env,
 }
 
 impl<'p> DeriveContext<'p, '_> {
+    /// The plan's expressions.
+    pub fn exprs(&self) -> &Exprs {
+        &self.plan.exprs
+    }
+
     /// The id of the node being derived.
     pub fn node(&self) -> PlanNodeId {
         self.self_
     }
 
     /// What outputs' columns are allocated from.
-    pub fn allocator(&self) -> &'p dyn Allocator {
-        self.allocator
+    pub fn env(&self) -> &'p Env {
+        self.env
     }
 
     /// What is known of input `i` once its needs are met.
@@ -350,7 +365,7 @@ impl<'p> DeriveContext<'p, '_> {
 
     /// A copy of `input(i)`, for an output that starts as its input.
     pub fn input_copy(&self, i: u32) -> Result<OutputProperties, AllocError> {
-        self.input(i).clone_in(self.allocator)
+        self.input(i).clone_in(self.env)
     }
 
     /// `id` as a column of the output: as it is in an input which has it,
@@ -371,23 +386,33 @@ impl<'p> DeriveContext<'p, '_> {
     /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
     /// scan to skip by.
     pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
+        // Each publishing `TopK` has a slot of its own, so one in another
+        // pipeline never cuts off this scan.
+        let slots = self.planned.iter().filter(|node| node.cutoff.is_some()).count();
         let node = at_mut!(self.planned, sort.node as usize);
-        let InputStep::Sort { keys, keep, publish, scan, .. } =
-            at_mut!(at_mut!(node.inputs, sort.input as usize).steps, sort.step);
+        let Some(InputStep::Sort { keys, keep, publish, scan, .. }) =
+            &mut at_mut!(node.inputs, sort.input as usize).step
+        else {
+            failed!()
+        };
         *keep = Some(rows);
         let first = *at!(keys, 0);
         let Some(scan) = *scan else { return };
         if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
             return;
         }
-        *publish = true;
-        at_mut!(self.planned, scan as usize).cutoff = Some(first);
+        let Ok(slot) = u32::try_from(slots) else { return };
+        if slot >= CUTOFFS_MAX {
+            return;
+        }
+        *publish = Some(slot);
+        at_mut!(self.planned, scan as usize).cutoff = Some((first, slot));
     }
 }
 
 /// Works out how one input of a node meets the node's needs.
 struct InputPlanner<'p> {
-    allocator: &'p dyn Allocator,
+    env: &'p Env,
     node: PlanNodeId,
     input: u32,
     out: &'p mut PlannedInput,
@@ -437,26 +462,27 @@ impl InputPlanner<'_> {
         // What was planned between the sort and here still says it's open, as
         // in Perfetto: only a LIMIT reads that, and it drops the open sort.
         let node = at_mut!(planned, sort.node as usize);
-        let steps = &mut at_mut!(node.inputs, sort.input as usize).steps;
-        // Only sorts are planned so far, and nothing after a sort before its
-        // order is read, so it's the last step.
-        check!(sort.step + 1 == steps.len());
-        let Some(InputStep::Sort { unsorted, scan, .. }) = steps.pop() else { failed!() };
+        let step = &mut at_mut!(node.inputs, sort.input as usize).step;
+        let Some(InputStep::Sort { unsorted, scan, .. }) = step.take() else { failed!() };
         (rows.arrangements, rows.scan) = (unsorted, scan);
         true
     }
 
     fn sort(&mut self, keys: &[SortKey]) -> Result<(), AllocError> {
         let rows = &mut self.out.rows;
-        let sort = OpenSort { node: self.node, input: self.input, step: self.out.steps.len() };
-        let keys_copy = SlowVec::fixed_from(self.allocator, keys.iter().copied())?;
-        self.out.steps.push(InputStep::Sort {
+        // Only one step fits, as a full list fails.
+        if self.out.step.is_some() {
+            return Err(AllocError);
+        }
+        let sort = OpenSort { node: self.node, input: self.input };
+        let keys_copy = SmallVec::fixed_from(self.env, keys.iter().copied())?;
+        self.out.step = Some(InputStep::Sort {
             keys: keys_copy,
             keep: None,
-            publish: false,
+            publish: None,
             unsorted: rows.arrangements,
             scan: rows.scan.take(),
-        })?;
+        });
         rows.arrangements = Arrangements::NONE;
         rows.arrangements.push(&[], keys);
         rows.open_sort = Some(sort);
@@ -466,14 +492,11 @@ impl InputPlanner<'_> {
 
 /// Plans each node of `plan`, by id, as Perfetto's `RunBoundPasses` does.
 /// A node's inputs come before it, so each is planned after them.
-pub fn plan_nodes(
-    allocator: &dyn Allocator,
-    plan: &LogicalPlan<'_>,
-) -> Result<Planned, LowerError> {
-    let mut planned = SlowVec::fixed(allocator, plan.nodes.len())?;
+pub fn plan_nodes(env: &Env, plan: &LogicalPlan<'_>) -> Result<Planned, LowerError> {
+    let mut planned = SmallVec::fixed(env, plan.nodes.len())?;
     for id in 0..plan.nodes.len() {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
-        plan_node_inputs(allocator, plan, &mut planned, id as PlanNodeId)?;
+        plan_node_inputs(env, plan, &mut planned, id as PlanNodeId)?;
     }
     Ok(planned)
 }
@@ -481,24 +504,24 @@ pub fn plan_nodes(
 /// Plans how each input of node `id` meets its needs, and derives its
 /// output. Everything below `id` must already be planned.
 fn plan_node_inputs(
-    allocator: &dyn Allocator,
+    env: &Env,
     plan: &LogicalPlan<'_>,
     planned: &mut Planned,
     id: PlanNodeId,
 ) -> Result<(), LowerError> {
     let node = at!(plan.nodes, id as usize);
-    let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
+    let mut inputs = SmallVec::fixed(env, node.children.len())?;
     for &child in node.children.iter() {
         check!(child < id);
-        let rows = at!(planned, child as usize).output.clone_in(allocator)?;
-        inputs.push(PlannedInput { steps: SlowVec::new(allocator, INPUT_STEPS_MAX)?, rows })?;
+        let rows = at!(planned, child as usize).output.clone_in(env)?;
+        inputs.push(PlannedInput { step: None, rows })?;
     }
     for (i, out) in (0..).zip(inputs.iter_mut()) {
-        let mut input = InputPlanner { allocator, node: id, input: i, out };
+        let mut input = InputPlanner { env, node: id, input: i, out };
         input.meet(planned, &node.op.needs(i))?;
     }
     planned.push(PlannedNode { inputs, output: OutputProperties::NONE, cutoff: None })?;
-    let mut derive = DeriveContext { plan, planned, self_: id, allocator };
+    let mut derive = DeriveContext { plan, planned, self_: id, env };
     let output = node.op.derive(&mut derive)?;
     at_mut!(planned, id as usize).output = output;
     Ok(())
