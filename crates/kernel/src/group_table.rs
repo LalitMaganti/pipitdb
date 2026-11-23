@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.
@@ -55,7 +55,7 @@ pub(crate) struct GroupTable {
     /// The hash table. An empty slot is 0. A used slot holds the top bits
     /// of the group's hash, then the group number plus one in the low
     /// `GROUP_BITS` bits.
-    slots: SlowVec<u64>,
+    slots: SmallVec<u64>,
     /// Each group's null bits, then its keys, then its payload, `stride`
     /// words each. Keeping them together means comparing a group reads one
     /// cache line.
@@ -74,11 +74,11 @@ pub(crate) struct GroupTable {
     /// pool: as in Perfetto, a null string is a key, not a null one.
     string_keys: u64,
     /// For each key, the last dictionary it came in, if it's a string key.
-    dictionaries: SlowVec<Option<Interned>>,
+    dictionaries: SmallVec<Option<Interned>>,
     /// With a single key, a string, each string's group plus one, 0 until it
     /// has one, at its number in the run's pool plus one, and the null
     /// string's at 0: so a row's group is found without hashing again.
-    number_groups: SlowVec<u32>,
+    number_groups: SmallVec<u32>,
     /// Whether a key not found gets no group, `NONE`, rather than a new
     /// one: a join's build side, once built.
     frozen: bool,
@@ -115,15 +115,15 @@ impl GroupTable {
         let first = usize::from(nullable != 0);
         let stride = first + keys + payload_words;
         Ok(GroupTable {
-            slots: SlowVec::new(env, 1)?,
+            slots: SmallVec::new(env, 1)?,
             records: Blocks::new(env, stride)?,
             stride,
             first,
             nullable,
             keys,
             string_keys,
-            dictionaries: SlowVec::fixed_from(env, (0..keys).map(|_| None))?,
-            number_groups: SlowVec::new(env, 1 << 31)?,
+            dictionaries: SmallVec::fixed_from(env, (0..keys).map(|_| None))?,
+            number_groups: SmallVec::new(env, 1 << 31)?,
             frozen: false,
         })
     }
@@ -433,7 +433,7 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
-        let mut slots = SlowVec::zeroed(env, capacity)?;
+        let mut slots = SmallVec::zeroed(env, capacity)?;
         let mask = capacity - 1;
         // No need to hash the keys again: `slot_of` only uses bits a slot has.
         for &slot in self.slots.iter().filter(|&&slot| slot != 0) {

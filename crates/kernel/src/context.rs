@@ -6,7 +6,7 @@ use crate::buffer::Buffer;
 use crate::env::{Env, Kind};
 use crate::function::DynFunction;
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::string_pool::StringPool;
 
@@ -20,7 +20,7 @@ pub struct Context<'a> {
     /// What states, other metadata and column buffers allocate from.
     env: &'a Env,
     /// Made when first reserved: most runs need none.
-    selections: Option<SlowVec<Selection>>,
+    selections: Option<SmallVec<Selection>>,
     /// Made when first used: most runs intern no strings.
     string_pool: Option<StringPool>,
     /// The strings the statement's conditions compare with, if it has any.
@@ -30,7 +30,7 @@ pub struct Context<'a> {
     /// By slot, the first key of the last row a `TopK` keeps, once it has
     /// published one, so its scan can skip rows that sort after it. Made
     /// when first reserved: most runs publish none.
-    cutoffs: Option<SlowVec<Option<i64>>>,
+    cutoffs: Option<SmallVec<Option<i64>>>,
 }
 
 impl<'a> Context<'a> {
@@ -97,7 +97,7 @@ impl<'a> Context<'a> {
         }
         let selections = match &mut self.selections {
             Some(selections) => selections,
-            None => self.selections.insert(SlowVec::new(self.env, SCRATCH_SELECTIONS_MAX)?),
+            None => self.selections.insert(SmallVec::new(self.env, SCRATCH_SELECTIONS_MAX)?),
         };
         while selections.len() < count {
             selections.push(Selection::all(0))?;
@@ -118,7 +118,7 @@ impl<'a> Context<'a> {
         check!(slot < CUTOFFS_MAX);
         let cutoffs = match &mut self.cutoffs {
             Some(cutoffs) => cutoffs,
-            None => self.cutoffs.insert(SlowVec::new(self.env, CUTOFFS_MAX as usize)?),
+            None => self.cutoffs.insert(SmallVec::new(self.env, CUTOFFS_MAX as usize)?),
         };
         while cutoffs.len() <= slot as usize {
             cutoffs.push(None)?;

@@ -13,7 +13,7 @@ use pipit_kernel::filter::{
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Scannable, Summary};
 use pipit_kernel::selection::{Kept, Selection};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 use pipit_kernel::step::{DynSource, Source};
 
 use crate::chunk::ChunkReader;
@@ -32,7 +32,7 @@ const KEPT_FEW: usize = 8;
 const ROW_GROUPS_MAX: usize = 1 << 24;
 
 pub struct ParquetTable<'a> {
-    files: SlowVec<File<'a>>,
+    files: SmallVec<File<'a>>,
     codecs: &'a dyn Codec,
 }
 
@@ -54,7 +54,7 @@ pub struct ScanState<'a> {
 /// column read, which for a lazy column only counts its rows, how many rows
 /// are left, and which file and row group it is, for lazy columns' handles.
 struct Rows<'a> {
-    readers: SlowVec<ChunkReader<'a>>,
+    readers: SmallVec<ChunkReader<'a>>,
     started: bool,
     left: u64,
     file: u32,
@@ -63,7 +63,7 @@ struct Rows<'a> {
 
 impl<'a> Rows<'a> {
     fn new(env: &Env, columns: usize) -> Result<Rows<'a>, Error> {
-        let readers = SlowVec::fixed(env, columns)?;
+        let readers = SmallVec::fixed(env, columns)?;
         Ok(Rows { readers, started: false, left: 0, file: 0, group: 0 })
     }
 
@@ -189,8 +189,8 @@ impl<'a> Rows<'a> {
 /// group in it: those whose statistics don't rule out the values kept.
 struct Pruned<'a> {
     table: &'a ParquetTable<'a>,
-    columns: SlowVec<(u32, Forms)>,
-    groups: SlowVec<(usize, usize)>,
+    columns: SmallVec<(u32, Forms)>,
+    groups: SmallVec<(usize, usize)>,
     /// What a `TopK` above publishes a cutoff on, if anything: a row group
     /// whose rows all sort after it is skipped as it's reached.
     cutoff: Option<Cutoff>,
@@ -245,7 +245,7 @@ impl<'a> ParquetTable<'a> {
         codecs: &'a dyn Codec,
         sources: &[&'a dyn ByteSource],
     ) -> Result<ParquetTable<'a>, Error> {
-        let mut files: SlowVec<File<'a>> = SlowVec::new(env, FILES_MAX)?;
+        let mut files: SmallVec<File<'a>> = SmallVec::new(env, FILES_MAX)?;
         for &source in sources {
             let footer = ParquetFile::open(env, source)?;
             if let Some(first) = files.first() {
@@ -314,7 +314,7 @@ impl Handle {
 /// What loading lazy columns keeps between batches: a reader for each
 /// column loaded, with the file and row group it reads.
 pub struct Loader<'a> {
-    readers: SlowVec<((u32, u32, u32), ChunkReader<'a>)>,
+    readers: SmallVec<((u32, u32, u32), ChunkReader<'a>)>,
 }
 
 impl<'a> Scannable for ParquetTable<'a> {
@@ -361,7 +361,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     }
 
     fn new_loader(&self, context: &mut Context) -> Result<Loader<'a>, Error> {
-        Ok(Loader { readers: SlowVec::fixed(context.env(), BATCH_COLUMNS_MAX as usize)? })
+        Ok(Loader { readers: SmallVec::fixed(context.env(), BATCH_COLUMNS_MAX as usize)? })
     }
 
     /// Reads the rows of `lazy` `selection` keeps, keeping a reader for each
@@ -488,7 +488,7 @@ impl<'a> Scannable for ParquetTable<'a> {
                 bounds.is_none_or(|bounds| condition.may_keep(bounds))
             })
         };
-        let mut groups = SlowVec::new(env, ROW_GROUPS_MAX)?;
+        let mut groups = SmallVec::new(env, ROW_GROUPS_MAX)?;
         let mut skipped = false;
         for (f, file) in self.files.iter().enumerate() {
             for group in 0..file.footer.row_groups() {
@@ -502,7 +502,7 @@ impl<'a> Scannable for ParquetTable<'a> {
         if !skipped && cutoff.is_none() {
             return Ok(None);
         }
-        let columns = SlowVec::fixed_from(env, columns.iter().copied())?;
+        let columns = SmallVec::fixed_from(env, columns.iter().copied())?;
         Ok(Some(DynSource::new(env, Pruned { table: self, columns, groups, cutoff })?))
     }
 }
@@ -684,7 +684,7 @@ mod tests {
             compare(Comparison::LessEqual, max),
             Node::And(0, 1),
         ];
-        Predicate::new(SlowVec::fixed_from(env, nodes.into_iter()).unwrap())
+        Predicate::new(SmallVec::fixed_from(env, nodes.into_iter()).unwrap())
     }
 
     #[test]
@@ -699,7 +699,7 @@ mod tests {
             let conditions = [Condition::new(0, &between(min, max))];
             let source =
                 table.scan(env, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
-            let pipeline = Pipeline::new(source, SlowVec::fixed(env, 0).unwrap());
+            let pipeline = Pipeline::new(source, SmallVec::fixed(env, 0).unwrap());
             let query = Env::current();
             let mut execution = pipeline.start(query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
@@ -745,13 +745,13 @@ mod tests {
             let cutoff = publish.map(|slot| Cutoff { slot, column: 0, descending: false });
             let source = table.scan(env, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
             let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
-            let keys = SlowVec::fixed_from(env, keys.into_iter()).unwrap();
+            let keys = SmallVec::fixed_from(env, keys.into_iter()).unwrap();
             let kept = core::cell::Cell::new(0);
             let steps = [
                 Step::Transform(DynTransform::new(env, Rows(&kept)).unwrap()),
                 Step::Operator(pipit_kernel::top_k::top_k(env, keys, 3, publish).unwrap()),
             ];
-            let steps = SlowVec::fixed_from(env, steps.into_iter()).unwrap();
+            let steps = SmallVec::fixed_from(env, steps.into_iter()).unwrap();
             let pipeline = Pipeline::new(source, steps);
             let query = Env::current();
             let mut execution = pipeline.start(query, None).unwrap();

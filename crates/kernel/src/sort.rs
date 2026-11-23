@@ -7,19 +7,19 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
 use crate::step::{Breaker, DynOperator};
 
 /// The breaker that sorts rows by `keys`, the first first, which must be
 /// columns of numbers.
-pub fn sort<'a>(env: &Env, keys: SlowVec<SortKey>) -> Result<DynOperator<'a>, AllocError> {
+pub fn sort<'a>(env: &Env, keys: SmallVec<SortKey>) -> Result<DynOperator<'a>, AllocError> {
     DynOperator::new(env, Sort { keys })
 }
 
 struct Sort {
-    keys: SlowVec<SortKey>,
+    keys: SmallVec<SortKey>,
 }
 
 /// The rows so far, and how many have been output.
@@ -137,10 +137,10 @@ mod tests {
     }
 
     /// Keys of `(column, descending)`.
-    fn by(keys: &[(u32, bool)]) -> SlowVec<SortKey> {
+    fn by(keys: &[(u32, bool)]) -> SmallVec<SortKey> {
         let env = Env::current();
         let keys = keys.iter().map(|&(column, descending)| SortKey { column, descending });
-        SlowVec::fixed_from(env, keys).unwrap()
+        SmallVec::fixed_from(env, keys).unwrap()
     }
 
     /// By the key ascending, then the value descending.
@@ -149,7 +149,7 @@ mod tests {
     /// Each row out of `step`, in order.
     fn run(rows: Rows, step: DynOperator<'static>) -> Vec<(Option<i64>, i64, Vec<u8>)> {
         let env = Env::current();
-        let mut steps = SlowVec::new(env, 1).unwrap();
+        let mut steps = SmallVec::new(env, 1).unwrap();
         assert!(steps.push(Step::Operator(step)).is_ok());
         let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
         let query = Env::current();

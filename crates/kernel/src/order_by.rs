@@ -4,14 +4,14 @@ use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{ColumnId, Op, PlanNode, SortKey};
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
 /// the first first. It needs its input sorted, which planning does only if
 /// it isn't known to be, and only for as many rows as a LIMIT just above
 /// reads. It reads every column, so each is made flat before it's held.
 pub struct OrderByOp {
-    pub keys: SlowVec<SortKey>,
+    pub keys: SmallVec<SortKey>,
 }
 
 impl<'c> Op<'c> for OrderByOp {

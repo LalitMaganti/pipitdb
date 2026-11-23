@@ -2,10 +2,10 @@
 
 use crate::allocator::AllocError;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 pub struct Names {
-    bytes: SlowVec<u8>,
+    bytes: SmallVec<u8>,
 }
 
 /// Where a name is in its `Names`.
@@ -18,12 +18,12 @@ pub struct Name {
 impl Names {
     /// Room for up to `max_bytes` of names, a power of two.
     pub fn new(env: &Env, max_bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: SlowVec::new(env, max_bytes)? })
+        Ok(Names { bytes: SmallVec::new(env, max_bytes)? })
     }
 
     /// Room for exactly `bytes` of names, which never grows.
     pub fn fixed(env: &Env, bytes: usize) -> Result<Names, AllocError> {
-        Ok(Names { bytes: SlowVec::fixed(env, bytes)? })
+        Ok(Names { bytes: SmallVec::fixed(env, bytes)? })
     }
 
     /// Copies `name` in.

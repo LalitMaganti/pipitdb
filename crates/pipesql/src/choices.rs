@@ -3,7 +3,7 @@
 //! them as the set `CHOICES`.
 
 use pipit_kernel::expression::{ExprBuilder, PRESENT};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -48,7 +48,7 @@ fn coalesce(
     let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
     // At least two, as `compile_arguments` checked.
     let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
-    let mut branches = SlowVec::fixed(compiler.env(), tested.len())?;
+    let mut branches = SmallVec::fixed(compiler.env(), tested.len())?;
     for &value in tested {
         branches.push((PRESENT, value))?;
     }

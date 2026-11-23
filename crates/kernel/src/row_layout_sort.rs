@@ -14,7 +14,7 @@ use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::Slot;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
 /// rather than sorted.
@@ -79,9 +79,9 @@ fn find_existing_order(rows: Rows) -> ExistingOrder {
 }
 
 /// The positions of the bytes which differ between any two rows.
-fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SlowVec<u32>, AllocError> {
+fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SmallVec<u32>, AllocError> {
     let stride = rows.stride;
-    let mut differs = SlowVec::<u8>::zeroed(env, stride)?;
+    let mut differs = SmallVec::<u8>::zeroed(env, stride)?;
     if stride >= 8 {
         // A word at a time, the last of which may overlap the one before it.
         let words = stride.div_ceil(8);
@@ -92,7 +92,7 @@ fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SlowVec<u32>, AllocError>
             u64::from_ne_bytes(bytes)
         };
         let first = rows.get(0);
-        let mut diff = SlowVec::<u64>::zeroed(env, words)?;
+        let mut diff = SmallVec::<u64>::zeroed(env, words)?;
         // XOR each row with the first and gather the differences. A byte is
         // the same in every row exactly when none of its bits are set.
         for r in 0..rows.count {
@@ -114,7 +114,7 @@ fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SlowVec<u32>, AllocError>
         }
     }
     let count = differs.iter().filter(|&&d| d != 0).count();
-    let mut varying = SlowVec::fixed(env, count)?;
+    let mut varying = SmallVec::fixed(env, count)?;
     for (b, &d) in differs.iter().enumerate() {
         if d != 0 {
             #[expect(clippy::cast_possible_truncation, reason = "a stride is at most 65,535")]
@@ -234,7 +234,7 @@ pub(crate) enum Sorted {
     /// Each row's word, in order. If they hold every byte that varies, at
     /// `varying`, `fixed` is the bytes of the first row, as every other byte
     /// is in every row.
-    Words { words: Array<u64>, packing: Words, varying: SlowVec<u32>, fixed: Option<SlowVec<u8>> },
+    Words { words: Array<u64>, packing: Words, varying: SmallVec<u32>, fixed: Option<SmallVec<u8>> },
 }
 
 impl Sorted {
@@ -407,7 +407,7 @@ pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<S
     let in_words = varying.len() <= packing.key_bytes;
     let mut fixed = None;
     if in_words {
-        fixed = Some(SlowVec::fixed_from(env, rows.get(0).iter().copied())?);
+        fixed = Some(SmallVec::fixed_from(env, rows.get(0).iter().copied())?);
     }
     let batch = BATCH_ROWS_MAX as usize;
     let mut words = Array::from_chunks(env, count as usize, batch, |start, out| {

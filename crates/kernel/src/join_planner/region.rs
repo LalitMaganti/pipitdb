@@ -9,7 +9,7 @@ use crate::expression::{Expr, Exprs};
 use crate::join::{JoinKind as Kind, JoinOp, equality};
 use crate::plan::{ColumnId, DynOp, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
 use crate::scannable::Key;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 use super::{
     EquivalenceSet, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph, Relation, RelationSet,
@@ -94,9 +94,9 @@ fn plan_region(
 ) -> Result<bool, AllocError> {
     // Its joins, and its relations: the children of its joins that aren't
     // joins of it.
-    let mut joins = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
-    let mut leaves = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
-    let mut pending = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
+    let mut joins = SmallVec::new(env, crate::plan::PLAN_NODES_MAX)?;
+    let mut leaves = SmallVec::new(env, crate::plan::PLAN_NODES_MAX)?;
+    let mut pending = SmallVec::new(env, crate::plan::PLAN_NODES_MAX)?;
     pending.push(root)?;
     while let Some(id) = pending.pop() {
         joins.push(id)?;
@@ -127,7 +127,7 @@ fn plan_region(
         }
     }
     // The equalities the region's joins require.
-    let mut equalities = SlowVec::new(env, crate::expression::EXPR_NODES_MAX)?;
+    let mut equalities = SmallVec::new(env, crate::expression::EXPR_NODES_MAX)?;
     let mut unplaced = false;
     for &id in joins.iter() {
         let Some(join) = at!(plan.nodes, id as usize).op.as_join() else { failed!() };
@@ -278,7 +278,7 @@ fn rebuild(
             (*at!(built, left as usize), *at!(built, right as usize));
         // The equalities whose relations it joins, one on each side: only
         // the lowest join that has both splits them so.
-        let mut conjuncts = SlowVec::fixed(env, equalities.len())?;
+        let mut conjuncts = SmallVec::fixed(env, equalities.len())?;
         for equality in equalities {
             let [a, b] = equality.relations.map(|relation| 1_u64 << relation);
             if (a & under_left != 0 && b & under_right != 0)
@@ -300,9 +300,13 @@ fn rebuild(
 }
 
 /// The columns of the relations of `under`, a bit each.
-fn columns_of(env: &Env, relation_of: &[u32], under: u64) -> Result<SlowVec<ColumnId>, AllocError> {
+fn columns_of(
+    env: &Env,
+    relation_of: &[u32],
+    under: u64,
+) -> Result<SmallVec<ColumnId>, AllocError> {
     let of = |&relation: &u32| relation != NONE && under >> relation & 1 != 0;
-    let mut columns = SlowVec::fixed(env, relation_of.iter().filter(|r| of(r)).count())?;
+    let mut columns = SmallVec::fixed(env, relation_of.iter().filter(|r| of(r)).count())?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
     columns.extend_within(
         (0..relation_of.len()).filter(|&c| of(at!(relation_of, c))).map(|c| c as ColumnId),

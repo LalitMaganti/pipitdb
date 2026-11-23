@@ -7,7 +7,7 @@ use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// How many bits of an id say where in its block its string is.
 const BLOCK_OFFSET_BITS: u32 = 21;
@@ -128,11 +128,11 @@ pub struct StringPool {
 struct Store {
     /// The blocks, of `BLOCK_CAPACITY` each, written up to `block_end` in
     /// the last.
-    blocks: SlowVec<Buffer>,
+    blocks: SmallVec<Buffer>,
     /// How many bytes of the last block are written.
     block_end: usize,
     /// Each string too large for a block, with a nul after it.
-    large_strings: SlowVec<Buffer>,
+    large_strings: SmallVec<Buffer>,
 }
 
 /// A string's hash, which the index takes as already hashed, its id, and
@@ -156,9 +156,9 @@ impl StringPool {
     /// A pool holding only the null string. `env` must outlive it.
     pub fn new(env: &Env) -> Result<StringPool, AllocError> {
         let mut store = Store {
-            blocks: SlowVec::new(env, BLOCKS_MAX)?,
+            blocks: SmallVec::new(env, BLOCKS_MAX)?,
             block_end: 0,
-            large_strings: SlowVec::new(env, 1 << 31)?,
+            large_strings: SmallVec::new(env, 1 << 31)?,
         };
         store.add_block(env)?;
         // The null string's slot, so no string's id is 0.

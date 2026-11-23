@@ -3,7 +3,7 @@
 
 use crate::allocator::AllocError;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// How many bits one partition splits on.
 const DIGIT_BITS: u32 = 8;
@@ -26,14 +26,14 @@ const SMALL: usize = 4096;
 /// also copies through; the block being carried to its bucket; and by block
 /// of the input, whether it's been moved. Partitioning is done before
 /// the buckets are sorted, so one is enough for every level.
-pub(crate) struct Scratch(SlowVec<u64>);
+pub(crate) struct Scratch(SmallVec<u64>);
 
 impl Scratch {
     /// For sorting up to `count` words.
     pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
         let len =
             if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(SlowVec::zeroed(env, len)?))
+        Ok(Scratch(SmallVec::zeroed(env, len)?))
     }
 }
 
@@ -232,7 +232,7 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
     let suffix = |element: &T, depth: usize| key(element).get(depth..).unwrap_or_default();
     // The byte of `key` at `depth`, plus one, or 0 for keys that short.
     let digit = |e: &T, depth| suffix(e, depth).first().map_or(0, |&b| usize::from(b) + 1);
-    let mut stack = SlowVec::new(env, 1 << 24)?;
+    let mut stack = SmallVec::new(env, 1 << 24)?;
     stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
     while let Some(bucket) = stack.pop() {
         let (depth, items) = (bucket.depth, at_mut!(elements, bucket.start..bucket.end));

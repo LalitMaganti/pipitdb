@@ -16,7 +16,7 @@ use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::choices::CHOICES;
@@ -39,8 +39,8 @@ pub struct TableFile {
 
 /// The tables, by name.
 struct Tables<'a> {
-    names: SlowVec<&'a str>,
-    tables: SlowVec<DynScannable<'a>>,
+    names: SmallVec<&'a str>,
+    tables: SmallVec<DynScannable<'a>>,
 }
 
 impl Catalog for Tables<'_> {
@@ -78,10 +78,10 @@ pub unsafe extern "C" fn run_query(
 /// As `run_query`, with every allocation from `env`.
 fn run(env: &Env, files: &[TableFile], query: &[u8]) -> Option<u64> {
     // The files, which their tables borrow for the query.
-    let mut sources: SlowVec<&[u8]> = SlowVec::fixed(env, files.len()).ok()?;
+    let mut sources: SmallVec<&[u8]> = SmallVec::fixed(env, files.len()).ok()?;
     let mut tables = Tables {
-        names: SlowVec::fixed(env, files.len()).ok()?,
-        tables: SlowVec::fixed(env, files.len()).ok()?,
+        names: SmallVec::fixed(env, files.len()).ok()?,
+        tables: SmallVec::fixed(env, files.len()).ok()?,
     };
     for file in files {
         // SAFETY: guaranteed by `run_query`'s caller.

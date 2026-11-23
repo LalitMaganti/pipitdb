@@ -7,7 +7,7 @@ use crate::buffer::Buffer;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// How many bytes a block holds.
 const BLOCK_BYTES: usize = BATCH_ROWS_MAX as usize * 8;
@@ -20,7 +20,7 @@ pub(crate) struct RowBlocks {
     /// `block_rows`' reciprocal, to divide by it with a multiply.
     reciprocal: u64,
     /// Each block, its rows below `len` written; `None` once let go of.
-    blocks: SlowVec<Option<Buffer>>,
+    blocks: SmallVec<Option<Buffer>>,
     /// The first block not let go of.
     kept: usize,
     /// How many rows there are.
@@ -33,7 +33,7 @@ impl RowBlocks {
         #[expect(clippy::cast_possible_truncation, reason = "at most `BLOCK_BYTES`")]
         let block_rows = (BLOCK_BYTES / stride) as u32;
         let reciprocal = u64::MAX / u64::from(block_rows) + 1;
-        let blocks = SlowVec::new(context.env(), 1 << 24)?;
+        let blocks = SmallVec::new(context.env(), 1 << 24)?;
         Ok(RowBlocks { stride, block_rows, reciprocal, blocks, kept: 0, len: 0 })
     }
 

@@ -11,7 +11,7 @@ use crate::join_planner::plan_regions;
 use crate::plan::{
     Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// Runs every pass over `plan`, with scratch memory from `env`.
 pub fn optimize(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
@@ -32,7 +32,7 @@ pub fn optimize(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError>
 
 /// The columns something later in a plan uses, by id.
 pub struct Needed<'e> {
-    columns: SlowVec<bool>,
+    columns: SmallVec<bool>,
     /// The plan's expressions, which ops' columns are read in.
     exprs: &'e Exprs,
 }
@@ -44,7 +44,7 @@ impl<'e> Needed<'e> {
         count: usize,
         exprs: &'e Exprs,
     ) -> Result<Needed<'e>, AllocError> {
-        let columns = SlowVec::fixed_from(env, core::iter::repeat_n(false, count))?;
+        let columns = SmallVec::fixed_from(env, core::iter::repeat_n(false, count))?;
         Ok(Needed { columns, exprs })
     }
 
@@ -87,7 +87,7 @@ pub fn prune_columns(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocE
     }
     // Nodes left to prune, and where each is referred to from: its parent's
     // children, or the root if `None`.
-    let mut pending = SlowVec::new(env, PLAN_NODES_MAX)?;
+    let mut pending = SmallVec::new(env, PLAN_NODES_MAX)?;
     pending.push((plan.root, None::<(PlanNodeId, usize)>))?;
     while let Some((mut id, from)) = pending.pop() {
         loop {
@@ -249,9 +249,9 @@ fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
 pub fn choose_by_estimates(
     env: &Env,
     plan: &mut LogicalPlan<'_>,
-) -> Result<SlowVec<Estimate>, AllocError> {
-    let mut estimates = SlowVec::fixed(env, plan.nodes.len())?;
-    let mut inputs = SlowVec::new(env, PLAN_NODES_MAX)?;
+) -> Result<SmallVec<Estimate>, AllocError> {
+    let mut estimates = SmallVec::fixed(env, plan.nodes.len())?;
+    let mut inputs = SmallVec::new(env, PLAN_NODES_MAX)?;
     let exprs = &plan.exprs;
     for node in plan.nodes.iter_mut() {
         inputs.retain(|_| false);
@@ -270,9 +270,9 @@ pub fn choose_by_estimates(
 fn parents(
     env: &Env,
     plan: &LogicalPlan<'_>,
-) -> Result<SlowVec<Option<(PlanNodeId, usize)>>, AllocError> {
+) -> Result<SmallVec<Option<(PlanNodeId, usize)>>, AllocError> {
     let orphans = core::iter::repeat_n(None, plan.nodes.len());
-    let mut parents = SlowVec::fixed_from(env, orphans)?;
+    let mut parents = SmallVec::fixed_from(env, orphans)?;
     for (id, node) in (0..).zip(plan.nodes.iter()) {
         for (slot, &child) in node.children.iter().enumerate() {
             *at_mut!(parents, child as usize) = Some((id, slot));
@@ -379,7 +379,7 @@ const ANY_FORM: Forms = OUTPUT_FORMS.union(Forms::LAZY).union(Forms::SEQUENCE);
 pub fn choose_forms(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     let (nodes, columns) = (plan.nodes.len(), plan.columns.len());
     let parents = parents(env, plan)?;
-    let mut reads = SlowVec::fixed(env, nodes)?;
+    let mut reads = SmallVec::fixed(env, nodes)?;
     for node in plan.nodes.iter() {
         let mut read = Needed::none(env, columns, &plan.exprs)?;
         node.op.reads(&mut read);
@@ -390,7 +390,7 @@ pub fn choose_forms(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocEr
         output.need(column.id);
     }
     // Each column made lazy: what made it, and where it's loaded.
-    let mut lazy = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
+    let mut lazy = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for maker in 0..nodes {
         for column in (0..).take(columns) {
             let (load, above_parent, accepted) =
@@ -416,7 +416,7 @@ pub fn choose_forms(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocEr
         if at!(lazy, ..i).iter().any(|entry| same(&entry)) {
             continue;
         }
-        let mut loaded = SlowVec::fixed(env, at!(lazy, i..).iter().filter(same).count())?;
+        let mut loaded = SmallVec::fixed(env, at!(lazy, i..).iter().filter(same).count())?;
         for &(_, _, column, forms) in at!(lazy, i..).iter().filter(same) {
             loaded.push((column, forms))?;
         }
@@ -607,7 +607,7 @@ mod tests {
             env: &Env,
             _: ColumnId,
         ) -> Result<Given, AllocError> {
-            Ok(Given::Passed(Some(SlowVec::fixed_from(env, [self.0].into_iter())?)))
+            Ok(Given::Passed(Some(SmallVec::fixed_from(env, [self.0].into_iter())?)))
         }
 
         fn derive(&self, _: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {

@@ -18,7 +18,7 @@ impl<T: Copy + Default, const N: usize> InlineVec<T, N> {
     }
 
     /// `values`, failing as running out of memory if there are more than
-    /// `N`, as a full `SlowVec` does.
+    /// `N`, as a full `SmallVec` does.
     pub fn from_slice(values: &[T]) -> Result<InlineVec<T, N>, AllocError> {
         let mut list = InlineVec::new();
         let Some(room) = list.values.get_mut(..values.len()) else { return Err(AllocError) };

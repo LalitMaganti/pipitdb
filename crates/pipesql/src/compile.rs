@@ -9,7 +9,7 @@ use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
 };
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
@@ -22,7 +22,7 @@ use pipit_kernel::env::Env;
 /// name.
 pub struct Relation {
     pub node: PlanNodeId,
-    pub columns: SlowVec<NamedColumn>,
+    pub columns: SmallVec<NamedColumn>,
 }
 
 /// A table alias, as `GoogleSQL`'s: a name for the columns a table had when
@@ -50,12 +50,12 @@ pub struct Compiler<'q, 'c> {
     env: &'q Env,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
-    pub scope: SlowVec<NamedColumn>,
+    pub scope: SmallVec<NamedColumn>,
     /// The aliases `t.x` can name columns by, the first `alias_count`, and
     /// their columns.
     aliases: [TableAlias; ALIASES_MAX],
     alias_count: usize,
-    alias_columns: SlowVec<NamedColumn>,
+    alias_columns: SmallVec<NamedColumn>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -159,8 +159,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
         let count = table.column_count();
-        let mut reads = SlowVec::fixed(self.env, count as usize)?;
-        let mut columns = SlowVec::new(self.env, PLAN_COLUMNS_MAX)?;
+        let mut reads = SmallVec::fixed(self.env, count as usize)?;
+        let mut columns = SmallVec::new(self.env, PLAN_COLUMNS_MAX)?;
         for i in 0..count {
             let (name, data_type) = (table.column_name(i), table.column_type(i));
             let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
@@ -229,10 +229,10 @@ pub fn compile<'c>(
         catalog,
         registry,
         plan: LogicalPlan::new(env)?,
-        scope: SlowVec::new(env, PLAN_COLUMNS_MAX)?,
+        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
         aliases: [TableAlias::default(); ALIASES_MAX],
         alias_count: 0,
-        alias_columns: SlowVec::new(env, ALIAS_COLUMNS_MAX)?,
+        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
         env,
     };
     let query = ast.node(ast.root());

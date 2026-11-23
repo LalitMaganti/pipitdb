@@ -24,7 +24,7 @@ use pipit_kernel::plan::{
 };
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
     let mut buffer = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
@@ -93,7 +93,7 @@ fn scan<'c>(
     plan: &mut LogicalPlan<'c>,
     table: &'c DynScannable<'c>,
 ) -> (PlanNodeId, [NamedColumn; 2]) {
-    let mut reads = SlowVec::new(Env::current(), 2).unwrap();
+    let mut reads = SmallVec::new(Env::current(), 2).unwrap();
     let mut bound = Vec::new();
     for (i, name) in (0..).zip(["k", "v"]) {
         let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -161,12 +161,12 @@ fn join(
     let columns = [probe_k.id, probe_v.id, build_k.id, build_v.id];
     let condition = condition(&mut plan.exprs, on, columns);
     let build_columns =
-        SlowVec::fixed_from(Env::current(), [build_k.id, build_v.id].into_iter()).unwrap();
+        SmallVec::fixed_from(Env::current(), [build_k.id, build_v.id].into_iter()).unwrap();
     let probe_columns =
-        SlowVec::fixed_from(Env::current(), [probe_k.id, probe_v.id].into_iter()).unwrap();
+        SmallVec::fixed_from(Env::current(), [probe_k.id, probe_v.id].into_iter()).unwrap();
     let conjuncts = match condition {
         Some(condition) => conjuncts_of(Env::current(), &plan.exprs, condition).unwrap(),
-        None => SlowVec::fixed(Env::current(), 0).unwrap(),
+        None => SmallVec::fixed(Env::current(), 0).unwrap(),
     };
     let join = JoinOp::new(kind, conjuncts, [probe_columns, build_columns]);
     let children = [probe, build];
@@ -437,8 +437,8 @@ fn joined_in_order(
         let condition = plan.exprs.add(nodes.nodes()).unwrap();
         let (probe, mut probe_columns) = probe;
         let sides = [
-            SlowVec::fixed_from(Env::current(), probe_columns.iter().copied()).unwrap(),
-            SlowVec::fixed_from(Env::current(), [k.id, v.id].into_iter()).unwrap(),
+            SmallVec::fixed_from(Env::current(), probe_columns.iter().copied()).unwrap(),
+            SmallVec::fixed_from(Env::current(), [k.id, v.id].into_iter()).unwrap(),
         ];
         let conjuncts = conjuncts_of(Env::current(), &plan.exprs, condition).unwrap();
         let join = JoinOp::new(JoinKind::Inner, conjuncts, sides);

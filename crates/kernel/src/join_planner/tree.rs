@@ -3,7 +3,7 @@
 
 use crate::allocator::AllocError;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// A node of a join tree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,13 +26,13 @@ pub struct Node {
 /// A join tree. Its nodes can be in any order, but the root is last.
 pub struct JoinTree {
     /// The nodes.
-    pub nodes: SlowVec<Node>,
+    pub nodes: SmallVec<Node>,
 }
 
 impl JoinTree {
     /// An empty tree with room for a join of `relations` relations.
     pub fn new(env: &Env, relations: usize) -> Result<JoinTree, AllocError> {
-        Ok(JoinTree { nodes: SlowVec::fixed(env, (2 * relations).saturating_sub(1))? })
+        Ok(JoinTree { nodes: SmallVec::fixed(env, (2 * relations).saturating_sub(1))? })
     }
 
     /// Adds a leaf for `relation`, of `rows` rows, and returns its node.
@@ -55,7 +55,7 @@ impl JoinTree {
     }
 
     fn push(&mut self, kind: JoinNode, rows: f64) -> Result<u32, AllocError> {
-        #[expect(clippy::cast_possible_truncation, reason = "at most a `SlowVec`'s length")]
+        #[expect(clippy::cast_possible_truncation, reason = "at most a `SmallVec`'s length")]
         let index = self.nodes.len() as u32;
         self.nodes.push(Node { kind, rows })?;
         Ok(index)

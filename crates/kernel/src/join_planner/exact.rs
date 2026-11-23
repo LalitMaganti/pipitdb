@@ -11,7 +11,7 @@ use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree};
 use crate::env::Env;
 use crate::error::Error;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// The most units it plans: a set of them is the bits of a `u64`.
 const UNITS_MAX: usize = 64;
@@ -74,7 +74,7 @@ struct Exact<'g, 'e, 'l, 'r> {
     /// Whether `plans` has a slot for every set, at the set's own index.
     dense: bool,
     /// The cheapest tree of each connected set, by `find`.
-    plans: SlowVec<Plan>,
+    plans: SmallVec<Plan>,
     /// For each unit, those an edge of one unit a side joins it to.
     adjacent: [u64; UNITS_MAX],
 }
@@ -92,7 +92,7 @@ pub(super) fn plan<'g>(
         return Ok(None);
     }
     // Every relation is below 64, so in the first word.
-    let mut links = SlowVec::new(env, LIST_MAX)?;
+    let mut links = SmallVec::new(env, LIST_MAX)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
     for (edge, found) in (0..graph.edges.len() as u32).zip(graph.edges.iter()) {
         links.push(Link { sides: [found.left.word(0), found.right.word(0)], edge })?;
@@ -178,7 +178,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
             }
         }
         let full = u64::MAX >> (UNITS_MAX - units);
-        let plans = SlowVec::none(env);
+        let plans = SmallVec::none(env);
         let (visits, dense) = (0, false);
         Exact {
             graph,
@@ -200,7 +200,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
         // Half full at most, so that a set is found in a few probes, or with
         // a slot for each set.
         let len = if self.dense { sets } else { (2 * sets).next_power_of_two() };
-        self.plans = SlowVec::fixed(env, len)?;
+        self.plans = SmallVec::fixed(env, len)?;
         self.plans.extend_within(repeat_n(EMPTY, len));
         for (i, &rows) in rows.iter().enumerate() {
             let (set, slot) = (1 << i, self.slot(1 << i));

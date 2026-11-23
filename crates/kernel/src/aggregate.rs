@@ -14,7 +14,7 @@ use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::scannable::Key;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::DynSource;
 use crate::step::Step;
 use crate::values::Values;
@@ -74,12 +74,12 @@ pub struct Aggregate {
 /// a row even if there are none.
 pub struct AggregateOp {
     /// The `Int64` and string columns rows are grouped by.
-    pub keys: SlowVec<ColumnId>,
+    pub keys: SmallVec<ColumnId>,
     /// What each group's rows make, from the columns each function reads.
-    pub aggregates: SlowVec<Aggregate>,
+    pub aggregates: SmallVec<Aggregate>,
     /// Each aggregate's value, once known without reading any rows: then it
     /// has no child, and outputs one row of them.
-    pub answer: Option<SlowVec<i64>>,
+    pub answer: Option<SmallVec<i64>>,
 }
 
 impl<'c> Op<'c> for AggregateOp {
@@ -128,7 +128,7 @@ impl<'c> Op<'c> for AggregateOp {
         if !self.keys.is_empty() {
             return Ok(false);
         }
-        let mut values = SlowVec::fixed(env, self.aggregates.len())?;
+        let mut values = SmallVec::fixed(env, self.aggregates.len())?;
         for aggregate in self.aggregates.iter() {
             // A summary's bounds are the least and greatest values. With no
             // rows, there are none, and MIN and MAX are null: scanned.
@@ -210,7 +210,7 @@ impl<'c> Op<'c> for AggregateOp {
     ) -> Result<(), LowerError> {
         let env = lowering.env();
         if let Some(answer) = &self.answer {
-            let values = SlowVec::fixed_from(env, answer.iter().copied())?;
+            let values = SmallVec::fixed_from(env, answer.iter().copied())?;
             lowering.set_source(DynSource::new(env, Values { values })?);
             return Ok(());
         }
@@ -221,7 +221,7 @@ impl<'c> Op<'c> for AggregateOp {
             string_keys |= u64::from(lowering.query_rows().type_of(key) == DataType::String) << k;
         }
         let keys = self.keys.iter().map(|&key| lowering.query_position(key));
-        let key_columns = SlowVec::fixed_from(env, keys)?;
+        let key_columns = SmallVec::fixed_from(env, keys)?;
         let aggregates = self.aggregates.iter().map(|aggregate| AggregateCall {
             function: aggregate.function,
             distinct: aggregate.distinct,
@@ -230,7 +230,7 @@ impl<'c> Op<'c> for AggregateOp {
                 .input
                 .map_or(DataType::Int64, |id| lowering.query_rows().type_of(id)),
         });
-        let aggregates = SlowVec::fixed_from(env, aggregates)?;
+        let aggregates = SmallVec::fixed_from(env, aggregates)?;
         let mut nullable_keys = 0;
         for (k, &key) in self.keys.iter().enumerate() {
             nullable_keys |= u64::from(lowering.query_rows().nullable_of(key)) << k;
@@ -246,7 +246,7 @@ impl<'c> Op<'c> for AggregateOp {
 pub struct HashAggregateSpec {
     /// Where the keys are in batches. With none, all rows are one group,
     /// output even if there are no rows.
-    pub key_columns: SlowVec<u32>,
+    pub key_columns: SmallVec<u32>,
     /// Bit `k` set if key `k` is a string, rather than an `Int64`. Perfetto
     /// learns this from the first batch, but a group-by here serves a batch
     /// with its keys' types even if none came.
@@ -255,7 +255,7 @@ pub struct HashAggregateSpec {
     /// keeps no null bits.
     pub nullable_keys: u64,
     /// Each aggregate.
-    pub aggregates: SlowVec<AggregateCall>,
+    pub aggregates: SmallVec<AggregateCall>,
 }
 
 /// One aggregate a breaker computes, as Perfetto's `AggregateCall`.

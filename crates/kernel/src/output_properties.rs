@@ -11,7 +11,7 @@ use crate::expression::Exprs;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// A layout known to hold for rows: grouped by the columns of its first
 /// `grouped` keys, none meaning one group, and each group sorted by the
@@ -320,7 +320,7 @@ pub enum InputStep {
     /// for a scan below to skip by. `unsorted` and `scan` are what was known
     /// of the rows before it, to undo it.
     Sort {
-        keys: SlowVec<SortKey>,
+        keys: SmallVec<SortKey>,
         keep: Option<u32>,
         publish: Option<u32>,
         unsorted: Arrangements,
@@ -340,7 +340,7 @@ pub struct PlannedInput {
 /// What is decided about a node before it is lowered.
 pub struct PlannedNode {
     /// Each input's steps, and what is known of its rows after them.
-    pub inputs: SlowVec<PlannedInput>,
+    pub inputs: SmallVec<PlannedInput>,
     /// What is known of the rows it outputs.
     pub output: OutputProperties,
     /// For a scan: the column, and whether descending, a `TopK` above sorts
@@ -349,7 +349,7 @@ pub struct PlannedNode {
 }
 
 /// By node, what's decided about it.
-pub type Planned = SlowVec<PlannedNode>;
+pub type Planned = SmallVec<PlannedNode>;
 
 /// What an op derives its output from.
 pub struct DeriveContext<'p, 'c> {
@@ -481,7 +481,7 @@ impl InputPlanner<'_> {
             return Err(AllocError);
         }
         let sort = OpenSort { node: self.node, input: self.input };
-        let keys_copy = SlowVec::fixed_from(self.env, keys.iter().copied())?;
+        let keys_copy = SmallVec::fixed_from(self.env, keys.iter().copied())?;
         self.out.step = Some(InputStep::Sort {
             keys: keys_copy,
             keep: None,
@@ -499,7 +499,7 @@ impl InputPlanner<'_> {
 /// Plans each node of `plan`, by id, as Perfetto's `RunBoundPasses` does.
 /// A node's inputs come before it, so each is planned after them.
 pub fn plan_nodes(env: &Env, plan: &LogicalPlan<'_>) -> Result<Planned, LowerError> {
-    let mut planned = SlowVec::fixed(env, plan.nodes.len())?;
+    let mut planned = SmallVec::fixed(env, plan.nodes.len())?;
     for id in 0..plan.nodes.len() {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
         plan_node_inputs(env, plan, &mut planned, id as PlanNodeId)?;
@@ -516,7 +516,7 @@ fn plan_node_inputs(
     id: PlanNodeId,
 ) -> Result<(), LowerError> {
     let node = at!(plan.nodes, id as usize);
-    let mut inputs = SlowVec::fixed(env, node.children.len())?;
+    let mut inputs = SmallVec::fixed(env, node.children.len())?;
     for &child in node.children.iter() {
         check!(child < id);
         let rows = at!(planned, child as usize).output;

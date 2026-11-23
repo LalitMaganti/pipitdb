@@ -20,7 +20,7 @@ use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::{DynSource, DynTransform, ErasedBatch, NewState};
 
 /// Named, typed columns, read into batches. Where a read is lives in
@@ -347,7 +347,7 @@ impl<'a> DynScannable<'a> {
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
     ) -> Result<DynSource<'_>, AllocError> {
-        let columns = SlowVec::fixed_from(env, columns)?;
+        let columns = SmallVec::fixed_from(env, columns)?;
         check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
         let column_count = self.column_count();
         // Each set holds flat, which every scannable can write, so checked
@@ -394,8 +394,8 @@ impl<'a> DynScannable<'a> {
     pub fn materialize(
         &self,
         env: &Env,
-        positions: SlowVec<u32>,
-        forms: SlowVec<Forms>,
+        positions: SmallVec<u32>,
+        forms: SmallVec<Forms>,
     ) -> Result<DynTransform<'_>, AllocError> {
         check!(forms.len() == positions.len() && forms.iter().all(|f| f.contains(Forms::FLAT)));
         let materialize = Materialize { scannable: NonNull::from(self).cast(), positions, forms };
@@ -422,7 +422,7 @@ struct Scan {
     scannable: NonNull<DynScannable<'static>>,
     /// Which of its columns, in order, each with the forms it may be
     /// written in.
-    columns: SlowVec<(u32, Forms)>,
+    columns: SmallVec<(u32, Forms)>,
 }
 
 /// A transform that loads lazy columns a `DynScannable` wrote.
@@ -430,9 +430,9 @@ struct Materialize {
     /// What wrote the lazy columns.
     scannable: NonNull<DynScannable<'static>>,
     /// Where they are in batches.
-    positions: SlowVec<u32>,
+    positions: SmallVec<u32>,
     /// The forms each may be loaded in.
-    forms: SlowVec<Forms>,
+    forms: SmallVec<Forms>,
 }
 
 unsafe fn scan_new_state(
@@ -598,7 +598,7 @@ mod tests {
         let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
         let pipeline = Pipeline::new(
             scannable.scan(env, columns, &[], None).unwrap(),
-            SlowVec::new(env, 1).unwrap(),
+            SmallVec::new(env, 1).unwrap(),
         );
         let query = Env::current();
         let mut execution = pipeline.start(query, None).unwrap();
@@ -716,11 +716,11 @@ mod tests {
         let source =
             scannable.scan(env, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None).unwrap();
         let keep = Step::Transform(DynTransform::new(env, KeepOdd).unwrap());
-        let positions = SlowVec::fixed_from(env, [0].into_iter()).unwrap();
-        let flat = SlowVec::fixed_from(env, [Forms::FLAT].into_iter()).unwrap();
+        let positions = SmallVec::fixed_from(env, [0].into_iter()).unwrap();
+        let flat = SmallVec::fixed_from(env, [Forms::FLAT].into_iter()).unwrap();
         let load = Step::Transform(scannable.materialize(env, positions, flat).unwrap());
         let pipeline =
-            Pipeline::new(source, SlowVec::fixed_from(env, [keep, load].into_iter()).unwrap());
+            Pipeline::new(source, SmallVec::fixed_from(env, [keep, load].into_iter()).unwrap());
         let query = Env::current();
         let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();

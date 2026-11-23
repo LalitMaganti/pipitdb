@@ -30,7 +30,7 @@ use crate::env::Env;
 use crate::row_store::RowStore;
 use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::{DynOperator, DynSource, Operator, Progress, Step, Transform};
 
 mod direct;
@@ -61,7 +61,7 @@ pub struct JoinOp {
     /// Each child's columns, at most a batch's, and a bit for each it
     /// outputs, which pruning clears: planning finds which child a column
     /// comes from by them all.
-    columns: [SlowVec<ColumnId>; 2],
+    columns: [SmallVec<ColumnId>; 2],
     outputs: [u64; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
@@ -70,8 +70,8 @@ pub struct JoinOp {
 
 impl JoinOp {
     /// A join of `kind` on `condition`, outputting `columns` of each child.
-    pub fn new(kind: JoinKind, conjuncts: Conjuncts, columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
-        let all = |columns: &SlowVec<ColumnId>| {
+    pub fn new(kind: JoinKind, conjuncts: Conjuncts, columns: [SmallVec<ColumnId>; 2]) -> JoinOp {
+        let all = |columns: &SmallVec<ColumnId>| {
             check!(columns.len() <= COLUMNS);
             #[expect(clippy::cast_possible_truncation, reason = "at most `COLUMNS`")]
             let len = columns.len() as u32;
@@ -327,13 +327,13 @@ impl<'c> Op<'c> for JoinOp {
         let exprs = lowering.exprs();
         // The conjuncts it hashes by need no test once their keys are found
         // equal; the rest are computed, a column each, and tested.
-        let mut tested = SlowVec::fixed(env, self.conjuncts.len())?;
+        let mut tested = SmallVec::fixed(env, self.conjuncts.len())?;
         let keys = Self::keys(exprs, probe, rows, &self.conjuncts, &mut tested);
         let mut condition = None;
         if !tested.is_empty() {
             let (held, count) = self.held(exprs, rows, &tested);
             let pairs = self.pairs(probe, rows, at!(held, ..count))?;
-            let mut programs = SlowVec::fixed(env, tested.len())?;
+            let mut programs = SmallVec::fixed(env, tested.len())?;
             for &conjunct in tested.iter() {
                 let (nodes, values) = (exprs.nodes(conjunct), lowering.expr_values());
                 let Ok(program) = type_expr(env, &pairs, nodes, values, true) else { failed!() };
@@ -357,7 +357,7 @@ impl<'c> Op<'c> for JoinOp {
             *data_type = rows.type_of(column);
         }
         let (held, outputs) = (held.len(), count);
-        let mut probe_types = SlowVec::fixed(env, probe.column_count() as usize)?;
+        let mut probe_types = SmallVec::fixed(env, probe.column_count() as usize)?;
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
@@ -387,7 +387,7 @@ impl JoinOp {
         probe: &OutputProperties,
         build: &OutputProperties,
         conjuncts: &[Expr],
-        tested: &mut SlowVec<Expr>,
+        tested: &mut SmallVec<Expr>,
     ) -> Option<Keys> {
         let mut keys =
             Keys { probe: [0; JOIN_KEYS_MAX], build: [0; JOIN_KEYS_MAX], count: 0, strings: 0 };
@@ -464,7 +464,7 @@ struct Join<'c> {
     /// Whether it outputs the build rows no probe row matched, at the end,
     /// with nulls of `probe_types` for the probe side's columns.
     keeps_build: bool,
-    probe_types: SlowVec<DataType>,
+    probe_types: SmallVec<DataType>,
 }
 
 /// What a run of a `Join` keeps.
@@ -483,7 +483,7 @@ struct Held {
     /// row plus one; and each build row's one before it of the group, or
     /// `NONE`; and whether any group has more than one.
     table: Option<GroupTable>,
-    before: SlowVec<u32>,
+    before: SmallVec<u32>,
     repeats: bool,
     /// With one integer key, unique, of values close enough, how to find
     /// a key's build row by its value, in place of `table`.
@@ -493,16 +493,16 @@ struct Held {
     /// is hashed, as `direct` finds them all.
     sequence: Sequence,
     /// With keys, each input row's build row of the next round, or `NONE`.
-    next_of: SlowVec<u32>,
+    next_of: SmallVec<u32>,
     /// A bit for each row of the batch being joined, set once a build row
     /// matched it.
     matched: [u64; BATCH_ROWS_MAX as usize / 64],
     /// For an inner or left join, a null column of each build column's
     /// type, a batch long: an unmatched row's.
-    nulls: SlowVec<ColumnView>,
+    nulls: SmallVec<ColumnView>,
     /// Each input row's build row in this round, for `gather`: always a
     /// build row's number, as every row is gathered.
-    paired: SlowVec<u32>,
+    paired: SmallVec<u32>,
     /// What computing the condition keeps.
     condition: Option<ComputeState>,
     /// When it keeps the build rows: a bit for each, set once a probe row
@@ -510,7 +510,7 @@ struct Held {
     /// a null column of each probe column's type, a batch long.
     build_matched: Bitmap,
     unmatched: u32,
-    probe_nulls: SlowVec<ColumnView>,
+    probe_nulls: SmallVec<ColumnView>,
 }
 
 /// Writes to `groups` the group in `table` of the keys at `positions` of
@@ -554,8 +554,8 @@ fn find_groups(
 }
 
 /// A null column of each of `types`, a batch long.
-fn null_columns(context: &mut Context, types: &[DataType]) -> Result<SlowVec<ColumnView>, Error> {
-    let mut nulls = SlowVec::fixed(context.env(), types.len())?;
+fn null_columns(context: &mut Context, types: &[DataType]) -> Result<SmallVec<ColumnView>, Error> {
+    let mut nulls = SmallVec::fixed(context.env(), types.len())?;
     for &data_type in types {
         let step = ExprStep { data_type, ..ExprStep::new(ExprOp::Null, 0, 0, 0) };
         let Some(null) = constant(context, &step)? else { failed!() };
@@ -869,15 +869,15 @@ impl Operator for Join<'_> {
             started: false,
             next: 0,
             table,
-            before: SlowVec::new(env, 1 << 31)?,
+            before: SmallVec::new(env, 1 << 31)?,
             repeats: false,
             direct: None,
             // Not arrays, which would be copied into place on each run.
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
-            next_of: SlowVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
+            next_of: SmallVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
             matched: [0; BATCH_ROWS_MAX as usize / 64],
             nulls,
-            paired: SlowVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
+            paired: SmallVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
             condition,
             build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,
@@ -993,8 +993,8 @@ mod tests {
             estimate.add_key(column, key);
             estimate
         };
-        let one = |column| SlowVec::fixed_from(Env::current(), [column].into_iter()).unwrap();
-        let conjuncts = SlowVec::fixed_from(Env::current(), condition.into_iter()).unwrap();
+        let one = |column| SmallVec::fixed_from(Env::current(), [column].into_iter()).unwrap();
+        let conjuncts = SmallVec::fixed_from(Env::current(), condition.into_iter()).unwrap();
         let mut join = JoinOp::new(kind, conjuncts, [one(0), one(1)]);
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build
@@ -1009,8 +1009,8 @@ mod tests {
         let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
         nodes.node(ExprOp::Eq, a, b).unwrap();
         let condition = exprs.add(nodes.nodes()).unwrap();
-        let conjuncts = SlowVec::fixed_from(Env::current(), [condition].into_iter()).unwrap();
-        let two = |a, b| SlowVec::fixed_from(Env::current(), [a, b].into_iter()).unwrap();
+        let conjuncts = SmallVec::fixed_from(Env::current(), [condition].into_iter()).unwrap();
+        let two = |a, b| SmallVec::fixed_from(Env::current(), [a, b].into_iter()).unwrap();
         let mut join = JoinOp::new(JoinKind::Inner, conjuncts, [two(0, 2), two(1, 3)]);
         let mut needed = Needed::none(Env::current(), 4, &exprs).unwrap();
         needed.need(2);

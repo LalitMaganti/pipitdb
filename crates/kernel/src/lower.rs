@@ -11,7 +11,7 @@ use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::sort::sort;
 use crate::statement::Statement;
 use crate::step::{DynSource, Step};
@@ -49,7 +49,7 @@ pub struct OutputColumn {
 pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
     names: Names,
-    columns: SlowVec<OutputColumn>,
+    columns: SmallVec<OutputColumn>,
     statement: Statement,
 }
 
@@ -84,7 +84,7 @@ pub struct Lowering<'p, 'c> {
     /// The pipeline's source, once a node sets it.
     source: Option<DynSource<'c>>,
     /// The steps after it, in order.
-    steps: SlowVec<Step<'c>>,
+    steps: SmallVec<Step<'c>>,
     /// What is known of the rows the steps so far output.
     rows: &'p OutputProperties,
     /// The values of the plan's expressions' `IN` lists, which each program
@@ -139,7 +139,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
             column: self.query_position(key.column),
             descending: key.descending,
         });
-        let keys = SlowVec::fixed_from(self.env, keys)?;
+        let keys = SmallVec::fixed_from(self.env, keys)?;
         let operator = match *keep {
             Some(count) => top_k(self.env, keys, count, *publish)?,
             None => sort(self.env, keys)?,
@@ -156,7 +156,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
         node: &PlanNode<'c>,
         input: u32,
     ) -> Result<(DynSource<'c>, &'p OutputProperties), LowerError> {
-        let side = SlowVec::new(self.env, LOWERED_STEPS_MAX)?;
+        let side = SmallVec::new(self.env, LOWERED_STEPS_MAX)?;
         let (source, steps, rows) =
             (self.source.take(), core::mem::replace(&mut self.steps, side), self.rows);
         let lowered = self.lower_input(node, input);
@@ -222,7 +222,7 @@ pub fn lower<'c>(
         planned,
         env,
         source: None,
-        steps: SlowVec::new(env, LOWERED_STEPS_MAX)?,
+        steps: SmallVec::new(env, LOWERED_STEPS_MAX)?,
         rows: &at!(planned, plan.root as usize).output,
         expr_values: None,
     };
@@ -235,7 +235,7 @@ pub fn lower<'c>(
     lowering.lower_node(plan.root)?;
 
     let mut names = Names::new(env, PLAN_NAME_BYTES_MAX)?;
-    let mut columns = SlowVec::fixed(env, plan.output.len())?;
+    let mut columns = SmallVec::fixed(env, plan.output.len())?;
     for column in plan.output.iter() {
         let name = names.add(plan.names.get(column.name))?;
         columns.push(OutputColumn { name, position: lowering.query_position(column.id) })?;
@@ -381,7 +381,7 @@ mod tests {
         let mut plan = LogicalPlan::new(env).unwrap();
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let b = plan.add_column("b", DataType::Int64, true).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let a_column = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
         let b_column = ScanColumn { column: 1, binding: b, forms: Forms::FLAT };
         assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
@@ -455,7 +455,7 @@ mod tests {
             plan.add_column("a", DataType::Int64, true).unwrap(),
             plan.add_column("b", DataType::Int64, true).unwrap(),
         ];
-        let mut columns = SlowVec::fixed(env, read.len()).unwrap();
+        let mut columns = SmallVec::fixed(env, read.len()).unwrap();
         for &column in read {
             let binding = bindings[column as usize];
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
@@ -507,7 +507,7 @@ mod tests {
         let env = Env::current();
         let table = DynScannable::new(env, AB).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -522,8 +522,8 @@ mod tests {
             let aggregate =
                 crate::aggregate::Aggregate { function, input: None, distinct: false, binding };
             let aggregate = crate::aggregate::AggregateOp {
-                keys: SlowVec::fixed_from(env, groups.iter().map(|&g| bindings[g].id)).unwrap(),
-                aggregates: SlowVec::fixed_from(env, [aggregate].into_iter()).unwrap(),
+                keys: SmallVec::fixed_from(env, groups.iter().map(|&g| bindings[g].id)).unwrap(),
+                aggregates: SmallVec::fixed_from(env, [aggregate].into_iter()).unwrap(),
                 answer: None,
             };
             let aggregate = DynOp::new(env, aggregate).unwrap();
@@ -533,7 +533,7 @@ mod tests {
         let sort_keys =
             keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
         let order_by =
-            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(env, sort_keys).unwrap() };
+            crate::order_by::OrderByOp { keys: SmallVec::fixed_from(env, sort_keys).unwrap() };
         let order_by = DynOp::new(env, order_by).unwrap();
         let children = [input];
         let ordered = plan.add_node(order_by, &children).unwrap();
@@ -575,7 +575,7 @@ mod tests {
         let env = Env::current();
         let table = DynScannable::new(env, AB).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -586,7 +586,7 @@ mod tests {
         let mut node = plan.add_node(scan, &[]).unwrap();
         for (column, descending) in [(1, false), (0, true)] {
             let key = SortKey { column: ids[column].id, descending };
-            let keys = SlowVec::fixed_from(env, [key].into_iter()).unwrap();
+            let keys = SmallVec::fixed_from(env, [key].into_iter()).unwrap();
             let order_by = DynOp::new(env, crate::order_by::OrderByOp { keys }).unwrap();
             let children = [node];
             node = plan.add_node(order_by, &children).unwrap();
@@ -600,7 +600,7 @@ mod tests {
         let env = Env::current();
         let table = DynScannable::new(env, AB).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -707,7 +707,7 @@ mod tests {
         let env = Env::current();
         let table = DynScannable::new(env, Nullable).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -782,7 +782,7 @@ mod tests {
         let table = DynScannable::new(env, Wide(70)).unwrap();
         let plan = |output: usize| {
             let mut plan = LogicalPlan::new(env).unwrap();
-            let mut columns = SlowVec::fixed(env, 70).unwrap();
+            let mut columns = SmallVec::fixed(env, 70).unwrap();
             for column in 0..70 {
                 let binding = plan.add_column("c", DataType::Int64, true).unwrap();
                 assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
@@ -936,7 +936,7 @@ mod tests {
     ) -> (StdVec<StdVec<i64>>, u32, alloc::string::String) {
         let env = Env::current();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 3).unwrap();
+        let mut columns = SmallVec::fixed(env, 3).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b"), (2, "c")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
         let table = Counted { lazy: false, loads: &loads, conditions: &conditions };
         let table = DynScannable::new(env, table).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
@@ -1061,7 +1061,7 @@ mod tests {
                 Stage::Filter => filter(&mut plan, &compared(ids[0], Comparison::Greater, 0)),
                 Stage::OrderBy => {
                     let key = SortKey { column: ids[1], descending: true };
-                    let keys = SlowVec::fixed_from(env, [key].into_iter()).unwrap();
+                    let keys = SmallVec::fixed_from(env, [key].into_iter()).unwrap();
                     DynOp::new(env, crate::order_by::OrderByOp { keys }).unwrap()
                 }
                 Stage::Limit(count) => {
@@ -1148,7 +1148,7 @@ mod tests {
         let mut plan = LogicalPlan::new(env).unwrap();
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
-        let columns = SlowVec::fixed_from(env, columns.into_iter()).unwrap();
+        let columns = SmallVec::fixed_from(env, columns.into_iter()).unwrap();
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let mut aggregates = StdVec::new();
@@ -1160,8 +1160,8 @@ mod tests {
             assert!(plan.output.push(binding).is_ok());
         }
         let aggregate = AggregateOp {
-            keys: SlowVec::fixed(env, 0).unwrap(),
-            aggregates: SlowVec::fixed_from(env, aggregates.into_iter()).unwrap(),
+            keys: SmallVec::fixed(env, 0).unwrap(),
+            aggregates: SmallVec::fixed_from(env, aggregates.into_iter()).unwrap(),
             answer: None,
         };
         let aggregate = DynOp::new(env, aggregate).unwrap();
@@ -1222,7 +1222,7 @@ mod tests {
             DynScannable::new(env, Counted { lazy: true, loads: &loads, conditions: &conditions })
                 .unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
-        let mut columns = SlowVec::fixed(env, 2).unwrap();
+        let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
