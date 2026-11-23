@@ -12,18 +12,20 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use pipit_kernel::containers::SmallVec;
+use pipit_kernel::containers::SpillVec;
 use pipit_kernel::env::Env;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
 pub const NESTING_MAX: usize = 64;
 
-/// How many stages a query, or items a list, can have.
-pub const LIST_MAX: usize = 64;
+/// How many stages a query, or items a list, can have: as many as a node
+/// can count.
+pub const LIST_MAX: usize = DATA_MAX as usize;
 
-/// How many values an `IN` list can have.
-pub const IN_LIST_MAX: usize = 1 << 16;
+/// How many items of a list are gathered in place, as most lists have no
+/// more. A longer list's are gathered in memory from the `Env`.
+const LIST_INLINE: usize = 64;
 
 /// Parses `source` as a query, with the stages in `registry`.
 pub fn parse_query(env: &Env, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
@@ -356,38 +358,28 @@ impl Parser<'_> {
     }
 
     /// `operand IN (1, -2, 'a')`, from the `IN`. The list holds literals
-    /// only, so it can be long without nesting: they're gathered as they're
-    /// read, and written next to each other once it ends.
+    /// only.
     fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
         self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let mut items = SmallVec::new(self.env, IN_LIST_MAX)?;
-        loop {
-            let negative = self.current().kind == TokenKind::Minus;
+        let list = self.items(Tag::List, TokenKind::Comma, &mut |parser, _| {
+            let negative = parser.current().kind == TokenKind::Minus;
             if negative {
-                self.advance()?;
+                parser.advance()?;
             }
-            let token = self.advance()?;
+            let token = parser.advance()?;
             let number = matches!(token.kind, TokenKind::Integer | TokenKind::Float);
             if !number && (negative || token.kind != TokenKind::String) {
                 return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
             }
-            let mut item = leaf(token)?;
-            if negative {
-                item = self.operation(Tag::Unary, Operator::Negate, &[item]);
-            }
-            if items.len() == IN_LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, token.span));
-            }
-            items.push(item)?;
-            let token = self.advance()?;
-            match token.kind {
-                TokenKind::RightParen => break,
-                TokenKind::Comma => {}
-                _ => return Err(Error::expected(TokenKind::RightParen, token.span)),
-            }
-        }
-        let list = self.list(Tag::List, &items);
+            let item = leaf(token)?;
+            Ok(if negative {
+                parser.operation(Tag::Unary, Operator::Negate, &[item])
+            } else {
+                item
+            })
+        })?;
+        self.expect(TokenKind::RightParen)?;
         Ok(self.operation(Tag::Binary, Operator::In, &[operand, list]))
     }
 
@@ -654,20 +646,10 @@ fn leaf(token: Token) -> Result<Node, Error> {
 impl Parser<'_> {
     /// Parses a query, returning its root, which is not in the tree yet.
     pub(crate) fn query(&mut self, registry: &Registry) -> Result<Node, Error> {
-        let mut stages = [Node::empty(); LIST_MAX];
-        let mut count = 0;
-        loop {
-            if count == LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
-            }
-            let point = if count == 0 { Point::Source } else { Point::Stage };
-            *at_mut!(stages, count) = self.stage(registry, point)?;
-            count += 1;
-            if self.current().kind != TokenKind::Pipe {
-                return Ok(self.list(Tag::Query, at!(stages, ..count)));
-            }
-            self.advance()?;
-        }
+        self.items(Tag::Query, TokenKind::Pipe, &mut |parser, first| {
+            let point = if first { Point::Source } else { Point::Stage };
+            parser.stage(registry, point)
+        })
     }
 
     fn stage(&mut self, registry: &Registry, point: Point) -> Result<Node, Error> {
@@ -754,19 +736,7 @@ impl Parser<'_> {
 
     /// One or more `shared`, separated by commas.
     fn list_of(&mut self, shared: Shared) -> Result<Node, Error> {
-        let mut items = [Node::empty(); LIST_MAX];
-        let mut count = 0;
-        loop {
-            if count == LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
-            }
-            *at_mut!(items, count) = self.shared(shared)?;
-            count += 1;
-            if self.current().kind != TokenKind::Comma {
-                return Ok(self.list(Tag::List, at!(items, ..count)));
-            }
-            self.advance()?;
-        }
+        self.items(Tag::List, TokenKind::Comma, &mut |parser, _| parser.shared(shared))
     }
 
     /// `words`, then one or more `shared`. If the first word isn't next, an
@@ -811,6 +781,28 @@ impl Parser<'_> {
     fn at_word(&self, word: &str) -> bool {
         let current = self.current();
         current.kind == TokenKind::Identifier && same_word(self.text(current), word.as_bytes())
+    }
+
+    /// Items `item` parses, whether each is the first, separated by
+    /// `separator`, as a `tag` node.
+    fn items(
+        &mut self,
+        tag: Tag,
+        separator: TokenKind,
+        item: &mut dyn FnMut(&mut Self, bool) -> Result<Node, Error>,
+    ) -> Result<Node, Error> {
+        let mut items = SpillVec::<Node, LIST_INLINE>::new(self.env, LIST_MAX);
+        loop {
+            if items.len() == LIST_MAX {
+                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
+            }
+            let next = item(self, items.is_empty())?;
+            items.push(next)?;
+            if self.current().kind != separator {
+                return Ok(self.list(tag, &items));
+            }
+            self.advance()?;
+        }
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.
@@ -898,7 +890,7 @@ mod tests {
             parse("NOT a IN (-1, 6) AND b in ('x')"),
             "(And (Not (In a (List (Negate 1) 6))) (In b (List 'x')))"
         );
-        // Lists hold only literals, and can be longer than calls can.
+        // Lists hold only literals, and can be as long as other lists.
         let long = (0..1000).map(|i| format!("{i}")).collect::<alloc::vec::Vec<_>>().join(", ");
         assert!(parse(&format!("a IN ({long})")).starts_with("(In a (List 0 1 2 "));
         assert_eq!(error("a IN ()"), (ErrorCode::ExpectedExpression, 6));
@@ -908,6 +900,22 @@ mod tests {
         assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
         // `IN` and `IS` are only keywords after an operand.
         assert_eq!(parse("in IN (1) OR is IS NULL"), "(Or (In in (List 1)) (IsNull is))");
+    }
+
+    #[test]
+    fn parses_lists_and_queries_longer_than_a_batch_is_wide() {
+        static REGISTRY: Registry = Registry::new(&[crate::stages::RELATIONAL]);
+        let items: alloc::vec::Vec<String> = (0..1000).map(|i| format!("c{i}")).collect();
+        // Each stage's list is gathered above the query's stages so far.
+        let wheres = "|> SELECT a, b ".repeat(100);
+        let source = format!("FROM t {wheres}|> SELECT {}", items.join(", "));
+        let ast = parse_query(Env::current(), &REGISTRY, source.as_bytes()).unwrap();
+        let query = ast.node(ast.root());
+        assert_eq!(query.child_count(), 102);
+        let last = ast.node(query.first_child() + 101);
+        assert_eq!(ast.node(last.first_child()).child_count(), 1000);
+        let second = ast.node(query.first_child() + 1);
+        assert_eq!(ast.node(second.first_child()).child_count(), 2);
     }
 
     #[test]

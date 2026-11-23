@@ -5,6 +5,8 @@
 //! - `Box` and `ErasedBox`: one value.
 //! - `SmallVec`: a growable list, as long as the query, not its data, says.
 //! - `InlineVec`: a short list held in place.
+//! - `SpillVec`: a list held in place while it's short, and allocated once
+//!   it isn't.
 //! - `Blocks`: data that grows with the rows, in blocks that never move.
 //! - `BitSlice`, `Bitmap` and `RankBitmap`: bits packed in words.
 
@@ -442,6 +444,15 @@ impl<T> SmallVec<T> {
         self.raw.len = 0;
     }
 
+    /// Keeps the first `len` values, forgetting the rest.
+    pub fn truncate(&mut self, len: usize)
+    where
+        T: Copy,
+    {
+        check!(len <= self.raw.len());
+        self.raw.set_len(len);
+    }
+
     /// Removes the last value, if any.
     pub fn pop(&mut self) -> Option<T> {
         self.raw.len = self.raw.len.checked_sub(1)?;
@@ -488,6 +499,28 @@ impl RawVec {
         // has written.
         let memory = unsafe { RawVec::room(env, item, capacity)? };
         Ok(RawVec { memory: ManuallyDrop::new(memory), len: 0, max })
+    }
+
+    /// Room for at most `max` values of `item` bytes, holding a copy of the
+    /// `count` at `values`: what a `SpillVec` of any type spills into.
+    ///
+    /// # Safety
+    ///
+    /// `values` must point to `count` values of `item` bytes.
+    #[cold]
+    #[inline(never)]
+    unsafe fn spilled(
+        env: &Env,
+        (item, max): (usize, usize),
+        values: NonNull<u8>,
+        count: usize,
+    ) -> Result<RawVec, AllocError> {
+        let mut raw = RawVec::new(env, item, 2 * count, max)?;
+        // SAFETY: it has room for `count` values, guaranteed by the caller
+        // to be at `values`.
+        unsafe { raw.memory.as_non_null().copy_from_nonoverlapping(values, count * item) };
+        raw.set_len(count);
+        Ok(raw)
     }
 
     fn len(&self) -> usize {
@@ -657,6 +690,92 @@ impl<T: Copy + Default, const N: usize> Deref for InlineVec<T, N> {
 impl<T: Copy + Default, const N: usize> DerefMut for InlineVec<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
         at_mut!(self.values, ..self.len as usize)
+    }
+}
+
+// `SpillVec`: up to `N` values in place, then all of them in memory from an
+// `Env`.
+
+/// A list most queries keep short but none bound, such as a list's items or
+/// a parser's frames. Its first `N` values are held in place, so a short one
+/// allocates nothing; once it has more, they all move to memory from its
+/// `Env`, so it's still one slice. Places not yet written are left so, so
+/// making one costs nothing.
+pub struct SpillVec<'e, T: Copy, const N: usize> {
+    /// The values, until it has more than `N`: the first `len` are written.
+    inline: [MaybeUninit<T>; N],
+    /// How many values `inline` holds.
+    len: u32,
+    /// Every value, once it has more than `N`.
+    spilled: Option<SmallVec<T>>,
+    /// What it spills into.
+    env: &'e Env,
+    /// The most values it can hold, a power of two.
+    max: usize,
+}
+
+impl<'e, T: Copy, const N: usize> SpillVec<'e, T, N> {
+    /// An empty list that can hold `max` values, rounded up to a power of
+    /// two, spilling into `env`.
+    pub fn new(env: &'e Env, max: usize) -> SpillVec<'e, T, N> {
+        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
+        let max = max.next_power_of_two();
+        SpillVec { inline: [const { MaybeUninit::uninit() }; N], len: 0, spilled: None, env, max }
+    }
+
+    /// Adds `value` at the end, spilling if it has `N`. Fails, dropping
+    /// `value`, if it holds `max` values or can't grow.
+    #[inline]
+    pub fn push(&mut self, value: T) -> Result<(), AllocError> {
+        if let Some(spilled) = &mut self.spilled {
+            return spilled.push(value);
+        }
+        if let Some(slot) = self.inline.get_mut(self.len as usize) {
+            slot.write(value);
+            self.len += 1;
+            return Ok(());
+        }
+        self.spill()?.push(value)
+    }
+
+    /// Moves the values into memory from the `Env`, which holds them from
+    /// then on. `RawVec::spilled` does the work, for every type.
+    #[cold]
+    fn spill(&mut self) -> Result<&mut SmallVec<T>, AllocError> {
+        let held = NonNull::from(self.held()).cast::<u8>();
+        let (item, count) = ((size_of::<T>(), self.max), self.len as usize);
+        // SAFETY: the first `len` values are written, and are `Copy`.
+        let raw = unsafe { RawVec::spilled(self.env, item, held, count)? };
+        Ok(self.spilled.insert(SmallVec { raw, values: PhantomData }))
+    }
+
+    /// The values `inline` holds.
+    fn held(&self) -> &[T] {
+        let written = at!(self.inline, ..self.len as usize);
+        // SAFETY: the first `len` were written, and `MaybeUninit<T>` is laid
+        // out as `T`.
+        unsafe { &*(core::ptr::from_ref(written) as *const [T]) }
+    }
+
+    /// Keeps the first `len` values.
+    pub fn truncate(&mut self, len: usize) {
+        check!(len <= self.len());
+        match &mut self.spilled {
+            Some(spilled) => spilled.truncate(len),
+            #[expect(clippy::cast_possible_truncation, reason = "at most `N`")]
+            None => self.len = len as u32,
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> Deref for SpillVec<'_, T, N> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match &self.spilled {
+            Some(spilled) => spilled,
+            None => self.held(),
+        }
     }
 }
 
@@ -1275,6 +1394,28 @@ mod tests {
             list.retain(|&value| value != 2);
             assert_eq!(*list, [1, 3]);
             assert!(InlineVec::<u32, 1>::from_slice(&[1, 2]).is_err());
+        }
+    }
+
+    mod spill_vec {
+        use crate::containers::*;
+
+        #[test]
+        fn spills_past_what_it_holds_in_place() {
+            let mut list = SpillVec::<u32, 2>::new(Env::current(), 5);
+            for value in 1..=8 {
+                assert!(list.push(value).is_ok());
+            }
+            assert_eq!(*list, [1, 2, 3, 4, 5, 6, 7, 8]);
+            // Its most is rounded up to 8.
+            assert!(list.push(9).is_err());
+            list.truncate(1);
+            assert!(list.push(5).is_ok());
+            assert_eq!(*list, [1, 5]);
+            let mut short = SpillVec::<u32, 2>::new(Env::current(), 2);
+            assert!(short.push(1).is_ok());
+            short.truncate(0);
+            assert!(short.is_empty());
         }
     }
 
