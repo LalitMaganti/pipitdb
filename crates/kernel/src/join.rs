@@ -9,6 +9,7 @@
 //! each key is its row's number above the first, as a table's ids are.
 
 use crate::allocator::AllocError;
+use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::containers::{Array, BitSlice, Bitmap, SmallVec};
 use crate::context::Context;
@@ -27,10 +28,11 @@ use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
 use crate::env::Env;
+use crate::pipeline::{SinkId, with_built};
 use crate::row_store::RowStore;
 use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
-use crate::step::{DynOperator, DynSource, Operator, Progress, Step, Transform};
+use crate::step::{DynOperator, Operator, Progress, Sink, Step, Transform};
 
 mod direct;
 
@@ -374,10 +376,10 @@ impl<'c> Op<'c> for JoinOp {
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
+        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys })?;
         let join = Join {
             kind: self.kind,
             build,
-            build_columns,
             held,
             build_types,
             outputs,
@@ -441,6 +443,7 @@ const JOIN_KEYS_MAX: usize = 4;
 
 /// The columns a join hashes its build side by, which its condition
 /// requires equal on both sides.
+#[derive(Clone, Copy)]
 struct Keys {
     /// Where each of the first `count` is in the probe side's batches.
     probe: [u32; JOIN_KEYS_MAX],
@@ -455,17 +458,14 @@ struct Keys {
 /// Tests its condition on each input batch's rows paired with build rows,
 /// a round at a time, outputting the pairs it's true for. Without keys, a
 /// round pairs every row with one build row, in turn. With keys, it pairs
-/// each row with its next build row of the same keys, found by hashing. The
-/// build side is drained on the first input: an empty probe side never
-/// reads it.
-struct Join<'c> {
+/// each row with its next build row of the same keys, found by hashing. Its
+/// `HashBuild` is built on the first input: an empty probe side never reads
+/// the build side.
+struct Join {
     /// Which rows it outputs.
     kind: JoinKind,
-    /// The build side.
-    build: DynSource<'c>,
-    /// Where the first `held` build columns are in the build side's
-    /// batches: those it outputs, then those only its condition reads.
-    build_columns: [u32; BATCH_COLUMNS_MAX as usize],
+    /// What holds the build side.
+    build: SinkId<HashBuild>,
     /// How many build columns it holds.
     held: usize,
     /// The types of the build columns it holds.
@@ -483,12 +483,24 @@ struct Join<'c> {
     probe_types: SmallVec<DataType>,
 }
 
-/// What a run of a `Join` keeps.
-struct Held {
-    /// The build side, once drained.
+/// Holds every row of a join's build side, and with keys, finds each one's
+/// group in a hash table, for the join to probe.
+struct HashBuild {
+    /// Where the first `held` build columns are in the build side's
+    /// batches: those the join outputs, then those only its condition reads.
+    build_columns: [u32; BATCH_COLUMNS_MAX as usize],
+    /// How many build columns it holds.
+    held: usize,
+    /// The keys it hashes by, if any.
+    keys: Option<Keys>,
+}
+
+/// What a run of a `HashBuild`'s pipeline builds.
+struct Building {
+    /// The build side so far, until it's combined.
     built: Option<Built>,
-    /// What probing keeps.
-    probing: Probing,
+    /// Each batch's groups, as hashing finds them: a batch of `u32`s.
+    groups: Buffer,
 }
 
 /// What draining the build side makes.
@@ -515,6 +527,8 @@ struct Built {
 
 /// What probing keeps, from one input batch to the next.
 struct Probing {
+    /// Whether it's read the build side, once built.
+    read_build: bool,
     /// Whether the input batch has had its first round.
     started: bool,
     /// Without keys, the build row of the next round; with keys, how many
@@ -542,14 +556,6 @@ struct Probing {
     /// When it keeps the build rows, a null column of each probe column's
     /// type, a batch long.
     probe_nulls: SmallVec<ColumnView>,
-}
-
-impl Held {
-    /// The build side, which must be drained, and what probing keeps.
-    fn parts(&mut self) -> (&mut Built, &mut Probing) {
-        let Some(built) = &mut self.built else { failed!() };
-        (built, &mut self.probing)
-    }
 }
 
 /// Writes to `groups` the group in `table` of the keys at `positions` of
@@ -622,89 +628,15 @@ fn selected(selection: &Selection) -> &[u16] {
     }
 }
 
-impl Join<'_> {
-    /// Whether it outputs the probe rows no build row matched.
-    fn keeps_probe(&self) -> bool {
-        self.kind == JoinKind::Left && !self.keeps_build
-    }
-
-    /// Holds every row of the build side, and with keys, finds each one's
-    /// group.
-    fn drain(&self, context: &mut Context, next_of: &mut [u32]) -> Result<Built, Error> {
-        let env = context.env();
-        // A word a group after its keys, for its last build row.
-        let table = match &self.keys {
-            Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
-            None => None,
-        };
-        let mut built = Built {
-            rows: RowStore::new(env)?,
-            count: 0,
-            table,
-            before: SmallVec::new(env, 1 << 31)?,
-            repeats: false,
-            direct: None,
-            sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
-        };
-        let mut run = self.build.start(context)?;
-        let mut batch = RowBatch::new();
-        let build_columns = at!(self.build_columns, ..self.held);
-        while run.next(context, &mut batch)? {
-            let selection = batch.selection();
-            let first = built.count;
-            built.count = built.count.checked_add(selection.len()).ok_or(Error::OutOfMemory)?;
-            if selection.is_empty() {
-                continue;
-            }
-            if let Some(keys) = &self.keys {
-                Self::hash(context, &mut built, next_of, keys, &batch, first)?;
-            }
-            if build_columns.is_empty() {
-                continue;
-            }
-            let mut columns = RowBatch::new();
-            columns.reset(batch.row_count());
-            let selection = batch.selection();
-            if build_columns.iter().all(|&c| matches!(batch.column(c).form(), Form::Flat)) {
-                columns.push_borrowed(build_columns.iter().map(|&c| batch.column(c)));
-            } else {
-                // A row store holds flat columns, and keys can come as
-                // sequences.
-                for &c in build_columns {
-                    let mut column = batch.column(c).clone();
-                    column.make_in(context, Forms::FLAT)?;
-                    let Ok(()) = columns.push_column(column) else { failed!() };
-                }
-            }
-            columns.selection_mut().clone_from(selection);
-            built.rows.append(context, &columns)?;
-        }
-        if let Some(table) = &mut built.table {
-            table.freeze();
-        }
-        // One integer key, each in one build row, is found by its value.
-        if let Sequence::From(min) = built.sequence {
-            built.direct = Some(Direct::sequence(min, built.count));
-            built.table = None;
-        } else if let (true, false, Some(table)) = (self.one_integer(), built.repeats, &built.table)
-        {
-            built.direct = Direct::of(context.env(), table, built.count)?;
-            if built.direct.is_some() {
-                built.table = None;
-            }
-        }
-        built.rows.flush(context)?;
-        Ok(built)
-    }
-
+impl HashBuild {
     /// Whether it joins on one integer key.
     fn one_integer(&self) -> bool {
         self.keys.as_ref().is_some_and(|keys| keys.count == 1 && keys.strings == 0)
     }
 
     /// Finds the groups of `batch`'s keys, its rows numbered from `first`,
-    /// in the hash table, working in `next_of`, unused until probing:
-    /// unless its one integer key continues a sequence, which needs none.
+    /// in the hash table, working in `next_of`: unless its one integer key
+    /// continues a sequence, which needs none.
     fn hash(
         context: &mut Context,
         built: &mut Built,
@@ -761,6 +693,111 @@ impl Join<'_> {
             table.set_payload(group, i64::from(row) + 1);
         }
         Ok(())
+    }
+}
+
+impl Sink for HashBuild {
+    type State = Option<Built>;
+    type Local = Building;
+
+    fn new_state(&self, _: &mut Context) -> Result<Option<Built>, Error> {
+        Ok(None)
+    }
+
+    fn new_local(&self, context: &mut Context) -> Result<Building, Error> {
+        let env = context.env();
+        // A word a group after its keys, for its last build row.
+        let table = match &self.keys {
+            Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
+            None => None,
+        };
+        let built = Built {
+            rows: RowStore::new(env)?,
+            count: 0,
+            table,
+            before: SmallVec::new(env, 1 << 31)?,
+            repeats: false,
+            direct: None,
+            sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
+        };
+        let groups = context.indices_buffer(BATCH_ROWS_MAX as usize * size_of::<u32>())?;
+        Ok(Building { built: Some(built), groups })
+    }
+
+    fn consume(
+        &self,
+        context: &mut Context,
+        building: &mut Building,
+        batch: &RowBatch,
+    ) -> Result<(), Error> {
+        let Some(built) = &mut building.built else { failed!() };
+        let selection = batch.selection();
+        let first = built.count;
+        built.count = built.count.checked_add(selection.len()).ok_or(Error::OutOfMemory)?;
+        if selection.is_empty() {
+            return Ok(());
+        }
+        if let Some(keys) = &self.keys {
+            let groups = building.groups.as_mut_slice::<u32>();
+            Self::hash(context, built, groups, keys, batch, first)?;
+        }
+        let build_columns = at!(self.build_columns, ..self.held);
+        if build_columns.is_empty() {
+            return Ok(());
+        }
+        let mut columns = RowBatch::new();
+        columns.reset(batch.row_count());
+        if build_columns.iter().all(|&c| matches!(batch.column(c).form(), Form::Flat)) {
+            columns.push_borrowed(build_columns.iter().map(|&c| batch.column(c)));
+        } else {
+            // A row store holds flat columns, and keys can come as sequences.
+            for &c in build_columns {
+                let mut column = batch.column(c).clone();
+                column.make_in(context, Forms::FLAT)?;
+                let Ok(()) = columns.push_column(column) else { failed!() };
+            }
+        }
+        columns.selection_mut().clone_from(selection);
+        built.rows.append(context, &columns)
+    }
+
+    /// Takes what the one run built: merging runs' comes with the executor
+    /// that runs more than one.
+    fn combine(
+        &self,
+        _: &mut Context,
+        state: &mut Option<Built>,
+        building: &mut Building,
+    ) -> Result<(), Error> {
+        check!(state.is_none());
+        *state = building.built.take();
+        Ok(())
+    }
+
+    fn finalize(&self, context: &mut Context, state: &mut Option<Built>) -> Result<(), Error> {
+        let Some(built) = state else { failed!() };
+        if let Some(table) = &mut built.table {
+            table.freeze();
+        }
+        // One integer key, each in one build row, is found by its value.
+        if let Sequence::From(min) = built.sequence {
+            built.direct = Some(Direct::sequence(min, built.count));
+            built.table = None;
+        } else if let (true, false, Some(table)) = (self.one_integer(), built.repeats, &built.table)
+        {
+            built.direct = Direct::of(context.env(), table, built.count)?;
+            if built.direct.is_some() {
+                built.table = None;
+            }
+        }
+        built.rows.flush(context)
+    }
+}
+
+impl Join {
+    /// Whether it outputs the probe rows no build row matched.
+    fn keeps_probe(&self) -> bool {
+        self.kind == JoinKind::Left && !self.keeps_build
     }
 
     /// Starts joining `input`: no row matched, and with keys, each row's
@@ -906,25 +943,32 @@ impl Join<'_> {
     }
 }
 
-impl Join<'_> {
-    /// Drains the build side into `held`, if it isn't yet.
-    fn drained(&self, context: &mut Context, held: &mut Held) -> Result<(), Error> {
-        if held.built.is_some() {
-            return Ok(());
-        }
-        let built = self.drain(context, &mut held.probing.next_of)?;
-        if self.keeps_build {
-            held.probing.build_matched = Bitmap::new(context.env(), built.count as usize)?;
-        }
-        held.built = Some(built);
-        Ok(())
+impl Join {
+    /// Calls `f` with the build side, built the first time, and `probing`,
+    /// which the first time readies for the build side's rows.
+    fn with_build<R>(
+        &self,
+        context: &mut Context,
+        probing: &mut Probing,
+        f: impl FnOnce(&mut Context, &mut Built, &mut Probing) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        with_built(context, self.build, |context, built| {
+            let Some(built) = built else { failed!() };
+            if !probing.read_build {
+                probing.read_build = true;
+                if self.keeps_build {
+                    probing.build_matched = Bitmap::new(context.env(), built.count as usize)?;
+                }
+            }
+            f(context, built, probing)
+        })?
     }
 }
 
-impl Operator for Join<'_> {
-    type State = Held;
+impl Operator for Join {
+    type State = Probing;
 
-    fn new_state(&self, context: &mut Context) -> Result<Held, Error> {
+    fn new_state(&self, context: &mut Context) -> Result<Probing, Error> {
         let env = context.env();
         let nulls = null_columns(context, at!(self.build_types, ..self.outputs))?;
         let probe_nulls = null_columns(context, &self.probe_types)?;
@@ -932,7 +976,8 @@ impl Operator for Join<'_> {
             Some(condition) => Some(condition.new_state(context)?),
             None => None,
         };
-        let probing = Probing {
+        Ok(Probing {
+            read_build: false,
             started: false,
             next: 0,
             // Not arrays, which would be copied into place on each run.
@@ -944,19 +989,48 @@ impl Operator for Join<'_> {
             build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,
             probe_nulls,
-        };
-        Ok(Held { built: None, probing })
+        })
     }
 
     fn execute(
         &self,
         context: &mut Context,
-        held: &mut Held,
+        probing: &mut Probing,
         input: &RowBatch,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
-        self.drained(context, held)?;
-        let (built, probing) = held.parts();
+        self.with_build(context, probing, |context, built, probing| {
+            self.probe(context, built, probing, input, output)
+        })
+    }
+
+    /// Outputs the build rows no probe row matched, if it keeps them, with
+    /// nulls for the probe side's columns, a batch at a time.
+    fn finish(
+        &self,
+        context: &mut Context,
+        probing: &mut Probing,
+        output: &mut RowBatch,
+    ) -> Result<Progress, Error> {
+        if !self.keeps_build {
+            return Ok(Progress::NeedInput);
+        }
+        self.with_build(context, probing, |context, built, probing| {
+            self.unmatched(context, built, probing, output)
+        })
+    }
+}
+
+impl Join {
+    /// Joins `input` with the build side, as `execute`.
+    fn probe(
+        &self,
+        context: &mut Context,
+        built: &mut Built,
+        probing: &mut Probing,
+        input: &RowBatch,
+        output: &mut RowBatch,
+    ) -> Result<Progress, Error> {
         // No probe row can be joined.
         if built.count == 0 && !self.keeps_probe() {
             return Ok(Progress::Done);
@@ -993,19 +1067,14 @@ impl Operator for Join<'_> {
         Ok(Progress::NeedInput)
     }
 
-    /// Outputs the build rows no probe row matched, if it keeps them, with
-    /// nulls for the probe side's columns, a batch at a time.
-    fn finish(
+    /// The build rows no probe row matched, a batch at a time, as `finish`.
+    fn unmatched(
         &self,
         context: &mut Context,
-        held: &mut Held,
+        built: &mut Built,
+        probing: &mut Probing,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
-        if !self.keeps_build {
-            return Ok(Progress::NeedInput);
-        }
-        self.drained(context, held)?;
-        let (built, probing) = held.parts();
         let mut count = 0;
         while probing.unmatched < built.count && count < BATCH_ROWS_MAX {
             let row = probing.unmatched;

@@ -4,6 +4,11 @@
 //! A pipeline is also a source, of the batches it outputs, as Perfetto's
 //! is: `into_source` makes one, whose runs are on their caller's `Context`.
 //!
+//! A pipeline can also end in a sink, which consumes what it outputs and
+//! builds what a step of another pipeline reads whole, such as a join's hash
+//! table of its build side. A plan's sinks are built when first read, by
+//! `built`, once in a run, so a join whose probe side is empty builds none.
+//!
 //! The steps are cut into segments at each operator. The first segment is the
 //! source and the transforms after it; each other is an operator and the
 //! transforms after it. A segment's transforms run in place on the batches its
@@ -13,6 +18,7 @@
 
 use core::alloc::Layout;
 use core::cell::Cell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
@@ -24,7 +30,9 @@ use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::RowBatch;
 use crate::statement::Statement;
-use crate::step::{DynSource, ErasedBatch, Progress, SourceNext, Step, StepFunctions};
+use crate::step::{
+    DynSink, DynSource, ErasedBatch, Progress, Sink, SourceNext, Step, StepFunctions,
+};
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -48,7 +56,18 @@ impl<'a> Pipeline<'a> {
         env: &'r Env,
         statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
-        let mut context = Context::new(env, statement);
+        self.start_with_sinks(env, statement, &[])
+    }
+
+    /// As `start`, of a plan whose pipelines that end in sinks are `sinks`,
+    /// which its steps read by their ids.
+    pub(crate) fn start_with_sinks<'r>(
+        &'r self,
+        env: &'r Env,
+        statement: Option<&'r Statement>,
+        sinks: &'r [SinkPipeline<'r>],
+    ) -> Result<Execution<'r>, Error> {
+        let mut context = Context::with_sinks(env, statement, sinks);
         let run = Run::new(self, &mut context)?;
         Ok(Execution { run, context })
     }
@@ -83,6 +102,78 @@ impl<'a> Pipeline<'a> {
         check!(layout.align() <= BUFFER_ALIGNMENT_BYTES);
         Ok((layout, slots))
     }
+}
+
+/// A pipeline that ends in a sink: what a step reads whole, such as a
+/// join's build side.
+pub struct SinkPipeline<'a> {
+    pub(crate) pipeline: Pipeline<'a>,
+    pub(crate) sink: DynSink<'a>,
+}
+
+/// The id of a plan's sink of type `T`, from `Lowering::add_sink`: so the
+/// state `with_built` gives for it is a `T`'s.
+pub struct SinkId<T>(u32, PhantomData<fn() -> T>);
+
+impl<T> Clone for SinkId<T> {
+    fn clone(&self) -> SinkId<T> {
+        *self
+    }
+}
+
+impl<T> Copy for SinkId<T> {}
+
+impl<T> SinkId<T> {
+    /// The id of sink `id`, which must be a `T`.
+    pub(crate) fn new(id: u32) -> SinkId<T> {
+        SinkId(id, PhantomData)
+    }
+}
+
+/// Calls `f` with sink `id`'s state, finalized, as `built` gives it.
+/// Only the step `id` was made for reads it, so it changes it alone.
+pub(crate) fn with_built<T: Sink, R>(
+    context: &mut Context,
+    id: SinkId<T>,
+    f: impl FnOnce(&mut Context, &mut T::State) -> R,
+) -> Result<R, Error> {
+    let state = built(context, id.0)?;
+    // SAFETY: sink `id` is a `T`, as only `Lowering::add_sink` makes ids,
+    // so its state is a `T::State`. It's in memory of its own, apart from
+    // the context's, and the one step that reads it isn't running `f`
+    // already.
+    let state = unsafe { state.cast::<T::State>().as_mut() };
+    Ok(f(context, state))
+}
+
+/// Sink `id`'s state, finalized: built by running its pipeline to its end
+/// the first time the run asks for it. The run keeps it until it ends, so
+/// it outlives the states of the steps that read it.
+pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error> {
+    if let Some(state) = context.built(id) {
+        return Ok(state);
+    }
+    let SinkPipeline { pipeline, sink } = context.sink_pipeline(id);
+    // One run, consuming into one local state, which it combines.
+    let local = sink.new_local(context)?;
+    {
+        let mut run = Run::new(pipeline, context)?;
+        let mut batch = RowBatch::new();
+        while run.next(context, &mut batch)? {
+            // SAFETY: `local` is the sink's.
+            unsafe { sink.consume(context, &local, &batch)? };
+        }
+    }
+    let state = sink.new_shared(context)?;
+    // SAFETY: both states are the sink's.
+    unsafe {
+        sink.combine(context, &state, &local)?;
+        drop(local);
+        sink.finalize(context, &state)?;
+    }
+    let built = state.as_ptr();
+    context.keep_built(id, state)?;
+    Ok(built)
 }
 
 #[cfg(test)]
@@ -498,7 +589,7 @@ mod tests {
     use crate::context::Context;
     use crate::env::Env;
     use crate::selection::Kept;
-    use crate::step::{Breaker, DynOperator, DynTransform, Operator, Source, Transform};
+    use crate::step::{Breaker, DynOperator, DynTransform, Operator, Sink, Source, Transform};
 
     fn int64s(values: &[i64]) -> ColumnView {
         let env = Env::current();
@@ -872,6 +963,76 @@ mod tests {
         }
     }
 
+    /// The sum of the first column of what it consumes. It counts in
+    /// `builds` how many times it's finalized.
+    struct Total<'a> {
+        builds: &'a Cell<u32>,
+    }
+
+    impl Sink for Total<'_> {
+        type State = i64;
+        type Local = i64;
+
+        fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
+            Ok(0)
+        }
+
+        fn new_local(&self, _: &mut Context) -> Result<i64, Error> {
+            Ok(0)
+        }
+
+        fn consume(&self, _: &mut Context, sum: &mut i64, input: &RowBatch) -> Result<(), Error> {
+            *sum += input.column(0).int64s().iter().sum::<i64>();
+            Ok(())
+        }
+
+        fn combine(&self, _: &mut Context, total: &mut i64, sum: &mut i64) -> Result<(), Error> {
+            *total += *sum;
+            Ok(())
+        }
+
+        fn finalize(&self, _: &mut Context, _: &mut i64) -> Result<(), Error> {
+            self.builds.set(self.builds.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// Adds a column of sink `total`'s sum to each batch.
+    struct WithTotal<'a> {
+        total: SinkId<Total<'a>>,
+    }
+
+    impl Operator for WithTotal<'_> {
+        type State = ();
+
+        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn execute(
+            &self,
+            context: &mut Context,
+            (): &mut (),
+            input: &RowBatch,
+            output: &mut RowBatch,
+        ) -> Result<Progress, Error> {
+            let total = with_built(context, self.total, |_, total| *total)?;
+            output.copy_from(input);
+            let column = int64s(&alloc::vec![total; input.row_count() as usize]);
+            assert!(output.push_column(column).is_ok());
+            Ok(Progress::NeedInput)
+        }
+
+        fn finish(
+            &self,
+            _: &mut Context,
+            (): &mut (),
+            _: &mut RowBatch,
+        ) -> Result<Progress, Error> {
+            Ok(Progress::NeedInput)
+        }
+    }
+
     /// Each batch's rows, as lists of values.
     fn batches(execution: &mut Execution) -> Vec<Vec<Vec<i64>>> {
         let mut batch = RowBatch::new();
@@ -1119,6 +1280,26 @@ mod tests {
         let outer = nested(failing, [operator(Sum)]);
         let mut execution = outer.start(query, None).unwrap();
         assert_eq!(execution.next(&mut RowBatch::new()), Err(Error::Corrupt));
+    }
+
+    #[test]
+    fn builds_a_sink_once_when_first_read() {
+        let (env, builds) = (Env::current(), Cell::new(0));
+        let built = pipeline(Numbers { batches: 2 }, []);
+        let sink = DynSink::new(env, Total { builds: &builds }).unwrap();
+        let sinks = [SinkPipeline { pipeline: built, sink }];
+        let total = SinkId::new(0);
+        let reads = pipeline(Numbers { batches: 2 }, [operator(WithTotal { total })]);
+        let mut execution = reads.start_with_sinks(env, None, &sinks).unwrap();
+        // 0 + 1 + 2 + 3, built once for both batches.
+        let expected = [[[0, 0, 6], [1, -1, 6]], [[2, -2, 6], [3, -3, 6]]];
+        assert_eq!(batches(&mut execution), expected);
+        assert_eq!(builds.get(), 1);
+        // A step with no input never reads it, so it isn't built.
+        let empty = pipeline(Numbers { batches: 0 }, [operator(WithTotal { total })]);
+        let mut execution = empty.start_with_sinks(env, None, &sinks).unwrap();
+        assert!(batches(&mut execution).is_empty());
+        assert_eq!(builds.get(), 1);
     }
 
     #[test]
