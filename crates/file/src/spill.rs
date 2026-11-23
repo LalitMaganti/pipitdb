@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pipit_kernel::bytes::ByteRange;
 use pipit_kernel::error::Error;
-use pipit_kernel::spill::{Block, LogId, SpillStore};
+use pipit_kernel::spill::{LogId, SpillStore};
 
 use crate::read_at;
 
@@ -55,13 +56,13 @@ impl SpillStore for FileSpill {
         Ok(LogId(logs.len() as u64 - 1))
     }
 
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error> {
         self.with(log, |log| {
             if log.sealed {
                 return Err(Error::Io);
             }
             log.file.write_all(bytes).map_err(|_| Error::Io)?;
-            let block = Block { offset: log.len, len: bytes.len() as u64 };
+            let block = ByteRange { offset: log.len, len: bytes.len() as u64 };
             log.len += block.len;
             Ok(block)
         })
@@ -74,7 +75,7 @@ impl SpillStore for FileSpill {
         })
     }
 
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+    fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error> {
         self.with(log, |log| {
             let fits = block.offset.checked_add(block.len).is_some_and(|end| end <= log.len);
             if !log.sealed || !fits || block.len != into.len() as u64 {

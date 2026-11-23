@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pipit_file::spill::FileSpill;
+use pipit_kernel::bytes::ByteRange;
 use pipit_kernel::error::Error;
-use pipit_kernel::spill::{Block, LogId, SpillStore};
+use pipit_kernel::spill::{LogId, SpillStore};
 use rusty_s3::actions::{CreateMultipartUpload, S3Action};
 use rusty_s3::{Bucket, Credentials};
 
@@ -200,7 +201,7 @@ impl SpillStore for S3Spill {
         Ok(LogId(logs.len() as u64 - 1))
     }
 
-    fn append(&self, log: LogId, bytes: &[u8]) -> Result<Block, Error> {
+    fn append(&self, log: LogId, bytes: &[u8]) -> Result<ByteRange, Error> {
         self.with(log, |log| {
             if log.sealed {
                 return Err(Error::Io);
@@ -210,7 +211,7 @@ impl SpillStore for S3Spill {
                 None => (self.staging.create()?, 0),
             };
             self.staging.append(staged, bytes)?;
-            let block = Block { offset: log.len, len: bytes.len() as u64 };
+            let block = ByteRange { offset: log.len, len: bytes.len() as u64 };
             log.len += block.len;
             log.staged = Some((staged, len + block.len));
             if len + block.len >= self.part_bytes {
@@ -232,7 +233,7 @@ impl SpillStore for S3Spill {
         })
     }
 
-    fn read(&self, log: LogId, block: Block, into: &mut [u8]) -> Result<(), Error> {
+    fn read(&self, log: LogId, block: ByteRange, into: &mut [u8]) -> Result<(), Error> {
         self.with(log, |log| {
             let fits = block.offset.checked_add(block.len).is_some_and(|end| end <= log.len);
             if !log.sealed || !fits || block.len != into.len() as u64 {
@@ -251,7 +252,7 @@ impl SpillStore for S3Spill {
                 log.fetched.push(fetched);
                 fetched
             };
-            let staged = Block { offset: block.offset - fetched.offset, len: block.len };
+            let staged = ByteRange { offset: block.offset - fetched.offset, len: block.len };
             self.staging.read(fetched.staged, staged, into)
         })
     }
@@ -293,7 +294,7 @@ struct Staged<'s> {
 impl Read for Staged<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         let n = (self.len - self.offset).min(out.len() as u64);
-        let block = Block { offset: self.offset, len: n };
+        let block = ByteRange { offset: self.offset, len: n };
         let n = usize::try_from(n).map_err(|_| std::io::ErrorKind::InvalidInput)?;
         self.store.read(self.log, block, &mut out[..n]).map_err(|_| std::io::ErrorKind::Other)?;
         self.offset += block.len;

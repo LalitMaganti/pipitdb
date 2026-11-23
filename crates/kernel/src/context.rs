@@ -3,7 +3,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::env::{Env, Kind};
+use crate::env::{Env, MemoryKind};
 use crate::function::DynFunction;
 use crate::selection::Selection;
 use crate::small_vec::SmallVec;
@@ -66,25 +66,25 @@ impl<'a> Context<'a> {
     /// functions, by kind, so how it's found can change in one place. It
     /// isn't zeroed: whoever fills it writes every byte that's read.
     pub fn values_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.env, Kind::Values, size_bytes)
+        buffer(self.env, MemoryKind::Values, size_bytes)
     }
 
     /// As `values_buffer`, for 4-byte values, such as dictionary indices, or
     /// string offsets, of which there's one more than rows.
     pub fn indices_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.env, Kind::Indices, size_bytes)
+        buffer(self.env, MemoryKind::Indices, size_bytes)
     }
 
     /// As `values_buffer`, for small things a column needs: its header, its
     /// validity bitmap, a lazy column's handle.
     pub fn small_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.env, Kind::Small, size_bytes)
+        buffer(self.env, MemoryKind::Small, size_bytes)
     }
 
     /// As `values_buffer`, for column data of no fixed size, such as
     /// strings' bytes.
     pub fn bytes_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.env, Kind::Base, size_bytes)
+        buffer(self.env, MemoryKind::Base, size_bytes)
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
@@ -149,7 +149,7 @@ impl<'a> Context<'a> {
 }
 
 /// `size_bytes` bytes from `env`, not zeroed.
-fn buffer(env: &Env, kind: Kind, size_bytes: usize) -> Result<Buffer, AllocError> {
+fn buffer(env: &Env, kind: MemoryKind, size_bytes: usize) -> Result<Buffer, AllocError> {
     // SAFETY: whoever fills it writes every byte that's read.
     unsafe { Buffer::allocate_uninit(env, kind, size_bytes) }
 }
