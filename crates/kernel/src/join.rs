@@ -250,16 +250,23 @@ impl<'c> Op<'c> for JoinOp {
         (self.kind == JoinKind::Inner || child == 0).then_some(child)
     }
 
-    /// Builds the side whose key is best, an id first, as it's never
-    /// hashed, then a unique key, as each probe row then has one build row;
-    /// then the side with fewer rows, by planning's estimates. A left join
-    /// that builds its first child outputs its unmatched rows at the end.
+    /// Builds a side whose key is an id, as it's never hashed; otherwise the
+    /// side whose hash table is smaller by planning's estimates: its rows,
+    /// each a word for every column it outputs and one for its entry. Of
+    /// sides of one size, one whose key is unique, as each probe row then
+    /// has one build row. A left join that builds its first child outputs
+    /// its unmatched rows at the end.
     fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
         let &[first, second] = inputs else { failed!() };
-        let [left, right] = self.side_keys(exprs, inputs);
-        // A better key, then fewer rows; as written if nothing tells them apart.
-        let rank = |key, input: &Estimate| (key, u64::MAX - input.rows.estimated);
-        self.build = u32::from(rank(left, &first) <= rank(right, &second));
+        let keys = self.side_keys(exprs, inputs);
+        let rank = |side: usize, input: &Estimate| {
+            let key = *at!(keys, side);
+            let outputs = at!(self.outputs, side).count_ones();
+            let bytes = input.rows.estimated.saturating_mul(u64::from(outputs) + 1);
+            (key == Key::Id, u64::MAX - bytes, key)
+        };
+        // As written if nothing tells them apart.
+        self.build = u32::from(rank(0, &first) <= rank(1, &second));
     }
 
     /// As many rows as the probe side, or fewer, and its keys but for ids,
@@ -1095,13 +1102,14 @@ mod tests {
     }
 
     #[test]
-    fn builds_the_side_with_the_better_key_then_fewer_rows() {
+    fn builds_an_id_then_the_smaller_side_then_a_unique_key() {
         let (few, many) = (10, 1_000_000);
         for kind in [JoinKind::Inner, JoinKind::Left] {
-            // An id, even if bigger, then a unique key, then fewer rows.
+            // An id, even if bigger, then fewer rows, then a unique key.
             assert_eq!(built(kind, (many, Key::Id), (few, Key::Unique)), 0);
-            assert_eq!(built(kind, (many, Key::Unique), (few, Key::None)), 0);
-            assert_eq!(built(kind, (few, Key::None), (many, Key::None)), 0);
+            assert_eq!(built(kind, (many, Key::Unique), (few, Key::None)), 1);
+            assert_eq!(built(kind, (few, Key::None), (many, Key::Unique)), 0);
+            assert_eq!(built(kind, (few, Key::None), (few, Key::Unique)), 1);
             assert_eq!(built(kind, (many, Key::None), (few, Key::None)), 1);
             // As written when nothing tells them apart.
             assert_eq!(built(kind, (few, Key::Id), (few, Key::Id)), 1);

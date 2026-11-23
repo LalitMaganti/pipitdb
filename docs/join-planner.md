@@ -69,8 +69,12 @@ before forms are chosen.
   each join taking the equalities whose two relations it brings together,
   and pruning then orders the plan's nodes inputs first again.
 - **Build side.** Each join chooses its own after planning: a side whose
-  key is an id, then a unique key, then the side with fewer estimated
-  rows. Next: fewer estimated bytes, in place of rows.
+  key is an id, which is never hashed; otherwise the side whose hash table
+  is smaller, its estimated rows times a word for each column it outputs
+  and one for its entry; of sides of one size, one whose key is unique.
+  Building on a unique key regardless of size can hash a big side to probe
+  a small one, and building costs several times what probing does. DuckDB
+  and DataFusion also choose by estimated bytes.
 
 ## Estimation
 
