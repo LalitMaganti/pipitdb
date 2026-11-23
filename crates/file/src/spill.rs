@@ -131,10 +131,7 @@ fn open_unnamed(dir: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::containers::BitSlice;
-
-    use pipit_kernel::buffer::Buffer;
-    use pipit_kernel::column::{ColumnView, DataType};
+    use pipit_kernel::column::ColumnView;
     use pipit_kernel::context::Context;
     use pipit_kernel::spill::{read_column, write_column};
 
@@ -142,13 +139,9 @@ mod tests {
     use pipit_kernel::env::Env;
 
     fn column(values: &[i64]) -> ColumnView {
-        let env = Env::current();
-        let mut buffer = Buffer::allocate(env, values.len() * 8).unwrap();
-        buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        let mut validity = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
-        validity.as_mut_slice::<u8>().fill(0b1111_1101);
-        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, Some(validity))
-            .unwrap()
+        // Every eighth row from the second is null.
+        let cells = values.iter().enumerate().map(|(row, &value)| (row % 8 != 1).then_some(value));
+        ColumnView::from_int64s(&mut Context::new(Env::current(), None), cells).unwrap()
     }
 
     #[test]

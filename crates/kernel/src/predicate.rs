@@ -726,15 +726,7 @@ mod tests {
     const B: [Option<i64>; 6] = [None, Some(2), None, Some(4), Some(5), Some(1)];
 
     fn column(cells: [Option<i64>; 6]) -> ColumnView {
-        let env = Env::current();
-        let mut values = Buffer::allocate(env, 48).unwrap();
-        let mut validity = Buffer::allocate(env, 1).unwrap();
-        for (row, cell) in cells.iter().enumerate() {
-            values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
-            validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
-        }
-        ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, Some(validity))
-            .unwrap()
+        ColumnView::from_int64s(&mut Context::new(Env::current(), None), cells.into_iter()).unwrap()
     }
 
     /// A predicate to evaluate both ways: by `Predicate`, and by hand.

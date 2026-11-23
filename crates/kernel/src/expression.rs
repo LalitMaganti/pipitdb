@@ -1636,17 +1636,8 @@ mod tests {
     const U: [Option<i64>; 5] = [Some(1), Some(0), Some(3), Some(0), Some(5)];
 
     fn column(cells: &[Option<i64>]) -> ColumnView {
-        let mut values = Buffer::allocate(Env::current(), cells.len() * 8).unwrap();
-        let mut validity =
-            Buffer::allocate(Env::current(), BitSlice::<u8>::words_for(cells.len())).unwrap();
-        validity.as_mut_slice::<u8>().fill(0);
-        for (row, cell) in cells.iter().enumerate() {
-            values.as_mut_slice::<i64>()[row] = cell.unwrap_or(i64::MAX);
-            BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row, cell.is_some());
-        }
-        let validity = cells.contains(&None).then_some(validity);
-        ColumnView::new(&mut Context::new(Env::current(), None), DataType::Int64, values, validity)
-            .unwrap()
+        let context = &mut Context::new(Env::current(), None);
+        ColumnView::from_int64s(context, cells.iter().copied()).unwrap()
     }
 
     fn batch(columns: &[ColumnView]) -> RowBatch<'static> {

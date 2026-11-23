@@ -389,16 +389,8 @@ mod tests {
 
     /// An `Int64` column of `values`, null where `None`.
     fn column(values: &[Option<i64>]) -> ColumnView {
-        let env = Env::current();
-        let mut words = Buffer::allocate(env, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
-        bits.as_mut_slice::<u8>().fill(0);
-        for (i, value) in values.iter().enumerate() {
-            words.as_mut_slice::<i64>()[i] = value.unwrap_or(0);
-            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, value.is_some());
-        }
-        let validity = values.iter().any(Option::is_none).then_some(bits);
-        ColumnView::new(&mut Context::new(env, None), DataType::Int64, words, validity).unwrap()
+        let context = &mut Context::new(Env::current(), None);
+        ColumnView::from_int64s(context, values.iter().copied()).unwrap()
     }
 
     /// Batches of a key `k` and a value `x`, each a list of rows, keeping
