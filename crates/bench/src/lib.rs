@@ -15,9 +15,7 @@ use pipit_kernel::expression::{
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::join::{JoinKind, JoinOp};
-use pipit_kernel::lower::{PhysicalPlan, lower};
-use pipit_kernel::optimize::optimize;
-use pipit_kernel::output_properties::plan_nodes;
+use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::pipeline::{Execution, Pipeline};
 use pipit_kernel::plan::{DynOp, LogicalPlan, ScanColumn, ScanOp};
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
@@ -339,9 +337,7 @@ fn count(mut execution: Execution<'_>) -> u64 {
 /// ready to run.
 pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
     let mut plan = compile(crate::env(), &REGISTRY, catalog, query.as_bytes()).ok()?;
-    optimize(crate::env(), &mut plan).ok()?;
-    let planned = plan_nodes(crate::env(), &plan).ok()?;
-    lower(crate::env(), &mut plan, &planned).ok()
+    PhysicalPlan::from_logical(crate::env(), &mut plan).ok()
 }
 
 /// Plans and runs `query` over `catalog`, as an embedder would each query,
@@ -867,7 +863,5 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
         plan.add_node(op, &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }
-    optimize(crate::env(), &mut plan).expect("optimizes");
-    let planned = plan_nodes(crate::env(), &plan).expect("plans");
-    lower(crate::env(), &mut plan, &planned).expect("lowers")
+    PhysicalPlan::from_logical(crate::env(), &mut plan).expect("lowers")
 }

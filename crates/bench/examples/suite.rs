@@ -19,9 +19,7 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
 use pipit_kernel::env::Env;
-use pipit_kernel::lower::lower;
-use pipit_kernel::optimize::optimize;
-use pipit_kernel::output_properties::plan_nodes;
+use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Kept;
@@ -277,9 +275,7 @@ impl Output {
 fn run(tables: &Tables, query: &str, env: &Env) -> Result<Vec<Output>, String> {
     let mut plan =
         compile(env, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
-    optimize(env, &mut plan).map_err(|e| format!("{e:?}"))?;
-    let planned = plan_nodes(env, &plan).map_err(|e| format!("{e:?}"))?;
-    let physical = lower(env, &mut plan, &planned).map_err(|e| format!("{e:?}"))?;
+    let physical = PhysicalPlan::from_logical(env, &mut plan).map_err(|e| format!("{e:?}"))?;
     let mut execution = physical.start(env).map_err(|e| format!("{e:?}"))?;
     let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
     let mut batch = RowBatch::new();

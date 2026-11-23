@@ -9,7 +9,8 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::expression::Exprs;
 use crate::names::{Name, Names};
-use crate::output_properties::{InputStep, OutputProperties, Planned};
+use crate::optimize::optimize;
+use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
 use crate::sort::sort;
@@ -54,6 +55,17 @@ pub struct PhysicalPlan<'c> {
 }
 
 impl<'c> PhysicalPlan<'c> {
+    /// `plan` optimized, planned and lowered: what an embedder runs.
+    #[inline(never)]
+    pub fn from_logical(
+        env: &Env,
+        plan: &mut LogicalPlan<'c>,
+    ) -> Result<PhysicalPlan<'c>, LowerError> {
+        optimize(env, plan)?;
+        let planned = plan_nodes(env, plan)?;
+        lower(env, plan, &planned)
+    }
+
     pub fn pipeline(&self) -> &Pipeline<'c> {
         &self.pipeline
     }
