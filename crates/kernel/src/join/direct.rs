@@ -8,26 +8,41 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::filter::{self, Range};
 use crate::global::Global;
-use crate::group_table::{GroupTable, NONE};
+use crate::group_table::GroupTable;
+use crate::rank_bitmap::RankBitmap;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 
-/// The most a key can be above the smallest for `Direct` to find build
-/// rows by their keys, as DuckDB's perfect hash join's: an array of 4 MB.
-const DIRECT_SPAN_MAX: u64 = 1 << 20;
+/// How far apart the keys can be for `Direct` to find build rows by them:
+/// 256 keys a build row, so its bitmap takes at most 48 bytes a row.
+const KEYS_PER_ROW: u64 = 256;
 
 /// Finds the build row of a key by its value, as a perfect hash does: by
 /// how far it is above the smallest key.
 pub(super) struct Direct {
     /// The smallest key, and how far above it the largest is.
-    pub(super) min: i64,
-    pub(super) span: u64,
-    /// The build row of each key, by how far it is above `min`, or `NONE`.
-    /// Empty if each key's build row is that, as a table's ids' are.
-    pub(super) rows: SlowVec<u32>,
+    min: i64,
+    span: u64,
+    /// Which keys have a build row, and which. None if each key's build row
+    /// is its number above `min`, as a table's ids' are.
+    keyed: Option<Keyed>,
+}
+
+/// Which keys have a build row, by their number above the smallest, and
+/// their rows in order of key, so a key's row is at its rank, as in DuckDB's
+/// perfect hash join.
+struct Keyed {
+    keys: RankBitmap,
+    rows: SlowVec<u32>,
 }
 
 impl Direct {
+    /// For `count` build rows whose keys are each their number above the
+    /// first, `min`, as a table's ids are.
+    pub(super) fn sequence(min: i64, count: u32) -> Direct {
+        Direct { min, span: u64::from(count - 1), keyed: None }
+    }
+
     /// For the build rows of `table`'s groups, of one integer key each,
     /// if their keys are close enough.
     pub(super) fn of(
@@ -40,41 +55,26 @@ impl Direct {
         let keys = (0..groups).map(|group| table.key(group, 0));
         let (Some(min), Some(max)) = (keys.clone().min(), keys.max()) else { return Ok(None) };
         let span = max.wrapping_sub(min).cast_unsigned();
-        if max < min || span >= DIRECT_SPAN_MAX {
+        if max < min || span > (u64::from(groups) * KEYS_PER_ROW).min(u32::MAX.into()) {
             return Ok(None);
         }
-        let above = |group| table.key(group, 0).wrapping_sub(min).cast_unsigned();
+        #[expect(clippy::cast_possible_truncation, reason = "at most `span`, in 32 bits")]
+        let above = |group| table.key(group, 0).wrapping_sub(min).cast_unsigned() as usize;
         // Each build row its key's number above the first: none is a null
         // key's, which has no group.
-        let each = (0..groups).all(|group| u64::from(last_of(table, group)) == above(group));
+        let each = (0..groups).all(|group| last_of(table, group) as usize == above(group));
         if groups == count && each {
-            return Ok(Some(Direct { min, span, rows: SlowVec::fixed(allocator, 0)? }));
+            return Ok(Some(Direct { min, span, keyed: None }));
         }
-        #[expect(clippy::cast_possible_truncation, reason = "below `DIRECT_SPAN_MAX`")]
-        let mut rows =
-            SlowVec::fixed_from(allocator, core::iter::repeat_n(NONE, span as usize + 1))?;
+        #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
+        let keys = RankBitmap::new(allocator, span as usize + 1, (0..groups).map(above))?;
+        let mut rows = SlowVec::fixed_from(allocator, core::iter::repeat_n(0, groups as usize))?;
         for group in 0..groups {
-            #[expect(clippy::cast_possible_truncation, reason = "below `DIRECT_SPAN_MAX`")]
-            let at = above(group) as usize;
-            *at_mut!(rows, at) = last_of(table, group);
+            *at_mut!(rows, keys.rank(above(group)) as usize) = last_of(table, group);
         }
-        Ok(Some(Direct { min, span, rows }))
+        Ok(Some(Direct { min, span, keyed: Some(Keyed { keys, rows }) }))
     }
-}
 
-/// Whether a join's build rows' keys have each been their number above the
-/// first's.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Sequence {
-    /// No build row yet.
-    Empty,
-    /// So far, from this first key.
-    From(i64),
-    /// Not, or not one integer key.
-    Broken,
-}
-
-impl Direct {
     /// Narrows `pairs` to its rows whose key, at `key`, has a build row,
     /// writing each one's to `paired`, of the `count` build rows. Every row
     /// is gathered, so one without a build row takes the first's.
@@ -91,30 +91,43 @@ impl Direct {
         let (min, span) = (self.min, self.span);
         filter::keep_within(&key, Range { lo: min, span }, pairs.selection_mut(), None);
         // A bound of 32 bits, so the loop works in 32 bits.
-        #[expect(clippy::cast_possible_truncation, reason = "below `DIRECT_SPAN_MAX`")]
+        #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
         let keys = span as u32 + 1;
-        let row_of = |value: i64| {
+        let above_of = |value: i64| {
             let above = value.wrapping_sub(min).cast_unsigned();
             #[expect(clippy::cast_possible_truncation, reason = "below `keys`")]
-            let row = if above < u64::from(keys) { above as u32 } else { 0 };
-            row
+            let above = if above < u64::from(keys) { above as u32 } else { 0 };
+            above
         };
         for (paired, &value) in paired.iter_mut().zip(key.int64s()) {
-            *paired = row_of(value);
+            *paired = above_of(value);
         }
-        if self.rows.is_empty() {
-            return Ok(());
+        let Some(Keyed { keys, rows }) = &self.keyed else { return Ok(()) };
+        // Most rows often have no build row, so those go before the rest's
+        // rows are found.
+        pairs.selection_mut().retain(|row| keys.get(*at!(paired, usize::from(row)) as usize));
+        let selection = pairs.selection();
+        for i in 0..selection.len() {
+            let paired = at_mut!(paired, selection.kept().row(i) as usize);
+            *paired = *at!(rows, keys.rank(*paired as usize) as usize);
         }
-        let rows = &self.rows;
-        for paired in paired.iter_mut() {
-            *paired = *at!(rows, *paired as usize);
-        }
-        pairs.selection_mut().retain(|row| *at!(paired, usize::from(row)) != NONE);
         for paired in paired.iter_mut() {
             *paired = (*paired).min(count - 1);
         }
         Ok(())
     }
+}
+
+/// Whether a join's build rows' keys have each been their number above the
+/// first's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sequence {
+    /// No build row yet.
+    Empty,
+    /// So far, from this first key.
+    From(i64),
+    /// Not, or not one integer key.
+    Broken,
 }
 
 /// The first of `key`'s first `count` values if each is one above the one
