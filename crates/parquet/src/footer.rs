@@ -4,9 +4,9 @@
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::DataType;
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};
-use pipit_kernel::small_vec::SmallVec;
 
 use crate::Error;
 use crate::thrift::{Cursor, STRUCT, Value};

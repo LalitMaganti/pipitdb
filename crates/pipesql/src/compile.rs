@@ -4,12 +4,12 @@
 
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::Forms;
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PlanNodeId, ScanColumn, ScanOp,
 };
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};

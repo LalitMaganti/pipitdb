@@ -4,9 +4,8 @@
 //! and rows are copied out once, in that order.
 
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::bitmap::BitSlice;
 use crate::column::{ColumnView, DataType};
+use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
@@ -16,7 +15,6 @@ use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
-use crate::small_vec::SmallVec;
 
 /// A column to sort by, and its direction.
 #[derive(Clone, Copy)]

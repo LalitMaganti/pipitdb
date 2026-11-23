@@ -3,11 +3,11 @@
 
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
 use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Key, Scannable, Summary};
-use pipit_kernel::small_vec::SmallVec;
 
 use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};

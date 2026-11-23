@@ -4,18 +4,15 @@
 
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::bitmap::BitSlice;
-use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
+use crate::containers::{Array, BitSlice, Blocks, SmallVec, address};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::small_vec::SmallVec;
 use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
 /// The most keys a grouping can have: one bit each says which are null.

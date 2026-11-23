@@ -3,14 +3,13 @@
 
 use super::last_of;
 use crate::allocator::AllocError;
-use crate::array::Array;
 use crate::column::{ColumnView, Form, Forms};
+use crate::containers::{Array, RankBitmap};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::filter::{self, Range};
 use crate::group_table::GroupTable;
-use crate::rank_bitmap::RankBitmap;
 use crate::row_batch::RowBatch;
 
 /// How far apart the keys can be for `Direct` to find build rows by them:

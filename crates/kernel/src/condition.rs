@@ -171,9 +171,9 @@ mod tests {
 
     use super::*;
 
+    use crate::containers::SmallVec;
     use crate::env::Env;
     use crate::filter::Comparison;
-    use crate::small_vec::SmallVec;
 
     /// A predicate on one column, to build and to evaluate by hand.
     #[derive(Clone)]

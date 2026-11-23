@@ -3,6 +3,7 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{
     ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, expr_can_be_null,
 };
@@ -12,7 +13,6 @@ use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
-use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::{Compiler, Relation};

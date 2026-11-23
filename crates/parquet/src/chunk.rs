@@ -1,10 +1,10 @@
 //! `ChunkReader`: a column chunk's values, a page at a time, decoded into
 //! columns a batch at a time.
 
-use pipit_kernel::bitmap::BitSlice;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
+use pipit_kernel::containers::BitSlice;
 use pipit_kernel::context::Context;
 use pipit_kernel::env::MemoryKind;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;

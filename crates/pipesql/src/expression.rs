@@ -2,12 +2,12 @@
 //! as Perfetto's `CompileExpr`.
 
 use pipit_kernel::column::DataType;
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{
     EXPR_NODES_MAX, Expr, ExprBuilder, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX,
     check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
-use pipit_kernel::small_vec::SmallVec;
 use pipit_kernel::string_pool::Id;
 
 use crate::ast::{Node, Operator, Tag};

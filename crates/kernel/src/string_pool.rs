@@ -2,13 +2,12 @@
 //! back in O(1), ported from Perfetto's.
 
 use crate::allocator::AllocError;
-use crate::array::Array;
 use crate::buffer::{Buffer, HEADER_BYTES};
+use crate::containers::{Array, SmallVec};
 use crate::env::{Env, MemoryKind};
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::small_vec::SmallVec;
 
 /// How many bits of an id say where in its block its string is.
 const BLOCK_OFFSET_BITS: u32 = 21;

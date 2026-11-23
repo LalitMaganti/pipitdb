@@ -9,6 +9,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::column::{DataType, Forms};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::env::Env;
 use pipit_kernel::lower::lower;
@@ -16,7 +17,6 @@ use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
-use pipit_kernel::small_vec::SmallVec;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::choices::CHOICES;

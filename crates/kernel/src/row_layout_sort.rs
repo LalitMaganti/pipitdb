@@ -8,13 +8,12 @@
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
-use crate::array::Array;
+use crate::containers::{Array, SmallVec};
 use crate::env::Env;
 use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::Slot;
-use crate::small_vec::SmallVec;
 
 /// Up to this many ascending runs, of this many rows on average, are merged
 /// rather than sorted.

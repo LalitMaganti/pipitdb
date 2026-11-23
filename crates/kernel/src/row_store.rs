@@ -2,16 +2,14 @@
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::bitmap::BitSlice;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
+use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::small_vec::SmallVec;
 use core::ops::Range;
 
 /// The bits of a row's place that say which row of its batch it is.

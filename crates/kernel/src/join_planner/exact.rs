@@ -9,9 +9,9 @@ use core::iter::repeat_n;
 use super::estimate::Estimator;
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree};
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
-use crate::small_vec::SmallVec;
 
 /// The most units it plans: a set of them is the bits of a `u64`.
 const UNITS_MAX: usize = 64;

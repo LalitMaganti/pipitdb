@@ -2,9 +2,8 @@
 //! edges.
 
 use crate::allocator::AllocError;
-use crate::bitmap::{BitSlice, Word};
+use crate::containers::{BitSlice, SmallVec, Word};
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// The most relations, edges or equivalence sets a graph holds.
 pub(super) const LIST_MAX: usize = 1 << 24;

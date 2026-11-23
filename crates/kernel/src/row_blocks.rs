@@ -4,10 +4,10 @@
 //! block at a time.
 
 use crate::buffer::Buffer;
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::small_vec::SmallVec;
 
 /// How many bytes a block holds.
 const BLOCK_BYTES: usize = BATCH_ROWS_MAX as usize * 8;

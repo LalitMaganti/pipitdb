@@ -13,9 +13,8 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::containers::{Array, Box, ErasedBox};
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};

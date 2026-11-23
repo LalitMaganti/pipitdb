@@ -6,9 +6,9 @@
 //! Calls block. A store that's remote does its uploads and fetches on its
 //! own threads, behind them.
 
-use crate::bitmap::BitSlice;
 use crate::bytes::ByteRange;
 use crate::column::{ColumnView, DataType, Strings, Validity};
+use crate::containers::BitSlice;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::BATCH_ROWS_MAX;

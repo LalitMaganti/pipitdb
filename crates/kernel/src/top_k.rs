@@ -6,12 +6,12 @@ use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
 use crate::column::DataType;
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
-use crate::small_vec::SmallVec;
 use crate::sorted_rows::{KeyColumn, SortKey, SortedRows, lay_out_keys_from};
 use crate::step::{Breaker, DynOperator};
 

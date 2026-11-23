@@ -5,11 +5,9 @@
 use super::estimate::Estimator;
 use super::graph::{QueryGraph, Sides};
 use super::tree::{JoinNode, JoinTree};
-use crate::array::Array;
-use crate::bitmap::BitSlice;
+use crate::containers::{Array, BitSlice, SmallVec};
 use crate::env::Env;
 use crate::error::Error;
-use crate::small_vec::SmallVec;
 
 /// No node, tree or edge.
 const NONE: u32 = u32::MAX;

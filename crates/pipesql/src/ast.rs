@@ -9,10 +9,9 @@ use crate::settings::build_setting;
 use core::ptr::NonNull;
 
 use pipit_kernel::allocator::AllocError;
-use pipit_kernel::array::Array;
 use pipit_kernel::buffer::Primitive;
+use pipit_kernel::containers::{Array, SmallVec};
 use pipit_kernel::env::Env;
-use pipit_kernel::small_vec::SmallVec;
 
 /// Leaves come first, so `tag < Unary` tells them apart.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

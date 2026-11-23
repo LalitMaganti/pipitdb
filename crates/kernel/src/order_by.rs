@@ -1,10 +1,10 @@
 //! `OrderByOp`: its child's rows sorted by keys, as `ORDER BY` does.
 
+use crate::containers::SmallVec;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
 use crate::plan::{ColumnId, Op, PlanNode, SortKey};
-use crate::small_vec::SmallVec;
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
 /// the first first. It needs its input sorted, which planning does only if

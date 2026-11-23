@@ -2,8 +2,8 @@
 //! arguments, so compile to `CASE`, as SQL's does. An embedder registers
 //! them as the set `CHOICES`.
 
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{ExprBuilder, PRESENT};
-use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::Node;
 use crate::compile::Compiler;

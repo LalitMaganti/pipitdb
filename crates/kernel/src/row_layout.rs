@@ -4,8 +4,8 @@
 //! <https://arrow.apache.org/blog/2022/11/07/multi-column-sorts-in-arrow-rust-part-2/>
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// What a slot holds.
 #[derive(Clone, Copy)]

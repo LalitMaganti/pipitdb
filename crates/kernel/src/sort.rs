@@ -3,11 +3,11 @@
 //! descending.
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::small_vec::SmallVec;
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
 use crate::step::{Breaker, DynOperator};
@@ -62,7 +62,7 @@ impl Breaker for Sort {
 
 #[cfg(test)]
 mod tests {
-    use crate::bitmap::BitSlice;
+    use crate::containers::BitSlice;
     use alloc::vec::Vec;
 
     use super::*;

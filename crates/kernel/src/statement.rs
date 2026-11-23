@@ -2,9 +2,9 @@
 //! the physical plan takes from the logical one.
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::function::DynFunction;
-use crate::small_vec::SmallVec;
 use crate::string_pool::{Id, StringPool};
 
 /// The most functions a statement binds.

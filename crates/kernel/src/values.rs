@@ -2,10 +2,10 @@
 //! known without reading any rows.
 
 use crate::column::{ColumnView, DataType};
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::small_vec::SmallVec;
 use crate::step::Source;
 
 /// Outputs one row: each column's `Int64`.

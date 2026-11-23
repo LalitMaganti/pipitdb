@@ -157,7 +157,7 @@ impl Hybrid {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::bitmap::BitSlice;
+    use pipit_kernel::containers::BitSlice;
     extern crate std;
 
     use super::*;

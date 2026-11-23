@@ -2,8 +2,8 @@
 //! relations in.
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// A node of a join tree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

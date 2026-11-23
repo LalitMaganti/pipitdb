@@ -4,6 +4,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
 use crate::expression::Exprs;
@@ -11,7 +12,6 @@ use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
-use crate::small_vec::SmallVec;
 use crate::sort::sort;
 use crate::statement::Statement;
 use crate::step::{DynSource, Step};

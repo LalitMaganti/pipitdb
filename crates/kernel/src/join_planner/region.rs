@@ -2,6 +2,7 @@
 //! plan, and rebuilding it in the order planned.
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::Estimate;
@@ -9,7 +10,6 @@ use crate::expression::{Expr, Exprs};
 use crate::join::{JoinKind as Kind, JoinOp, equality};
 use crate::plan::{ColumnId, DynOp, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
 use crate::scannable::Key;
-use crate::small_vec::SmallVec;
 
 use super::{
     EquivalenceSet, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph, Relation, RelationSet,
