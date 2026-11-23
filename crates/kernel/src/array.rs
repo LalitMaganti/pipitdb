@@ -2,18 +2,14 @@
 //! size, for data that must be contiguous, such as what a sort splits into
 //! slices. It never grows: data that grows goes in blocks that never move.
 
-use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
+use crate::allocator::{AllocError, Allocator, layout};
+use crate::buffer::Primitive;
 use crate::global::Global;
-
-/// 2 MB: Linux's huge page on x86 and on most ARM systems.
-const HUGE_PAGE_BYTES: usize = 1 << 21;
 
 /// `len` values, zeroed when made.
 pub(crate) struct Array<T: Primitive> {
@@ -22,16 +18,6 @@ pub(crate) struct Array<T: Primitive> {
     /// What the values came from.
     global: NonNull<Global>,
     owns: PhantomData<T>,
-}
-
-/// The layout of `bytes` of data that's read at random. On Linux, from a huge
-/// page up, it's aligned to one, so the system backs it with huge pages and
-/// reading it at random doesn't also miss the TLB. Elsewhere that alignment
-/// would only waste memory, as WebAssembly's, which is all one heap.
-pub(crate) fn layout(bytes: usize) -> Result<Layout, AllocError> {
-    let huge = cfg!(any(target_os = "linux", target_os = "android")) && bytes >= HUGE_PAGE_BYTES;
-    let align = if huge { HUGE_PAGE_BYTES } else { BUFFER_ALIGNMENT_BYTES };
-    Layout::from_size_align(bytes, align).map_err(|_| AllocError)
 }
 
 impl<T: Primitive> Array<T> {
@@ -149,7 +135,5 @@ mod tests {
         array[4] = 9;
         assert_eq!(&*array, &[0, 1, 2, 3, 9]);
         assert!(Array::<u64>::zeroed(global, 0).unwrap().is_empty());
-        let huge = layout(HUGE_PAGE_BYTES).unwrap().align();
-        assert_eq!(huge, if cfg!(target_os = "linux") { HUGE_PAGE_BYTES } else { 64 });
     }
 }

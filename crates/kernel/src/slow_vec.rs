@@ -237,25 +237,10 @@ struct Aligned;
 // alignment.
 const _: () = assert!(align_of::<Aligned>() == BUFFER_ALIGNMENT_BYTES);
 
-/// 16 KB: the largest memory page among the systems we run on (Apple's
-/// are 16 KB, most others' 4 KB), so memory aligned to it starts on a page
-/// everywhere.
-const PAGE_BYTES: usize = 1 << 14;
-
-/// 256 KB: a `SlowVec` this big or bigger asks for page-aligned memory.
-const LARGE_BYTES: usize = 1 << 18;
-
 /// The layout of the memory for `capacity` values of `item` bytes each.
-///
-/// From `LARGE_BYTES` up, it asks for page alignment, as a hint to the
-/// allocator: this is a big block that one owner keeps for a long time,
-/// such as a hash table, so it's best taken from the system as whole pages
-/// and given back to it when freed, rather than kept in a heap.
 #[inline(never)]
 fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
-    let bytes = item.checked_mul(capacity).ok_or(AllocError)?;
-    let align = if bytes >= LARGE_BYTES { PAGE_BYTES } else { BUFFER_ALIGNMENT_BYTES };
-    Layout::from_size_align(bytes, align).map_err(|_| AllocError)
+    crate::allocator::layout(item.checked_mul(capacity).ok_or(AllocError)?)
 }
 
 impl RawVec {
@@ -377,7 +362,7 @@ mod tests {
     use core::ptr::NonNull;
 
     use super::*;
-    use crate::allocator::Heap;
+    use crate::allocator::{Heap, PAGE_BYTES};
 
     /// Allows `left` allocations, counting those still live. A `Global`
     /// over it takes one, for itself, and holds it while it lives.
