@@ -11,7 +11,7 @@ use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
-use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
+use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
@@ -286,7 +286,11 @@ fn join(
     let allocator = compiler.allocator();
     let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
     let columns = [probe_columns, build_columns];
-    let op = DynOp::new(allocator, JoinOp::new(kind, condition, columns))?;
+    let conjuncts = match condition {
+        Some(condition) => conjuncts_of(allocator, &compiler.plan.exprs, condition)?,
+        None => SlowVec::fixed(allocator, 0)?,
+    };
+    let op = DynOp::new(allocator, JoinOp::new(kind, conjuncts, columns))?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())

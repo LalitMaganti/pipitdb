@@ -746,7 +746,9 @@ fn join_op(exprs: &mut Exprs, [utid, dur]: [u32; 2], [id, tid]: [u32; 2]) -> Dyn
     let condition = Some(exprs.add(nodes.nodes()).expect("allocates"));
     let columns =
         |list: [u32; 2]| SlowVec::fixed_from(crate::global(), list.into_iter()).expect("allocates");
-    let op = JoinOp::new(JoinKind::Inner, condition, [columns([utid, dur]), columns([id, tid])]);
+    let columns = [columns([utid, dur]), columns([id, tid])];
+    let conjuncts = SlowVec::fixed_from(crate::global(), condition.into_iter()).expect("allocates");
+    let op = JoinOp::new(JoinKind::Inner, conjuncts, columns);
     DynOp::new(crate::global(), op).expect("allocates")
 }
 

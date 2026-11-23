@@ -14,15 +14,15 @@ use crate::context::Context;
 use crate::error::Error;
 use crate::estimate::Estimate;
 use crate::expression::{
-    Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep, Exprs, check_expr_type,
-    columns_of, conjuncts, constant, mark_expr_columns, type_expr,
+    Compute, ComputeState, Expr, ExprOp, ExprStep, Exprs, check_expr_type, columns_of, constant,
+    mark_expr_columns, type_expr,
 };
 use crate::filter::{self, Comparison, Range, Value};
 use crate::group_table::{GroupTable, NONE};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Given, Op, PlanNode};
+use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
 use crate::global::Global;
@@ -49,12 +49,13 @@ pub enum JoinKind {
 pub struct JoinOp {
     /// Which rows it outputs.
     kind: JoinKind,
-    /// Which pairs of rows are joined, an `Int64` true where it isn't 0 or
-    /// null: every pair if none, a cross join.
-    condition: Option<Expr>,
+    /// Which pairs of rows are joined: those every one of these conditions,
+    /// an `Int64`, is true for, not 0 or null. With none, every pair: a
+    /// cross join.
+    conjuncts: Conjuncts,
     /// Each child's columns, at most a batch's, and a bit for each it
-    /// outputs, which pruning clears: which child a column comes from is
-    /// known by them all.
+    /// outputs, which pruning clears: planning finds which child a column
+    /// comes from by them all.
     columns: [SlowVec<ColumnId>; 2],
     outputs: [u64; 2],
     /// Which child is the build side: the second, unless planning chooses
@@ -64,7 +65,7 @@ pub struct JoinOp {
 
 impl JoinOp {
     /// A join of `kind` on `condition`, outputting `columns` of each child.
-    pub fn new(kind: JoinKind, condition: Option<Expr>, columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
+    pub fn new(kind: JoinKind, conjuncts: Conjuncts, columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
         let all = |columns: &SlowVec<ColumnId>| {
             check!(columns.len() <= COLUMNS);
             #[expect(clippy::cast_possible_truncation, reason = "at most `COLUMNS`")]
@@ -72,7 +73,7 @@ impl JoinOp {
             u64::MAX.checked_shr(64 - len).unwrap_or(0)
         };
         let outputs = [all(at!(columns, 0)), all(at!(columns, 1))];
-        JoinOp { kind, condition, columns, outputs, build: 1 }
+        JoinOp { kind, conjuncts, columns, outputs, build: 1 }
     }
 
     fn probe(&self) -> u32 {
@@ -119,23 +120,16 @@ impl JoinOp {
     /// condition: what decides which side to build.
     fn side_keys(&self, exprs: &Exprs, inputs: &[Estimate]) -> [Key; 2] {
         let mut keys = [Key::None; 2];
-        let Some(condition) = self.condition else { return keys };
-        let nodes = exprs.nodes(condition);
-        conjuncts(nodes, condition.root, &mut |conjunct| {
-            let node = at!(nodes, conjunct as usize);
-            let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column);
-            let (Some(a), Some(b)) = (column(node.a), column(node.b)) else { return };
-            if node.op != ExprOp::Eq {
-                return;
-            }
+        for &conjunct in self.conjuncts.iter() {
+            let Some(columns) = equality(exprs.nodes(conjunct)) else { continue };
             for (side, key) in keys.iter_mut().enumerate() {
-                for column in [a.a, b.a] {
+                for column in columns {
                     if at!(self.columns, side).iter().any(|&c| c == column) {
                         *key = (*key).max(at!(inputs, side).key(column));
                     }
                 }
             }
-        });
+        }
         keys
     }
 
@@ -145,7 +139,7 @@ impl JoinOp {
         &self,
         exprs: &Exprs,
         build: &OutputProperties,
-        tested: bool,
+        tested: &[Expr],
     ) -> ([ColumnId; COLUMNS], usize) {
         let mut held = [0; COLUMNS];
         let mut count = 0;
@@ -161,7 +155,7 @@ impl JoinOp {
         for &column in at!(outputs, ..output_count) {
             add(column);
         }
-        if let Some(condition) = self.condition.filter(|_| tested) {
+        for &condition in tested {
             columns_of(exprs.nodes(condition), condition.root, &mut add);
         }
         (held, count)
@@ -199,7 +193,7 @@ impl<'c> Op<'c> for JoinOp {
 
     /// Its condition's columns, and the build columns, which it copies.
     fn reads(&self, reads: &mut Needed) {
-        if let Some(condition) = self.condition {
+        for &condition in self.conjuncts.iter() {
             mark_expr_columns(condition, reads);
         }
         for (columns, outputs) in self.columns.iter().zip(&self.outputs) {
@@ -214,14 +208,8 @@ impl<'c> Op<'c> for JoinOp {
     /// Sequences of what can be its keys, as a table's ids come: a build
     /// side's it holds no hash table for.
     fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
-        let key = self.condition.is_some_and(|expr| {
-            let nodes = exprs.nodes(expr);
-            let is_column = |i: u32| {
-                nodes.get(i as usize).is_some_and(|n| n.op == ExprOp::Column && n.a == column)
-            };
-            nodes
-                .iter()
-                .any(|node| node.op == ExprOp::Eq && (is_column(node.a) || is_column(node.b)))
+        let key = self.conjuncts.iter().any(|&conjunct| {
+            equality(exprs.nodes(conjunct)).is_some_and(|columns| columns.contains(&column))
         });
         if key { Forms::FLAT | Forms::SEQUENCE } else { Forms::FLAT }
     }
@@ -281,9 +269,9 @@ impl<'c> Op<'c> for JoinOp {
     /// an inner or left join, whose rows come out by build row, in no order.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let (probe, build) = (self.probe(), self.build);
-        let (held, count) = self.held(c.exprs(), c.input(build), true);
+        let (held, count) = self.held(c.exprs(), c.input(build), &self.conjuncts);
         let pairs = self.pairs(c.input(probe), c.input(build), at!(held, ..count))?;
-        if let Some(condition) = self.condition {
+        for &condition in self.conjuncts.iter() {
             let nodes = c.exprs().nodes(condition);
             let data_type = check_expr_type(nodes, &|column| pairs.type_of(column));
             if data_type != Ok(DataType::Int64) {
@@ -314,30 +302,26 @@ impl<'c> Op<'c> for JoinOp {
         let (build, rows) = lowering.lower_side(node, self.build)?;
         lowering.lower_input(node, self.probe())?;
         let probe = lowering.query_rows();
-        let mut condition = None;
-        let mut keys = None;
-        let mut tested = false;
         let exprs = lowering.exprs();
-        if let Some(expr) = self.condition {
-            let nodes = exprs.nodes(expr);
-            keys = Self::keys(probe, rows, nodes);
-            // A condition that's only its keys' equalities needs no test once
-            // they're found equal: each key takes three nodes, and each `AND`
-            // between them one.
-            tested = keys.as_ref().is_none_or(|keys| nodes.len() != keys.count * 4 - 1);
-            if tested {
-                let (held, count) = self.held(exprs, rows, true);
-                let pairs = self.pairs(probe, rows, at!(held, ..count))?;
-                let values = lowering.expr_values();
+        // The conjuncts it hashes by need no test once their keys are found
+        // equal; the rest are computed, a column each, and tested.
+        let mut tested = SlowVec::fixed(allocator, self.conjuncts.len())?;
+        let keys = Self::keys(exprs, probe, rows, &self.conjuncts, &mut tested);
+        let mut condition = None;
+        if !tested.is_empty() {
+            let (held, count) = self.held(exprs, rows, &tested);
+            let pairs = self.pairs(probe, rows, at!(held, ..count))?;
+            let mut programs = SlowVec::fixed(allocator, tested.len())?;
+            for &conjunct in tested.iter() {
+                let (nodes, values) = (exprs.nodes(conjunct), lowering.expr_values());
                 let Ok(program) = type_expr(allocator, &pairs, nodes, values, true) else {
                     failed!()
                 };
-                let mut programs = SlowVec::fixed(allocator, 1)?;
                 programs.push(program)?;
-                condition = Some(Compute { programs });
             }
+            condition = Some(Compute { programs });
         }
-        let (held, count) = self.held(exprs, rows, tested);
+        let (held, count) = self.held(exprs, rows, &tested);
         let held = at!(held, ..count);
         let position = |&column: &ColumnId| {
             let Some(position) = rows.position_of(column) else { failed!() };
@@ -374,59 +358,48 @@ impl<'c> Op<'c> for JoinOp {
 }
 
 impl JoinOp {
-    /// The keys to hash the build side by, if `condition` requires a probe
-    /// column equal to a build column of a type a hash table keys: the
-    /// `=`s it `AND`s at its top. A row with a null key, equal to none, is
-    /// paired with none.
+    /// The keys to hash the build side by, if any of `conjuncts` requires a
+    /// probe column equal to a build column of a type a hash table keys; and
+    /// in `tested`, the rest of them. A row with a null key, equal to none,
+    /// is paired with none.
     fn keys(
+        exprs: &Exprs,
         probe: &OutputProperties,
         build: &OutputProperties,
-        nodes: &[ExprStep],
+        conjuncts: &[Expr],
+        tested: &mut SlowVec<Expr>,
     ) -> Option<Keys> {
         let mut keys =
             Keys { probe: [0; JOIN_KEYS_MAX], build: [0; JOIN_KEYS_MAX], count: 0, strings: 0 };
-        // The nodes still to look at, from the root.
-        let mut pending = [0; EXPR_NODES_MAX];
-        let mut count = 1;
-        *at_mut!(pending, 0) = nodes.len() - 1;
-        while count > 0 && keys.count < JOIN_KEYS_MAX {
-            count -= 1;
-            let node = at!(nodes, *at!(pending, count));
-            // Only `AND` and `=` read two nodes: other nodes' `a` and `b` can be
-            // anything, such as a column's id.
-            let operands = || (at!(nodes, node.a as usize), at!(nodes, node.b as usize));
-            match node.op {
-                ExprOp::And => {
-                    *at_mut!(pending, count) = node.a as usize;
-                    *at_mut!(pending, count + 1) = node.b as usize;
-                    count += 2;
-                }
-                ExprOp::Eq
-                    if operands().0.op == ExprOp::Column && operands().1.op == ExprOp::Column =>
-                {
-                    let (a, b) = operands();
-                    let (p, q) =
-                        if probe.position_of(a.a).is_some() { (a.a, b.a) } else { (b.a, a.a) };
-                    let (Some(at), Some(index)) = (probe.position_of(p), build.position_of(q))
-                    else {
-                        continue;
-                    };
-                    let data_type = probe.type_of(p);
-                    if data_type != build.type_of(q) || data_type == DataType::Float64 {
-                        continue;
-                    }
-                    if data_type == DataType::String {
-                        keys.strings |= 1 << keys.count;
-                    }
-                    *at_mut!(keys.probe, keys.count) = at;
-                    *at_mut!(keys.build, keys.count) = index;
-                    keys.count += 1;
-                }
-                _ => {}
+        for &conjunct in conjuncts {
+            let key = equality(exprs.nodes(conjunct)).and_then(|[a, b]| {
+                let (p, q) = if probe.position_of(a).is_some() { (a, b) } else { (b, a) };
+                let (at, index) = (probe.position_of(p)?, build.position_of(q)?);
+                let data_type = probe.type_of(p);
+                let hashed = data_type == build.type_of(q) && data_type != DataType::Float64;
+                (hashed && keys.count < JOIN_KEYS_MAX).then_some((at, index, data_type))
+            });
+            let Some((at, index, data_type)) = key else {
+                tested.extend_within(core::iter::once(conjunct));
+                continue;
+            };
+            if data_type == DataType::String {
+                keys.strings |= 1 << keys.count;
             }
+            *at_mut!(keys.probe, keys.count) = at;
+            *at_mut!(keys.build, keys.count) = index;
+            keys.count += 1;
         }
         (keys.count > 0).then_some(keys)
     }
+}
+
+/// The columns `nodes`, a conjunct, requires equal, if it's an equality of
+/// two columns.
+fn equality(nodes: &[ExprStep]) -> Option<[ColumnId; 2]> {
+    let root = nodes.last()?;
+    let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column).map(|n| n.a);
+    (root.op == ExprOp::Eq).then_some([column(root.a)?, column(root.b)?])
 }
 
 /// The most keys a join hashes by. Equalities past them are tested, as the
@@ -952,10 +925,12 @@ impl Join<'_> {
             }
         }
         if let (Some(condition), Some(state)) = (&self.condition, &mut held.condition) {
+            let first = pairs.column_count() as usize;
             condition.process(context, state, pairs)?;
             let (columns, selection) = pairs.columns_and_selection();
-            let Some(truth) = columns.last() else { failed!() };
-            filter::compare(truth, Comparison::NotEqual, Value::Int64(0), selection, None);
+            for truth in at!(columns, first..) {
+                filter::compare(truth, Comparison::NotEqual, Value::Int64(0), selection, None);
+            }
         }
         // Only the condition read the columns after the output's.
         while pairs.column_count() > outputs {
@@ -1128,7 +1103,8 @@ mod tests {
             estimate
         };
         let one = |column| SlowVec::fixed_from(Global::current(), [column].into_iter()).unwrap();
-        let mut join = JoinOp::new(kind, condition, [one(0), one(1)]);
+        let conjuncts = SlowVec::fixed_from(Global::current(), condition.into_iter()).unwrap();
+        let mut join = JoinOp::new(kind, conjuncts, [one(0), one(1)]);
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build
     }
@@ -1141,9 +1117,10 @@ mod tests {
         let mut nodes = ExprBuilder::new(Global::current()).unwrap();
         let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
         nodes.node(ExprOp::Eq, a, b).unwrap();
-        let condition = Some(exprs.add(nodes.nodes()).unwrap());
+        let condition = exprs.add(nodes.nodes()).unwrap();
+        let conjuncts = SlowVec::fixed_from(Global::current(), [condition].into_iter()).unwrap();
         let two = |a, b| SlowVec::fixed_from(Global::current(), [a, b].into_iter()).unwrap();
-        let mut join = JoinOp::new(JoinKind::Inner, condition, [two(0, 2), two(1, 3)]);
+        let mut join = JoinOp::new(JoinKind::Inner, conjuncts, [two(0, 2), two(1, 3)]);
         let mut needed = Needed::none(Global::current(), 4, &exprs).unwrap();
         needed.need(2);
         needed.need(3);
