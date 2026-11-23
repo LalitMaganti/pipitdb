@@ -10,7 +10,7 @@ use crate::buffer::Buffer;
 use crate::containers::SmallVec;
 use crate::env::{Env, MemoryKind};
 use crate::function::DynFunction;
-use crate::pipeline::SinkPipeline;
+use crate::pipeline::{SinkPipeline, Sinks};
 use crate::plan::PLAN_NODES_MAX;
 use crate::selection::Selection;
 use crate::statement::Statement;
@@ -38,8 +38,8 @@ pub struct Context<'a> {
     /// published one, so its scan can skip rows that sort after it. Made
     /// when first reserved: most runs publish none.
     cutoffs: Option<SmallVec<Option<i64>>>,
-    /// The plan's pipelines that end in sinks, by id.
-    sinks: &'a [SinkPipeline<'a>],
+    /// The plan's pipelines that end in sinks, if it has any.
+    sinks: Option<&'a Sinks<'a>>,
     /// By sink id, the sink's state once the run has built it. Made when
     /// first built: most runs build none.
     built: Option<SmallVec<Option<OwnedState>>>,
@@ -55,7 +55,7 @@ impl<'a> Context<'a> {
             literals: statement.and_then(Statement::literals),
             functions: statement.map_or(&[], Statement::functions),
             cutoffs: None,
-            sinks: &[],
+            sinks: None,
             built: None,
         }
     }
@@ -64,14 +64,20 @@ impl<'a> Context<'a> {
     pub(crate) fn with_sinks(
         env: &'a Env,
         statement: Option<&'a Statement>,
-        sinks: &'a [SinkPipeline<'a>],
+        sinks: &'a Sinks<'a>,
     ) -> Context<'a> {
-        Context { sinks, ..Context::new(env, statement) }
+        Context { sinks: Some(sinks), ..Context::new(env, statement) }
     }
 
     /// The pipeline that ends in sink `id`.
     pub(crate) fn sink_pipeline(&self, id: u32) -> &'a SinkPipeline<'a> {
-        at!(self.sinks, id as usize)
+        let Some(sinks) = self.sinks else { failed!() };
+        sinks.get(id)
+    }
+
+    /// The number of the plan's list of sinks, or 0 if it has none.
+    pub(crate) fn sinks_list(&self) -> u32 {
+        self.sinks.map_or(0, Sinks::list)
     }
 
     /// Sink `id`'s state, if the run has built it.

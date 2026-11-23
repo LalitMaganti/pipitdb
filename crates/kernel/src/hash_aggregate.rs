@@ -7,27 +7,22 @@ use crate::aggregate_function::{
     AggregateInput, AggregateInputLoader, GroupStates, SeenBytes, StringExtreme,
     finalize_to_buffer, make_aggregate_function,
 };
-use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms};
 use crate::containers::SmallVec;
 use crate::context::Context;
-use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::group_table::{GroupTable, KEYS_MAX};
 use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::step::{Breaker, DynOperator};
+use crate::step::Breaker;
 use crate::string_pool::CACHED_SLOTS;
 
 /// The breaker that aggregates by `spec`.
-pub fn hash_aggregate<'a>(
-    env: &Env,
-    spec: HashAggregateSpec,
-) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(env, HashAggregate::new(spec))
+pub fn hash_aggregate(spec: HashAggregateSpec) -> HashAggregate {
+    HashAggregate::new(spec)
 }
 
 /// Groups rows by their keys and outputs a row for each group: its keys,
@@ -36,7 +31,7 @@ pub fn hash_aggregate<'a>(
 /// Input rows are not stored. Each row is added to its group's state for
 /// each aggregate, which is stored next to the group's keys, so memory grows
 /// with the groups, not the rows.
-struct HashAggregate {
+pub struct HashAggregate {
     /// Its keys and aggregates.
     spec: HashAggregateSpec,
     /// How many words of state a group keeps: each aggregate's, one after
@@ -44,7 +39,7 @@ struct HashAggregate {
     state_words: usize,
 }
 
-struct State {
+pub struct State {
     /// The groups, by their keys.
     groups: GroupTable,
     /// With no keys, the state of the single group.
@@ -376,6 +371,7 @@ impl Breaker for HashAggregate {
 #[cfg(test)]
 mod tests {
     use crate::containers::BitSlice;
+    use crate::pipeline::after_breaker;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -386,7 +382,7 @@ mod tests {
     use crate::column::DataType;
     use crate::env::Env;
     use crate::pipeline::Pipeline;
-    use crate::step::{DynSource, Source, Step};
+    use crate::step::{DynSource, Source};
 
     /// An `Int64` column of `values`, null where `None`.
     fn column(values: &[Option<i64>]) -> ColumnView {
@@ -520,11 +516,10 @@ mod tests {
         spec: HashAggregateSpec,
     ) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let env = Env::current();
-        let mut steps = SmallVec::new(env, 1).unwrap();
-        assert!(steps.push(Step::Operator(hash_aggregate(env, spec).unwrap())).is_ok());
-        let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
-        let query = Env::current();
-        let mut execution = pipeline.start(query, None)?;
+        let input =
+            Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
+        let (sinks, pipeline) = after_breaker(input, hash_aggregate(spec), []);
+        let mut execution = pipeline.start_with_sinks(env, None, &sinks)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {
