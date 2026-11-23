@@ -23,11 +23,13 @@ fn query(source: String) -> u32 {
 
 library_benchmark_group!(name = parser_group, benchmarks = [query]);
 
-/// Finds one row of a small table by its id, from the query's text: what a
-/// query costs before any rows are read.
+/// Finds one row of a small table by its id, from the query's text.
 const POINT: &str = "FROM t |> WHERE id = 42 |> SELECT a, b";
 
+// `empty` reads every column of a table of no rows: what any query costs
+// before it reads a row.
 #[library_benchmark]
+#[bench::empty(pipitdb_bench::small_table(0), "FROM t")]
 #[bench::point(pipitdb_bench::small_table(100), POINT)]
 fn small(catalog: &'static dyn Catalog, query: &str) -> u64 {
     black_box(pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)))
