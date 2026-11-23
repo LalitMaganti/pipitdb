@@ -23,7 +23,9 @@ pub const ITEMS_MAX: usize = 8;
 /// Where a stage can go: first in a query, or after `|>`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Point {
+    /// First in a query, as `FROM`.
     Source,
+    /// After `|>`.
     Stage,
 }
 
@@ -31,6 +33,7 @@ pub enum Point {
 /// node, in order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Item {
+    /// Exactly one.
     One(Shared),
     /// One or more, separated by commas, under a `List` node.
     List(Shared),
@@ -50,7 +53,9 @@ pub enum Item {
 /// The pieces of grammar stages are built from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shared {
+    /// A name, as a `Name`.
     Name,
+    /// An expression.
     Expr,
     /// An expression, then maybe `AS` and its name: a `Named` if there is
     /// one.
@@ -65,8 +70,11 @@ pub enum Shared {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rule {
+    /// The word a stage starts with, matched ignoring case.
     pub keyword: &'static str,
+    /// Where the stage can go.
     pub point: Point,
+    /// What comes after the keyword.
     pub items: &'static [Item],
     /// Adds the stage, whose node is passed, to the plan being compiled.
     pub compile: fn(&mut Compiler<'_, '_>, Node) -> Result<(), Error>,
@@ -87,8 +95,11 @@ pub struct FunctionRule {
 /// Rules, found by keyword, and functions, found by name. A rule's id is
 /// `set << 8 | index in set`.
 pub struct Registry {
+    /// The rules, in sets.
     sets: &'static [&'static [Rule]],
+    /// Each rule's id, by its keyword.
     keywords: KeywordTable<STAGE_SLOTS>,
+    /// The functions, in sets.
     functions: &'static [&'static [FunctionRule]],
     /// Compiles a call of a function, which only a registry with functions
     /// can: so one without doesn't pay for the code.

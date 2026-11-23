@@ -42,10 +42,15 @@ pub fn parse_expression(env: &Env, source: &[u8]) -> Result<Ast, Error> {
 pub(crate) struct Parser<'a> {
     /// What lists too long for the stack are gathered with.
     env: &'a Env,
+    /// The query's text.
     source: &'a [u8],
+    /// The tokens of `source`.
     lexer: Lexer<'a>,
+    /// The token the parser is on.
     current: Token,
+    /// The tree's nodes so far.
     nodes: Nodes,
+    /// The first error found, once there is one.
     failed: Option<Error>,
 }
 
@@ -208,10 +213,15 @@ enum Keyword {
 
 #[derive(Clone, Copy)]
 enum Pending {
+    /// A unary operator, waiting for its operand.
     Unary(Operator),
+    /// A binary operator and its left operand, waiting for its right.
     Binary(Operator, Node),
+    /// A `(`, waiting for the expression in it and its `)`.
     Parenthesis,
+    /// A call's name, waiting for its first argument.
     Call(Node),
+    /// An argument of a call, waiting for the next, or the `)`.
     Argument(Node),
     /// A `CASE`, its parts on the frames above it.
     Case,

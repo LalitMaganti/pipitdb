@@ -34,8 +34,11 @@ pub const PART_BYTES_MIN: u64 = 5 << 20;
 const SIGNED_FOR: Duration = Duration::from_mins(15);
 
 pub struct S3Spill {
+    /// What requests are sent with.
     agent: ureq::Agent,
+    /// Where the logs are.
     bucket: Bucket,
+    /// What requests are signed with.
     credentials: Credentials,
     /// What each log's key starts with: the prefix given, and a UUID made
     /// for this store, so no other store, on any machine, uses its keys.
@@ -44,18 +47,24 @@ pub struct S3Spill {
     next: AtomicU64,
     /// Where parts are staged before they're uploaded.
     staging: FileSpill,
+    /// How many bytes a part has at least, but the last of a log.
     part_bytes: u64,
+    /// Each log, by its number; `None` once deleted.
     logs: Mutex<Vec<Option<Log>>>,
 }
 
 struct Log {
+    /// Its object's key.
     key: String,
+    /// Its multipart upload.
     upload_id: String,
     /// Each part uploaded's `ETag`, in order.
     etags: Vec<String>,
     /// The part being staged, and its length so far.
     staged: Option<(LogId, u64)>,
+    /// How many bytes were appended.
     len: u64,
+    /// Whether it's sealed, and so can be read but not appended to.
     sealed: bool,
     /// What reads fetched of the sealed log, kept until it's deleted.
     fetched: Vec<Fetched>,
