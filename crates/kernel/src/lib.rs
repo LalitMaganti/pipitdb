@@ -32,6 +32,7 @@ mod group_table;
 mod hash_aggregate;
 pub mod inline_vec;
 pub mod join;
+pub mod join_planner;
 pub mod like;
 pub mod limit;
 mod listed;
