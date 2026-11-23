@@ -355,3 +355,31 @@ fn finds_no_build_row_for_a_null_among_ids() {
         );
     }
 }
+
+#[test]
+fn builds_the_smaller_side_of_a_left_join() {
+    // The first side is much smaller, so is built, and its rows nothing
+    // matched come out at the end. Its keys are its rows' numbers but for a
+    // null, which no probe row's number may find.
+    let small: Vec<Option<i64>> = (0..40).map(|i| (i != 5).then_some(i)).collect();
+    let large: Vec<Option<i64>> = (0..2100).map(|i| (i % 7 != 3).then_some(i % 45)).collect();
+    let (left, right) = (table(&small), table(&large));
+    for kind in KINDS {
+        for on in [On::Equal, On::Less, On::EqualAndLess, On::Always] {
+            for above in [Above::Nothing, Above::IsNull, Above::Positive] {
+                assert_eq!(
+                    join(&left, &right, kind, on, above).0,
+                    expected(&small, &large, kind, on, above),
+                    "{kind:?} {on:?}"
+                );
+            }
+        }
+    }
+    // Nothing on the second side, or on the first.
+    for (first, second) in [(&small[..], &[][..]), (&[][..], &large[..])] {
+        assert_eq!(
+            join(&table(first), &table(second), JoinKind::Left, On::Equal, Above::Nothing).0,
+            expected(first, second, JoinKind::Left, On::Equal, Above::Nothing)
+        );
+    }
+}

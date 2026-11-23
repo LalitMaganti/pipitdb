@@ -158,6 +158,18 @@ impl OutputProperties {
         at!(self.columns, ..self.column_count as usize)
     }
 
+    /// Makes every column one that can hold a null.
+    pub(crate) fn make_nullable(&mut self) {
+        for column in at_mut!(self.columns, ..self.column_count as usize) {
+            column.nullable = true;
+        }
+    }
+
+    /// The types of a batch's columns, in order.
+    pub(crate) fn types(&self) -> impl Iterator<Item = DataType> + '_ {
+        self.columns().iter().map(|column| column.data_type)
+    }
+
     /// How many columns a batch has.
     pub fn column_count(&self) -> u32 {
         self.column_count
