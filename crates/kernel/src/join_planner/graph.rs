@@ -1,0 +1,199 @@
+//! The query graph: a join region's relations, and the joins between them as
+//! edges.
+
+use crate::allocator::AllocError;
+use crate::global::Global;
+use crate::slow_vec::SlowVec;
+
+/// The most relations, edges or equivalence sets a graph holds.
+const LIST_MAX: usize = 1 << 24;
+
+/// The most words a `RelationSet` grows to, enough for `LIST_MAX` relations.
+const WORDS_MAX: usize = LIST_MAX / 64;
+
+/// A set of relations, by index. The first 64 relations take one word,
+/// and the set grows a word at a time past them.
+pub struct RelationSet {
+    /// Relations 0 to 63.
+    first: u64,
+    /// Relations 64 and up, 64 to a word. Words past the end are empty.
+    rest: SlowVec<u64>,
+}
+
+impl RelationSet {
+    /// An empty set. It allocates nothing until it holds a relation past 63.
+    pub fn new(global: &Global) -> Result<RelationSet, AllocError> {
+        Ok(RelationSet { first: 0, rest: SlowVec::new(global, WORDS_MAX)? })
+    }
+
+    /// Word `i`, which holds relations `64 * i` to `64 * i + 63`.
+    #[inline]
+    pub fn word(&self, i: usize) -> u64 {
+        match i {
+            0 => self.first,
+            _ => self.rest.get(i - 1).copied().unwrap_or(0),
+        }
+    }
+
+    /// How many words it has. All words past these are empty.
+    #[inline]
+    pub fn words(&self) -> usize {
+        1 + self.rest.len()
+    }
+
+    pub fn insert(&mut self, relation: u32) -> Result<(), AllocError> {
+        let word = relation as usize / 64;
+        if word >= self.words() {
+            self.rest.extend_zeroed(word + 1 - self.words())?;
+        }
+        *self.word_mut(word) |= 1 << (relation % 64);
+        Ok(())
+    }
+
+    pub fn contains(&self, relation: u32) -> bool {
+        self.word(relation as usize / 64) & (1 << (relation % 64)) != 0
+    }
+
+    /// Adds every relation of `other`.
+    pub fn union_with(&mut self, other: &RelationSet) -> Result<(), AllocError> {
+        if other.words() > self.words() {
+            self.rest.extend_zeroed(other.words() - self.words())?;
+        }
+        for i in 0..other.words() {
+            *self.word_mut(i) |= other.word(i);
+        }
+        Ok(())
+    }
+
+    /// How many relations it has.
+    pub fn count(&self) -> u32 {
+        (0..self.words()).map(|i| self.word(i).count_ones()).sum()
+    }
+
+    pub fn is_subset(&self, of: &RelationSet) -> bool {
+        (0..self.words()).all(|i| self.word(i) & !of.word(i) == 0)
+    }
+
+    /// Whether every relation of `self` is in `a` or `b`.
+    pub fn is_subset_of_union(&self, a: &RelationSet, b: &RelationSet) -> bool {
+        (0..self.words()).all(|i| self.word(i) & !(a.word(i) | b.word(i)) == 0)
+    }
+
+    pub fn overlaps(&self, other: &RelationSet) -> bool {
+        (0..self.words().min(other.words())).any(|i| self.word(i) & other.word(i) != 0)
+    }
+
+    fn word_mut(&mut self, i: usize) -> &mut u64 {
+        match i {
+            0 => &mut self.first,
+            _ => at_mut!(self.rest, i - 1),
+        }
+    }
+}
+
+/// A relation to join: a table, or a subquery the join region can't look
+/// into.
+#[derive(Clone, Copy, Debug)]
+pub struct Relation {
+    /// Its estimated rows after its filters.
+    pub rows: u64,
+    /// Its rows before its filters.
+    pub unfiltered_rows: u64,
+    /// The most rows it can have, guaranteed, unlike `rows`. A relation of
+    /// at most one row may be cross-joined to anything.
+    pub max_rows: u64,
+}
+
+/// Columns that are joined by equality, so that they all hold the same
+/// values.
+#[derive(Clone, Copy, Debug)]
+pub struct EquivalenceSet {
+    /// How many distinct values they can take. For a unique key, it's that
+    /// relation's unfiltered rows. Without distinct counts, it's the fewest
+    /// rows of their relations.
+    pub domain: u64,
+}
+
+/// Which rows a join returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    /// The rows that match.
+    Inner,
+    /// The rows that match, and the left side's rows that don't, with nulls.
+    Left,
+    /// The left side's rows that match.
+    Semi,
+    /// The left side's rows that don't match.
+    Anti,
+}
+
+/// A join between two sets of relations. It's an edge of the graph, or a
+/// hyperedge if either side has more than one relation.
+pub struct JoinEdge {
+    /// The relations that must be on one side of a join for this edge to
+    /// apply there. They are the relations its condition reads and, for a
+    /// non-inner join, the left of its total eligibility set: the side whose
+    /// rows it keeps.
+    pub left: RelationSet,
+    /// The same for the other side.
+    pub right: RelationSet,
+    /// Which rows the join returns.
+    pub kind: JoinKind,
+    /// The equivalence set it joins on, by index.
+    pub equivalence: u32,
+}
+
+/// Whether the join operator can run a join of two sets of relations, each
+/// given as the words of a `RelationSet`. The optimizer passes it in, for
+/// joins the operator can't run yet.
+pub type Executable = fn(&QueryGraph, &[u64], &[u64]) -> bool;
+
+/// The relations of a join region and the joins between them.
+pub struct QueryGraph {
+    /// The relations, by index.
+    pub relations: SlowVec<Relation>,
+    /// The joins between them.
+    pub edges: SlowVec<JoinEdge>,
+    /// The equivalence sets the joins join on, by index.
+    pub equivalences: SlowVec<EquivalenceSet>,
+    /// Which joins can run, if not all of them.
+    pub executable: Option<Executable>,
+}
+
+impl QueryGraph {
+    /// An empty graph whose joins can all run.
+    pub fn new(global: &Global) -> Result<QueryGraph, AllocError> {
+        Ok(QueryGraph {
+            relations: SlowVec::new(global, LIST_MAX)?,
+            edges: SlowVec::new(global, LIST_MAX)?,
+            equivalences: SlowVec::new(global, LIST_MAX)?,
+            executable: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::global::Global;
+
+    fn set(relations: &[u32]) -> RelationSet {
+        let mut set = RelationSet::new(Global::current()).unwrap();
+        for &relation in relations {
+            set.insert(relation).unwrap();
+        }
+        set
+    }
+
+    #[test]
+    fn sets_grow_past_a_word() {
+        let mut a = set(&[1, 70, 200]);
+        assert_eq!((a.words(), a.word(1), a.word(2)), (4, 1 << 6, 0));
+        assert!(set(&[70]).is_subset(&a) && !a.is_subset(&set(&[1, 70])));
+        assert!(set(&[3]).is_subset_of_union(&a, &set(&[3])));
+        assert!(a.overlaps(&set(&[200])) && !a.overlaps(&set(&[2])));
+        a.union_with(&set(&[500])).unwrap();
+        assert_eq!(a.count(), 4);
+        assert!(a.contains(500) && !a.contains(499));
+    }
+}
