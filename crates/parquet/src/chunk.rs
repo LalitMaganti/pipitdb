@@ -92,7 +92,6 @@ struct Body {
 
 /// A chunk's dictionary: words for fixed-width types, or views into its page
 /// for strings.
-#[derive(Clone)]
 struct Dictionary {
     /// The values, as a column, with their bounds if they're integers.
     values: ColumnView,
@@ -220,42 +219,12 @@ impl<'s> ChunkReader<'s> {
             self.position.deferred += rows;
             return Ok(());
         }
-        let (page, _) = self.body(context)?;
-        self.advance(context, page.as_slice::<u8>(), rows)
-    }
-
-    /// Moves past the next `rows` rows of `page`, the body being read,
-    /// without decoding their values.
-    fn advance(&mut self, context: &Context, page: &[u8], rows: usize) -> Result<(), Error> {
-        let mut valid = rows;
-        if self.column.optional {
-            let levels = self.levels(page)?;
-            let mut scratch = self.take_scratch(context)?;
-            let decoded = scratch.as_mut_slice::<u32>();
-            valid = 0;
-            for start in (0..rows).step_by(decoded.len()) {
-                let chunk = at_mut!(decoded, ..(rows - start).min(BATCH_ROWS_MAX as usize));
-                self.position.level.take(levels, chunk).ok_or(Error::Corrupt)?;
-                valid += chunk.iter().filter(|&&level| level == 1).count();
-            }
-            self.scratch = Some(scratch);
-        }
-        let at = self.position.value;
-        match (self.position.indexed, self.data_type) {
-            (true, _) => {
-                let indices = page.get(at..).ok_or(Error::Corrupt)?;
-                self.position.index.skip(indices, valid).ok_or(Error::Corrupt)?;
-            }
-            (false, DataType::String) => {
-                let mut at = at;
-                for _ in 0..valid {
-                    at += 4 + plain::length(page, at)?;
-                }
-                self.position.value = at;
-            }
-            (false, _) => self.position.value += valid * plain::width(self.column.physical),
-        }
-        Ok(())
+        self.body(context)?;
+        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
+        let page = body.as_slice::<u8>();
+        let (column, data_type) = (self.column, self.data_type);
+        let position = &mut self.position;
+        position.advance(context, column, data_type, &mut self.scratch, page, rows)
     }
 
     /// The next `rows` rows, as `read` gives them, but with values only for
@@ -275,13 +244,16 @@ impl<'s> ChunkReader<'s> {
         if self.data_type == DataType::String {
             return self.read(context, rows, forms);
         }
-        let (body, dictionary) = self.body(context)?;
+        self.body(context)?;
+        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
         let page = body.as_slice::<u8>();
-        let mut scratch = self.take_scratch(context)?;
-        let (validity, valid) = self.validity(context, page, rows, scratch.as_mut_slice())?;
-        self.scratch = Some(scratch);
+        let position = &mut self.position;
+        let decoded = scratch(context, &mut self.scratch)?.as_mut_slice();
+        let (validity, valid) =
+            position.validity(context, self.column.optional, page, rows, decoded)?;
         let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
-        let bounds = match &dictionary {
+        let dictionary = if position.indexed { self.dictionary.as_ref() } else { None };
+        let bounds = match dictionary {
             Some(dictionary) => dictionary.bounds,
             None => self.bounds,
         };
@@ -302,11 +274,11 @@ impl<'s> ChunkReader<'s> {
             }
         };
         let mut passed = 0;
-        if let Some(dictionary) = &dictionary {
+        if let Some(dictionary) = dictionary {
             let Some(words) = &dictionary.words else { return Err(Error::Corrupt) };
             let entries = at!(words.as_slice::<i64>(), ..dictionary.count);
-            let indices = page.get(self.position.value..).ok_or(Error::Corrupt)?;
-            let index = &mut self.position.index;
+            let indices = page.get(position.value..).ok_or(Error::Corrupt)?;
+            let index = &mut position.index;
             let mut one = [0];
             for &kept in kept {
                 let kept = usize::from(kept);
@@ -318,15 +290,15 @@ impl<'s> ChunkReader<'s> {
             }
             index.skip(indices, valid - passed).ok_or(Error::Corrupt)?;
         } else {
-            let (width, at) = (plain::width(self.column.physical), self.position.value);
+            let (width, at) = (plain::width(self.column.physical), position.value);
             for &kept in kept {
                 let kept = usize::from(kept);
                 let Some(value) = value_of(kept) else { continue };
                 plain::words(self.column, page, at + value * width, at_mut!(values, kept..=kept))?;
             }
-            self.position.value = at + valid * width;
+            position.value = at + valid * width;
         }
-        self.position.left -= rows;
+        position.left -= rows;
         let column = ColumnView::new(context, self.data_type, out, validity)?;
         Ok(bounds::bounded(column, bounds))
     }
@@ -340,199 +312,53 @@ impl<'s> ChunkReader<'s> {
         forms: Forms,
     ) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
-        let (body, dictionary) = self.body(context)?;
+        self.body(context)?;
+        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
         let page = body.as_slice::<u8>();
-        let mut scratch = self.take_scratch(context)?;
-        let decoded = scratch.as_mut_slice::<u32>();
-        let (validity, valid) = self.validity(context, page, rows, decoded)?;
-        if let Some(dictionary) = &dictionary {
-            let mut column =
-                self.indexed(context, page, dictionary, rows, valid, validity, decoded)?;
+        let position = &mut self.position;
+        let decoded = scratch(context, &mut self.scratch)?.as_mut_slice();
+        let (validity, valid) =
+            position.validity(context, self.column.optional, page, rows, decoded)?;
+        let data_type = self.data_type;
+        let column = if position.indexed {
+            let Some(dictionary) = &self.dictionary else { pipit_kernel::failed!() };
+            let mut column = position
+                .indexed(context, data_type, page, dictionary, rows, valid, validity, decoded)?;
             // Strings' dictionaries are kept, and a run of one entry is a
             // constant, unless `forms` rules them out.
             column.make_in(context, forms)?;
-            self.scratch = Some(scratch);
-            self.position.left -= rows;
-            return Ok(column);
-        }
-        let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
-        let column = match self.data_type {
-            DataType::String => {
-                // Views into the page, so no string is copied: the column
-                // holds the page.
-                let mut views = context.values_buffer(rows * 8)?;
-                let at = self.position.value;
-                self.position.value = plain::views(page, at, views.as_mut_slice::<u32>(), valid)?;
-                if let Some(bits) = bits {
-                    bits::spread(views.as_mut_slice::<i64>(), valid, bits, 0);
+            column
+        } else {
+            let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
+            match data_type {
+                DataType::String => {
+                    // Views into the page, so no string is copied: the column
+                    // holds the page.
+                    let mut views = context.values_buffer(rows * 8)?;
+                    let at = position.value;
+                    position.value = plain::views(page, at, views.as_mut_slice::<u32>(), valid)?;
+                    if let Some(bits) = bits {
+                        bits::spread(views.as_mut_slice::<i64>(), valid, bits, 0);
+                    }
+                    ColumnView::strings(context, views, body.clone(), validity)?
                 }
-                ColumnView::strings(context, views, body.clone(), validity)?
-            }
-            DataType::Int64 | DataType::Float64 => {
-                let mut out = context.values_buffer(rows * 8)?;
-                let words = out.as_mut_slice::<i64>();
-                let (column, at) = (self.column, self.position.value);
-                self.position.value = plain::words(column, page, at, at_mut!(words, ..valid))?;
-                if let Some(bits) = bits {
-                    bits::spread(words, valid, bits, 0);
+                DataType::Int64 | DataType::Float64 => {
+                    let mut out = context.values_buffer(rows * 8)?;
+                    let words = out.as_mut_slice::<i64>();
+                    let (column, at) = (self.column, position.value);
+                    position.value = plain::words(column, page, at, at_mut!(words, ..valid))?;
+                    if let Some(bits) = bits {
+                        bits::spread(words, valid, bits, 0);
+                    }
+                    bounds::bounded(
+                        ColumnView::new(context, data_type, out, validity)?,
+                        self.bounds,
+                    )
                 }
-                bounds::bounded(
-                    ColumnView::new(context, self.data_type, out, validity)?,
-                    self.bounds,
-                )
             }
         };
-        self.scratch = Some(scratch);
-        self.position.left -= rows;
+        position.left -= rows;
         Ok(column)
-    }
-
-    /// The scratch memory, to give back once used.
-    fn take_scratch(&mut self, context: &Context) -> Result<Buffer, Error> {
-        match self.scratch.take() {
-            Some(scratch) => Ok(scratch),
-            None => Ok(Buffer::allocate(context.allocator(), SCRATCH_BYTES)?),
-        }
-    }
-
-    /// The page's definition levels.
-    fn levels<'p>(&self, page: &'p [u8]) -> Result<&'p [u8], Error> {
-        page.get(self.position.levels.0..self.position.levels.1).ok_or(Error::Corrupt)
-    }
-
-    /// The next `rows` rows of a page of indices into `dictionary`, `valid`
-    /// of them not null as `validity` says: a constant, if every row has one
-    /// value; else, for strings, a dictionary column, which copies none; else
-    /// flat values, looked up once here so operators read them plainly, as
-    /// DuckDB's reader does. Indices are decoded into `decoded`, a run at a
-    /// time.
-    #[expect(clippy::too_many_arguments, reason = "a step of `read`")]
-    fn indexed(
-        &mut self,
-        context: &mut Context,
-        page: &[u8],
-        dictionary: &Dictionary,
-        rows: usize,
-        valid: usize,
-        validity: Option<Buffer>,
-        decoded: &mut [u32],
-    ) -> Result<ColumnView, Error> {
-        let bytes = page.get(self.position.value..).ok_or(Error::Corrupt)?;
-        let rows32 = u32::try_from(rows).map_err(|_| Error::Corrupt)?;
-        let count = dictionary.count;
-        if valid == 0 {
-            let null = dictionary.nullable.slice(dictionary.nullable.row_count() - 1, 1);
-            return Ok(ColumnView::constant(context, &null, rows32)?);
-        }
-        let mut run = self.position.index.next_run(bytes, at_mut!(decoded, ..valid));
-        // One value for every row.
-        if let Some(Run::Repeat(i, n)) = run
-            && n == rows
-            && (i as usize) < count
-        {
-            return Ok(ColumnView::constant(context, &dictionary.values.slice(i, 1), rows32)?);
-        }
-        let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
-        let null = u32::try_from(count).map_err(|_| Error::Unsupported)?;
-        let mut at = 0;
-        if let Some(words) = &dictionary.words {
-            let entries = at!(words.as_slice::<i64>(), ..count);
-            let entry = |i: u32| entries.get(i as usize).copied().ok_or(Error::Corrupt);
-            let mut out = context.values_buffer(rows * 8)?;
-            let values = out.as_mut_slice::<i64>();
-            loop {
-                match run.ok_or(Error::Corrupt)? {
-                    Run::Repeat(i, n) => at_mut!(values, at..at + n).fill(entry(i)?),
-                    Run::Packed(n) => {
-                        let indices = at!(decoded, ..n);
-                        // Checked together, so each lookup needn't be.
-                        if indices.iter().fold(0, |max, &i| max.max(i)) as usize >= count {
-                            return Err(Error::Corrupt);
-                        }
-                        for (value, &i) in at_mut!(values, at..at + n).iter_mut().zip(indices) {
-                            // SAFETY: every index is below `count`, the number
-                            // of `entries`, checked just above.
-                            *value = unsafe { *entries.get_unchecked(i as usize) };
-                        }
-                    }
-                }
-                at += run.map_or(0, Run::len);
-                if at == valid {
-                    break;
-                }
-                run = self.position.index.next_run(bytes, at_mut!(decoded, ..valid - at));
-            }
-            if let Some(bits) = bits {
-                bits::spread(values, valid, bits, 0);
-            }
-            let column = ColumnView::new(context, self.data_type, out, validity)?;
-            return Ok(bounds::bounded(column, dictionary.bounds));
-        }
-        let mut indices = context.indices_buffer(rows * 4)?;
-        let out = indices.as_mut_slice::<u32>();
-        loop {
-            match run.ok_or(Error::Corrupt)? {
-                Run::Repeat(i, n) => at_mut!(out, at..at + n).fill(i),
-                Run::Packed(n) => at_mut!(out, at..at + n).copy_from_slice(at!(decoded, ..n)),
-            }
-            at += run.map_or(0, Run::len);
-            if at == valid {
-                break;
-            }
-            run = self.position.index.next_run(bytes, at_mut!(decoded, ..valid - at));
-        }
-        if at!(out, ..valid).iter().any(|&i| i >= null) {
-            return Err(Error::Corrupt);
-        }
-        Ok(match bits {
-            None => ColumnView::dictionary(context, &dictionary.values, indices)?,
-            Some(bits) => {
-                bits::spread(out, valid, bits, null);
-                ColumnView::dictionary(context, &dictionary.nullable, indices)?
-            }
-        })
-    }
-
-    /// The next `rows` rows' validity, from their definition levels, or
-    /// `None` if they can't be null or none are; and how many aren't null.
-    /// Levels are decoded into `decoded`.
-    fn validity(
-        &mut self,
-        context: &mut Context,
-        page: &[u8],
-        rows: usize,
-        decoded: &mut [u32],
-    ) -> Result<(Option<Buffer>, usize), Error> {
-        if !self.column.optional {
-            return Ok((None, rows));
-        }
-        let levels = self.levels(page)?;
-        let mut bits = [0_u8; BATCH_ROWS_MAX as usize / 8];
-        let (mut row, mut valid) = (0, 0);
-        while row < rows {
-            let left = at_mut!(decoded, ..rows - row);
-            match self.position.level.next_run(levels, left).ok_or(Error::Corrupt)? {
-                Run::Repeat(level, n) => {
-                    if level == 1 {
-                        bits::set(&mut bits, row, n);
-                        valid += n;
-                    }
-                    row += n;
-                }
-                Run::Packed(n) => {
-                    for &level in at!(decoded, ..n) {
-                        *at_mut!(bits, row / 8) |= u8::from(level == 1) << (row % 8);
-                        (row, valid) = (row + 1, valid + usize::from(level == 1));
-                    }
-                }
-            }
-        }
-        if valid == rows {
-            return Ok((None, rows));
-        }
-        let mut validity = context.small_buffer(rows.div_ceil(8))?;
-        validity.as_mut_slice::<u8>().copy_from_slice(at!(bits, ..rows.div_ceil(8)));
-        Ok((Some(validity), valid))
     }
 
     /// Moves to the next page, reading only its header.
@@ -581,51 +407,47 @@ impl<'s> ChunkReader<'s> {
         Ok(())
     }
 
-    /// The body of the page being read, read if it isn't already, and its
-    /// levels and values found if they haven't been; and the dictionary, if
+    /// Reads the body of the page being read, if it isn't already, and finds
+    /// its levels and values, if they haven't been; and the dictionary, if
     /// its values are indices into it.
-    fn body(&mut self, context: &mut Context) -> Result<(Buffer, Option<Dictionary>), Error> {
-        let dictionary = if self.position.indexed { Some(self.dictionary(context)?) } else { None };
+    fn body(&mut self, context: &mut Context) -> Result<(), Error> {
+        if self.position.indexed && self.dictionary.is_none() {
+            self.dictionary(context)?;
+        }
         let body = self.position.body;
-        let page = match &self.page {
-            Some((at, page)) if *at == body.at => page.clone(),
-            _ => {
-                let page = self.read_body(context, body)?;
-                self.page = Some((body.at, page.clone()));
-                page
-            }
-        };
+        if !matches!(&self.page, Some((at, _)) if *at == body.at) {
+            self.page = Some((body.at, self.read_body(context, body)?));
+        }
         if !self.position.started {
+            let Some((_, page)) = &self.page else { pipit_kernel::failed!() };
             let bytes = page.as_slice::<u8>();
+            let position = &mut self.position;
             // An optional column's definition levels come first, after their
             // length.
             if self.column.optional {
                 let len = plain::length(bytes, 0)?;
-                (self.position.levels, self.position.value) = ((4, 4 + len), 4 + len);
+                (position.levels, position.value) = ((4, 4 + len), 4 + len);
             }
             // Indices come after their width in bits.
-            if self.position.indexed {
-                let width = u32::from(*bytes.get(self.position.value).ok_or(Error::Corrupt)?);
+            if position.indexed {
+                let width = u32::from(*bytes.get(position.value).ok_or(Error::Corrupt)?);
                 if width > 32 {
                     return Err(Error::Corrupt);
                 }
-                (self.position.index, self.position.value) =
-                    (Hybrid::new(width), self.position.value + 1);
+                (position.index, position.value) = (Hybrid::new(width), position.value + 1);
             }
-            (self.position.level, self.position.started) = (Hybrid::new(1), true);
-            let deferred = core::mem::take(&mut self.position.deferred);
+            (position.level, position.started) = (Hybrid::new(1), true);
+            let deferred = core::mem::take(&mut position.deferred);
             if deferred > 0 {
-                self.advance(context, bytes, deferred)?;
+                let (column, data_type) = (self.column, self.data_type);
+                position.advance(context, column, data_type, &mut self.scratch, bytes, deferred)?;
             }
         }
-        Ok((page, dictionary))
+        Ok(())
     }
 
-    /// The chunk's dictionary, decoded the first time it's needed.
-    fn dictionary(&mut self, context: &mut Context) -> Result<Dictionary, Error> {
-        if let Some(dictionary) = &self.dictionary {
-            return Ok(dictionary.clone());
-        }
+    /// Decodes the chunk's dictionary.
+    fn dictionary(&mut self, context: &mut Context) -> Result<(), Error> {
         let (body, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
         let body = self.read_body(context, body)?;
         let page = body.as_slice::<u8>();
@@ -664,8 +486,8 @@ impl<'s> ChunkReader<'s> {
         let values = bounds::bounded(values.slice(0, count32), bounds);
         let nullable = bounds::bounded(nullable, bounds);
         bounds = bounds.or(self.bounds);
-        let dictionary = Dictionary { values, bounds, words, nullable, count };
-        Ok(self.dictionary.insert(dictionary).clone())
+        self.dictionary = Some(Dictionary { values, bounds, words, nullable, count });
+        Ok(())
     }
 
     /// A page's body, decompressed if it's stored compressed.
@@ -705,6 +527,219 @@ impl<'s> ChunkReader<'s> {
             }
             window *= 4;
         }
+    }
+}
+
+/// The scratch memory in `slot`, allocated the first time it's needed.
+fn scratch<'b>(context: &Context, slot: &'b mut Option<Buffer>) -> Result<&'b mut Buffer, Error> {
+    match slot {
+        Some(scratch) => Ok(scratch),
+        None => Ok(slot.insert(Buffer::allocate(context.allocator(), SCRATCH_BYTES)?)),
+    }
+}
+
+impl Position {
+    /// The page's definition levels.
+    fn levels<'p>(&self, page: &'p [u8]) -> Result<&'p [u8], Error> {
+        page.get(self.levels.0..self.levels.1).ok_or(Error::Corrupt)
+    }
+
+    /// Moves past the next `rows` rows of `page`, the body being read, of
+    /// `column`, without decoding their values. Levels are decoded into the
+    /// scratch memory in `slot`.
+    fn advance(
+        &mut self,
+        context: &Context,
+        column: Column,
+        data_type: DataType,
+        slot: &mut Option<Buffer>,
+        page: &[u8],
+        rows: usize,
+    ) -> Result<(), Error> {
+        let mut valid = rows;
+        if column.optional {
+            let levels = self.levels(page)?;
+            let decoded = scratch(context, slot)?.as_mut_slice::<u32>();
+            valid = 0;
+            for start in (0..rows).step_by(decoded.len()) {
+                let chunk = at_mut!(decoded, ..(rows - start).min(BATCH_ROWS_MAX as usize));
+                self.level.take(levels, chunk).ok_or(Error::Corrupt)?;
+                valid += chunk.iter().filter(|&&level| level == 1).count();
+            }
+        }
+        let at = self.value;
+        match (self.indexed, data_type) {
+            (true, _) => {
+                let indices = page.get(at..).ok_or(Error::Corrupt)?;
+                self.index.skip(indices, valid).ok_or(Error::Corrupt)?;
+            }
+            (false, DataType::String) => {
+                let mut at = at;
+                for _ in 0..valid {
+                    at += 4 + plain::length(page, at)?;
+                }
+                self.value = at;
+            }
+            (false, _) => self.value += valid * plain::width(column.physical),
+        }
+        Ok(())
+    }
+
+    /// The next `rows` rows of a page of indices into `dictionary`, `valid`
+    /// of them not null as `validity` says: a constant, if every row has one
+    /// value; else, for strings, a dictionary column, which copies none; else
+    /// flat values, looked up once here so operators read them plainly, as
+    /// DuckDB's reader does. Indices are decoded into `decoded`, a run at a
+    /// time.
+    #[expect(clippy::too_many_arguments, reason = "a step of `read`")]
+    fn indexed(
+        &mut self,
+        context: &mut Context,
+        data_type: DataType,
+        page: &[u8],
+        dictionary: &Dictionary,
+        rows: usize,
+        valid: usize,
+        validity: Option<Buffer>,
+        decoded: &mut [u32],
+    ) -> Result<ColumnView, Error> {
+        let bytes = page.get(self.value..).ok_or(Error::Corrupt)?;
+        let rows32 = u32::try_from(rows).map_err(|_| Error::Corrupt)?;
+        let count = dictionary.count;
+        if valid == 0 {
+            let null = dictionary.nullable.slice(dictionary.nullable.row_count() - 1, 1);
+            return Ok(ColumnView::constant(context, &null, rows32)?);
+        }
+        let mut run = self.index.next_run(bytes, at_mut!(decoded, ..valid));
+        // One value for every row.
+        if let Some(Run::Repeat(i, n)) = run
+            && n == rows
+            && (i as usize) < count
+        {
+            return Ok(ColumnView::constant(context, &dictionary.values.slice(i, 1), rows32)?);
+        }
+        let null = u32::try_from(count).map_err(|_| Error::Unsupported)?;
+        let mut at = 0;
+        if let Some(words) = &dictionary.words {
+            let entries = at!(words.as_slice::<i64>(), ..count);
+            let entry = |i: u32| entries.get(i as usize).copied().ok_or(Error::Corrupt);
+            let mut out = context.values_buffer(rows * 8)?;
+            let values = out.as_mut_slice::<i64>();
+            loop {
+                match run.ok_or(Error::Corrupt)? {
+                    Run::Repeat(i, n) => at_mut!(values, at..at + n).fill(entry(i)?),
+                    Run::Packed(n) => {
+                        let indices = at!(decoded, ..n);
+                        // Checked together, so each lookup needn't be.
+                        if indices.iter().fold(0, |max, &i| max.max(i)) as usize >= count {
+                            return Err(Error::Corrupt);
+                        }
+                        for (value, &i) in at_mut!(values, at..at + n).iter_mut().zip(indices) {
+                            // SAFETY: every index is below `count`, the number
+                            // of `entries`, checked just above.
+                            *value = unsafe { *entries.get_unchecked(i as usize) };
+                        }
+                    }
+                }
+                at += run.map_or(0, Run::len);
+                if at == valid {
+                    break;
+                }
+                run = self.index.next_run(bytes, at_mut!(decoded, ..valid - at));
+            }
+            if let Some(bits) = &validity {
+                bits::spread(values, valid, bits.as_slice(), 0);
+            }
+            let column = ColumnView::new(context, data_type, out, validity)?;
+            return Ok(bounds::bounded(column, dictionary.bounds));
+        }
+        let mut indices = context.indices_buffer(rows * 4)?;
+        let out = indices.as_mut_slice::<u32>();
+        loop {
+            match run.ok_or(Error::Corrupt)? {
+                Run::Repeat(i, n) => at_mut!(out, at..at + n).fill(i),
+                // Only the first run is in `decoded`: the rest are unpacked
+                // in place.
+                Run::Packed(n) if at == 0 => at_mut!(out, ..n).copy_from_slice(at!(decoded, ..n)),
+                Run::Packed(_) => {}
+            }
+            at += run.map_or(0, Run::len);
+            if at == valid {
+                break;
+            }
+            run = self.index.next_run(bytes, at_mut!(out, at..valid));
+        }
+        if at!(out, ..valid).iter().any(|&i| i >= null) {
+            return Err(Error::Corrupt);
+        }
+        Ok(match &validity {
+            None => ColumnView::dictionary(context, &dictionary.values, indices)?,
+            Some(bits) => {
+                bits::spread(out, valid, bits.as_slice(), null);
+                ColumnView::dictionary(context, &dictionary.nullable, indices)?
+            }
+        })
+    }
+
+    /// The next `rows` rows' validity, from their definition levels, or
+    /// `None` if they can't be null or none are; and how many aren't null.
+    /// Levels are decoded into `decoded`.
+    fn validity(
+        &mut self,
+        context: &mut Context,
+        optional: bool,
+        page: &[u8],
+        rows: usize,
+        decoded: &mut [u32],
+    ) -> Result<(Option<Buffer>, usize), Error> {
+        if !optional {
+            return Ok((None, rows));
+        }
+        let levels = self.levels(page)?;
+        // Most pages have no nulls, so their levels are runs of 1s.
+        let mut row = 0;
+        let mut run = loop {
+            if row == rows {
+                return Ok((None, rows));
+            }
+            let left = at_mut!(decoded, ..rows - row);
+            let run = self.level.next_run(levels, left).ok_or(Error::Corrupt)?;
+            if run != Run::Repeat(1, run.len()) {
+                break run;
+            }
+            row += run.len();
+        };
+        let mut validity = context.small_buffer(rows.div_ceil(8))?;
+        let bits = validity.as_mut_slice::<u8>();
+        bits.fill(0);
+        bits::set(bits, 0, row);
+        let mut valid = row;
+        loop {
+            match run {
+                Run::Repeat(level, n) => {
+                    if level == 1 {
+                        bits::set(bits, row, n);
+                        valid += n;
+                    }
+                    row += n;
+                }
+                Run::Packed(n) => {
+                    for &level in at!(decoded, ..n) {
+                        *at_mut!(bits, row / 8) |= u8::from(level == 1) << (row % 8);
+                        (row, valid) = (row + 1, valid + usize::from(level == 1));
+                    }
+                }
+            }
+            if row == rows {
+                break;
+            }
+            let left = at_mut!(decoded, ..rows - row);
+            run = self.level.next_run(levels, left).ok_or(Error::Corrupt)?;
+        }
+        if valid == rows {
+            return Ok((None, rows));
+        }
+        Ok((Some(validity), valid))
     }
 }
 

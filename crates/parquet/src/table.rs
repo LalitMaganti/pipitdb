@@ -121,7 +121,7 @@ impl<'a> Rows<'a> {
             // test its rows.
             let published =
                 cutoff.and_then(|(c, cutoff)| Some((c, cutoff, context.cutoff(cutoff.slot)?)));
-            let tested = match published {
+            let mut tested = match published {
                 Some((c, cutoff, value)) => {
                     let values =
                         at_mut!(self.readers, c).read(context, rows as usize, Forms::FLAT)?;
@@ -156,9 +156,9 @@ impl<'a> Rows<'a> {
             }
             for (i, (reader, &(column, forms))) in self.readers.iter_mut().zip(columns).enumerate()
             {
-                let view = match &tested {
-                    Some((c, view)) if *c == i => view.clone(),
-                    _ if forms.contains(Forms::LAZY) => {
+                let view = match tested.take_if(|(c, _)| *c == i) {
+                    Some((_, view)) => view,
+                    None if forms.contains(Forms::LAZY) => {
                         // Where its rows are, for `load`: only counted here, so
                         // no page body is read.
                         let (header, row) = reader.place();
@@ -168,7 +168,7 @@ impl<'a> Rows<'a> {
                         reader.pass(rows as usize);
                         ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
                     }
-                    _ => reader.read(context, rows as usize, forms)?,
+                    None => reader.read(context, rows as usize, forms)?,
                 };
                 let Ok(()) = batch.push_column(view) else {
                     pipit_kernel::failed!();
