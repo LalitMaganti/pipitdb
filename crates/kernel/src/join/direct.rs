@@ -3,6 +3,7 @@
 
 use super::last_of;
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::column::{ColumnView, Form, Forms};
 use crate::context::Context;
 use crate::env::Env;
@@ -11,7 +12,6 @@ use crate::filter::{self, Range};
 use crate::group_table::GroupTable;
 use crate::rank_bitmap::RankBitmap;
 use crate::row_batch::RowBatch;
-use crate::small_vec::SmallVec;
 
 /// How far apart the keys can be for `Direct` to find build rows by them:
 /// 256 keys a build row, so its bitmap takes at most 48 bytes a row.
@@ -33,7 +33,7 @@ pub(super) struct Direct {
 /// perfect hash join.
 struct Keyed {
     keys: RankBitmap,
-    rows: SmallVec<u32>,
+    rows: Array<u32>,
 }
 
 impl Direct {
@@ -68,7 +68,7 @@ impl Direct {
         }
         #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
         let keys = RankBitmap::new(env, span as usize + 1, (0..groups).map(above))?;
-        let mut rows = SmallVec::fixed_from(env, core::iter::repeat_n(0, groups as usize))?;
+        let mut rows = Array::zeroed(env, groups as usize)?;
         for group in 0..groups {
             *at_mut!(rows, keys.rank(above(group)) as usize) = last_of(table, group);
         }

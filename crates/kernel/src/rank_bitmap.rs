@@ -2,14 +2,14 @@
 //! which numbers whatever the set bits stand for, in order, without gaps.
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::bitmap::Bitmap;
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// Bits, with how many are set before each word of them.
 pub struct RankBitmap {
     bits: Bitmap,
-    before: SmallVec<u32>,
+    before: Array<u32>,
 }
 
 impl RankBitmap {
@@ -23,7 +23,7 @@ impl RankBitmap {
         for at in set {
             bits.set(at);
         }
-        let mut before = SmallVec::fixed_from(env, bits.words().iter().map(|_| 0))?;
+        let mut before = Array::zeroed(env, bits.words().len())?;
         let mut count = 0;
         for (before, word) in before.iter_mut().zip(bits.words()) {
             *before = count;

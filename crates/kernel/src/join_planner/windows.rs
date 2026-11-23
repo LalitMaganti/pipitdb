@@ -6,6 +6,7 @@ use super::estimate::Estimator;
 use super::exact::{self, Link};
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree, Node};
+use crate::array::Array;
 use crate::bitmap::BitSlice;
 use crate::env::Env;
 use crate::error::Error;
@@ -27,9 +28,9 @@ struct Windows<'a, 'g, 'e, 't> {
     /// How many words a set of relations takes.
     words: usize,
     /// Each node's relations, `words` words a node.
-    sets: SmallVec<u64>,
+    sets: Array<u64>,
     /// For each relation of the window, the subtree it's in.
-    label: SmallVec<u8>,
+    label: Array<u8>,
     /// The edges between the window's subtrees.
     links: SmallVec<Link>,
 }
@@ -45,7 +46,7 @@ pub(super) fn improve<'g>(
 ) -> Result<(), Error> {
     let count = graph.relations.len();
     let words = BitSlice::<u64>::words_for(count);
-    let mut sets = SmallVec::zeroed(env, (tree.nodes.len() + 2) * words)?;
+    let mut sets = Array::zeroed(env, (tree.nodes.len() + 2) * words)?;
     for (node, found) in tree.nodes.iter().enumerate() {
         match found.kind {
             JoinNode::Relation(relation) => {
@@ -65,7 +66,7 @@ pub(super) fn improve<'g>(
         tree,
         words,
         sets,
-        label: SmallVec::zeroed(env, count)?,
+        label: Array::zeroed(env, count)?,
         links: SmallVec::new(env, LIST_MAX)?,
     };
     // Joins come after their children, so each window's subtrees have

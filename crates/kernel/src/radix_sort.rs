@@ -2,6 +2,7 @@
 //! whole blocks at a time, and sorting strings by their bytes.
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::env::Env;
 use crate::small_vec::SmallVec;
 
@@ -26,14 +27,14 @@ const SMALL: usize = 4096;
 /// also copies through; the block being carried to its bucket; and by block
 /// of the input, whether it's been moved. Partitioning is done before
 /// the buckets are sorted, so one is enough for every level.
-pub(crate) struct Scratch(SmallVec<u64>);
+pub(crate) struct Scratch(Array<u64>);
 
 impl Scratch {
     /// For sorting up to `count` words.
     pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
         let len =
             if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(SmallVec::zeroed(env, len)?))
+        Ok(Scratch(Array::zeroed(env, len)?))
     }
 }
 

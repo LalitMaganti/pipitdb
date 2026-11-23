@@ -4,8 +4,8 @@
 use core::ops::{Deref, DerefMut};
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// A word bits are packed in.
 pub trait Word: Copy {
@@ -138,13 +138,13 @@ impl BitSlice<u8> {
 
 /// Bits of its own, a `u64` at a time.
 pub struct Bitmap {
-    words: SmallVec<u64>,
+    words: Array<u64>,
 }
 
 impl Bitmap {
     /// `len` bits, all clear.
     pub fn new(env: &Env, len: usize) -> Result<Bitmap, AllocError> {
-        Ok(Bitmap { words: SmallVec::zeroed(env, BitSlice::<u64>::words_for(len))? })
+        Ok(Bitmap { words: Array::zeroed(env, BitSlice::<u64>::words_for(len))? })
     }
 
     /// Clears every bit.

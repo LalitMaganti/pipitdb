@@ -9,6 +9,7 @@
 //! each key is its row's number above the first, as a table's ids are.
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::bitmap::{BitSlice, Bitmap};
 use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
@@ -493,7 +494,7 @@ struct Held {
     /// is hashed, as `direct` finds them all.
     sequence: Sequence,
     /// With keys, each input row's build row of the next round, or `NONE`.
-    next_of: SmallVec<u32>,
+    next_of: Array<u32>,
     /// A bit for each row of the batch being joined, set once a build row
     /// matched it.
     matched: [u64; BATCH_ROWS_MAX as usize / 64],
@@ -502,7 +503,7 @@ struct Held {
     nulls: SmallVec<ColumnView>,
     /// Each input row's build row in this round, for `gather`: always a
     /// build row's number, as every row is gathered.
-    paired: SmallVec<u32>,
+    paired: Array<u32>,
     /// What computing the condition keeps.
     condition: Option<ComputeState>,
     /// When it keeps the build rows: a bit for each, set once a probe row
@@ -874,10 +875,10 @@ impl Operator for Join<'_> {
             direct: None,
             // Not arrays, which would be copied into place on each run.
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
-            next_of: SmallVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
+            next_of: Array::zeroed(env, BATCH_ROWS_MAX as usize)?,
             matched: [0; BATCH_ROWS_MAX as usize / 64],
             nulls,
-            paired: SmallVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
+            paired: Array::zeroed(env, BATCH_ROWS_MAX as usize)?,
             condition,
             build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,

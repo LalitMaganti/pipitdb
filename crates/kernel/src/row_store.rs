@@ -2,6 +2,7 @@
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::bitmap::BitSlice;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
@@ -516,7 +517,7 @@ impl Copies {
     /// value that arrived in it goes.
     /// Columns with a bit in `in_order` are left as they are.
     fn put_in_order(&self, env: &Env, words: &[u64], in_order: u64) -> Result<(), Error> {
-        let mut values = SmallVec::<i64>::zeroed(env, 1 << REGION_BITS)?;
+        let mut values = Array::<i64>::zeroed(env, 1 << REGION_BITS)?;
         for first in (0..self.rows).step_by(1 << REGION_BITS) {
             let end = self.rows.min(first + (1 << REGION_BITS));
             for k in (0..self.buffers.len() / self.batches).filter(|k| in_order >> k & 1 == 0) {

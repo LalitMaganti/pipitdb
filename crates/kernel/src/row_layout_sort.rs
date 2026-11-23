@@ -81,7 +81,7 @@ fn find_existing_order(rows: Rows) -> ExistingOrder {
 /// The positions of the bytes which differ between any two rows.
 fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SmallVec<u32>, AllocError> {
     let stride = rows.stride;
-    let mut differs = SmallVec::<u8>::zeroed(env, stride)?;
+    let mut differs = Array::<u8>::zeroed(env, stride)?;
     if stride >= 8 {
         // A word at a time, the last of which may overlap the one before it.
         let words = stride.div_ceil(8);
@@ -92,7 +92,7 @@ fn find_varying_bytes(env: &Env, rows: Rows) -> Result<SmallVec<u32>, AllocError
             u64::from_ne_bytes(bytes)
         };
         let first = rows.get(0);
-        let mut diff = SmallVec::<u64>::zeroed(env, words)?;
+        let mut diff = Array::<u64>::zeroed(env, words)?;
         // XOR each row with the first and gather the differences. A byte is
         // the same in every row exactly when none of its bits are set.
         for r in 0..rows.count {
