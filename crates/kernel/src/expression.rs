@@ -214,7 +214,10 @@ fn prepare(
 }
 
 /// `step`'s value at every row a batch can have, if it's a constant.
-fn constant(context: &mut Context, step: &ExprStep) -> Result<Option<ColumnView>, AllocError> {
+pub(crate) fn constant(
+    context: &mut Context,
+    step: &ExprStep,
+) -> Result<Option<ColumnView>, AllocError> {
     if !matches!(step.op, ExprOp::Constant | ExprOp::Null) {
         return Ok(None);
     }
