@@ -28,11 +28,12 @@ pub(super) struct Direct {
     keyed: Option<Keyed>,
 }
 
-/// Which keys have a build row, by their number above the smallest, and
-/// their rows in order of key, so a key's row is at its rank, as in DuckDB's
-/// perfect hash join.
+/// The build rows in order of key, and which keys have one, by their number
+/// above the smallest, so a key's row is at its rank, as in DuckDB's perfect
+/// hash join. With no gaps between the keys, a key's rank is its number, so
+/// there's no bitmap.
 struct Keyed {
-    keys: RankBitmap,
+    keys: Option<RankBitmap>,
     rows: Array<u32>,
 }
 
@@ -66,11 +67,15 @@ impl Direct {
         if groups == count && each {
             return Ok(Some(Direct { min, span, keyed: None }));
         }
+        let gaps = span + 1 > u64::from(groups);
         #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
-        let keys = RankBitmap::new(env, span as usize + 1, (0..groups).map(above))?;
+        let keys = gaps
+            .then(|| RankBitmap::new(env, span as usize + 1, (0..groups).map(above)))
+            .transpose()?;
         let mut rows = Array::zeroed(env, groups as usize)?;
         for group in 0..groups {
-            *at_mut!(rows, keys.rank(above(group)) as usize) = last_of(table, group);
+            let at = keys.as_ref().map_or(above(group), |keys| keys.rank(above(group)) as usize);
+            *at_mut!(rows, at) = last_of(table, group);
         }
         Ok(Some(Direct { min, span, keyed: Some(Keyed { keys, rows }) }))
     }
@@ -103,6 +108,13 @@ impl Direct {
             *paired = above_of(value);
         }
         let Some(Keyed { keys, rows }) = &self.keyed else { return Ok(()) };
+        let Some(keys) = keys else {
+            // Every key within the bounds has a build row.
+            for paired in paired.iter_mut() {
+                *paired = *at!(rows, *paired as usize);
+            }
+            return Ok(());
+        };
         // Most rows often have no build row, so those go before the rest's
         // rows are found.
         pairs.selection_mut().retain(|row| keys.get(*at!(paired, usize::from(row)) as usize));

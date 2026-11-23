@@ -326,10 +326,16 @@ fn finds_build_rows_by_their_keys() {
             .collect();
     let probe = table(&probe_keys);
     // Ids across batches, each following the last, as a table's are, found
-    // with no bitmap; with a gap, and in another order, found by a bitmap;
-    // and repeated, hashed.
-    let groups: [&[(i64, u32)]; 4] =
-        [&[(0, 2048), (2048, 952)], &[(0, 4), (5, 4)], &[(10, 4), (0, 4)], &[(0, 4), (2, 4)]];
+    // with no bitmap; in another order, without gaps, found by their number;
+    // with a gap, and in another order, found by a bitmap; and repeated,
+    // hashed.
+    let groups: [&[(i64, u32)]; 5] = [
+        &[(0, 2048), (2048, 952)],
+        &[(4, 4), (0, 4)],
+        &[(0, 4), (5, 4)],
+        &[(10, 4), (0, 4)],
+        &[(0, 4), (2, 4)],
+    ];
     for groups in groups {
         let (build, build_keys) = sequences(groups);
         for kind in KINDS {
