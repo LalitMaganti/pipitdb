@@ -83,11 +83,29 @@ impl RelationSet {
         (0..self.words().min(other.words())).any(|i| self.word(i) & other.word(i) != 0)
     }
 
+    /// Whether it has any relation of `set`, given as words, and whether all
+    /// its relations are in `set`.
+    pub fn meets(&self, set: &[u64]) -> (bool, bool) {
+        let (mut some, mut all) = (false, true);
+        for (i, set) in set.iter().enumerate() {
+            let word = self.word(i);
+            some |= word & set != 0;
+            all &= word & !set == 0;
+        }
+        (some, all)
+    }
+
     fn word_mut(&mut self, i: usize) -> &mut u64 {
         match i {
             0 => &mut self.first,
             _ => at_mut!(self.rest, i - 1),
         }
+    }
+}
+
+impl PartialEq for RelationSet {
+    fn eq(&self, other: &RelationSet) -> bool {
+        (0..self.words().max(other.words())).all(|i| self.word(i) == other.word(i))
     }
 }
 
@@ -143,6 +161,60 @@ pub struct JoinEdge {
     pub equivalence: u32,
 }
 
+/// Sets node `slot`'s relations in `sets`, `words` words a node, to those
+/// of nodes `left` and `right`.
+#[inline(never)]
+pub(super) fn union(sets: &mut [u64], words: usize, slot: u32, [left, right]: [u32; 2]) {
+    let (left, right, slot) =
+        (left as usize * words, right as usize * words, slot as usize * words);
+    for i in 0..words {
+        let word = *at!(sets, left + i) | *at!(sets, right + i);
+        *at_mut!(sets, slot + i) = word;
+    }
+}
+
+/// What a planner keeps of an edge to tell quickly which sets hold its sides.
+#[derive(Clone, Copy)]
+pub(super) struct Sides {
+    /// The first relation of its left side, then of its right.
+    pub(super) first: [u32; 2],
+    /// Whether its left side, then its right, has more than one relation.
+    pub(super) more: [bool; 2],
+}
+
+impl Sides {
+    #[inline(never)]
+    pub(super) fn of(edge: &JoinEdge) -> Sides {
+        let mut sides = Sides { first: [u32::MAX; 2], more: [false; 2] };
+        for (i, side) in [&edge.left, &edge.right].into_iter().enumerate() {
+            let mut count = 0;
+            for w in (0..side.words()).rev() {
+                let word = side.word(w);
+                if word != 0 {
+                    #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
+                    let relation = w as u32 * 64 + word.trailing_zeros();
+                    *at_mut!(sides.first, i) = relation;
+                }
+                count += word.count_ones();
+            }
+            *at_mut!(sides.more, i) = count > 1;
+        }
+        sides
+    }
+
+    /// Whether side `right` of `edge`, whose sides these are, has any
+    /// relation of `set`, and whether all its relations are in `set`. A side
+    /// of one relation is answered from that relation alone.
+    pub(super) fn meets(self, edge: &JoinEdge, right: usize, set: &[u64]) -> (bool, bool) {
+        if *at!(self.more, right) {
+            return if right == 0 { &edge.left } else { &edge.right }.meets(set);
+        }
+        let relation = *at!(self.first, right) as usize;
+        let has = at!(set, relation / 64) >> (relation % 64) & 1 != 0;
+        (has, has)
+    }
+}
+
 /// Whether the join operator can run a join of two sets of relations, each
 /// given as the words of a `RelationSet`. The optimizer passes it in, for
 /// joins the operator can't run yet.
@@ -195,5 +267,8 @@ mod tests {
         a.union_with(&set(&[500])).unwrap();
         assert_eq!(a.count(), 4);
         assert!(a.contains(500) && !a.contains(499));
+        let b = set(&[1, 70]);
+        assert!(b.meets(&[2, 0]) == (true, false) && b.meets(&[2, 1 << 6]) == (true, true));
+        assert!(set(&[3]) == set(&[3]) && set(&[3]) != set(&[3, 64]));
     }
 }
