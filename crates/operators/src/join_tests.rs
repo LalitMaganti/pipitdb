@@ -11,7 +11,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::{ExprOp, ExprStep};
+use pipit_kernel::expression::{ExprBuilder, ExprOp};
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
@@ -24,24 +24,15 @@ use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::slow_vec::SlowVec;
 
-/// A node of `op` reading `a` and `b`, or of value `value`.
-fn node(op: ExprOp, a: u32, b: u32, value: i64) -> ExprStep {
-    let data_type = DataType::Int64;
-    ExprStep { op, data_type, a, b, c: 0, int_value: value, double_value: 0.0 }
-}
-
 /// Adds the nodes of `column > value`, and returns its root.
-fn greater(nodes: &mut Vec<ExprStep>, column: u32, value: i64) -> u32 {
-    nodes.push(node(ExprOp::Column, column, 0, 0));
-    nodes.push(node(ExprOp::Constant, 0, 0, value));
-    let at = u32::try_from(nodes.len()).unwrap();
-    nodes.push(node(ExprOp::Gt, at - 2, at - 1, 0));
-    at
+fn greater(nodes: &mut ExprBuilder, column: u32, value: i64) -> u32 {
+    let (column, value) = (nodes.column(column).unwrap(), nodes.int(value).unwrap());
+    nodes.node(ExprOp::Gt, column, value).unwrap()
 }
 
 /// A filter of the expression of `nodes`, added to `plan`'s.
-fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &[ExprStep]) -> DynOp<'c> {
-    let condition = plan.exprs.add(nodes).unwrap();
+fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &ExprBuilder) -> DynOp<'c> {
+    let condition = plan.exprs.add(nodes.nodes()).unwrap();
     DynOp::new(&Heap, FilterOp::new(&Heap, &plan.exprs, condition).unwrap()).unwrap()
 }
 
@@ -123,7 +114,7 @@ fn join(
     let mut plan = LogicalPlan::new(&Heap).unwrap();
     let (mut probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
     if let Some(value) = above {
-        let mut nodes = Vec::new();
+        let mut nodes = ExprBuilder::new(&Heap).unwrap();
         greater(&mut nodes, probe_columns[1].id, value);
         let filter = filter(&mut plan, &nodes);
         let children = [probe];
@@ -196,10 +187,10 @@ fn filtered_above(
     let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
-    let mut nodes = Vec::new();
+    let mut nodes = ExprBuilder::new(&Heap).unwrap();
     let a = greater(&mut nodes, dur.id, durs);
     let b = greater(&mut nodes, tid.id, tids);
-    nodes.push(node(ExprOp::And, a, b, 0));
+    nodes.node(ExprOp::And, a, b).unwrap();
     let filter = filter(&mut plan, &nodes);
     let children = [join];
     plan.add_node(filter, &children).unwrap();

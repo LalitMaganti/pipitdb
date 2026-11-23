@@ -3,7 +3,8 @@
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, check_expr_type,
+    EXPR_NODES_MAX, Expr, ExprBuilder, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX,
+    check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::slow_vec::SlowVec;
@@ -21,10 +22,10 @@ pub fn compile_expr(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
-    let mut nodes = SlowVec::new(compiler.allocator(), EXPR_NODES_MAX)?;
+    let mut nodes = ExprBuilder::new(compiler.allocator())?;
     compile(compiler, node, 0, &mut nodes)?;
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
-    let data_type = check_expr_type(&nodes, &type_of).map_err(|error| {
+    let data_type = check_expr_type(nodes.nodes(), &type_of).map_err(|error| {
         let span = compiler.span(node);
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
@@ -42,7 +43,7 @@ pub fn compile_expr(
         };
         Error::new(code, span)
     })?;
-    let expr = compiler.plan.exprs.add(&nodes)?;
+    let expr = compiler.plan.exprs.add(nodes.nodes())?;
     Ok((expr, data_type))
 }
 
@@ -51,24 +52,17 @@ pub fn is_null(compiler: &Compiler<'_, '_>, node: Node) -> bool {
     node.tag() == Tag::Name && same_word(compiler.text(node.span()).as_bytes(), b"null")
 }
 
-/// A node of `op` reading nodes `a` and `b`, or of value `int_value`.
-fn expr_node(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
-    ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value, double_value: 0.0 }
-}
-
 /// Appends `node`, and returns its index.
 fn push_node(
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     node: ExprStep,
     span: Node,
     compiler: &Compiler<'_, '_>,
 ) -> Result<u32, Error> {
-    if nodes.len() == EXPR_NODES_MAX {
+    if nodes.is_full() {
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(span)));
     }
-    nodes.push(node)?;
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    Ok(nodes.len() as u32 - 1)
+    Ok(nodes.push(node)?)
 }
 
 /// `a IN (1, 2)` or `a IN ('x', 'y')`: a list of integers, or of strings,
@@ -78,11 +72,10 @@ fn in_list(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let operand = nodes.len() as u32 - 1;
+    let operand = nodes.last();
     let list = compiler.node(node.first_child() + 1);
     let len = list.child_count();
     if compiler.plan.exprs.values().len() + len as usize > PLAN_EXPR_VALUES_MAX {
@@ -107,7 +100,7 @@ fn in_list(
         kind = Some(item_kind);
         compiler.plan.exprs.add_value(listed)?;
     }
-    let mut test = expr_node(ExprOp::In, operand, start, 0);
+    let mut test = ExprStep::new(ExprOp::In, operand, start, 0);
     (test.c, test.data_type) = (len, kind.unwrap_or(DataType::Int64));
     push_node(nodes, test, node, compiler)?;
     Ok(())
@@ -119,29 +112,29 @@ fn compile(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     // An expression is at least as large as it is deep.
     if depth == EXPR_NODES_MAX {
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
     }
     let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
-    let push = |compiler: &Compiler<'_, '_>, nodes: &mut SlowVec<ExprStep>, added| {
+    let push = |compiler: &Compiler<'_, '_>, nodes: &mut ExprBuilder, added| {
         push_node(nodes, added, node, compiler)
     };
     match node.tag() {
         Tag::Name if is_null(compiler, node) => {
-            push(compiler, nodes, expr_node(ExprOp::Null, 0, 0, 0))?;
+            push(compiler, nodes, ExprStep::new(ExprOp::Null, 0, 0, 0))?;
         }
         Tag::Name => {
             let column = compiler.find_column(node)?.id;
-            push(compiler, nodes, expr_node(ExprOp::Column, column, 0, 0))?;
+            push(compiler, nodes, ExprStep::new(ExprOp::Column, column, 0, 0))?;
         }
         Tag::Integer => {
             push(
                 compiler,
                 nodes,
-                expr_node(ExprOp::Constant, 0, 0, integer(compiler, node, false)?),
+                ExprStep::new(ExprOp::Constant, 0, 0, integer(compiler, node, false)?),
             )?;
         }
         Tag::Float => {
@@ -149,7 +142,7 @@ fn compile(
         }
         Tag::String => {
             let id = string(compiler, node)?;
-            let mut constant = expr_node(ExprOp::Constant, id.raw_id(), 0, 0);
+            let mut constant = ExprStep::new(ExprOp::Constant, id.raw_id(), 0, 0);
             constant.data_type = DataType::String;
             push(compiler, nodes, constant)?;
         }
@@ -182,12 +175,10 @@ fn compile(
                 }
             };
             compile(compiler, child(compiler, 0), depth + 1, nodes)?;
-            #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-            let a = nodes.len() as u32 - 1;
+            let a = nodes.last();
             compile(compiler, child(compiler, 1), depth + 1, nodes)?;
-            #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-            let b = nodes.len() as u32 - 1;
-            push(compiler, nodes, expr_node(op, a, b, 0))?;
+            let b = nodes.last();
+            push(compiler, nodes, ExprStep::new(op, a, b, 0))?;
         }
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
     }
@@ -197,14 +188,14 @@ fn compile(
 /// How a registry compiles a call of a function it may have: as
 /// `call_function` does, or as `no_function` does when it has none.
 pub(crate) type CallFunction =
-    fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>;
+    fn(&mut Compiler<'_, '_>, Node, usize, &mut ExprBuilder) -> Result<(), Error>;
 
 /// Fails the call `node`, as a registry without functions can't compile it.
 pub(crate) fn no_function(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     _: usize,
-    _: &mut SlowVec<ExprStep>,
+    _: &mut ExprBuilder,
 ) -> Result<(), Error> {
     Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node)))
 }
@@ -215,7 +206,7 @@ pub(crate) fn call_function(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let name = compiler.node(node.first_child()).span();
     let text = compiler.text(name).as_bytes();
@@ -235,7 +226,7 @@ pub(crate) fn call_function(
 pub fn compile_arguments(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     fewest: u32,
     most: u32,
 ) -> Result<SlowVec<u32>, Error> {
@@ -246,8 +237,7 @@ pub fn compile_arguments(
     let mut values = SlowVec::fixed(compiler.allocator(), count as usize)?;
     for i in 1..=count {
         compile(compiler, compiler.node(node.first_child() + i), depth + 1, nodes)?;
-        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-        values.push(nodes.len() as u32 - 1)?;
+        values.push(nodes.last())?;
     }
     Ok(values)
 }
@@ -264,7 +254,7 @@ pub type Bind = fn(&mut Compiler<'_, '_>, Node) -> Result<DynFunction, Error>;
 pub fn call_bound(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     (arguments, result): (&[DataType], DataType),
     bind: Bind,
 ) -> Result<(), Error> {
@@ -279,11 +269,11 @@ pub fn call_bound(
     };
     let mut first = None;
     for (&value, &data_type) in values.iter().zip(arguments) {
-        let mut argument = expr_node(ExprOp::Argument, value, 0, 0);
+        let mut argument = ExprStep::new(ExprOp::Argument, value, 0, 0);
         argument.data_type = data_type;
         first.get_or_insert(push_node(nodes, argument, node, compiler)?);
     }
-    let mut call = expr_node(ExprOp::Call, first.unwrap_or(0), count, 0);
+    let mut call = ExprStep::new(ExprOp::Call, first.unwrap_or(0), count, 0);
     call.data_type = result;
     call.c = id;
     push_node(nodes, call, node, compiler)?;
@@ -296,17 +286,18 @@ pub fn call_bound(
 pub(crate) fn push_case(
     compiler: &Compiler<'_, '_>,
     node: Node,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     branches: &[(u32, u32)],
     otherwise: u32,
 ) -> Result<(), Error> {
     let mut first = None;
     for &(condition, value) in branches {
-        let when = push_node(nodes, expr_node(ExprOp::When, condition, value, 0), node, compiler)?;
+        let when =
+            push_node(nodes, ExprStep::new(ExprOp::When, condition, value, 0), node, compiler)?;
         first.get_or_insert(when);
     }
     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let mut case = expr_node(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
+    let mut case = ExprStep::new(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
     case.c = otherwise;
     push_node(nodes, case, node, compiler)?;
     Ok(())
@@ -319,40 +310,35 @@ fn case(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let count = node.child_count();
     let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
-    let last = |nodes: &SlowVec<ExprStep>| {
-        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-        let last = nodes.len() as u32 - 1;
-        last
-    };
     let subject = child(compiler, 0);
     let subject = if subject.is_empty() {
         None
     } else {
         compile(compiler, subject, depth + 1, nodes)?;
-        Some(last(nodes))
+        Some(nodes.last())
     };
     // Each `WHEN`'s condition and value.
     let mut branches = SlowVec::fixed(compiler.allocator(), (count as usize - 2) / 2)?;
     for i in (1..count - 1).step_by(2) {
         compile(compiler, child(compiler, i), depth + 1, nodes)?;
-        let mut condition = last(nodes);
+        let mut condition = nodes.last();
         if let Some(subject) = subject {
-            let equal = expr_node(ExprOp::Eq, subject, condition, 0);
+            let equal = ExprStep::new(ExprOp::Eq, subject, condition, 0);
             condition = push_node(nodes, equal, node, compiler)?;
         }
         compile(compiler, child(compiler, i + 1), depth + 1, nodes)?;
-        branches.push((condition, last(nodes)))?;
+        branches.push((condition, nodes.last()))?;
     }
     let otherwise = child(compiler, count - 1);
     let otherwise = if otherwise.is_empty() {
-        push_node(nodes, expr_node(ExprOp::Null, 0, 0, 0), node, compiler)?
+        push_node(nodes, ExprStep::new(ExprOp::Null, 0, 0, 0), node, compiler)?
     } else {
         compile(compiler, otherwise, depth + 1, nodes)?;
-        last(nodes)
+        nodes.last()
     };
     push_case(compiler, node, nodes, &branches, otherwise)
 }
@@ -363,7 +349,7 @@ fn unary(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let op = match node.operator() {
         Operator::IsNull => ExprOp::IsNull,
@@ -372,9 +358,8 @@ fn unary(
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
     };
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let a = nodes.len() as u32 - 1;
-    push_node(nodes, expr_node(op, a, 0, 0), node, compiler)?;
+    let a = nodes.last();
+    push_node(nodes, ExprStep::new(op, a, 0, 0), node, compiler)?;
     Ok(())
 }
 
@@ -384,17 +369,16 @@ fn like(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let pattern = compiler.node(node.first_child() + 1);
     if pattern.tag() != Tag::String {
         return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(pattern)));
     }
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let a = nodes.len() as u32 - 1;
+    let a = nodes.last();
     let pattern = string(compiler, pattern)?;
-    push_node(nodes, expr_node(ExprOp::Like, a, pattern.raw_id(), 0), node, compiler)?;
+    push_node(nodes, ExprStep::new(ExprOp::Like, a, pattern.raw_id(), 0), node, compiler)?;
     Ok(())
 }
 
@@ -403,19 +387,18 @@ fn negate(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let operand = compiler.node(node.first_child());
     if operand.tag() == Tag::Integer {
         // Read as negative, so the smallest integer can be written.
         let value = integer(compiler, operand, true)?;
-        push_node(nodes, expr_node(ExprOp::Constant, 0, 0, value), node, compiler)?;
+        push_node(nodes, ExprStep::new(ExprOp::Constant, 0, 0, value), node, compiler)?;
         return Ok(());
     }
     compile(compiler, operand, depth + 1, nodes)?;
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let x = nodes.len() as u32 - 1;
-    let last = at_mut!(nodes, x as usize);
+    let x = nodes.last();
+    let last = at_mut!(nodes.nodes_mut(), x as usize);
     if last.op == ExprOp::Constant
         && last.data_type == DataType::Int64
         && let Some(negated) = last.int_value.checked_neg()
@@ -424,8 +407,8 @@ fn negate(
         return Ok(());
     }
     // As in SQLite, -x is x * -1: an integer overflows only at its smallest.
-    let minus_one = push_node(nodes, expr_node(ExprOp::Constant, 0, 0, -1), node, compiler)?;
-    push_node(nodes, expr_node(ExprOp::Mul, x, minus_one, 0), node, compiler)?;
+    let minus_one = push_node(nodes, ExprStep::new(ExprOp::Constant, 0, 0, -1), node, compiler)?;
+    push_node(nodes, ExprStep::new(ExprOp::Mul, x, minus_one, 0), node, compiler)?;
     Ok(())
 }
 

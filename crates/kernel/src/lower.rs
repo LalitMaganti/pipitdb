@@ -252,14 +252,8 @@ mod tests {
     use alloc::vec::Vec as StdVec;
     use core::cell::RefCell;
 
-    /// A node of `op` reading `a` and `b`, or of value `value`.
-    fn step(op: ExprOp, a: u32, b: u32, value: i64) -> ExprStep {
-        let data_type = DataType::Int64;
-        ExprStep { op, data_type, a, b, c: 0, int_value: value, double_value: 0.0 }
-    }
-
     /// The nodes of `column <comparison> value`.
-    fn compared(column: ColumnId, comparison: Comparison, value: i64) -> StdVec<ExprStep> {
+    fn compared(column: ColumnId, comparison: Comparison, value: i64) -> ExprBuilder {
         let op = match comparison {
             Comparison::Equal => ExprOp::Eq,
             Comparison::NotEqual => ExprOp::Ne,
@@ -268,13 +262,15 @@ mod tests {
             Comparison::Greater => ExprOp::Gt,
             Comparison::GreaterEqual => ExprOp::Ge,
         };
-        let constant = step(ExprOp::Constant, 0, 0, value);
-        StdVec::from([step(ExprOp::Column, column, 0, 0), constant, step(op, 0, 1, 0)])
+        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let (column, value) = (nodes.column(column).unwrap(), nodes.int(value).unwrap());
+        nodes.node(op, column, value).unwrap();
+        nodes
     }
 
     /// A filter of the expression of `nodes`, added to `plan`'s.
-    fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &[ExprStep]) -> DynOp<'c> {
-        let condition = plan.exprs.add(nodes).unwrap();
+    fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &ExprBuilder) -> DynOp<'c> {
+        let condition = plan.exprs.add(nodes.nodes()).unwrap();
         DynOp::new(&Heap, FilterOp::new(&Heap, &plan.exprs, condition).unwrap()).unwrap()
     }
 
@@ -286,7 +282,7 @@ mod tests {
     use crate::condition::{Condition, Cutoff};
     use crate::context::Context;
     use crate::error::Error;
-    use crate::expression::{ExprOp, ExprStep, Exprs};
+    use crate::expression::{ExprBuilder, ExprOp, Exprs};
     use crate::filter::Comparison;
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
@@ -712,8 +708,10 @@ mod tests {
         let scan = plan.add_node(scan, &[]).unwrap();
         let (a, b) = (bindings[0].id, bindings[1].id);
         let mut nodes = compared(a, Comparison::Greater, 1);
-        nodes.extend([step(ExprOp::Column, b, 0, 0), step(ExprOp::IsNull, 3, 0, 0)]);
-        nodes.push(step(ExprOp::Or, 2, 4, 0));
+        let greater = nodes.last();
+        let b = nodes.column(b).unwrap();
+        let null = nodes.node(ExprOp::IsNull, b, 0).unwrap();
+        nodes.node(ExprOp::Or, greater, null).unwrap();
         let filter = filter(&mut plan, &nodes);
         plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
