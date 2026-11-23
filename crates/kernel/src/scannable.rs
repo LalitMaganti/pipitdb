@@ -199,9 +199,15 @@ type ScannableLoad = unsafe fn(
 ) -> Result<ColumnView, Error>;
 
 /// A `Scannable` of any type that lives for `'a`, owned in memory from an
-/// `Env`, and functions that know its type.
+/// `Env`, and its type's functions.
 pub struct DynScannable<'a> {
     scannable: ErasedBox,
+    functions: &'a ScannableFunctions<'a>,
+}
+
+/// A scannable type's functions, and the layouts of its state and loader:
+/// one table for each type.
+struct ScannableFunctions<'a> {
     column_count: unsafe fn(NonNull<()>) -> u32,
     column_name: unsafe fn(NonNull<()>, u32) -> *const str,
     column_type: unsafe fn(NonNull<()>, u32) -> DataType,
@@ -219,123 +225,124 @@ pub struct DynScannable<'a> {
     new_loader: NewState,
     drop_loader: unsafe fn(NonNull<u8>),
     load: ScannableLoad,
-    lifetime: PhantomData<&'a ()>,
+}
+
+/// Holds `T`'s table.
+struct Functions<'a, T>(PhantomData<(&'a (), T)>);
+
+impl<'a, T: Scannable + 'a> Functions<'a, T> {
+    const TABLE: ScannableFunctions<'a> = ScannableFunctions {
+        // SAFETY: only called with this scannable and its state, as is each below.
+        column_count: |scannable| unsafe { value_of::<T>(scannable).column_count() },
+        // SAFETY: as above.
+        column_name: |scannable, column| unsafe { value_of::<T>(scannable).column_name(column) },
+        // SAFETY: as above.
+        column_type: |scannable, column| unsafe { value_of::<T>(scannable).column_type(column) },
+        // SAFETY: as above.
+        column_nullable: |scannable, column| unsafe {
+            value_of::<T>(scannable).column_nullable(column)
+        },
+        // SAFETY: as above.
+        column_key: |scannable, column| unsafe { value_of::<T>(scannable).column_key(column) },
+        state_layout: Layout::new::<T::State<'a>>(),
+        // SAFETY: as above. The state borrows the scan's columns, which
+        // outlive it, as the scan's step drops its state first.
+        open: |scannable, context, columns, state| unsafe {
+            let made = value_of::<T>(scannable).open(context, columns)?;
+            write_state(state, made);
+            Ok(())
+        },
+        drop_state: drop_state::<T::State<'a>>,
+        // SAFETY: as above.
+        // The batch's columns may view the scannable, which lives for
+        // `'a`.
+        next: |scannable, context, state, batch| unsafe {
+            let state = state_of::<T::State<'a>>(state);
+            let batch = batch.cast::<RowBatch<'a>>().as_mut();
+            value_of::<T>(scannable).next(context, state, batch)
+        },
+        // SAFETY: as above. The source borrows the scannable, for as
+        // long as `scan` says.
+        scan_within: |scannable, env, columns, conditions, cutoff| unsafe {
+            value_of::<T>(scannable).scan_within(env, columns, conditions, cutoff)
+        },
+        // SAFETY: as above.
+        forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
+        // SAFETY: as above.
+        summary: |scannable, column| unsafe { value_of::<T>(scannable).summary(column) },
+        // SAFETY: as above.
+        sorted_by: |scannable| {
+            // SAFETY: as above. The orders live as long as the scannable,
+            // which is all `DynScannable::sorted_by` lends them for.
+            let orders: &[&[(u32, bool)]] = unsafe { value_of::<T>(scannable).sorted_by() };
+            #[expect(clippy::unnecessary_cast, reason = "it erases the orders' lifetime")]
+            let orders = core::ptr::from_ref(orders) as *const [&'static [(u32, bool)]];
+            orders
+        },
+        loader_layout: Layout::new::<T::Loader>(),
+        // SAFETY: as above.
+        new_loader: |scannable, context, loader| unsafe {
+            let made = value_of::<T>(scannable).new_loader(context)?;
+            write_state(loader, made);
+            Ok(())
+        },
+        drop_loader: drop_state::<T::Loader>,
+        // SAFETY: as above.
+        load: |scannable, context, loader, lazy, selection, forms| unsafe {
+            let loader = state_of::<T::Loader>(loader);
+            value_of::<T>(scannable).load(context, loader, lazy, selection, forms)
+        },
+    };
 }
 
 impl<'a> DynScannable<'a> {
     pub fn new<T: Scannable + 'a>(env: &Env, scannable: T) -> Result<DynScannable<'a>, AllocError> {
         const { assert!(align_of::<T::State<'a>>() <= BUFFER_ALIGNMENT_BYTES) };
         const { assert!(align_of::<T::Loader>() <= BUFFER_ALIGNMENT_BYTES) };
-        Ok(DynScannable {
-            scannable: Box::new(env, scannable)?.erase(),
-            // SAFETY: only called with this scannable and its state, as is each below.
-            column_count: |scannable| unsafe { value_of::<T>(scannable).column_count() },
-            // SAFETY: as above.
-            column_name: |scannable, column| unsafe {
-                value_of::<T>(scannable).column_name(column)
-            },
-            // SAFETY: as above.
-            column_type: |scannable, column| unsafe {
-                value_of::<T>(scannable).column_type(column)
-            },
-            // SAFETY: as above.
-            column_nullable: |scannable, column| unsafe {
-                value_of::<T>(scannable).column_nullable(column)
-            },
-            // SAFETY: as above.
-            column_key: |scannable, column| unsafe { value_of::<T>(scannable).column_key(column) },
-            state_layout: Layout::new::<T::State<'a>>(),
-            // SAFETY: as above. The state borrows the scan's columns, which
-            // outlive it, as the scan's step drops its state first.
-            open: |scannable, context, columns, state| unsafe {
-                let made = value_of::<T>(scannable).open(context, columns)?;
-                write_state(state, made);
-                Ok(())
-            },
-            drop_state: drop_state::<T::State<'a>>,
-            // SAFETY: as above.
-            // The batch's columns may view the scannable, which lives for
-            // `'a`.
-            next: |scannable, context, state, batch| unsafe {
-                let state = state_of::<T::State<'a>>(state);
-                let batch = batch.cast::<RowBatch<'a>>().as_mut();
-                value_of::<T>(scannable).next(context, state, batch)
-            },
-            // SAFETY: as above. The source borrows the scannable, for as
-            // long as `scan` says.
-            scan_within: |scannable, env, columns, conditions, cutoff| unsafe {
-                value_of::<T>(scannable).scan_within(env, columns, conditions, cutoff)
-            },
-            // SAFETY: as above.
-            forms: |scannable, column| unsafe { value_of::<T>(scannable).forms(column) },
-            // SAFETY: as above.
-            summary: |scannable, column| unsafe { value_of::<T>(scannable).summary(column) },
-            // SAFETY: as above.
-            sorted_by: |scannable| {
-                // SAFETY: as above. The orders live as long as the scannable,
-                // which is all `DynScannable::sorted_by` lends them for.
-                let orders: &[&[(u32, bool)]] = unsafe { value_of::<T>(scannable).sorted_by() };
-                #[expect(clippy::unnecessary_cast, reason = "it erases the orders' lifetime")]
-                let orders = core::ptr::from_ref(orders) as *const [&'static [(u32, bool)]];
-                orders
-            },
-            loader_layout: Layout::new::<T::Loader>(),
-            // SAFETY: as above.
-            new_loader: |scannable, context, loader| unsafe {
-                let made = value_of::<T>(scannable).new_loader(context)?;
-                write_state(loader, made);
-                Ok(())
-            },
-            drop_loader: drop_state::<T::Loader>,
-            // SAFETY: as above.
-            load: |scannable, context, loader, lazy, selection, forms| unsafe {
-                let loader = state_of::<T::Loader>(loader);
-                value_of::<T>(scannable).load(context, loader, lazy, selection, forms)
-            },
-            lifetime: PhantomData,
-        })
+        let scannable = Box::new(env, scannable)?.erase();
+        Ok(DynScannable { scannable, functions: &Functions::<'a, T>::TABLE })
     }
 
     pub fn column_count(&self) -> u32 {
         // SAFETY: the function matches the scannable's type.
-        unsafe { (self.column_count)(self.scannable.as_ptr()) }
+        unsafe { (self.functions.column_count)(self.scannable.as_ptr()) }
     }
 
     pub fn column_name(&self, column: u32) -> &str {
         // SAFETY: as above, and the name lives as long as the scannable.
-        unsafe { &*(self.column_name)(self.scannable.as_ptr(), column) }
+        unsafe { &*(self.functions.column_name)(self.scannable.as_ptr(), column) }
     }
 
     pub fn column_type(&self, column: u32) -> DataType {
         // SAFETY: as above.
-        unsafe { (self.column_type)(self.scannable.as_ptr(), column) }
+        unsafe { (self.functions.column_type)(self.scannable.as_ptr(), column) }
     }
 
     pub fn column_nullable(&self, column: u32) -> bool {
         // SAFETY: called with its own scannable.
-        unsafe { (self.column_nullable)(self.scannable.as_ptr(), column) }
+        unsafe { (self.functions.column_nullable)(self.scannable.as_ptr(), column) }
     }
 
     pub fn column_key(&self, column: u32) -> Key {
         // SAFETY: called with its own scannable.
-        unsafe { (self.column_key)(self.scannable.as_ptr(), column) }
+        unsafe { (self.functions.column_key)(self.scannable.as_ptr(), column) }
     }
 
     /// The forms `column` can be written in.
     pub fn summary(&self, column: Option<u32>) -> Option<Summary> {
         // SAFETY: as above.
-        unsafe { (self.summary)(self.scannable.as_ptr(), column) }
+        unsafe { (self.functions.summary)(self.scannable.as_ptr(), column) }
     }
 
     pub fn forms(&self, column: u32) -> Forms {
         // SAFETY: as above.
-        unsafe { (self.forms)(self.scannable.as_ptr(), column) }
+        unsafe { (self.functions.forms)(self.scannable.as_ptr(), column) }
     }
 
     /// The orders its rows are known to be in.
     pub fn sorted_by(&self) -> &[&[(u32, bool)]] {
         // SAFETY: as above, and the keys live as long as the scannable.
-        unsafe { &*(self.sorted_by)(self.scannable.as_ptr()) }
+        unsafe { &*(self.functions.sorted_by)(self.scannable.as_ptr()) }
     }
 
     /// A source of `columns` of this, in that order, each written in one of
@@ -366,7 +373,7 @@ impl<'a> DynScannable<'a> {
             // source borrows `self`.
             let within = unsafe {
                 let scannable = self.scannable.as_ptr();
-                (self.scan_within)(scannable, env, &columns, conditions, cutoff)?
+                (self.functions.scan_within)(scannable, env, &columns, conditions, cutoff)?
             };
             if let Some(source) = within {
                 return Ok(source);
@@ -379,9 +386,9 @@ impl<'a> DynScannable<'a> {
         let source = unsafe {
             DynSource::from_parts(
                 step,
-                self.state_layout,
+                self.functions.state_layout,
                 scan_new_state,
-                self.drop_state,
+                self.functions.drop_state,
                 scan_next,
                 "Scan",
             )
@@ -407,9 +414,9 @@ impl<'a> DynScannable<'a> {
         Ok(unsafe {
             DynTransform::from_parts(
                 step,
-                self.loader_layout,
+                self.functions.loader_layout,
                 materialize_new_state,
-                self.drop_loader,
+                self.functions.drop_loader,
                 materialize_process,
                 "Materialize",
             )
@@ -446,7 +453,9 @@ unsafe fn scan_new_state(
     // SAFETY: as above.
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.open)(scannable.scannable.as_ptr(), context, &scan.columns, state) }
+    unsafe {
+        (scannable.functions.open)(scannable.scannable.as_ptr(), context, &scan.columns, state)
+    }
 }
 
 unsafe fn scan_next(
@@ -461,7 +470,7 @@ unsafe fn scan_next(
     let scannable = unsafe { scan.scannable.as_ref() };
     // SAFETY: the function matches the scannable's type, and `state` holds
     // its state.
-    unsafe { (scannable.next)(scannable.scannable.as_ptr(), context, state, batch) }
+    unsafe { (scannable.functions.next)(scannable.scannable.as_ptr(), context, state, batch) }
 }
 
 unsafe fn materialize_new_state(
@@ -472,7 +481,7 @@ unsafe fn materialize_new_state(
     // SAFETY: `step` is a `Materialize`, whose scannable outlives it.
     let scannable = unsafe { step.cast::<Materialize>().as_ref().scannable.as_ref() };
     // SAFETY: the function matches the scannable's type.
-    unsafe { (scannable.new_loader)(scannable.scannable.as_ptr(), context, loader) }
+    unsafe { (scannable.functions.new_loader)(scannable.scannable.as_ptr(), context, loader) }
 }
 
 unsafe fn materialize_process(
@@ -495,7 +504,14 @@ unsafe fn materialize_process(
         // SAFETY: the function matches the scannable's type, and `loader`
         // holds its loader.
         let column = unsafe {
-            (scannable.load)(scannable.scannable.as_ptr(), context, loader, lazy, selection, forms)
+            (scannable.functions.load)(
+                scannable.scannable.as_ptr(),
+                context,
+                loader,
+                lazy,
+                selection,
+                forms,
+            )
         }?;
         check!(!column.is_lazy() && column.row_count() == batch.row_count());
         batch.set_column(position, column);
