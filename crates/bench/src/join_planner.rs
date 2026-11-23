@@ -479,6 +479,44 @@ pub fn as_written(global: &Global, graph: &QueryGraph) -> Result<JoinTree, Error
     Ok(tree)
 }
 
+/// A query graph of `count` tables. If `star`, each table joins the first
+/// one; if not, each joins the one before it. Each join is many-to-one on the
+/// smaller table's key.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+pub fn join_graph(star: bool, count: u32) -> QueryGraph {
+    let mut graph = QueryGraph::new(crate::global()).expect("allocates");
+    for relation in 0..count {
+        let rows = 100 + u64::from(relation) * 2_654_435_761 % 100_000;
+        graph
+            .relations
+            .push(Relation { rows, unfiltered_rows: rows, max_rows: rows })
+            .expect("allocates");
+        let Some(before) = relation.checked_sub(1) else { continue };
+        let other = if star { 0 } else { before };
+        let domain = rows.min(graph.relations.get(other as usize).expect("added").rows);
+        graph.equivalences.push(EquivalenceSet { domain }).expect("allocates");
+        let (left, right) = (
+            relation_set([other]).expect("allocates"),
+            relation_set([relation]).expect("allocates"),
+        );
+        let edge = JoinEdge { left, right, kind: JoinKind::Inner, equivalence: before };
+        graph.edges.push(edge).expect("allocates");
+    }
+    graph
+}
+
+/// Plans the joins of `graph`, and returns how many nodes the plan has, or 0
+/// if it keeps the written order.
+pub fn plan_joins(graph: &QueryGraph) -> usize {
+    pipit_kernel::join_planner::plan(crate::global(), graph)
+        .map_or(0, |tree| tree.map_or(0, |tree| tree.nodes.len()))
+}
+
+/// The planner's tree for `graph`, or the written order where it keeps that.
+pub fn plan(global: &Global, graph: &QueryGraph) -> Result<JoinTree, Error> {
+    pipit_kernel::join_planner::plan(global, graph)?.map_or_else(|| as_written(global, graph), Ok)
+}
+
 /// The cheapest valid tree of `graph`, of at most `EXHAUSTIVE_MAX`
 /// relations, by dynamic programming over every subset of its relations,
 /// and its cost. Each subset keeps the rows of its cheapest tree.
@@ -623,6 +661,44 @@ mod tests {
         assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
     }
 
+    /// Each relation left joined to all those before it: a long graph with
+    /// few connected sets, so it's planned exactly.
+    fn left_chain(count: u32) -> QueryGraph {
+        let mut graph = QueryGraph::new(crate::global()).unwrap();
+        for relation in 0..count {
+            let rows = 10 + u64::from(relation * 7919 % 1000);
+            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
+            graph.equivalences.push(EquivalenceSet { domain: rows }).unwrap();
+            if relation > 0 {
+                let (left, right) =
+                    (relation_set(0..relation).unwrap(), relation_set([relation]).unwrap());
+                let edge = JoinEdge { left, right, kind: JoinKind::Left, equivalence: relation };
+                graph.edges.push(edge).unwrap();
+            }
+        }
+        graph
+    }
+
+    #[test]
+    fn small_graphs_are_planned_optimally() {
+        for shape in SHAPES {
+            for (count, mixed) in [(2, false), (3, true), (7, false), (10, true)] {
+                let graph = generate(shape, count, mixed).unwrap();
+                let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+                let (_, optimum) = exhaustive(&graph).unwrap();
+                assert!(planned.valid.is_ok() && planned.cost <= optimum * (1.0 + 1e-9));
+            }
+        }
+    }
+
+    #[test]
+    fn long_graphs_with_few_connected_sets_are_planned_exactly() {
+        let graph = left_chain(50);
+        let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+        let written = cost(&graph, &as_written(crate::global(), &graph).unwrap()).unwrap();
+        assert_eq!(planned, written);
+    }
+
     /// A fact of 1000 rows with dimensions of 10 and 20 on its keys, and a
     /// relation of one row: joined to the fact if `connected`, or to nothing.
     fn one_row_star(connected: bool) -> QueryGraph {
@@ -657,6 +733,11 @@ mod tests {
             assert!(cost(&graph, &tree).unwrap().valid.is_ok());
             let (tree, optimum) = exhaustive(&graph).unwrap();
             assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
+            // A disconnected graph may take any cross product, which exact
+            // search doesn't try, so only its validity is checked.
+            let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+            assert!(planned.valid.is_ok());
+            assert!(!connected || planned.cost <= optimum * (1.0 + 1e-9));
         }
     }
 
@@ -677,5 +758,6 @@ mod tests {
         assert_eq!(cost(&graph, &written).unwrap().valid, Err(Invalid::Executable));
         let (tree, _) = exhaustive(&graph).unwrap();
         assert!(cost(&graph, &tree).unwrap().valid.is_ok());
+        assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
     }
 }

@@ -6,7 +6,7 @@ use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// The most relations, edges or equivalence sets a graph holds.
-const LIST_MAX: usize = 1 << 24;
+pub(super) const LIST_MAX: usize = 1 << 24;
 
 /// The most words a `RelationSet` grows to, enough for `LIST_MAX` relations.
 const WORDS_MAX: usize = LIST_MAX / 64;

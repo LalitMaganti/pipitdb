@@ -64,6 +64,13 @@ impl<T> SlowVec<T> {
         SlowVec::empty(global, len, len)
     }
 
+    /// An empty `SlowVec` that allocates nothing and never grows.
+    pub fn none(global: &Global) -> SlowVec<T> {
+        let values = NonNull::<Aligned>::dangling().cast();
+        let raw = RawVec { values, global: NonNull::from(global), len: 0, capacity: 0, max: 0 };
+        SlowVec { raw, values: PhantomData }
+    }
+
     /// `values`, in a `SlowVec` that never grows.
     #[inline]
     pub fn fixed_from(

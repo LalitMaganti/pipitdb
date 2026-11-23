@@ -46,6 +46,14 @@ impl JoinTree {
         self.push(JoinNode::Join { left, right }, rows)
     }
 
+    /// Adds a node to a tree that has room for it, and returns it.
+    pub(super) fn add(&mut self, kind: JoinNode, rows: f64) -> u32 {
+        match self.push(kind, rows) {
+            Ok(index) => index,
+            Err(_) => failed!(),
+        }
+    }
+
     fn push(&mut self, kind: JoinNode, rows: f64) -> Result<u32, AllocError> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a `SlowVec`'s length")]
         let index = self.nodes.len() as u32;

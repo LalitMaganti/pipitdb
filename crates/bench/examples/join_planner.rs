@@ -23,11 +23,11 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::global::Global;
 use pipit_kernel::join_planner::{QueryGraph, RelationSet};
 use pipitdb_bench::join_planner::{
-    EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name,
+    EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name, plan,
 };
 
 /// The planners competing, by name. Add one here.
-const PLANNERS: &[(&str, Enumerator)] = &[("as_written", as_written)];
+const PLANNERS: &[(&str, Enumerator)] = &[("as_written", as_written), ("plan", plan)];
 
 const SIZES: [usize; 7] = [5, 10, 15, 20, 50, 100, 500];
 
