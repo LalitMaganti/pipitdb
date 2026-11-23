@@ -38,11 +38,22 @@ struct RawVec {
 }
 
 impl<T> SlowVec<T> {
-    /// An empty `SlowVec` that can grow to `max` values.
+    /// An empty `SlowVec` that can grow to `max` values. It allocates
+    /// nothing until a value is added, so never fails: a `Result` only so
+    /// callers can treat every constructor alike.
     #[inline]
     pub fn new(allocator: &dyn Allocator, max: usize) -> Result<SlowVec<T>, AllocError> {
+        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
-        SlowVec::empty(allocator, 0, max)
+        let Ok(max) = u32::try_from(max) else { failed!() };
+        let raw = RawVec {
+            values: NonNull::<Aligned>::dangling().cast(),
+            allocator: forget_lifetime(allocator),
+            len: 0,
+            capacity: 0,
+            max,
+        };
+        Ok(SlowVec { raw, values: PhantomData })
     }
 
     /// An empty `SlowVec` with room for `len` values, rounded up, that never
@@ -235,6 +246,18 @@ fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
     Layout::from_size_align(bytes, align).map_err(|_| AllocError)
 }
 
+/// `allocator`, whose lifetime is forgotten: it outlives the values, as
+/// callers promise.
+#[inline]
+fn forget_lifetime(allocator: &dyn Allocator) -> NonNull<dyn Allocator> {
+    // SAFETY: only the lifetime changes.
+    unsafe {
+        core::mem::transmute::<NonNull<dyn Allocator + '_>, NonNull<dyn Allocator>>(NonNull::from(
+            allocator,
+        ))
+    }
+}
+
 impl RawVec {
     /// Room for `capacity` values of `item` bytes, zeroed if `zeroed`, and
     /// at most `max`, which is at least `capacity`: both rounded up to a
@@ -255,14 +278,7 @@ impl RawVec {
             _ if zeroed => allocator.allocate_zeroed(layout(item, capacity)?)?,
             _ => allocator.allocate(layout(item, capacity)?)?,
         };
-        // The allocator outlives the values, as callers promise, so its
-        // lifetime can be forgotten.
-        // SAFETY: only the lifetime changes.
-        let allocator = unsafe {
-            core::mem::transmute::<NonNull<dyn Allocator + '_>, NonNull<dyn Allocator>>(
-                NonNull::from(allocator),
-            )
-        };
+        let allocator = forget_lifetime(allocator);
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
         let capacity = capacity as u32;
         Ok(RawVec { values, allocator, len: 0, capacity, max })
