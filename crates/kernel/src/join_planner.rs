@@ -23,6 +23,13 @@ use crate::error::Error;
 /// plan, of 1,000 relations, takes about 1 s; a soft target.
 const WORK_MAX: usize = 1 << 27;
 
+/// What a join's hash table costs for each row of its smaller side, where
+/// each row the join makes costs 1. Building a row costs 8 to 15 times what
+/// probing one does on x86-64 and Apple CPUs alike, as
+/// `crates/bench/build_cost.py` measures; plans of TPC-H and TPC-DS are the
+/// same for any value from 1 to 64.
+pub const BUILD_COST: f64 = 10.0;
+
 /// Plans the joins of `graph`: exactly if exact search can afford it, or
 /// else greedily, improved by windows. `None` keeps the plan as written: for
 /// one or two relations, which have one plan, or if greedy ordering is

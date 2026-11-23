@@ -18,7 +18,8 @@ work budget bounds all of it, so planning always ends with a valid plan.
    values they can take.
 3. **Estimate.** A join's rows follow from its inputs' rows and the domains
    of the equivalence sets it joins on (see Estimation). A tree's cost is
-   C_out: the rows of all its joins added up.
+   C_out, the rows of all its joins added up, plus 10 for each row of
+   each join's smaller side, the hash table it builds (see Cost).
 4. **Valid join.** Two trees may be joined only if an edge connects them,
    unless the graph is disconnected. A join must apply every edge whose
    relations it brings together, so each side of the edge must be on one
@@ -139,9 +140,16 @@ What it needs of a function is its cost per call and its selectivity.
 | Full outer joins | Issue: no join kind yet |
 | Outer-join reordering rules | Issue: Moerkotte, Fender and Eich's conflict rules |
 
-- **Cost.** C_out counts the rows each join makes, which ranks hash joins
-  well. A join that compares every pair also costs left × right
-  comparisons, each at its function's cost per call.
+- **Cost.** C_out counts the rows each join makes, but not that building
+  a hash table costs more than probing one: 8 to 15 times a row, on Intel,
+  AMD and Apple CPUs alike, as `crates/bench/build_cost.py` measures.
+  PostgreSQL charges about 5 times; DuckDB's thesis on join ordering
+  (Ebergen 2022, §6.3) found plans with fewer rows built ran faster despite
+  more rows made. So each join also costs 10 for each row of its smaller
+  side. TPC-H's and TPC-DS's plans are the same for any factor from 1 to
+  64, so the factor needn't match the machine. A join that compares every
+  pair also costs left × right comparisons, each at its function's cost
+  per call.
 - **A function's facts.** Its cost per call and its selectivity, or for a
   table-valued function its rows. An undeclared function is taken as
   expensive and keeping every row, the bound that always holds, so the
@@ -172,5 +180,8 @@ What it needs of a function is its cost per call and its selectivity.
   Reordering for Query Optimization".
 - Hellerstein and Stonebraker 1993, "Predicate Migration: Optimizing
   Queries with Expensive Predicates".
+- Ebergen 2022, "Join Order Optimization with (Almost) No Statistics"
+  (MSc thesis, CWI).
 - Leis et al. 2015, "How Good Are Query Optimizers, Really?".
-- PostgreSQL, `calc_joinrel_size_estimate` in `costsize.c`.
+- PostgreSQL, `calc_joinrel_size_estimate` and `initial_cost_hashjoin` in
+  `costsize.c`.

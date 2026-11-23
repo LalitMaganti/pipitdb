@@ -6,6 +6,7 @@
 
 use core::iter::repeat_n;
 
+use super::BUILD_COST;
 use super::estimate::Estimator;
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree};
@@ -387,7 +388,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
             return;
         }
         let rows = if fresh { self.estimator.finish() } else { found.rows };
-        let cost = l.cost + r.cost + rows.max(1.0);
+        let cost = l.cost + r.cost + rows.max(1.0) + BUILD_COST * l.rows.min(r.rows);
         if fresh || cost < found.cost {
             *at_mut!(self.plans, i) = Plan { set, cost, rows, split: left };
         }
