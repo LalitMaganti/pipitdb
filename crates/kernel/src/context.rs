@@ -3,8 +3,8 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
+use crate::env::{Env, Kind};
 use crate::function::DynFunction;
-use crate::global::{Global, Kind};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
 use crate::statement::Statement;
@@ -18,7 +18,7 @@ pub const CUTOFFS_MAX: u32 = 1 << 6;
 
 pub struct Context<'a> {
     /// What states, other metadata and column buffers allocate from.
-    global: &'a Global,
+    env: &'a Env,
     /// Made when first reserved: most runs need none.
     selections: Option<SlowVec<Selection>>,
     /// Made when first used: most runs intern no strings.
@@ -34,10 +34,10 @@ pub struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    /// A context allocating from `global`, of `statement`, if any.
-    pub fn new(global: &'a Global, statement: Option<&'a Statement>) -> Context<'a> {
+    /// A context allocating from `env`, of `statement`, if any.
+    pub fn new(env: &'a Env, statement: Option<&'a Statement>) -> Context<'a> {
         Context {
-            global,
+            env,
             selections: None,
             string_pool: None,
             literals: statement.and_then(Statement::literals),
@@ -57,8 +57,8 @@ impl<'a> Context<'a> {
     }
 
     /// What the run's memory comes from, for states to allocate with.
-    pub fn allocator(&self) -> &'a Global {
-        self.global
+    pub fn env(&self) -> &'a Env {
+        self.env
     }
 
     /// Memory for a batch's column of 8-byte values, `size_bytes` of them,
@@ -66,25 +66,25 @@ impl<'a> Context<'a> {
     /// functions, by kind, so how it's found can change in one place. It
     /// isn't zeroed: whoever fills it writes every byte that's read.
     pub fn values_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.global, Kind::Values, size_bytes)
+        buffer(self.env, Kind::Values, size_bytes)
     }
 
     /// As `values_buffer`, for 4-byte values, such as dictionary indices, or
     /// string offsets, of which there's one more than rows.
     pub fn indices_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.global, Kind::Indices, size_bytes)
+        buffer(self.env, Kind::Indices, size_bytes)
     }
 
     /// As `values_buffer`, for small things a column needs: its header, its
     /// validity bitmap, a lazy column's handle.
     pub fn small_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.global, Kind::Small, size_bytes)
+        buffer(self.env, Kind::Small, size_bytes)
     }
 
     /// As `values_buffer`, for column data of no fixed size, such as
     /// strings' bytes.
     pub fn bytes_buffer(&mut self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        buffer(self.global, Kind::Base, size_bytes)
+        buffer(self.env, Kind::Base, size_bytes)
     }
 
     /// Makes sure there are at least `count` scratch selections. Steps call
@@ -97,7 +97,7 @@ impl<'a> Context<'a> {
         }
         let selections = match &mut self.selections {
             Some(selections) => selections,
-            None => self.selections.insert(SlowVec::new(self.global, SCRATCH_SELECTIONS_MAX)?),
+            None => self.selections.insert(SlowVec::new(self.env, SCRATCH_SELECTIONS_MAX)?),
         };
         while selections.len() < count {
             selections.push(Selection::all(0))?;
@@ -118,7 +118,7 @@ impl<'a> Context<'a> {
         check!(slot < CUTOFFS_MAX);
         let cutoffs = match &mut self.cutoffs {
             Some(cutoffs) => cutoffs,
-            None => self.cutoffs.insert(SlowVec::new(self.global, CUTOFFS_MAX as usize)?),
+            None => self.cutoffs.insert(SlowVec::new(self.env, CUTOFFS_MAX as usize)?),
         };
         while cutoffs.len() <= slot as usize {
             cutoffs.push(None)?;
@@ -141,17 +141,17 @@ impl<'a> Context<'a> {
     /// can be compared.
     pub fn string_pool(&mut self) -> Result<&mut StringPool, AllocError> {
         if self.string_pool.is_none() {
-            self.string_pool = Some(StringPool::new(self.global)?);
+            self.string_pool = Some(StringPool::new(self.env)?);
         }
         let Some(pool) = &mut self.string_pool else { failed!() };
         Ok(pool)
     }
 }
 
-/// `size_bytes` bytes from `allocator`, not zeroed.
-fn buffer(global: &Global, kind: Kind, size_bytes: usize) -> Result<Buffer, AllocError> {
+/// `size_bytes` bytes from `env`, not zeroed.
+fn buffer(env: &Env, kind: Kind, size_bytes: usize) -> Result<Buffer, AllocError> {
     // SAFETY: whoever fills it writes every byte that's read.
-    unsafe { Buffer::allocate_uninit_in(global, kind, size_bytes) }
+    unsafe { Buffer::allocate_uninit_in(env, kind, size_bytes) }
 }
 
 #[cfg(test)]
@@ -160,8 +160,8 @@ mod tests {
 
     #[test]
     fn shares_scratch_between_steps() {
-        let global = Global::current();
-        let mut context = Context::new(global, None);
+        let env = Env::current();
+        let mut context = Context::new(env, None);
         assert!(context.selections().is_empty());
         // As many as the most reserved, not the sum.
         assert!(context.reserve_selections(2).is_ok() && context.reserve_selections(1).is_ok());

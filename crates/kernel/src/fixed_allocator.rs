@@ -170,32 +170,32 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::buffer::Buffer;
-    use crate::global::{Global, Kind};
+    use crate::env::{Env, Kind};
 
     #[test]
     fn carves_blocks_exactly_and_hands_them_out_again() {
-        let global = Global::current();
+        let env = Env::current();
         let words = BATCH_ROWS_MAX as usize * 8;
-        let before = global.used();
-        let a = Buffer::allocate_in(global, Kind::Values, words).unwrap();
-        let b = Buffer::allocate_in(global, Kind::Values, words).unwrap();
+        let before = env.used();
+        let a = Buffer::allocate_in(env, Kind::Values, words).unwrap();
+        let b = Buffer::allocate_in(env, Kind::Values, words).unwrap();
         // One chunk counts, and the second block is right after the first.
-        let chunk = global.used() - before;
+        let chunk = env.used() - before;
         let (pa, pb) = (a.as_slice::<u8>().as_ptr(), b.as_slice::<u8>().as_ptr());
         assert_eq!(pb.addr() - pa.addr(), VALUES_BYTES);
         drop(b);
-        let c = Buffer::allocate_in(global, Kind::Values, words).unwrap();
+        let c = Buffer::allocate_in(env, Kind::Values, words).unwrap();
         assert_eq!(c.as_slice::<u8>().as_ptr(), pb);
-        assert_eq!(global.used() - before, chunk);
+        assert_eq!(env.used() - before, chunk);
         drop((a, c));
     }
 
     #[test]
     fn hands_out_a_whole_block_for_less() {
-        let global = Global::current();
+        let env = Env::current();
         let rows = BATCH_ROWS_MAX as usize;
-        let offsets = Buffer::allocate_in(global, Kind::Indices, (rows + 1) * 4).unwrap();
-        let short = Buffer::allocate_in(global, Kind::Indices, 10 * 4).unwrap();
+        let offsets = Buffer::allocate_in(env, Kind::Indices, (rows + 1) * 4).unwrap();
+        let short = Buffer::allocate_in(env, Kind::Indices, 10 * 4).unwrap();
         assert_eq!(short.size_bytes(), 40);
         drop((offsets, short));
     }
@@ -203,27 +203,27 @@ mod tests {
     #[test]
     #[should_panic(expected = "block_bytes")]
     fn checks_nothing_asks_for_more_than_a_block() {
-        let global = Global::current();
+        let env = Env::current();
         // With its header, it's more than a small block.
-        let _ = Buffer::allocate_in(global, Kind::Small, SMALL_BYTES);
+        let _ = Buffer::allocate_in(env, Kind::Small, SMALL_BYTES);
     }
 
     #[test]
     fn zeroes_blocks_handed_out_again_when_asked() {
-        let global = Global::current();
-        let mut a = Buffer::allocate_in(global, Kind::Small, 100).unwrap();
+        let env = Env::current();
+        let mut a = Buffer::allocate_in(env, Kind::Small, 100).unwrap();
         a.as_mut_slice::<u8>().fill(7);
         drop(a);
-        let b = Buffer::allocate_in(global, Kind::Small, 100).unwrap();
+        let b = Buffer::allocate_in(env, Kind::Small, 100).unwrap();
         assert_eq!(b.as_slice::<u8>(), [0; 100]);
     }
 
     #[test]
     fn chunks_count_against_a_limit() {
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(Heap, 1000) }.unwrap();
-        let before = global.used();
-        assert!(Buffer::allocate_in(&global, Kind::Small, 100).is_err());
-        assert_eq!(global.used(), before);
+        let env = unsafe { Env::new(Heap, 1000) }.unwrap();
+        let before = env.used();
+        assert!(Buffer::allocate_in(&env, Kind::Small, 100).is_err());
+        assert_eq!(env.used(), before);
     }
 }

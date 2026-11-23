@@ -7,8 +7,8 @@ use super::exact::{self, Link};
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree, Node};
 use crate::bitmap::BitSlice;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// How many subtrees a window joins.
@@ -17,7 +17,7 @@ const WINDOW: usize = 8;
 /// The plan as it's improved, and what it reads of the graph.
 struct Windows<'a, 'g, 'e, 't> {
     /// Where the windows' searches get their memory.
-    global: &'a Global,
+    env: &'a Env,
     /// The graph being planned.
     graph: &'g QueryGraph,
     /// Estimates the rows of the joins it tries.
@@ -37,7 +37,7 @@ struct Windows<'a, 'g, 'e, 't> {
 /// Improves `tree`, a plan of `graph` whose joins come after their
 /// children, with windows, drawing on `work`. Once it's spent, windows stop.
 pub(super) fn improve<'g>(
-    global: &Global,
+    env: &Env,
     graph: &'g QueryGraph,
     estimator: &mut Estimator<'g>,
     tree: &mut JoinTree,
@@ -45,7 +45,7 @@ pub(super) fn improve<'g>(
 ) -> Result<(), Error> {
     let count = graph.relations.len();
     let words = BitSlice::<u64>::words_for(count);
-    let mut sets = SlowVec::zeroed(global, (tree.nodes.len() + 2) * words)?;
+    let mut sets = SlowVec::zeroed(env, (tree.nodes.len() + 2) * words)?;
     for (node, found) in tree.nodes.iter().enumerate() {
         match found.kind {
             JoinNode::Relation(relation) => {
@@ -59,14 +59,14 @@ pub(super) fn improve<'g>(
         }
     }
     let mut windows = Windows {
-        global,
+        env,
         graph,
         estimator,
         tree,
         words,
         sets,
-        label: SlowVec::zeroed(global, count)?,
-        links: SlowVec::new(global, LIST_MAX)?,
+        label: SlowVec::zeroed(env, count)?,
+        links: SlowVec::new(env, LIST_MAX)?,
     };
     // Joins come after their children, so each window's subtrees have
     // already been improved.
@@ -152,7 +152,7 @@ impl Windows<'_, '_, '_, '_> {
         });
         let (rows, links) = (at!(rows, ..k), &self.links);
         let solved =
-            exact::solve(self.global, graph, self.estimator, links, rows, single, &mut can_run)?;
+            exact::solve(self.env, graph, self.estimator, links, rows, single, &mut can_run)?;
         let Some(solved) = solved else { return Ok(()) };
         // Its nodes come after their children and its root last, so the new
         // root goes in `root`, the first slot, which is taken last.
@@ -244,7 +244,7 @@ fn can_run(
 
 #[cfg(test)]
 mod tests {
-    use crate::global::Global;
+    use crate::env::Env;
     use crate::join_planner::{
         EquivalenceSet, JoinEdge, JoinKind, JoinNode, QueryGraph, Relation, RelationSet, plan,
     };
@@ -252,15 +252,15 @@ mod tests {
     /// A graph of relations of `rows`, each a pair of rows and the most rows,
     /// and inner joins between pairs of relations on domains of `edges`.
     fn graph(rows: &[(u64, u64)], edges: &[(u32, u32, u64)]) -> QueryGraph {
-        let mut graph = QueryGraph::new(Global::current()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for &(rows, max_rows) in rows {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
         }
         for (equivalence, &(left, right, domain)) in (0..).zip(edges) {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
             let (mut left_set, mut right_set) = (
-                RelationSet::new(Global::current()).unwrap(),
-                RelationSet::new(Global::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
             );
             left_set.insert(left).unwrap();
             right_set.insert(right).unwrap();
@@ -279,7 +279,7 @@ mod tests {
         rows.push((1, 1));
         let edges: alloc::vec::Vec<(u32, u32, u64)> = (1..70).map(|i| (i - 1, i, 10)).collect();
         let graph = graph(&rows, &edges);
-        let tree = plan(Global::current(), &graph).unwrap().unwrap();
+        let tree = plan(Env::current(), &graph).unwrap().unwrap();
         let mut seen = [false; 71];
         for node in tree.nodes.iter() {
             if let JoinNode::Relation(relation) = node.kind {

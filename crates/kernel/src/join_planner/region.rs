@@ -2,10 +2,10 @@
 //! plan, and rebuilding it in the order planned.
 
 use crate::allocator::AllocError;
+use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::Estimate;
 use crate::expression::{Expr, Exprs};
-use crate::global::Global;
 use crate::join::{JoinKind as Kind, JoinOp, equality};
 use crate::plan::{ColumnId, DynOp, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
 use crate::scannable::Key;
@@ -37,7 +37,7 @@ struct Equality {
 /// rebuilds those it finds a plan for in their new order. Returns whether
 /// any changed, which leaves the plan to prune again.
 pub(crate) fn plan_regions(
-    global: &Global,
+    env: &Env,
     plan: &mut LogicalPlan<'_>,
     estimates: &[Estimate],
 ) -> Result<bool, AllocError> {
@@ -66,7 +66,7 @@ pub(crate) fn plan_regions(
         let reachable = id == plan.root || parent != NONE;
         let root = is_plannable(id) && (parent == NONE || !is_plannable(parent));
         if reachable && root {
-            changed |= plan_region(global, plan, estimates, id, parent)?;
+            changed |= plan_region(env, plan, estimates, id, parent)?;
         }
     }
     // Pruning next orders the nodes again, inputs first.
@@ -86,7 +86,7 @@ fn plannable(exprs: &Exprs, op: &DynOp<'_>) -> bool {
 /// Plans the region whose root is join `root`, and rebuilds it if planning
 /// finds a plan. Returns whether it did.
 fn plan_region(
-    global: &Global,
+    env: &Env,
     plan: &mut LogicalPlan<'_>,
     estimates: &[Estimate],
     root: PlanNodeId,
@@ -94,9 +94,9 @@ fn plan_region(
 ) -> Result<bool, AllocError> {
     // Its joins, and its relations: the children of its joins that aren't
     // joins of it.
-    let mut joins = SlowVec::new(global, crate::plan::PLAN_NODES_MAX)?;
-    let mut leaves = SlowVec::new(global, crate::plan::PLAN_NODES_MAX)?;
-    let mut pending = SlowVec::new(global, crate::plan::PLAN_NODES_MAX)?;
+    let mut joins = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
+    let mut leaves = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
+    let mut pending = SlowVec::new(env, crate::plan::PLAN_NODES_MAX)?;
     pending.push(root)?;
     while let Some(id) = pending.pop() {
         joins.push(id)?;
@@ -127,7 +127,7 @@ fn plan_region(
         }
     }
     // The equalities the region's joins require.
-    let mut equalities = SlowVec::new(global, crate::expression::EXPR_NODES_MAX)?;
+    let mut equalities = SlowVec::new(env, crate::expression::EXPR_NODES_MAX)?;
     let mut unplaced = false;
     for &id in joins.iter() {
         let Some(join) = at!(plan.nodes, id as usize).op.as_join() else { failed!() };
@@ -143,13 +143,13 @@ fn plan_region(
     if unplaced {
         return Ok(false);
     }
-    let graph = graph(global, estimates, &leaves, &equalities)?;
-    let tree = match super::plan(global, &graph) {
+    let graph = graph(env, estimates, &leaves, &equalities)?;
+    let tree = match super::plan(env, &graph) {
         Ok(Some(tree)) => tree,
         Ok(None) | Err(Error::Unsupported) => return Ok(false),
         Err(_) => return Err(AllocError),
     };
-    let new_root = rebuild(global, plan, &joins, &leaves, &equalities, &relation_of, &tree)?;
+    let new_root = rebuild(env, plan, &joins, &leaves, &equalities, &relation_of, &tree)?;
     // The new root takes the old one's place: its first join's.
     match parent {
         NONE => plan.root = new_root,
@@ -166,12 +166,12 @@ fn plan_region(
 /// The query graph of a region's relations, whose estimates are those of
 /// `leaves`, joined by `equalities`.
 fn graph(
-    global: &Global,
+    env: &Env,
     estimates: &[Estimate],
     leaves: &[PlanNodeId],
     equalities: &[Equality],
 ) -> Result<QueryGraph, AllocError> {
-    let mut graph = QueryGraph::new(global)?;
+    let mut graph = QueryGraph::new(env)?;
     for &leaf in leaves {
         let estimate = at!(estimates, leaf as usize);
         // A filter lowers a relation's estimate, but not the most it can
@@ -220,7 +220,7 @@ fn graph(
         }
     }
     for equality in equalities {
-        let (mut left, mut right) = (RelationSet::new(global)?, RelationSet::new(global)?);
+        let (mut left, mut right) = (RelationSet::new(env)?, RelationSet::new(env)?);
         let ([a, b], [column, _]) = (equality.relations, equality.columns);
         left.insert(a)?;
         right.insert(b)?;
@@ -235,7 +235,7 @@ fn graph(
 /// equalities its two sides bring together, and outputs all their
 /// relations' columns, for pruning to trim.
 fn rebuild(
-    global: &Global,
+    env: &Env,
     plan: &mut LogicalPlan<'_>,
     joins: &[PlanNodeId],
     leaves: &[PlanNodeId],
@@ -278,7 +278,7 @@ fn rebuild(
             (*at!(built, left as usize), *at!(built, right as usize));
         // The equalities whose relations it joins, one on each side: only
         // the lowest join that has both splits them so.
-        let mut conjuncts = SlowVec::fixed(global, equalities.len())?;
+        let mut conjuncts = SlowVec::fixed(env, equalities.len())?;
         for equality in equalities {
             let [a, b] = equality.relations.map(|relation| 1_u64 << relation);
             if (a & under_left != 0 && b & under_right != 0)
@@ -287,14 +287,12 @@ fn rebuild(
                 conjuncts.extend_within(core::iter::once(equality.conjunct));
             }
         }
-        let columns = [
-            columns_of(global, relation_of, under_left)?,
-            columns_of(global, relation_of, under_right)?,
-        ];
+        let columns =
+            [columns_of(env, relation_of, under_left)?, columns_of(env, relation_of, under_right)?];
         let op = JoinOp::new(Kind::Inner, conjuncts, columns);
         let Some(slot) = slots.next() else { failed!() };
         let plan_node = at_mut!(plan.nodes, slot as usize);
-        plan_node.op = DynOp::new(global, op)?;
+        plan_node.op = DynOp::new(env, op)?;
         plan_node.children = crate::plan::Children::from_slice(&[left, right])?;
         *at_mut!(built, i as usize) = (slot, under_left | under_right);
     }
@@ -302,13 +300,9 @@ fn rebuild(
 }
 
 /// The columns of the relations of `under`, a bit each.
-fn columns_of(
-    global: &Global,
-    relation_of: &[u32],
-    under: u64,
-) -> Result<SlowVec<ColumnId>, AllocError> {
+fn columns_of(env: &Env, relation_of: &[u32], under: u64) -> Result<SlowVec<ColumnId>, AllocError> {
     let of = |&relation: &u32| relation != NONE && under >> relation & 1 != 0;
-    let mut columns = SlowVec::fixed(global, relation_of.iter().filter(|r| of(r)).count())?;
+    let mut columns = SlowVec::fixed(env, relation_of.iter().filter(|r| of(r)).count())?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
     columns.extend_within(
         (0..relation_of.len()).filter(|&c| of(at!(relation_of, c))).map(|c| c as ColumnId),

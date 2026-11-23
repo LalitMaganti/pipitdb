@@ -16,9 +16,9 @@ use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
+use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
-use crate::global::Global;
 use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
@@ -197,7 +197,7 @@ impl Step<'_> {
     }
 }
 
-/// A step of any type that lives for `'a`, owned in memory from an allocator:
+/// A step of any type that lives for `'a`, owned in memory from an `Env`:
 /// a pointer to it, and functions that know its type. `F` is the function a
 /// pipeline calls for each batch.
 pub struct Erased<'a, F> {
@@ -271,10 +271,10 @@ impl<'a> DynSource<'a> {
         }
     }
 
-    pub fn new<T: Source + 'a>(allocator: &Global, source: T) -> Result<DynSource<'a>, AllocError> {
+    pub fn new<T: Source + 'a>(env: &Env, source: T) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
-            step: Box::new(allocator, source)?.erase(),
+            step: Box::new(env, source)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this source and its state, as is each below.
             new_state: |source, context, state| unsafe {
@@ -297,11 +297,11 @@ impl<'a> DynSource<'a> {
 
     /// A run of this source outside a pipeline, such as of a join's build
     /// side, which the join drains: its state, in memory from `context`'s
-    /// allocator.
+    /// `Env`.
     pub fn start<'s>(&'s self, context: &mut Context) -> Result<SourceRun<'s, 'a>, Error> {
         let size_bytes = self.state_layout.size().max(1);
         // SAFETY: `new_state` writes the state, and nothing reads the rest.
-        let mut memory = unsafe { Buffer::allocate_uninit(context.allocator(), size_bytes)? };
+        let mut memory = unsafe { Buffer::allocate_uninit(context.env(), size_bytes)? };
         let Some(state) = NonNull::new(memory.as_mut_ptr::<u8>()) else { failed!() };
         // SAFETY: the memory has the state's size, and alignment, which
         // `new` checked is at most a buffer's.
@@ -377,13 +377,10 @@ impl<'a> DynTransform<'a> {
         }
     }
 
-    pub fn new<T: Transform + 'a>(
-        allocator: &Global,
-        transform: T,
-    ) -> Result<DynTransform<'a>, AllocError> {
+    pub fn new<T: Transform + 'a>(env: &Env, transform: T) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
-            step: Box::new(allocator, transform)?.erase(),
+            step: Box::new(env, transform)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this transform and its state, as is each below.
             new_state: |transform, context, state| unsafe {
@@ -417,13 +414,10 @@ impl<'a> DynTransform<'a> {
 }
 
 impl<'a> DynOperator<'a> {
-    pub fn new<T: Operator + 'a>(
-        allocator: &Global,
-        operator: T,
-    ) -> Result<DynOperator<'a>, AllocError> {
+    pub fn new<T: Operator + 'a>(env: &Env, operator: T) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
-            step: Box::new(allocator, operator)?.erase(),
+            step: Box::new(env, operator)?.erase(),
             state_layout: Layout::new::<T::State>(),
             // SAFETY: only called with this operator and its state, as is each below.
             new_state: |operator, context, state| unsafe {

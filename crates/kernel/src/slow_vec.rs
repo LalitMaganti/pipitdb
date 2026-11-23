@@ -8,7 +8,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
-use crate::global::Global;
+use crate::env::Env;
 
 /// A list for building things now and then, such as plans and footers. It
 /// stays small rather than fast: what doesn't depend on its values' type is
@@ -29,7 +29,7 @@ struct RawVec {
     /// Room for exactly `capacity` values, the first `len` of them written.
     values: NonNull<u8>,
     /// What `values` came from.
-    global: NonNull<Global>,
+    env: NonNull<Env>,
     /// How many values there are.
     len: usize,
     /// How many values fit: a power of two, or 0 before any are added.
@@ -43,13 +43,13 @@ impl<T> SlowVec<T> {
     /// nothing until a value is added, so never fails: a `Result` only so
     /// callers can treat every constructor alike.
     #[inline]
-    pub fn new(global: &Global, max: usize) -> Result<SlowVec<T>, AllocError> {
+    pub fn new(env: &Env, max: usize) -> Result<SlowVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
         let Ok(max) = u32::try_from(max) else { failed!() };
         let raw = RawVec {
             values: NonNull::<Aligned>::dangling().cast(),
-            global: NonNull::from(global),
+            env: NonNull::from(env),
             len: 0,
             capacity: 0,
             max,
@@ -60,24 +60,24 @@ impl<T> SlowVec<T> {
     /// An empty `SlowVec` with room for `len` values, rounded up, that never
     /// grows: for lists whose length is known.
     #[inline]
-    pub fn fixed(global: &Global, len: usize) -> Result<SlowVec<T>, AllocError> {
-        SlowVec::empty(global, len, len)
+    pub fn fixed(env: &Env, len: usize) -> Result<SlowVec<T>, AllocError> {
+        SlowVec::empty(env, len, len)
     }
 
     /// An empty `SlowVec` that allocates nothing and never grows.
-    pub fn none(global: &Global) -> SlowVec<T> {
+    pub fn none(env: &Env) -> SlowVec<T> {
         let values = NonNull::<Aligned>::dangling().cast();
-        let raw = RawVec { values, global: NonNull::from(global), len: 0, capacity: 0, max: 0 };
+        let raw = RawVec { values, env: NonNull::from(env), len: 0, capacity: 0, max: 0 };
         SlowVec { raw, values: PhantomData }
     }
 
     /// `values`, in a `SlowVec` that never grows.
     #[inline]
     pub fn fixed_from(
-        global: &Global,
+        env: &Env,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<SlowVec<T>, AllocError> {
-        let mut vec = SlowVec::fixed(global, values.len())?;
+        let mut vec = SlowVec::fixed(env, values.len())?;
         vec.extend_within(values);
         Ok(vec)
     }
@@ -96,12 +96,12 @@ impl<T> SlowVec<T> {
     /// `len` zeros, in a `SlowVec` that never grows. Zeroed by the
     /// allocator, which on fresh pages needn't write them.
     #[inline]
-    pub fn zeroed(global: &Global, len: usize) -> Result<SlowVec<T>, AllocError>
+    pub fn zeroed(env: &Env, len: usize) -> Result<SlowVec<T>, AllocError>
     where
         T: Primitive,
     {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        let mut raw = RawVec::new(global, size_of::<T>(), len, len, true)?;
+        let mut raw = RawVec::new(env, size_of::<T>(), len, len, true)?;
         raw.len = len;
         Ok(SlowVec { raw, values: PhantomData })
     }
@@ -113,10 +113,10 @@ impl<T> SlowVec<T> {
     /// An empty `SlowVec` with room for `capacity` values, 0 or `max`,
     /// rounded up.
     #[inline]
-    fn empty(global: &Global, capacity: usize, max: usize) -> Result<SlowVec<T>, AllocError> {
+    fn empty(env: &Env, capacity: usize, max: usize) -> Result<SlowVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(SlowVec {
-            raw: RawVec::new(global, size_of::<T>(), capacity, max, false)?,
+            raw: RawVec::new(env, size_of::<T>(), capacity, max, false)?,
             values: PhantomData,
         })
     }
@@ -249,7 +249,7 @@ impl RawVec {
     /// power of two, but for a `capacity` of 0.
     #[inline(never)]
     fn new(
-        global: &Global,
+        env: &Env,
         item: usize,
         capacity: usize,
         max: usize,
@@ -260,12 +260,12 @@ impl RawVec {
         let values = match capacity {
             // Nothing to allocate; aligned for any value, as slices need.
             0 => NonNull::<Aligned>::dangling().cast(),
-            _ if zeroed => global.allocate_zeroed(layout(item, capacity)?)?,
-            _ => global.allocate(layout(item, capacity)?)?,
+            _ if zeroed => env.allocate_zeroed(layout(item, capacity)?)?,
+            _ => env.allocate(layout(item, capacity)?)?,
         };
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
         let capacity = capacity as u32;
-        Ok(RawVec { values, global: NonNull::from(global), len: 0, capacity, max })
+        Ok(RawVec { values, env: NonNull::from(env), len: 0, capacity, max })
     }
 
     /// Where the next value of `item` bytes goes, growing if full, and
@@ -294,8 +294,8 @@ impl RawVec {
         // Powers of two up to `max` stay powers of two up to `max`.
         let doubled = if self.capacity == 0 { 4 } else { self.capacity as usize * 2 };
         let capacity = doubled.max(needed.next_power_of_two()).min(self.max as usize);
-        // SAFETY: a `Global` outlives what's allocated from it.
-        let to = unsafe { self.global.as_ref() }.allocate(layout(item, capacity)?)?;
+        // SAFETY: an `Env` outlives what's allocated from it.
+        let to = unsafe { self.env.as_ref() }.allocate(layout(item, capacity)?)?;
         // SAFETY: both hold at least `len` values. They're moved, not
         // dropped.
         unsafe { to.copy_from_nonoverlapping(self.values, self.len * item) };
@@ -320,9 +320,9 @@ impl RawVec {
             return;
         }
         let Ok(layout) = layout(item, self.capacity as usize) else { failed!() };
-        // SAFETY: allocated with this layout from this `Global`, which
+        // SAFETY: allocated with this layout from this `Env`, which
         // outlives it.
-        unsafe { self.global.as_ref().deallocate(self.values, layout) };
+        unsafe { self.env.as_ref().deallocate(self.values, layout) };
     }
 }
 
@@ -364,7 +364,7 @@ mod tests {
     use super::*;
     use crate::allocator::{Heap, PAGE_BYTES};
 
-    /// Allows `left` allocations, counting those still live. A `Global`
+    /// Allows `left` allocations, counting those still live. An `Env`
     /// over it takes one, for itself, and holds it while it lives.
     #[derive(Clone)]
     struct Limited {
@@ -395,8 +395,8 @@ mod tests {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&global, 128).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&env, 128).unwrap();
         for i in 0..100 {
             assert!(values.push(i).is_ok());
         }
@@ -408,9 +408,9 @@ mod tests {
 
     #[test]
     fn drops_its_values() {
-        let global = Global::current();
+        let env = Env::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(global, 16).unwrap();
+        let mut values = SlowVec::new(env, 16).unwrap();
         for _ in 0..10 {
             assert!(values.push(value.clone()).is_ok());
         }
@@ -426,8 +426,8 @@ mod tests {
         let left = Rc::new(Cell::new(2));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&global, 128).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&env, 128).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -440,8 +440,8 @@ mod tests {
         let left = Rc::new(Cell::new(2));
         let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::fixed(&global, 3).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::fixed(&env, 3).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -453,8 +453,8 @@ mod tests {
 
     #[test]
     fn zeroed_holds_zeros() {
-        let global = Global::current();
-        let values = SlowVec::<i64>::zeroed(global, 5).unwrap();
+        let env = Env::current();
+        let values = SlowVec::<i64>::zeroed(env, 5).unwrap();
         assert_eq!(*values, [0; 5]);
         assert_eq!(values.capacity(), 8);
     }
@@ -479,10 +479,10 @@ mod tests {
     fn asks_for_exact_sizes_and_pages_when_large() {
         let layouts = Rc::new(RefCell::new(StdVec::new()));
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(Layouts(layouts.clone()), usize::MAX) }.unwrap();
-        drop(SlowVec::<u64>::fixed(&global, 100).unwrap());
-        drop(SlowVec::<u64>::fixed(&global, 1 << 15).unwrap());
-        // After the `Global`'s own.
+        let env = unsafe { Env::new(Layouts(layouts.clone()), usize::MAX) }.unwrap();
+        drop(SlowVec::<u64>::fixed(&env, 100).unwrap());
+        drop(SlowVec::<u64>::fixed(&env, 1 << 15).unwrap());
+        // After the `Env`'s own.
         let asked: StdVec<_> =
             layouts.borrow()[1..].iter().map(|l| (l.size(), l.align())).collect();
         assert_eq!(asked, [(128 * 8, 64), (1 << 18, PAGE_BYTES)]);
@@ -493,16 +493,16 @@ mod tests {
         let left = Rc::new(Cell::new(1));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let values = SlowVec::<u64>::new(&global, 16).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let values = SlowVec::<u64>::new(&env, 16).unwrap();
         assert!(values.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
-        let global = Global::current();
-        let _ = SlowVec::<u64>::new(global, 100);
+        let env = Env::current();
+        let _ = SlowVec::<u64>::new(env, 100);
     }
 
     #[test]
@@ -510,8 +510,8 @@ mod tests {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&global, 16).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&env, 16).unwrap();
         assert!(values.extend_from_slice(&[1_u64, 2, 3]).is_ok());
         values.free();
         assert!(values.is_empty() && live.get() == 1);
@@ -525,8 +525,8 @@ mod tests {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: left.clone(), live };
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&global, 16).unwrap();
+        let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&env, 16).unwrap();
         assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
         assert!(values.extend_from_slice(&[6]).is_ok());
         assert_eq!(*values, [1, 2, 3, 4, 5, 6]);
@@ -538,9 +538,9 @@ mod tests {
 
     #[test]
     fn retains_and_pops() {
-        let global = Global::current();
+        let env = Env::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(global, 8).unwrap();
+        let mut values = SlowVec::new(env, 8).unwrap();
         for i in 0..6 {
             assert!(values.push((i, value.clone())).is_ok());
         }
@@ -553,8 +553,8 @@ mod tests {
 
     #[test]
     fn rounds_its_room_up() {
-        let global = Global::current();
-        let values = SlowVec::<u64>::fixed(global, 5).unwrap();
+        let env = Env::current();
+        let values = SlowVec::<u64>::fixed(env, 5).unwrap();
         assert_eq!(values.capacity(), 8);
     }
 }

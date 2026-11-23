@@ -9,8 +9,8 @@ use core::iter::repeat_n;
 use super::estimate::Estimator;
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree};
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// The most units it plans: a set of them is the bits of a `u64`.
@@ -83,7 +83,7 @@ struct Exact<'g, 'e, 'l, 'r> {
 /// and exact search would visit fewer than `VISITS_MAX` sets and pairs, and
 /// it has a valid tree.
 pub(super) fn plan<'g>(
-    global: &Global,
+    env: &Env,
     graph: &'g QueryGraph,
     estimator: &mut Estimator<'g>,
 ) -> Result<Option<JoinTree>, Error> {
@@ -92,7 +92,7 @@ pub(super) fn plan<'g>(
         return Ok(None);
     }
     // Every relation is below 64, so in the first word.
-    let mut links = SlowVec::new(global, LIST_MAX)?;
+    let mut links = SlowVec::new(env, LIST_MAX)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `LIST_MAX`")]
     for (edge, found) in (0..graph.edges.len() as u32).zip(graph.edges.iter()) {
         links.push(Link { sides: [found.left.word(0), found.right.word(0)], edge })?;
@@ -109,15 +109,15 @@ pub(super) fn plan<'g>(
     let single = (0..)
         .zip(graph.relations.iter())
         .fold(0, |single, (i, relation)| single | u64::from(relation.max_rows <= 1) << i);
-    let mut exact = Exact::new(global, graph, estimator, &links, &mut can_run, count, single);
+    let mut exact = Exact::new(env, graph, estimator, &links, &mut can_run, count, single);
     // A graph of n relations has fewer than 2^n connected sets. Each set
     // the search visits but the relations is made by a pair it counted.
     let small = (count <= SMALL_MAX).then_some(1 << count);
     let Some(sets) = small.or_else(|| Some(exact.count(count)? + count)) else { return Ok(None) };
-    exact.table(global, at!(rows, ..count), sets)?;
+    exact.table(env, at!(rows, ..count), sets)?;
     // It visits no more than were counted, or than `SMALL_MAX` relations have.
     exact.enumerate(count, true);
-    exact.tree(global, count)
+    exact.tree(env, count)
 }
 
 /// The cheapest valid tree of a few units, of `rows` rows, joined by
@@ -127,7 +127,7 @@ pub(super) fn plan<'g>(
 /// The units in `single` are one relation of at most one row. `can_run` says
 /// which joins of units can run.
 pub(super) fn solve<'g>(
-    global: &Global,
+    env: &Env,
     graph: &'g QueryGraph,
     estimator: &mut Estimator<'g>,
     links: &[Link],
@@ -136,9 +136,9 @@ pub(super) fn solve<'g>(
     can_run: CanRun,
 ) -> Result<Option<JoinTree>, Error> {
     let units = rows.len();
-    let mut exact = Exact::new(global, graph, estimator, links, can_run, units, single);
+    let mut exact = Exact::new(env, graph, estimator, links, can_run, units, single);
     exact.dense = true;
-    exact.table(global, rows, 1 << units)?;
+    exact.table(env, rows, 1 << units)?;
     // Each split of a set is tried once: the left side holds its lowest
     // unit. Its sides' trees are done, as they're smaller sets.
     for set in 3..=exact.full {
@@ -152,14 +152,14 @@ pub(super) fn solve<'g>(
             }
         }
     }
-    exact.tree(global, units)
+    exact.tree(env, units)
 }
 
 impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     /// A search of `units` units, joined by `links`, of which those in
     /// `single` are one relation of at most one row.
     fn new(
-        global: &Global,
+        env: &Env,
         graph: &'g QueryGraph,
         estimator: &'e mut Estimator<'g>,
         links: &'l [Link],
@@ -178,7 +178,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
             }
         }
         let full = u64::MAX >> (UNITS_MAX - units);
-        let plans = SlowVec::none(global);
+        let plans = SlowVec::none(env);
         let (visits, dense) = (0, false);
         Exact {
             graph,
@@ -196,11 +196,11 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     }
 
     /// Makes room for `sets` sets, and a tree of each unit of `rows` rows.
-    fn table(&mut self, global: &Global, rows: &[f64], sets: usize) -> Result<(), Error> {
+    fn table(&mut self, env: &Env, rows: &[f64], sets: usize) -> Result<(), Error> {
         // Half full at most, so that a set is found in a few probes, or with
         // a slot for each set.
         let len = if self.dense { sets } else { (2 * sets).next_power_of_two() };
-        self.plans = SlowVec::fixed(global, len)?;
+        self.plans = SlowVec::fixed(env, len)?;
         self.plans.extend_within(repeat_n(EMPTY, len));
         for (i, &rows) in rows.iter().enumerate() {
             let (set, slot) = (1 << i, self.slot(1 << i));
@@ -210,11 +210,11 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     }
 
     /// The cheapest tree of all `units` units, if they have one.
-    fn tree(&self, global: &Global, units: usize) -> Result<Option<JoinTree>, Error> {
+    fn tree(&self, env: &Env, units: usize) -> Result<Option<JoinTree>, Error> {
         if self.get(self.full).is_none() {
             return Ok(None);
         }
-        let mut tree = JoinTree::new(global, units)?;
+        let mut tree = JoinTree::new(env, units)?;
         self.build(&mut tree, self.full);
         Ok(Some(tree))
     }
@@ -437,21 +437,21 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global::Global;
+    use crate::env::Env;
     use crate::join_planner::{EquivalenceSet, JoinEdge, JoinKind, Relation, RelationSet};
 
     /// A graph of relations of `rows`, each a pair of rows and the most rows,
     /// and inner joins between pairs of relations on domains of `edges`.
     fn graph(rows: &[(u64, u64)], edges: &[(u32, u32, u64)]) -> QueryGraph {
-        let mut graph = QueryGraph::new(Global::current()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for &(rows, max_rows) in rows {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
         }
         for (equivalence, &(left, right, domain)) in (0..).zip(edges) {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
             let (mut left_set, mut right_set) = (
-                RelationSet::new(Global::current()).unwrap(),
-                RelationSet::new(Global::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
             );
             left_set.insert(left).unwrap();
             right_set.insert(right).unwrap();
@@ -465,12 +465,12 @@ mod tests {
     fn one_row_relations_join_anything() {
         // Two joined relations, and one of a row with no edge to them.
         let mut graph = graph(&[(100, 100), (10, 10), (1, 1)], &[(0, 1, 10)]);
-        let mut estimator = Estimator::new(Global::current(), &graph).unwrap();
-        let tree = plan(Global::current(), &graph, &mut estimator).unwrap();
+        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
+        let tree = plan(Env::current(), &graph, &mut estimator).unwrap();
         assert_eq!(tree.map(|tree| tree.nodes.len()), Some(5));
         // Without its bound of a row, it needs a cross product.
         at_mut!(graph.relations, 2).max_rows = 2;
-        let mut estimator = Estimator::new(Global::current(), &graph).unwrap();
-        assert!(plan(Global::current(), &graph, &mut estimator).unwrap().is_none());
+        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
+        assert!(plan(Env::current(), &graph, &mut estimator).unwrap().is_none());
     }
 }

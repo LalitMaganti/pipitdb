@@ -6,8 +6,8 @@
 use crate::allocator::AllocError;
 use crate::column::DataType;
 use crate::context::CUTOFFS_MAX;
+use crate::env::Env;
 use crate::expression::Exprs;
-use crate::global::Global;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
@@ -418,7 +418,7 @@ impl DeriveContext<'_, '_> {
 
 /// Works out how one input of a node meets the node's needs.
 struct InputPlanner<'p> {
-    allocator: &'p Global,
+    env: &'p Env,
     node: PlanNodeId,
     input: u32,
     out: &'p mut PlannedInput,
@@ -481,7 +481,7 @@ impl InputPlanner<'_> {
             return Err(AllocError);
         }
         let sort = OpenSort { node: self.node, input: self.input };
-        let keys_copy = SlowVec::fixed_from(self.allocator, keys.iter().copied())?;
+        let keys_copy = SlowVec::fixed_from(self.env, keys.iter().copied())?;
         self.out.step = Some(InputStep::Sort {
             keys: keys_copy,
             keep: None,
@@ -498,11 +498,11 @@ impl InputPlanner<'_> {
 
 /// Plans each node of `plan`, by id, as Perfetto's `RunBoundPasses` does.
 /// A node's inputs come before it, so each is planned after them.
-pub fn plan_nodes(allocator: &Global, plan: &LogicalPlan<'_>) -> Result<Planned, LowerError> {
-    let mut planned = SlowVec::fixed(allocator, plan.nodes.len())?;
+pub fn plan_nodes(env: &Env, plan: &LogicalPlan<'_>) -> Result<Planned, LowerError> {
+    let mut planned = SlowVec::fixed(env, plan.nodes.len())?;
     for id in 0..plan.nodes.len() {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
-        plan_node_inputs(allocator, plan, &mut planned, id as PlanNodeId)?;
+        plan_node_inputs(env, plan, &mut planned, id as PlanNodeId)?;
     }
     Ok(planned)
 }
@@ -510,20 +510,20 @@ pub fn plan_nodes(allocator: &Global, plan: &LogicalPlan<'_>) -> Result<Planned,
 /// Plans how each input of node `id` meets its needs, and derives its
 /// output. Everything below `id` must already be planned.
 fn plan_node_inputs(
-    allocator: &Global,
+    env: &Env,
     plan: &LogicalPlan<'_>,
     planned: &mut Planned,
     id: PlanNodeId,
 ) -> Result<(), LowerError> {
     let node = at!(plan.nodes, id as usize);
-    let mut inputs = SlowVec::fixed(allocator, node.children.len())?;
+    let mut inputs = SlowVec::fixed(env, node.children.len())?;
     for &child in node.children.iter() {
         check!(child < id);
         let rows = at!(planned, child as usize).output;
         inputs.push(PlannedInput { step: None, rows })?;
     }
     for (i, out) in (0..).zip(inputs.iter_mut()) {
-        let mut input = InputPlanner { allocator, node: id, input: i, out };
+        let mut input = InputPlanner { env, node: id, input: i, out };
         input.meet(planned, &node.op.needs(i))?;
     }
     planned.push(PlannedNode { inputs, output: OutputProperties::NONE, cutoff: None })?;

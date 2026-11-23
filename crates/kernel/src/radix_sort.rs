@@ -2,7 +2,7 @@
 //! whole blocks at a time, and sorting strings by their bytes.
 
 use crate::allocator::AllocError;
-use crate::global::Global;
+use crate::env::Env;
 use crate::slow_vec::SlowVec;
 
 /// How many bits one partition splits on.
@@ -30,10 +30,10 @@ pub(crate) struct Scratch(SlowVec<u64>);
 
 impl Scratch {
     /// For sorting up to `count` words.
-    pub(crate) fn new(allocator: &Global, count: usize) -> Result<Scratch, AllocError> {
+    pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
         let len =
             if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(SlowVec::zeroed(allocator, len)?))
+        Ok(Scratch(SlowVec::zeroed(env, len)?))
     }
 }
 
@@ -221,7 +221,7 @@ struct Bucket {
 /// next, from a stack rather than by recursion. Equal keys end up in any
 /// order. `scratch` must be at least as long.
 pub(crate) fn msd_radix_sort<'k, T: Copy>(
-    allocator: &Global,
+    env: &Env,
     elements: &mut [T],
     scratch: &mut [T],
     key: impl Fn(&T) -> &'k [u8],
@@ -232,7 +232,7 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
     let suffix = |element: &T, depth: usize| key(element).get(depth..).unwrap_or_default();
     // The byte of `key` at `depth`, plus one, or 0 for keys that short.
     let digit = |e: &T, depth| suffix(e, depth).first().map_or(0, |&b| usize::from(b) + 1);
-    let mut stack = SlowVec::new(allocator, 1 << 24)?;
+    let mut stack = SlowVec::new(env, 1 << 24)?;
     stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
     while let Some(bucket) = stack.pop() {
         let (depth, items) = (bucket.depth, at_mut!(elements, bucket.start..bucket.end));
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn sorts_words_of_any_spread() {
-        let global = Global::current();
+        let env = Env::current();
         for (count, mask) in
             [(100_000_u64, u64::MAX), (50_000, 0xFF << 24), (9000, 0), (10, u64::MAX)]
         {
@@ -297,7 +297,7 @@ mod tests {
                 .collect();
             let mut expected = words.clone();
             expected.sort_unstable();
-            let mut scratch = Scratch::new(global, words.len()).unwrap();
+            let mut scratch = Scratch::new(env, words.len()).unwrap();
             sort_words(&mut words, &mut scratch);
             assert_eq!(words, expected);
         }
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn sorts_strings_by_their_bytes() {
-        let global = Global::current();
+        let env = Env::current();
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let strings: Vec<Vec<u8>> = (0..2000)
             .map(|_| {
@@ -320,8 +320,7 @@ mod tests {
             .collect();
         let mut order: Vec<u32> = (0..2000).collect();
         let mut scratch = order.clone();
-        msd_radix_sort(global, &mut order, &mut scratch, |&i| strings[i as usize].as_slice())
-            .unwrap();
+        msd_radix_sort(env, &mut order, &mut scratch, |&i| strings[i as usize].as_slice()).unwrap();
         let sorted: Vec<&Vec<u8>> = order.iter().map(|&i| &strings[i as usize]).collect();
         let mut expected: Vec<&Vec<u8>> = strings.iter().collect();
         expected.sort();

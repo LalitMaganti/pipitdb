@@ -3,7 +3,7 @@
 
 use crate::allocator::AllocError;
 use crate::bitmap::{BitSlice, Word};
-use crate::global::Global;
+use crate::env::Env;
 use crate::slow_vec::SlowVec;
 
 /// The most relations, edges or equivalence sets a graph holds.
@@ -23,8 +23,8 @@ pub struct RelationSet {
 
 impl RelationSet {
     /// An empty set. It allocates nothing until it holds a relation past 63.
-    pub fn new(global: &Global) -> Result<RelationSet, AllocError> {
-        Ok(RelationSet { first: 0, rest: SlowVec::new(global, WORDS_MAX)? })
+    pub fn new(env: &Env) -> Result<RelationSet, AllocError> {
+        Ok(RelationSet { first: 0, rest: SlowVec::new(env, WORDS_MAX)? })
     }
 
     /// Word `i`, which holds relations `64 * i` to `64 * i + 63`.
@@ -236,11 +236,11 @@ pub struct QueryGraph {
 
 impl QueryGraph {
     /// An empty graph whose joins can all run.
-    pub fn new(global: &Global) -> Result<QueryGraph, AllocError> {
+    pub fn new(env: &Env) -> Result<QueryGraph, AllocError> {
         Ok(QueryGraph {
-            relations: SlowVec::new(global, LIST_MAX)?,
-            edges: SlowVec::new(global, LIST_MAX)?,
-            equivalences: SlowVec::new(global, LIST_MAX)?,
+            relations: SlowVec::new(env, LIST_MAX)?,
+            edges: SlowVec::new(env, LIST_MAX)?,
+            equivalences: SlowVec::new(env, LIST_MAX)?,
             executable: None,
         })
     }
@@ -249,10 +249,10 @@ impl QueryGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global::Global;
+    use crate::env::Env;
 
     fn set(relations: &[u32]) -> RelationSet {
-        let mut set = RelationSet::new(Global::current()).unwrap();
+        let mut set = RelationSet::new(Env::current()).unwrap();
         for &relation in relations {
             set.insert(relation).unwrap();
         }

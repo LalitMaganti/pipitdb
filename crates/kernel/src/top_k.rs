@@ -7,8 +7,8 @@ use core::cmp::Ordering;
 use crate::allocator::AllocError;
 use crate::column::DataType;
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
 use crate::slow_vec::SlowVec;
@@ -26,12 +26,12 @@ use crate::step::{Breaker, DynOperator};
 /// the cutoff: from then on, rows which don't come before it are dropped as
 /// they arrive, so on most inputs pruning soon becomes rare.
 pub fn top_k<'a>(
-    allocator: &Global,
+    env: &Env,
     keys: SlowVec<SortKey>,
     count: u32,
     publish: Option<u32>,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(allocator, TopK { keys, count, publish })
+    DynOperator::new(env, TopK { keys, count, publish })
 }
 
 struct TopK {
@@ -64,9 +64,9 @@ impl Breaker for TopK {
         if let Some(slot) = self.publish {
             context.reserve_cutoff(slot)?;
         }
-        let allocator = context.allocator();
-        let rows = SortedRows::new(allocator)?;
-        let keys = SlowVec::new(allocator, 1 << 31)?;
+        let env = context.env();
+        let rows = SortedRows::new(env)?;
+        let keys = SlowVec::new(env, 1 << 31)?;
         Ok(Kept { rows, cutoff: None, keys, emitted: 0 })
     }
 
@@ -80,7 +80,7 @@ impl Breaker for TopK {
             return Ok(());
         }
         // Keys are checked even when no row is output, as in Perfetto.
-        kept.rows.check_keys(context.allocator(), input, &self.keys)?;
+        kept.rows.check_keys(context.env(), input, &self.keys)?;
         if self.count == 0 {
             return Ok(());
         }
@@ -182,7 +182,7 @@ impl TopK {
         let rows = &mut kept.rows;
         rows.sort(context)?;
         rows.truncate_order(self.count);
-        let mut first = SortedRows::new(context.allocator())?;
+        let mut first = SortedRows::new(context.env())?;
         let mut batch = RowBatch::new();
         let mut at = 0;
         while at < self.count {
@@ -191,13 +191,13 @@ impl TopK {
         }
         first.flush(context)?;
         let last = self.count - 1;
-        let allocator = context.allocator();
-        let keys = SlowVec::fixed_from(allocator, first.keys_of(last).iter().copied())?;
+        let env = context.env();
+        let keys = SlowVec::fixed_from(env, first.keys_of(last).iter().copied())?;
         if let Some(slot) = self.publish {
             context.set_cutoff(slot, decode(first.layout().slot(0), &keys, false));
         }
-        let mut strings = SlowVec::fixed(allocator, self.keys.len())?;
-        let mut bytes = SlowVec::new(allocator, 1 << 31)?;
+        let mut strings = SlowVec::fixed(env, self.keys.len())?;
+        let mut bytes = SlowVec::new(env, 1 << 31)?;
         for column in first.key_columns() {
             let string = column.string().and_then(|column| first.string(column, last));
             strings.push(string.map(|string| (bytes.len(), string.len())))?;

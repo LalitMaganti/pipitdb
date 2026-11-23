@@ -16,7 +16,7 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 
 /// What a query reads rows from, compiled: its plan node, and its columns, by
 /// name.
@@ -47,7 +47,7 @@ pub struct Compiler<'q, 'c> {
     ast: &'q Ast,
     catalog: &'c dyn Catalog,
     registry: &'q Registry,
-    allocator: &'q Global,
+    env: &'q Env,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SlowVec<NamedColumn>,
@@ -89,8 +89,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 
     /// What to make plan nodes with.
-    pub fn allocator(&self) -> &'q Global {
-        self.allocator
+    pub fn env(&self) -> &'q Env {
+        self.env
     }
 
     /// Whether two of `columns` have one name, ignoring case: a relation's
@@ -159,8 +159,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
         let count = table.column_count();
-        let mut reads = SlowVec::fixed(self.allocator, count as usize)?;
-        let mut columns = SlowVec::new(self.allocator, PLAN_COLUMNS_MAX)?;
+        let mut reads = SlowVec::fixed(self.env, count as usize)?;
+        let mut columns = SlowVec::new(self.env, PLAN_COLUMNS_MAX)?;
         for i in 0..count {
             let (name, data_type) = (table.column_name(i), table.column_type(i));
             let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
@@ -170,7 +170,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let op = DynOp::new(self.allocator, ScanOp::new(table, reads))?;
+        let op = DynOp::new(self.env, ScanOp::new(table, reads))?;
         let node = self.plan.add_node(op, &[])?;
         Ok(Relation { node, columns })
     }
@@ -217,23 +217,23 @@ impl<'q, 'c> Compiler<'q, 'c> {
 /// Parses `source` with the stages in `registry`, and compiles it, finding
 /// tables in `catalog`. The plan's result is the last stage's columns.
 pub fn compile<'c>(
-    allocator: &Global,
+    env: &Env,
     registry: &Registry,
     catalog: &'c dyn Catalog,
     source: &[u8],
 ) -> Result<LogicalPlan<'c>, Error> {
-    let ast = parse_query(allocator, registry, source)?;
+    let ast = parse_query(env, registry, source)?;
     let mut compiler = Compiler {
         source,
         ast: &ast,
         catalog,
         registry,
-        plan: LogicalPlan::new(allocator)?,
-        scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+        plan: LogicalPlan::new(env)?,
+        scope: SlowVec::new(env, PLAN_COLUMNS_MAX)?,
         aliases: [TableAlias::default(); ALIASES_MAX],
         alias_count: 0,
-        alias_columns: SlowVec::new(allocator, ALIAS_COLUMNS_MAX)?,
-        allocator,
+        alias_columns: SlowVec::new(env, ALIAS_COLUMNS_MAX)?,
+        env,
     };
     let query = ast.node(ast.root());
     for i in 0..query.child_count() {
@@ -255,7 +255,7 @@ mod tests {
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
-    use pipit_kernel::global::Global;
+    use pipit_kernel::env::Env;
     use pipit_kernel::lower::lower;
     use pipit_kernel::output_properties::plan_nodes;
     use pipit_kernel::row_batch::RowBatch;
@@ -287,7 +287,7 @@ mod tests {
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
         compile: |compiler, node, depth, nodes| {
-            let bind: Bind = |c, _| Ok(DynFunction::new(c.allocator(), Half)?);
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Half)?);
             let signature = (&[DataType::Float64][..], DataType::Float64);
             call_bound(compiler, (node, depth), nodes, signature, bind)
         },
@@ -334,18 +334,18 @@ mod tests {
 
     fn catalog() -> Tables {
         let column = |data_type, values: [i64; 2]| {
-            let mut buffer = Buffer::allocate(Global::current(), 16).unwrap();
+            let mut buffer = Buffer::allocate(Env::current(), 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-            ColumnView::new(&mut Context::new(Global::current(), None), data_type, buffer, None)
+            ColumnView::new(&mut Context::new(Env::current(), None), data_type, buffer, None)
                 .unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
-        let mut views = Buffer::allocate(Global::current(), 16).unwrap();
+        let mut views = Buffer::allocate(Env::current(), 16).unwrap();
         views.as_mut_slice::<u32>().copy_from_slice(&[0, 4, 4, 0]);
-        let mut bytes = Buffer::allocate(Global::current(), 4).unwrap();
+        let mut bytes = Buffer::allocate(Env::current(), 4).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(b"it's");
         let strings =
-            ColumnView::strings(&mut Context::new(Global::current(), None), views, bytes, None)
+            ColumnView::strings(&mut Context::new(Env::current(), None), views, bytes, None)
                 .unwrap();
         let columns = [
             column(DataType::Int64, [1, 2]),
@@ -359,37 +359,33 @@ mod tests {
             ("f", DataType::Float64),
             ("s", DataType::String),
         ];
-        let table = Table::new(Global::current(), &schema, &[&columns]).unwrap();
+        let table = Table::new(Env::current(), &schema, &[&columns]).unwrap();
         let same = [column(DataType::Int64, [1, 2]), column(DataType::Int64, [3, 4])];
         let same_names = [("a", DataType::Int64), ("A", DataType::Int64)];
-        let same = Table::new(Global::current(), &same_names, &[&same]).unwrap();
+        let same = Table::new(Env::current(), &same_names, &[&same]).unwrap();
         // `x` is 1 and null.
-        let mut values = Buffer::allocate(Global::current(), 16).unwrap();
+        let mut values = Buffer::allocate(Env::current(), 16).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 0]);
-        let mut validity = Buffer::allocate(Global::current(), 8).unwrap();
+        let mut validity = Buffer::allocate(Env::current(), 8).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
         let x = ColumnView::new(
-            &mut Context::new(Global::current(), None),
+            &mut Context::new(Env::current(), None),
             DataType::Int64,
             values,
             Some(validity),
         );
         let nulls =
-            Table::new(Global::current(), &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
-        let scannable = |table| DynScannable::new(Global::current(), table).unwrap();
+            Table::new(Env::current(), &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
+        let scannable = |table| DynScannable::new(Env::current(), table).unwrap();
         // `id` is 10, 11 and 12, stored as a sequence, and `v` 1, 2 and 3.
-        let id = ColumnView::sequence(&mut Context::new(Global::current(), None), 10, 3).unwrap();
-        let mut values = Buffer::allocate(Global::current(), 24).unwrap();
+        let id = ColumnView::sequence(&mut Context::new(Env::current(), None), 10, 3).unwrap();
+        let mut values = Buffer::allocate(Env::current(), 24).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
-        let v = ColumnView::new(
-            &mut Context::new(Global::current(), None),
-            DataType::Int64,
-            values,
-            None,
-        )
-        .unwrap();
+        let v =
+            ColumnView::new(&mut Context::new(Env::current(), None), DataType::Int64, values, None)
+                .unwrap();
         let schema = [("id", DataType::Int64), ("v", DataType::Int64)];
-        let ids = Table::new(Global::current(), &schema, &[&[id, v]]).unwrap();
+        let ids = Table::new(Env::current(), &schema, &[&[id, v]]).unwrap();
         Tables(scannable(table), scannable(same), scannable(nulls), scannable(ids))
     }
 
@@ -397,10 +393,10 @@ mod tests {
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let planned = plan_nodes(Global::current(), &plan).unwrap();
-        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
-        let query = Global::current();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let planned = plan_nodes(Env::current(), &plan).unwrap();
+        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
@@ -437,8 +433,7 @@ mod tests {
 
     fn error(query: &str) -> (ErrorCode, u32) {
         let catalog = catalog();
-        let error =
-            compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
+        let error = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
@@ -663,7 +658,7 @@ mod tests {
     fn knows_which_columns_can_be_null() {
         let catalog = catalog();
         let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let plan = compile(Global::current(), &REGISTRY, &catalog, query).unwrap();
+        let plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
         let nullable = |name: &str| {
             let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
             column.unwrap().nullable
@@ -747,10 +742,10 @@ mod tests {
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
-        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query).unwrap();
-        let planned = plan_nodes(Global::current(), &plan).unwrap();
-        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
-        let query = Global::current();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
+        let planned = plan_nodes(Env::current(), &plan).unwrap();
+        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
@@ -922,11 +917,11 @@ mod tests {
     /// result column's values.
     fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
-        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        pipit_kernel::optimize::optimize(Global::current(), &mut plan).unwrap();
-        let planned = plan_nodes(Global::current(), &plan).unwrap();
-        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
-        let query = Global::current();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        pipit_kernel::optimize::optimize(Env::current(), &mut plan).unwrap();
+        let planned = plan_nodes(Env::current(), &plan).unwrap();
+        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());

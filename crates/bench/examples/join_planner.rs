@@ -20,7 +20,7 @@ use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
 use pipit_kernel::allocator::Heap;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 use pipit_kernel::join_planner::{QueryGraph, RelationSet};
 use pipitdb_bench::join_planner::{
     EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name, plan,
@@ -50,17 +50,17 @@ struct Outcome {
 
 fn run(planner: Enumerator, graph: &QueryGraph) -> Result<Outcome, String> {
     // SAFETY: the tree, all planning keeps, is dropped before it.
-    let global = unsafe { Global::new(Heap, usize::MAX) }.map_err(fail)?;
-    let tree = planner(&global, graph).map_err(fail)?;
+    let env = unsafe { Env::new(Heap, usize::MAX) }.map_err(fail)?;
+    let tree = planner(&env, graph).map_err(fail)?;
     let costed = cost(graph, &tree)?;
     drop(tree);
-    let peak = global.peak();
+    let peak = env.peak();
 
     let mut times = Vec::new();
     let started = Instant::now();
     while times.len() < 3 || (started.elapsed() < TIMING && times.len() < 101) {
         let start = Instant::now();
-        let tree = planner(pipitdb_bench::global(), graph).map_err(fail)?;
+        let tree = planner(pipitdb_bench::env(), graph).map_err(fail)?;
         times.push(start.elapsed());
         drop(tree);
         if times.len() == 1 && started.elapsed() > TIMING * 5 {

@@ -5,9 +5,9 @@ use super::last_of;
 use crate::allocator::AllocError;
 use crate::column::{ColumnView, Form, Forms};
 use crate::context::Context;
+use crate::env::Env;
 use crate::error::Error;
 use crate::filter::{self, Range};
-use crate::global::Global;
 use crate::group_table::GroupTable;
 use crate::rank_bitmap::RankBitmap;
 use crate::row_batch::RowBatch;
@@ -46,7 +46,7 @@ impl Direct {
     /// For the build rows of `table`'s groups, of one integer key each,
     /// if their keys are close enough.
     pub(super) fn of(
-        allocator: &Global,
+        env: &Env,
         table: &GroupTable,
         count: u32,
     ) -> Result<Option<Direct>, AllocError> {
@@ -67,8 +67,8 @@ impl Direct {
             return Ok(Some(Direct { min, span, keyed: None }));
         }
         #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
-        let keys = RankBitmap::new(allocator, span as usize + 1, (0..groups).map(above))?;
-        let mut rows = SlowVec::fixed_from(allocator, core::iter::repeat_n(0, groups as usize))?;
+        let keys = RankBitmap::new(env, span as usize + 1, (0..groups).map(above))?;
+        let mut rows = SlowVec::fixed_from(env, core::iter::repeat_n(0, groups as usize))?;
         for group in 0..groups {
             *at_mut!(rows, keys.rank(above(group)) as usize) = last_of(table, group);
         }

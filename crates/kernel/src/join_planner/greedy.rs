@@ -6,8 +6,8 @@ use super::estimate::Estimator;
 use super::graph::{QueryGraph, Sides};
 use super::tree::{JoinNode, JoinTree};
 use crate::bitmap::BitSlice;
+use crate::env::Env;
 use crate::error::Error;
-use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// No node, tree or edge.
@@ -70,7 +70,7 @@ struct Greedy<'g, 'e> {
 /// valid pair is joined. `None` if no valid pair is left in a connected
 /// graph, which hyperedges can cause.
 pub(super) fn plan<'g>(
-    global: &Global,
+    env: &Env,
     graph: &'g QueryGraph,
     estimator: &mut Estimator<'g>,
     work: &mut usize,
@@ -81,9 +81,9 @@ pub(super) fn plan<'g>(
         graph,
         estimator,
         words,
-        nodes: SlowVec::fixed(global, 2 * count - 1)?,
-        sets: SlowVec::zeroed(global, (2 * count - 1) * words)?,
-        edges: SlowVec::fixed(global, graph.edges.len())?,
+        nodes: SlowVec::fixed(env, 2 * count - 1)?,
+        sets: SlowVec::zeroed(env, (2 * count - 1) * words)?,
+        edges: SlowVec::fixed(env, graph.edges.len())?,
         hypers: NONE,
     };
     #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
@@ -111,7 +111,7 @@ pub(super) fn plan<'g>(
     if !greedy.join_all(work) {
         return Ok(None);
     }
-    let mut tree = JoinTree::new(global, count)?;
+    let mut tree = JoinTree::new(env, count)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
     for (index, node) in (0..greedy.nodes.len() as u32).zip(greedy.nodes.iter()) {
         match node.right {
@@ -355,7 +355,7 @@ impl Greedy<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global::Global;
+    use crate::env::Env;
     use crate::join_planner::{
         EquivalenceSet, JoinEdge, JoinKind, JoinNode, Relation, RelationSet,
     };
@@ -363,15 +363,15 @@ mod tests {
     /// A graph of relations of `rows`, each a pair of rows and the most rows,
     /// and inner joins between pairs of relations on domains of `edges`.
     fn graph(rows: &[(u64, u64)], edges: &[(u32, u32, u64)]) -> QueryGraph {
-        let mut graph = QueryGraph::new(Global::current()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for &(rows, max_rows) in rows {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
         }
         for (equivalence, &(left, right, domain)) in (0..).zip(edges) {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
             let (mut left_set, mut right_set) = (
-                RelationSet::new(Global::current()).unwrap(),
-                RelationSet::new(Global::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
+                RelationSet::new(Env::current()).unwrap(),
             );
             left_set.insert(left).unwrap();
             right_set.insert(right).unwrap();
@@ -383,9 +383,9 @@ mod tests {
 
     /// The first join greedy ordering makes in `graph`.
     fn first_join(graph: &QueryGraph) -> JoinNode {
-        let mut estimator = Estimator::new(Global::current(), graph).unwrap();
+        let mut estimator = Estimator::new(Env::current(), graph).unwrap();
         let mut work = 1 << 20;
-        let tree = plan(Global::current(), graph, &mut estimator, &mut work).unwrap().unwrap();
+        let tree = plan(Env::current(), graph, &mut estimator, &mut work).unwrap().unwrap();
         at!(tree.nodes, graph.relations.len()).kind
     }
 

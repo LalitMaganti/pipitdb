@@ -5,15 +5,15 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use pipit_kernel::env::Env;
 use pipit_kernel::error::Error;
-use pipit_kernel::global::Global;
 use pipit_kernel::join_planner::{
     EquivalenceSet, Estimator, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph, ROWS_MAX,
     Relation, RelationSet,
 };
 
-/// Picks a valid join tree for a graph, with memory from an global.
-pub type Enumerator = fn(&Global, &QueryGraph) -> Result<JoinTree, Error>;
+/// Picks a valid join tree for a graph, with memory from an `Env`.
+pub type Enumerator = fn(&Env, &QueryGraph) -> Result<JoinTree, Error>;
 
 /// The most relations the exhaustive search takes, as its time is 3^n.
 pub const EXHAUSTIVE_MAX: usize = 20;
@@ -110,7 +110,7 @@ fn round(rows: f64) -> u64 {
 }
 
 fn relation_set(relations: impl IntoIterator<Item = u32>) -> Result<RelationSet, String> {
-    let mut set = RelationSet::new(crate::global()).map_err(fail)?;
+    let mut set = RelationSet::new(crate::env()).map_err(fail)?;
     for relation in relations {
         set.insert(relation).map_err(fail)?;
     }
@@ -244,7 +244,7 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
         }
     }
 
-    let mut graph = QueryGraph::new(crate::global()).map_err(fail)?;
+    let mut graph = QueryGraph::new(crate::env()).map_err(fail)?;
     for relation in relations {
         graph.relations.push(relation).map_err(fail)?;
     }
@@ -404,11 +404,11 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
     let invalid = |why| Ok(Costed { cost: ROWS_MAX, valid: Err(why) });
     let Some(order) = post_order(tree) else { return invalid(Invalid::Shape) };
     let connected = is_connected(graph)?;
-    let mut estimator = Estimator::new(crate::global(), graph).map_err(fail)?;
+    let mut estimator = Estimator::new(crate::env(), graph).map_err(fail)?;
     // Each node's relations and rows.
     let mut sets: Vec<Option<RelationSet>> = (0..order.len()).map(|_| None).collect();
     let mut rows = vec![0.0; order.len()];
-    let mut seen = RelationSet::new(crate::global()).map_err(fail)?;
+    let mut seen = RelationSet::new(crate::env()).map_err(fail)?;
     let (mut total, mut valid) = (0.0_f64, Ok(()));
     for node in order {
         let (set, node_rows) = match tree.nodes.get(node).map(|node| node.kind) {
@@ -455,17 +455,17 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
 
 /// The relations joined left-deep in the order they're written: the
 /// baseline plans are measured against.
-pub fn as_written(global: &Global, graph: &QueryGraph) -> Result<JoinTree, Error> {
+pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
     let count = graph.relations.len();
-    let mut estimator = Estimator::new(global, graph)?;
-    let mut tree = JoinTree::new(global, count)?;
-    let (mut joined, mut root, mut rows) = (RelationSet::new(global)?, 0, 0.0);
+    let mut estimator = Estimator::new(env, graph)?;
+    let mut tree = JoinTree::new(env, count)?;
+    let (mut joined, mut root, mut rows) = (RelationSet::new(env)?, 0, 0.0);
     #[expect(clippy::cast_possible_truncation, reason = "at most `u32::MAX`")]
     for relation in 0..count as u32 {
         #[expect(clippy::cast_precision_loss, reason = "an estimate")]
         let leaf_rows = graph.relations.get(relation as usize).map_or(0.0, |r| r.rows as f64);
         let leaf = tree.relation(relation, leaf_rows)?;
-        let mut set = RelationSet::new(global)?;
+        let mut set = RelationSet::new(env)?;
         set.insert(relation)?;
         (root, rows) = if relation == 0 {
             (leaf, leaf_rows)
@@ -484,7 +484,7 @@ pub fn as_written(global: &Global, graph: &QueryGraph) -> Result<JoinTree, Error
 /// smaller table's key.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn join_graph(star: bool, count: u32) -> QueryGraph {
-    let mut graph = QueryGraph::new(crate::global()).expect("allocates");
+    let mut graph = QueryGraph::new(crate::env()).expect("allocates");
     for relation in 0..count {
         let rows = 100 + u64::from(relation) * 2_654_435_761 % 100_000;
         graph
@@ -508,13 +508,13 @@ pub fn join_graph(star: bool, count: u32) -> QueryGraph {
 /// Plans the joins of `graph`, and returns how many nodes the plan has, or 0
 /// if it keeps the written order.
 pub fn plan_joins(graph: &QueryGraph) -> usize {
-    pipit_kernel::join_planner::plan(crate::global(), graph)
+    pipit_kernel::join_planner::plan(crate::env(), graph)
         .map_or(0, |tree| tree.map_or(0, |tree| tree.nodes.len()))
 }
 
 /// The planner's tree for `graph`, or the written order where it keeps that.
-pub fn plan(global: &Global, graph: &QueryGraph) -> Result<JoinTree, Error> {
-    pipit_kernel::join_planner::plan(global, graph)?.map_or_else(|| as_written(global, graph), Ok)
+pub fn plan(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
+    pipit_kernel::join_planner::plan(env, graph)?.map_or_else(|| as_written(env, graph), Ok)
 }
 
 /// The cheapest valid tree of `graph`, of at most `EXHAUSTIVE_MAX`
@@ -539,7 +539,7 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
         let found = found.rows as f64;
         rows[1 << relation] = found;
     }
-    let mut estimator = Estimator::new(crate::global(), graph).map_err(fail)?;
+    let mut estimator = Estimator::new(crate::env(), graph).map_err(fail)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most 2^20 subsets")]
     for set in 1..subsets as u32 {
         let within: Vec<_> = edges.iter().filter(|edge| (edge.0 | edge.1) & !set == 0).collect();
@@ -590,7 +590,7 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
     if best[all].is_infinite() {
         return Err("no valid tree".into());
     }
-    let mut tree = JoinTree::new(crate::global(), count).map_err(fail)?;
+    let mut tree = JoinTree::new(crate::env(), count).map_err(fail)?;
     build(&mut tree, &split, &rows, all)?;
     Ok((tree, best[all]))
 }
@@ -613,7 +613,7 @@ mod tests {
     /// A fact of 1000 rows, joined to a dimension of 10 on its key, and
     /// left joined to another of 100, which then joins the first dimension.
     fn star() -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::global()).unwrap();
+        let mut graph = QueryGraph::new(crate::env()).unwrap();
         for rows in [1000, 10, 100] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
         }
@@ -635,7 +635,7 @@ mod tests {
 
     /// A tree joining `first` and `second`, then that to `third`.
     fn left_deep([first, second, third]: [u32; 3]) -> JoinTree {
-        let mut tree = JoinTree::new(crate::global(), 3).unwrap();
+        let mut tree = JoinTree::new(crate::env(), 3).unwrap();
         let (a, b) = (tree.relation(first, 0.0).unwrap(), tree.relation(second, 0.0).unwrap());
         let joined = tree.join(a, b, 0.0).unwrap();
         let c = tree.relation(third, 0.0).unwrap();
@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn costs_and_checks_trees() {
         let graph = star();
-        let written = as_written(crate::global(), &graph).unwrap();
+        let written = as_written(crate::env(), &graph).unwrap();
         // 1000 * 10 / 10, then a left join keeping all 1000.
         assert_eq!(cost(&graph, &written).unwrap(), Costed { cost: 2000.0, valid: Ok(()) });
         // The left join before the inner one breaks its TES.
@@ -664,7 +664,7 @@ mod tests {
     /// Each relation left joined to all those before it: a long graph with
     /// few connected sets, so it's planned exactly.
     fn left_chain(count: u32) -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::global()).unwrap();
+        let mut graph = QueryGraph::new(crate::env()).unwrap();
         for relation in 0..count {
             let rows = 10 + u64::from(relation * 7919 % 1000);
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
@@ -684,7 +684,7 @@ mod tests {
         for shape in SHAPES {
             for (count, mixed) in [(2, false), (3, true), (7, false), (10, true)] {
                 let graph = generate(shape, count, mixed).unwrap();
-                let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+                let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
                 let (_, optimum) = exhaustive(&graph).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= optimum * (1.0 + 1e-9));
             }
@@ -696,8 +696,8 @@ mod tests {
         for shape in SHAPES {
             for (count, mixed) in [(20, true), (70, false), (70, true)] {
                 let graph = generate(shape, count, mixed).unwrap();
-                let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
-                let written = cost(&graph, &as_written(crate::global(), &graph).unwrap()).unwrap();
+                let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
+                let written = cost(&graph, &as_written(crate::env(), &graph).unwrap()).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= written.cost);
             }
         }
@@ -708,22 +708,22 @@ mod tests {
         for count in [5, 70] {
             let mut graph = generate(Shape::Chain, count, true).unwrap();
             graph.relations.push(Relation { rows: 3, unfiltered_rows: 3, max_rows: 3 }).unwrap();
-            assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
+            assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
         }
     }
 
     #[test]
     fn long_graphs_with_few_connected_sets_are_planned_exactly() {
         let graph = left_chain(50);
-        let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
-        let written = cost(&graph, &as_written(crate::global(), &graph).unwrap()).unwrap();
+        let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
+        let written = cost(&graph, &as_written(crate::env(), &graph).unwrap()).unwrap();
         assert_eq!(planned, written);
     }
 
     /// A fact of 1000 rows with dimensions of 10 and 20 on its keys, and a
     /// relation of one row: joined to the fact if `connected`, or to nothing.
     fn one_row_star(connected: bool) -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::global()).unwrap();
+        let mut graph = QueryGraph::new(crate::env()).unwrap();
         for (rows, max_rows) in [(1000, 1000), (10, 10), (20, 20), (1, 1)] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
         }
@@ -743,7 +743,7 @@ mod tests {
         for connected in [true, false] {
             let graph = one_row_star(connected);
             // The one-row relation joins a dimension, with no edge between.
-            let mut tree = JoinTree::new(crate::global(), 4).unwrap();
+            let mut tree = JoinTree::new(crate::env(), 4).unwrap();
             let (dimension, one) =
                 (tree.relation(1, 10.0).unwrap(), tree.relation(3, 1.0).unwrap());
             let crossed = tree.join(dimension, one, 10.0).unwrap();
@@ -756,7 +756,7 @@ mod tests {
             assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
             // A disconnected graph may take any cross product, which exact
             // search doesn't try, so only its validity is checked.
-            let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+            let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
             assert!(planned.valid.is_ok());
             assert!(!connected || planned.cost <= optimum * (1.0 + 1e-9));
         }
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn plans_keep_to_joins_that_can_run() {
         // A chain of 3, whose first two relations can't be joined directly.
-        let mut graph = QueryGraph::new(crate::global()).unwrap();
+        let mut graph = QueryGraph::new(crate::env()).unwrap();
         for rows in [10, 20, 30] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
             graph.equivalences.push(EquivalenceSet { domain: 10 }).unwrap();
@@ -775,14 +775,14 @@ mod tests {
             graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence }).unwrap();
         }
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
-        let written = as_written(crate::global(), &graph).unwrap();
+        let written = as_written(crate::env(), &graph).unwrap();
         assert_eq!(cost(&graph, &written).unwrap().valid, Err(Invalid::Executable));
         let (tree, _) = exhaustive(&graph).unwrap();
         assert!(cost(&graph, &tree).unwrap().valid.is_ok());
-        assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
+        assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
         // Too big for exact search, so planned greedily, then by windows.
         let mut graph = generate(Shape::Chain, 70, false).unwrap();
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
-        assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
+        assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
     }
 }

@@ -274,7 +274,7 @@ impl Nodes {
     }
 
     /// Allocates the next block, and the slot table with the second block,
-    /// from the allocator the first block came from.
+    /// from the `Env` the first block came from.
     #[cold]
     pub(crate) fn grow(&mut self) -> Result<(), ErrorCode> {
         if self.rest_count == BLOCK_SLOTS - 1 {
@@ -336,13 +336,13 @@ fn slots(table: &Buffer) -> *const Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pipit_kernel::global::Global;
+    use pipit_kernel::env::Env;
 
     #[test]
     fn nodes_span_blocks() {
-        let global = Global::current();
+        let env = Env::current();
         // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(global, BLOCK_BYTES) }.unwrap();
+        let first = unsafe { Buffer::allocate_uninit(env, BLOCK_BYTES) }.unwrap();
         let mut nodes = Nodes::new(first);
         let count = u32::try_from(2 * BLOCK_NODES + 1).unwrap();
         for i in 0..count {

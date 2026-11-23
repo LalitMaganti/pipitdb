@@ -33,7 +33,7 @@ impl RowBlocks {
         #[expect(clippy::cast_possible_truncation, reason = "at most `BLOCK_BYTES`")]
         let block_rows = (BLOCK_BYTES / stride) as u32;
         let reciprocal = u64::MAX / u64::from(block_rows) + 1;
-        let blocks = SlowVec::new(context.allocator(), 1 << 24)?;
+        let blocks = SlowVec::new(context.env(), 1 << 24)?;
         Ok(RowBlocks { stride, block_rows, reciprocal, blocks, kept: 0, len: 0 })
     }
 

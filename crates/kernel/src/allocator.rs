@@ -1,6 +1,6 @@
 //! `Allocator`, what memory comes from, and `Heap`, the system's. A query's
-//! `Global` owns the allocator it takes memory from, and what's allocated
-//! keeps the `Global` alive, so can't outlive it.
+//! `Env` owns the allocator it takes memory from, and what's allocated
+//! keeps the `Env` alive, so can't outlive it.
 
 use core::alloc::Layout;
 use core::ptr::NonNull;

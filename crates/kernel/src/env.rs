@@ -1,10 +1,11 @@
-//! `Global`: what every part of a query shares, such as its memory and its
-//! budget.
+//! `Env`: the environment a query runs in, which every part of it is
+//! passed: its memory and budget now, and what else they share later, such
+//! as its I/O.
 //!
-//! What's allocated from a `Global` points back to it, without a lifetime,
-//! so a `Global` must outlive everything allocated from it. One that's
+//! What's allocated from an `Env` points back to it, without a lifetime,
+//! so an `Env` must outlive everything allocated from it. One that's
 //! `'static`, from `leak` or `current`, always does; one from `new` lives
-//! as long as its `OwnedGlobal`, which whoever makes it promises is dropped
+//! as long as its `OwnedEnv`, which whoever makes it promises is dropped
 //! last.
 
 use core::alloc::Layout;
@@ -15,14 +16,14 @@ use core::ptr::NonNull;
 use crate::allocator::{AllocError, Allocator};
 use crate::fixed_allocator::{FixedAllocator, INDICES_BYTES, SMALL_BYTES, VALUES_BYTES};
 
-/// A query's memory: its budget, which plans, states, lists and column data
+/// A query's environment. Its memory is its budget, which plans, states, lists and column data
 /// of no fixed size come from, and a `FixedAllocator` for each kind of
 /// column buffer its batches are made of, taking their chunks from it, so
 /// everything a query takes counts against its budget, this included.
 ///
 /// It lives in memory from the allocator it was made with, so it never
 /// moves.
-pub struct Global {
+pub struct Env {
     budget: Budget,
     values: FixedAllocator<'static>,
     indices: FixedAllocator<'static>,
@@ -31,15 +32,15 @@ pub struct Global {
     /// branch.
     allocators: [NonNull<dyn Allocator>; KIND_COUNT],
     /// Frees the block this is in, and the allocator in it.
-    free: unsafe fn(NonNull<Global>),
+    free: unsafe fn(NonNull<Env>),
     /// The bytes of the block this is in.
     block_bytes: usize,
 }
 
-/// Allocates from the allocator a `Global` was made with while the bytes
+/// Allocates from the allocator an `Env` was made with while the bytes
 /// allocated stay within `limit`, and fails past it.
 struct Budget {
-    /// The allocator, in the same block as the `Global`.
+    /// The allocator, in the same block as the `Env`.
     base: NonNull<dyn Allocator>,
     limit: usize,
     /// The bytes allocated now.
@@ -48,7 +49,7 @@ struct Budget {
     peak: Cell<usize>,
 }
 
-/// Which of a `Global`'s allocators memory comes from.
+/// Which of an `Env`'s allocators memory comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -64,26 +65,26 @@ pub enum Kind {
 
 const KIND_COUNT: usize = Kind::Small as usize + 1;
 
-/// A `Global` and the allocator it was made with, in one allocation from it.
+/// An `Env` and the allocator it was made with, in one allocation from it.
 #[repr(C)]
 struct Block<A> {
-    global: Global,
+    env: Env,
     base: A,
 }
 
-impl Global {
+impl Env {
     /// A query's memory, all of it from `base`, which it owns, at most
     /// `limit` bytes of it.
     ///
     /// # Safety
     ///
     /// Everything allocated from it must be dropped before the
-    /// `OwnedGlobal`.
+    /// `OwnedEnv`.
     #[expect(clippy::new_ret_no_self, reason = "it lives in memory it owns, held by the owner")]
     pub unsafe fn new<A: Allocator + 'static>(
         base: A,
         limit: usize,
-    ) -> Result<OwnedGlobal, AllocError> {
+    ) -> Result<OwnedEnv, AllocError> {
         let layout = Layout::new::<Block<A>>();
         if layout.size() > limit {
             return Err(AllocError);
@@ -97,7 +98,7 @@ impl Global {
             let at = block.as_ptr();
             (&raw mut (*at).base).write(base);
             let base: &dyn Allocator = &(*at).base;
-            let budget = &raw mut (*at).global.budget;
+            let budget = &raw mut (*at).env.budget;
             budget.write(Budget {
                 base: NonNull::from(base),
                 limit,
@@ -105,56 +106,53 @@ impl Global {
                 peak: Cell::new(layout.size()),
             });
             let budget: &'static Budget = &*budget;
-            let global = &raw mut (*at).global;
-            (&raw mut (*global).values).write(FixedAllocator::new(budget, VALUES_BYTES));
-            (&raw mut (*global).indices).write(FixedAllocator::new(budget, INDICES_BYTES));
-            (&raw mut (*global).small).write(FixedAllocator::new(budget, SMALL_BYTES));
+            let env = &raw mut (*at).env;
+            (&raw mut (*env).values).write(FixedAllocator::new(budget, VALUES_BYTES));
+            (&raw mut (*env).indices).write(FixedAllocator::new(budget, INDICES_BYTES));
+            (&raw mut (*env).small).write(FixedAllocator::new(budget, SMALL_BYTES));
             let allocators: [NonNull<dyn Allocator>; KIND_COUNT] = [
                 NonNull::from(budget),
-                NonNull::from(&(*global).values),
-                NonNull::from(&(*global).indices),
-                NonNull::from(&(*global).small),
+                NonNull::from(&(*env).values),
+                NonNull::from(&(*env).indices),
+                NonNull::from(&(*env).small),
             ];
-            (&raw mut (*global).allocators).write(allocators);
-            (&raw mut (*global).free).write(free::<A>);
-            (&raw mut (*global).block_bytes).write(layout.size());
+            (&raw mut (*env).allocators).write(allocators);
+            (&raw mut (*env).free).write(free::<A>);
+            (&raw mut (*env).block_bytes).write(layout.size());
         }
-        Ok(OwnedGlobal(block.cast()))
+        Ok(OwnedEnv(block.cast()))
     }
 
     /// As `new`, one that's never freed, so outlives everything: for one
     /// kept for a whole program or thread.
-    pub fn leak<A: Allocator + 'static>(
-        base: A,
-        limit: usize,
-    ) -> Result<&'static Global, AllocError> {
+    pub fn leak<A: Allocator + 'static>(base: A, limit: usize) -> Result<&'static Env, AllocError> {
         // SAFETY: it's never dropped.
-        let owned = unsafe { Global::new(base, limit) }?;
-        let global = owned.0;
+        let owned = unsafe { Env::new(base, limit) }?;
+        let env = owned.0;
         core::mem::forget(owned);
         // SAFETY: it's never freed.
-        Ok(unsafe { global.as_ref() })
+        Ok(unsafe { env.as_ref() })
     }
 
-    /// This thread's `Global`, from the system's heap, without a limit, made
+    /// This thread's `Env`, from the system's heap, without a limit, made
     /// the first time it's asked for, and freed when the thread exits unless
     /// something allocated from it is still held: for tools, and tests.
     ///
     /// Not quite `'static`: a thread-local's destructor that runs after its
     /// own mustn't use what was allocated from it, as an empty list, which
-    /// holds no memory, would then grow from a freed `Global`.
+    /// holds no memory, would then grow from a freed `Env`.
     #[cfg(any(test, feature = "std"))]
-    pub fn current() -> &'static Global {
+    pub fn current() -> &'static Env {
         std::thread_local! {
             // SAFETY: kept in a thread-local.
-            static CURRENT: ThreadGlobal = unsafe { ThreadGlobal::new() };
+            static CURRENT: ThreadEnv = unsafe { ThreadEnv::new() };
         }
-        CURRENT.with(ThreadGlobal::get)
+        CURRENT.with(ThreadEnv::get)
     }
 
     /// The allocator memory of `kind` comes from.
     pub fn allocator(&self, kind: Kind) -> &dyn Allocator {
-        // SAFETY: each points into this `Global`, which outlives the borrow.
+        // SAFETY: each points into this `Env`, which outlives the borrow.
         unsafe { at!(self.allocators, kind as usize).as_ref() }
     }
 
@@ -177,64 +175,62 @@ impl Global {
     }
 }
 
-/// Owns a `Global` from `Global::new`, and frees it when dropped, checking
+/// Owns an `Env` from `Env::new`, and frees it when dropped, checking
 /// everything allocated from it was freed first.
-pub struct OwnedGlobal(NonNull<Global>);
+pub struct OwnedEnv(NonNull<Env>);
 
-impl Deref for OwnedGlobal {
-    type Target = Global;
+impl Deref for OwnedEnv {
+    type Target = Env;
 
-    fn deref(&self) -> &Global {
-        // SAFETY: this owns the `Global`, which lives until it's dropped.
+    fn deref(&self) -> &Env {
+        // SAFETY: this owns the `Env`, which lives until it's dropped.
         unsafe { self.0.as_ref() }
     }
 }
 
-impl Drop for OwnedGlobal {
+impl Drop for OwnedEnv {
     fn drop(&mut self) {
-        // SAFETY: `free` was made for this `Global`'s block, and whoever made
+        // SAFETY: `free` was made for this `Env`'s block, and whoever made
         // it promised nothing allocated from it is left.
         unsafe { (self.free)(self.0) }
     }
 }
 
-/// Holds a `Global` for a thread, and frees it as `OwnedGlobal::release`
+/// Holds an `Env` for a thread, and frees it as `OwnedEnv::release`
 /// does when the thread exits.
-pub struct ThreadGlobal(core::mem::ManuallyDrop<OwnedGlobal>);
+pub struct ThreadEnv(core::mem::ManuallyDrop<OwnedEnv>);
 
-impl ThreadGlobal {
-    /// A `Global` from the system's heap, without a limit.
+impl ThreadEnv {
+    /// An `Env` from the system's heap, without a limit.
     ///
     /// # Safety
     ///
-    /// It must be kept in a thread-local, as `get` lends the `Global` for
-    /// as long as the thread lives, under `Global::current`'s rule.
-    pub unsafe fn new() -> ThreadGlobal {
+    /// It must be kept in a thread-local, as `get` lends the `Env` for
+    /// as long as the thread lives, under `Env::current`'s rule.
+    pub unsafe fn new() -> ThreadEnv {
         // SAFETY: it's released, not dropped, so it's freed only if nothing
         // allocated from it is held.
-        let Ok(global) = (unsafe { Global::new(crate::allocator::Heap, usize::MAX) }) else {
-            failed!()
-        };
-        ThreadGlobal(core::mem::ManuallyDrop::new(global))
+        let Ok(env) = (unsafe { Env::new(crate::allocator::Heap, usize::MAX) }) else { failed!() };
+        ThreadEnv(core::mem::ManuallyDrop::new(env))
     }
 
-    /// The `Global`, for as long as the thread lives, as
-    /// `Global::current` says.
-    pub fn get(&self) -> &'static Global {
+    /// The `Env`, for as long as the thread lives, as
+    /// `Env::current` says.
+    pub fn get(&self) -> &'static Env {
         // SAFETY: it's freed only when the thread exits.
         unsafe { self.0.0.as_ref() }
     }
 }
 
-impl Drop for ThreadGlobal {
+impl Drop for ThreadEnv {
     fn drop(&mut self) {
         // SAFETY: taken once, here.
         unsafe { core::mem::ManuallyDrop::take(&mut self.0) }.release();
     }
 }
 
-impl OwnedGlobal {
-    /// Frees the `Global` if nothing allocated from it is held, and keeps it
+impl OwnedEnv {
+    /// Frees the `Env` if nothing allocated from it is held, and keeps it
     /// for good if something is, which can then still use it.
     pub fn release(self) {
         if !self.holds_nothing() {
@@ -243,25 +239,25 @@ impl OwnedGlobal {
     }
 }
 
-/// Frees `global`, a `Block<A>`'s, and its allocator.
+/// Frees `env`, a `Block<A>`'s, and its allocator.
 ///
 /// # Safety
 ///
-/// `global` must be in a `Block<A>` from `Global::new`, with nothing
+/// `env` must be in a `Block<A>` from `Env::new`, with nothing
 /// allocated from it left.
-unsafe fn free<A: Allocator>(global: NonNull<Global>) {
-    let block = global.cast::<Block<A>>();
+unsafe fn free<A: Allocator>(env: NonNull<Env>) {
+    let block = env.cast::<Block<A>>();
     // SAFETY: the block holds both fields. Dropping the fixed allocators
     // first gives their chunks back, so all that's left is the block, which
     // `base` then frees from outside it. They're dropped one by one, not as
-    // a `Global`, whose `&mut` would end the budget's borrow they hold; the
+    // an `Env`, whose `&mut` would end the budget's borrow they hold; the
     // rest needs no drop.
     unsafe {
-        let global = &raw mut (*block.as_ptr()).global;
-        (&raw mut (*global).values).drop_in_place();
-        (&raw mut (*global).indices).drop_in_place();
-        (&raw mut (*global).small).drop_in_place();
-        check!((*block.as_ptr()).global.used() == size_of::<Block<A>>());
+        let env = &raw mut (*block.as_ptr()).env;
+        (&raw mut (*env).values).drop_in_place();
+        (&raw mut (*env).indices).drop_in_place();
+        (&raw mut (*env).small).drop_in_place();
+        check!((*block.as_ptr()).env.used() == size_of::<Block<A>>());
         let base = (&raw const (*block.as_ptr()).base).read();
         base.deallocate(block.cast(), Layout::new::<Block<A>>());
     }
@@ -275,7 +271,7 @@ impl Budget {
         if used > self.limit {
             return Err(AllocError);
         }
-        // SAFETY: the allocator lives in the `Global`'s block, as this does.
+        // SAFETY: the allocator lives in the `Env`'s block, as this does.
         let base = unsafe { self.base.as_ref() };
         let ptr = if zeroed { base.allocate_zeroed(layout) } else { base.allocate(layout) }?;
         self.used.set(used);
@@ -284,7 +280,7 @@ impl Budget {
     }
 }
 
-// SAFETY: forwards to the allocator the `Global` was made with.
+// SAFETY: forwards to the allocator the `Env` was made with.
 unsafe impl Allocator for Budget {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
         self.charge(layout, false)
@@ -307,7 +303,7 @@ unsafe impl Allocator for Budget {
 }
 
 // SAFETY: forwards to its budget.
-unsafe impl Allocator for Global {
+unsafe impl Allocator for Env {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
         self.budget.allocate(layout)
     }
@@ -336,28 +332,28 @@ mod tests {
     #[test]
     fn fails_past_its_limit_and_counts_the_peak() {
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let global = unsafe { Global::new(Heap, 2000) }.unwrap();
-        let empty = global.used();
-        let first = Buffer::allocate(&global, 600).unwrap();
+        let env = unsafe { Env::new(Heap, 2000) }.unwrap();
+        let empty = env.used();
+        let first = Buffer::allocate(&env, 600).unwrap();
         // A buffer's header counts too.
-        let one = global.used() - empty;
+        let one = env.used() - empty;
         assert!(one > 600);
-        assert!(Buffer::allocate(&global, 1200).is_err());
-        assert_eq!(global.used() - empty, one);
+        assert!(Buffer::allocate(&env, 1200).is_err());
+        assert_eq!(env.used() - empty, one);
 
         // What's freed can be allocated again.
         drop(first);
-        assert_eq!(global.used(), empty);
-        let second = Buffer::allocate(&global, 1000).unwrap();
-        let two = global.used();
+        assert_eq!(env.used(), empty);
+        let second = Buffer::allocate(&env, 1000).unwrap();
+        let two = env.used();
         drop(second);
-        assert_eq!((global.used(), global.peak()), (empty, two));
+        assert_eq!((env.used(), env.peak()), (empty, two));
     }
 
     #[test]
     fn cannot_be_made_past_its_limit() {
         // SAFETY: nothing is allocated from it.
-        assert!(unsafe { Global::new(Heap, 16) }.is_err());
+        assert!(unsafe { Env::new(Heap, 16) }.is_err());
     }
 
     /// A static block, which `Bump` hands out, so what's allocated from it
@@ -408,39 +404,39 @@ mod tests {
     fn checks_nothing_outlives_it() {
         // SAFETY: the buffer is forgotten, so never freed through it after
         // the drop, whose check is what's tested.
-        let global = unsafe { Global::new(Bump(&OUTLIVED), usize::MAX) }.unwrap();
-        core::mem::forget(Buffer::allocate(&global, 8).unwrap());
-        drop(global);
+        let env = unsafe { Env::new(Bump(&OUTLIVED), usize::MAX) }.unwrap();
+        core::mem::forget(Buffer::allocate(&env, 8).unwrap());
+        drop(env);
     }
 
     #[test]
     fn released_once_nothing_is_held() {
         // SAFETY: what's allocated from it is dropped before it's released.
-        let global = unsafe { Global::new(Heap, usize::MAX) }.unwrap();
-        let empty = global.used();
-        drop(Buffer::allocate_in(&global, Kind::Small, 8).unwrap());
-        assert!(global.holds_nothing());
-        assert!(global.used() > empty);
-        global.release();
+        let env = unsafe { Env::new(Heap, usize::MAX) }.unwrap();
+        let empty = env.used();
+        drop(Buffer::allocate_in(&env, Kind::Small, 8).unwrap());
+        assert!(env.holds_nothing());
+        assert!(env.used() > empty);
+        env.release();
     }
 
     #[test]
     fn kept_while_something_is_held() {
         // SAFETY: released, not dropped, so the buffer it keeps is never
-        // freed through a freed `Global`.
-        let global = unsafe { Global::new(Bump(&KEPT), usize::MAX) }.unwrap();
-        let buffer = Buffer::allocate(&global, 8).unwrap();
-        assert!(!global.holds_nothing());
-        global.release();
+        // freed through a freed `Env`.
+        let env = unsafe { Env::new(Bump(&KEPT), usize::MAX) }.unwrap();
+        let buffer = Buffer::allocate(&env, 8).unwrap();
+        assert!(!env.holds_nothing());
+        env.release();
         assert_eq!(buffer.as_slice::<u64>(), [0]);
         core::mem::forget(buffer);
     }
 
     #[test]
     fn each_thread_has_its_own() {
-        let here = core::ptr::from_ref(Global::current());
-        assert!(core::ptr::eq(here, Global::current()));
-        let there = std::thread::spawn(|| core::ptr::from_ref(Global::current()).addr());
+        let here = core::ptr::from_ref(Env::current());
+        assert!(core::ptr::eq(here, Env::current()));
+        let there = std::thread::spawn(|| core::ptr::from_ref(Env::current()).addr());
         assert_ne!(here.addr(), there.join().unwrap());
     }
 }

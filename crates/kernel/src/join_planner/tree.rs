@@ -2,7 +2,7 @@
 //! relations in.
 
 use crate::allocator::AllocError;
-use crate::global::Global;
+use crate::env::Env;
 use crate::slow_vec::SlowVec;
 
 /// A node of a join tree.
@@ -31,8 +31,8 @@ pub struct JoinTree {
 
 impl JoinTree {
     /// An empty tree with room for a join of `relations` relations.
-    pub fn new(global: &Global, relations: usize) -> Result<JoinTree, AllocError> {
-        Ok(JoinTree { nodes: SlowVec::fixed(global, (2 * relations).saturating_sub(1))? })
+    pub fn new(env: &Env, relations: usize) -> Result<JoinTree, AllocError> {
+        Ok(JoinTree { nodes: SlowVec::fixed(env, (2 * relations).saturating_sub(1))? })
     }
 
     /// Adds a leaf for `relation`, of `rows` rows, and returns its node.
@@ -65,11 +65,11 @@ impl JoinTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::global::Global;
+    use crate::env::Env;
 
     #[test]
     fn trees_number_their_nodes() {
-        let mut tree = JoinTree::new(Global::current(), 2).unwrap();
+        let mut tree = JoinTree::new(Env::current(), 2).unwrap();
         let (a, b) = (tree.relation(1, 10.0).unwrap(), tree.relation(0, 20.0).unwrap());
         assert_eq!(tree.join(a, b, 5.0).unwrap(), 2);
         assert_eq!(at!(tree.nodes, 2).kind, JoinNode::Join { left: 0, right: 1 });

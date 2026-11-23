@@ -181,7 +181,7 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 /// `AS a`: the columns in scope, named by alias `a`, the only one.
 fn compile_as(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     compiler.clear_aliases();
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
     compiler.add_alias(compiler.node(stage.first_child()), &scope)
 }
@@ -207,8 +207,8 @@ fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, E
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
-    let allocator = compiler.allocator();
-    let filter = DynOp::new(allocator, FilterOp::new(allocator, &compiler.plan.exprs, condition)?)?;
+    let env = compiler.env();
+    let filter = DynOp::new(env, FilterOp::new(env, &compiler.plan.exprs, condition)?)?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(filter, &children)?;
     Ok(())
@@ -252,8 +252,8 @@ fn join(
     condition: Option<(Node, Node)>,
 ) -> Result<(), Error> {
     let probe = compiler.plan.root;
-    let allocator = compiler.allocator();
-    let probe_columns = SlowVec::fixed_from(allocator, compiler.scope.iter().map(|c| c.id))?;
+    let env = compiler.env();
+    let probe_columns = SlowVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
         table = only(compiler, table)?;
     }
@@ -283,14 +283,14 @@ fn join(
             None
         }
     };
-    let allocator = compiler.allocator();
-    let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
+    let env = compiler.env();
+    let build_columns = SlowVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
     let columns = [probe_columns, build_columns];
     let conjuncts = match condition {
-        Some(condition) => conjuncts_of(allocator, &compiler.plan.exprs, condition)?,
-        None => SlowVec::fixed(allocator, 0)?,
+        Some(condition) => conjuncts_of(env, &compiler.plan.exprs, condition)?,
+        None => SlowVec::fixed(env, 0)?,
     };
-    let op = DynOp::new(allocator, JoinOp::new(kind, conjuncts, columns))?;
+    let op = DynOp::new(env, JoinOp::new(kind, conjuncts, columns))?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())
@@ -304,9 +304,9 @@ fn using_columns(
     build: &Relation,
     using: Node,
 ) -> Result<Expr, Error> {
-    let allocator = compiler.allocator();
-    let mut nodes = ExprBuilder::new(allocator)?;
-    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    let env = compiler.env();
+    let mut nodes = ExprBuilder::new(env)?;
+    let mut scope = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
     // Each build column joined on, one for each name in the list.
     let mut joined = [0; LIST_MAX];
     for i in 0..using.child_count() {
@@ -367,12 +367,12 @@ fn compile_extend(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
 /// The column of each item of `stage`'s list, under its alias if it has
 /// one, after the scope's columns if `extend`, are the new scope.
 fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result<(), Error> {
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     if extend {
         scope.extend_from_slice(&compiler.scope)?;
     }
     let list = compiler.node(stage.first_child());
-    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
+    let mut computed = SlowVec::fixed(compiler.env(), list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let name = match alias {
@@ -412,7 +412,7 @@ fn named(
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
 fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
     for i in 0..list.child_count() {
         let name = listed_once(compiler, list, i, 0)?;
@@ -454,9 +454,9 @@ fn change_in_place(
     renames: bool,
 ) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.allocator(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
-    let mut computed = SlowVec::fixed(compiler.allocator(), list.child_count() as usize)?;
+    let mut computed = SlowVec::fixed(compiler.env(), list.child_count() as usize)?;
     let target = u32::from(!renames);
     for i in 0..list.child_count() {
         let found = compiler.find_column(listed_once(compiler, list, i, target)?)?;
@@ -530,8 +530,8 @@ fn add_compute(
     if computed.is_empty() {
         return Ok(());
     }
-    let allocator = compiler.allocator();
-    let compute = DynOp::new(allocator, ComputeOp { items: computed })?;
+    let env = compiler.env();
+    let compute = DynOp::new(env, ComputeOp { items: computed })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(compute, &children)?;
     Ok(())
@@ -541,8 +541,8 @@ fn add_compute(
 /// stably. Keys are columns.
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let allocator = compiler.allocator();
-    let mut keys = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    let env = compiler.env();
+    let mut keys = SlowVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let key = compiler.node(list.first_child() + i);
         let column = compiler.node(key.first_child());
@@ -553,7 +553,7 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         let column = compiler.find_column(column)?.id;
         keys.push(SortKey { column, descending: key.descending() })?;
     }
-    let order_by = DynOp::new(allocator, OrderByOp { keys })?;
+    let order_by = DynOp::new(env, OrderByOp { keys })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(order_by, &children)?;
     Ok(())
@@ -572,8 +572,8 @@ fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
             return Err(Error::unsupported(Unsupported::Limit, compiler.span(second)));
         }
     };
-    let allocator = compiler.allocator();
-    let limit = DynOp::new(allocator, LimitOp { count, offset })?;
+    let env = compiler.env();
+    let limit = DynOp::new(env, LimitOp { count, offset })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(limit, &children)?;
     Ok(())
@@ -593,9 +593,9 @@ fn count(compiler: &Compiler<'_, '_>, node: Node) -> Result<u64, Error> {
 fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let by = compiler.node(stage.first_child() + 1);
-    let allocator = compiler.allocator();
-    let mut keys = SlowVec::fixed(allocator, by.child_count() as usize)?;
-    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    let env = compiler.env();
+    let mut keys = SlowVec::fixed(env, by.child_count() as usize)?;
+    let mut scope = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         if key.tag() != Tag::Name {
@@ -609,7 +609,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         keys.push(column.id)?;
         scope.push(named(compiler, column, alias)?)?;
     }
-    let mut aggregates = SlowVec::fixed(allocator, list.child_count() as usize)?;
+    let mut aggregates = SlowVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (item, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let span = compiler.span(item);
@@ -651,7 +651,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
-    let aggregate = DynOp::new(allocator, AggregateOp { keys, aggregates, answer: None })?;
+    let aggregate = DynOp::new(env, AggregateOp { keys, aggregates, answer: None })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
@@ -684,7 +684,7 @@ mod tests {
     use crate::registry::Registry;
 
     use super::*;
-    use pipit_kernel::global::Global;
+    use pipit_kernel::env::Env;
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
 
@@ -715,14 +715,14 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let global = Global::current();
-        let ast = parse_query(global, &REGISTRY, source.as_bytes()).unwrap();
+        let env = Env::current();
+        let ast = parse_query(env, &REGISTRY, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let global = Global::current();
-        let error = parse_query(global, &REGISTRY, source.as_bytes()).unwrap_err();
+        let env = Env::current();
+        let error = parse_query(env, &REGISTRY, source.as_bytes()).unwrap_err();
         (error.code, error.span.start)
     }
 

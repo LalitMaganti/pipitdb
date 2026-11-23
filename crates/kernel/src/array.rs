@@ -9,31 +9,31 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator, layout};
 use crate::buffer::Primitive;
-use crate::global::Global;
+use crate::env::Env;
 
 /// `len` values, zeroed when made.
 pub(crate) struct Array<T: Primitive> {
     values: NonNull<T>,
     len: usize,
     /// What the values came from.
-    global: NonNull<Global>,
+    env: NonNull<Env>,
     owns: PhantomData<T>,
 }
 
 impl<T: Primitive> Array<T> {
     /// `len` zeroes: fresh memory from the system is zero already, so a big
     /// one costs nothing to make.
-    pub(crate) fn zeroed(global: &Global, len: usize) -> Result<Array<T>, AllocError> {
-        Array::allocate(global, len, true)
+    pub(crate) fn zeroed(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
+        Array::allocate(env, len, true)
     }
 
     /// `len` values, value `i` being `value(i)`, each written once.
     pub(crate) fn from_fn(
-        global: &Global,
+        env: &Env,
         len: usize,
         mut value: impl FnMut(usize) -> T,
     ) -> Result<Array<T>, AllocError> {
-        let array = Array::<T>::allocate(global, len, false)?;
+        let array = Array::<T>::allocate(env, len, false)?;
         for i in 0..len {
             // SAFETY: there's room for `len` values.
             unsafe { array.values.as_ptr().add(i).write(value(i)) };
@@ -45,13 +45,13 @@ impl<T: Primitive> Array<T> {
     /// `write(start, out)`, which writes every one of `out`, values `start`
     /// on.
     pub(crate) fn from_chunks(
-        global: &Global,
+        env: &Env,
         len: usize,
         chunk: usize,
         mut write: impl FnMut(usize, &mut [MaybeUninit<T>]),
     ) -> Result<Array<T>, AllocError> {
         check!(chunk > 0);
-        let array = Array::<T>::allocate(global, len, false)?;
+        let array = Array::<T>::allocate(env, len, false)?;
         for start in (0..len).step_by(chunk) {
             let count = chunk.min(len - start);
             // SAFETY: values `start..start + count` are within the array, and
@@ -66,13 +66,13 @@ impl<T: Primitive> Array<T> {
 
     /// Room for `len` values, zeroed if `zeroed`, else unwritten: callers
     /// that don't zero write each value before it's read.
-    fn allocate(global: &Global, len: usize, zeroed: bool) -> Result<Array<T>, AllocError> {
+    fn allocate(env: &Env, len: usize, zeroed: bool) -> Result<Array<T>, AllocError> {
         let bytes = size_of::<T>().checked_mul(len).ok_or(AllocError)?;
         let values = match bytes {
             0 => NonNull::dangling(),
-            _ => allocate_bytes(global, bytes, zeroed)?.cast(),
+            _ => allocate_bytes(env, bytes, zeroed)?.cast(),
         };
-        Ok(Array { values, len, global: NonNull::from(global), owns: PhantomData })
+        Ok(Array { values, len, env: NonNull::from(env), owns: PhantomData })
     }
 }
 
@@ -98,8 +98,8 @@ impl<T: Primitive> Drop for Array<T> {
         let bytes = size_of::<T>() * self.len;
         if bytes != 0 {
             // SAFETY: allocated by `allocate_bytes`, with these bytes, from
-            // this `Global`, which outlives it.
-            unsafe { free_bytes(self.global.as_ref(), self.values.cast(), bytes) };
+            // this `Env`, which outlives it.
+            unsafe { free_bytes(self.env.as_ref(), self.values.cast(), bytes) };
         }
     }
 }
@@ -107,21 +107,21 @@ impl<T: Primitive> Drop for Array<T> {
 /// `bytes` of memory, zeroed if `zeroed`. Out of line, and of no type, so
 /// every `Array` shares it.
 #[inline(never)]
-fn allocate_bytes(global: &Global, bytes: usize, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
+fn allocate_bytes(env: &Env, bytes: usize, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
     let layout = layout(bytes)?;
-    if zeroed { global.allocate_zeroed(layout) } else { global.allocate(layout) }
+    if zeroed { env.allocate_zeroed(layout) } else { env.allocate(layout) }
 }
 
 /// Frees `bytes` at `values`.
 ///
 /// # Safety
 ///
-/// They must be from `allocate_bytes`, with `global`.
+/// They must be from `allocate_bytes`, with `env`.
 #[inline(never)]
-unsafe fn free_bytes(global: &Global, values: NonNull<u8>, bytes: usize) {
+unsafe fn free_bytes(env: &Env, values: NonNull<u8>, bytes: usize) {
     let Ok(layout) = layout(bytes) else { failed!() };
     // SAFETY: as the caller promises.
-    unsafe { global.deallocate(values, layout) };
+    unsafe { env.deallocate(values, layout) };
 }
 
 #[cfg(test)]
@@ -130,10 +130,10 @@ mod tests {
 
     #[test]
     fn holds_exactly_its_values() {
-        let global = Global::current();
-        let mut array = Array::<u32>::from_fn(global, 5, |i| u32::try_from(i).unwrap()).unwrap();
+        let env = Env::current();
+        let mut array = Array::<u32>::from_fn(env, 5, |i| u32::try_from(i).unwrap()).unwrap();
         array[4] = 9;
         assert_eq!(&*array, &[0, 1, 2, 3, 9]);
-        assert!(Array::<u64>::zeroed(global, 0).unwrap().is_empty());
+        assert!(Array::<u64>::zeroed(env, 0).unwrap().is_empty());
     }
 }

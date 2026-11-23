@@ -26,7 +26,7 @@ use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProper
 use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
-use crate::global::Global;
+use crate::env::Env;
 use crate::row_store::RowStore;
 use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
@@ -278,7 +278,7 @@ impl<'c> Op<'c> for JoinOp {
     fn give_condition(
         &mut self,
         _: &Exprs,
-        _: &Global,
+        _: &Env,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         if self.kind == JoinKind::Left && self.child_of(column) == 1 {
@@ -320,25 +320,23 @@ impl<'c> Op<'c> for JoinOp {
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 2);
-        let allocator = lowering.allocator();
+        let env = lowering.env();
         let (build, rows) = lowering.lower_side(node, self.build)?;
         lowering.lower_input(node, self.probe())?;
         let probe = lowering.query_rows();
         let exprs = lowering.exprs();
         // The conjuncts it hashes by need no test once their keys are found
         // equal; the rest are computed, a column each, and tested.
-        let mut tested = SlowVec::fixed(allocator, self.conjuncts.len())?;
+        let mut tested = SlowVec::fixed(env, self.conjuncts.len())?;
         let keys = Self::keys(exprs, probe, rows, &self.conjuncts, &mut tested);
         let mut condition = None;
         if !tested.is_empty() {
             let (held, count) = self.held(exprs, rows, &tested);
             let pairs = self.pairs(probe, rows, at!(held, ..count))?;
-            let mut programs = SlowVec::fixed(allocator, tested.len())?;
+            let mut programs = SlowVec::fixed(env, tested.len())?;
             for &conjunct in tested.iter() {
                 let (nodes, values) = (exprs.nodes(conjunct), lowering.expr_values());
-                let Ok(program) = type_expr(allocator, &pairs, nodes, values, true) else {
-                    failed!()
-                };
+                let Ok(program) = type_expr(env, &pairs, nodes, values, true) else { failed!() };
                 programs.push(program)?;
             }
             condition = Some(Compute { programs });
@@ -359,7 +357,7 @@ impl<'c> Op<'c> for JoinOp {
             *data_type = rows.type_of(column);
         }
         let (held, outputs) = (held.len(), count);
-        let mut probe_types = SlowVec::fixed(allocator, probe.column_count() as usize)?;
+        let mut probe_types = SlowVec::fixed(env, probe.column_count() as usize)?;
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
@@ -375,7 +373,7 @@ impl<'c> Op<'c> for JoinOp {
             keeps_build: self.keeps_build(),
             probe_types,
         };
-        lowering.add_operator(Step::Operator(DynOperator::new(allocator, join)?))
+        lowering.add_operator(Step::Operator(DynOperator::new(env, join)?))
     }
 }
 
@@ -557,7 +555,7 @@ fn find_groups(
 
 /// A null column of each of `types`, a batch long.
 fn null_columns(context: &mut Context, types: &[DataType]) -> Result<SlowVec<ColumnView>, Error> {
-    let mut nulls = SlowVec::fixed(context.allocator(), types.len())?;
+    let mut nulls = SlowVec::fixed(context.env(), types.len())?;
     for &data_type in types {
         let step = ExprStep { data_type, ..ExprStep::new(ExprOp::Null, 0, 0, 0) };
         let Some(null) = constant(context, &step)? else { failed!() };
@@ -636,13 +634,13 @@ impl Join<'_> {
             held.direct = Some(Direct::sequence(min, held.count));
             held.table = None;
         } else if let (true, false, Some(table)) = (self.one_integer(), held.repeats, &held.table) {
-            held.direct = Direct::of(context.allocator(), table, held.count)?;
+            held.direct = Direct::of(context.env(), table, held.count)?;
             if held.direct.is_some() {
                 held.table = None;
             }
         }
         if self.keeps_build {
-            held.build_matched = Bitmap::new(context.allocator(), held.count as usize)?;
+            held.build_matched = Bitmap::new(context.env(), held.count as usize)?;
         }
         held.rows.flush(context)
     }
@@ -851,8 +849,8 @@ impl Operator for Join<'_> {
     type State = Held;
 
     fn new_state(&self, context: &mut Context) -> Result<Held, Error> {
-        let allocator = context.allocator();
-        let rows = RowStore::new(allocator)?;
+        let env = context.env();
+        let rows = RowStore::new(env)?;
         let nulls = null_columns(context, at!(self.build_types, ..self.outputs))?;
         let probe_nulls = null_columns(context, &self.probe_types)?;
         let condition = match &self.condition {
@@ -861,7 +859,7 @@ impl Operator for Join<'_> {
         };
         // A word a group after its keys, for its last build row.
         let table = match &self.keys {
-            Some(keys) => Some(GroupTable::new(allocator, keys.count, keys.strings, 0, 1)?),
+            Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
             None => None,
         };
         Ok(Held {
@@ -871,17 +869,17 @@ impl Operator for Join<'_> {
             started: false,
             next: 0,
             table,
-            before: SlowVec::new(allocator, 1 << 31)?,
+            before: SlowVec::new(env, 1 << 31)?,
             repeats: false,
             direct: None,
             // Not arrays, which would be copied into place on each run.
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
-            next_of: SlowVec::zeroed(allocator, BATCH_ROWS_MAX as usize)?,
+            next_of: SlowVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
             matched: [0; BATCH_ROWS_MAX as usize / 64],
             nulls,
-            paired: SlowVec::zeroed(allocator, BATCH_ROWS_MAX as usize)?,
+            paired: SlowVec::zeroed(env, BATCH_ROWS_MAX as usize)?,
             condition,
-            build_matched: Bitmap::new(allocator, 0)?,
+            build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,
             probe_nulls,
         })
@@ -985,8 +983,8 @@ mod tests {
     /// The child a join of `kind` on `a = b` builds, given its children's
     /// rows and keys.
     fn built(kind: JoinKind, first: (u64, Key), second: (u64, Key)) -> u32 {
-        let mut exprs = Exprs::new(Global::current()).unwrap();
-        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
+        let mut exprs = Exprs::new(Env::current()).unwrap();
+        let mut nodes = ExprBuilder::new(Env::current()).unwrap();
         let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
         nodes.node(ExprOp::Eq, a, b).unwrap();
         let condition = Some(exprs.add(nodes.nodes()).unwrap());
@@ -995,8 +993,8 @@ mod tests {
             estimate.add_key(column, key);
             estimate
         };
-        let one = |column| SlowVec::fixed_from(Global::current(), [column].into_iter()).unwrap();
-        let conjuncts = SlowVec::fixed_from(Global::current(), condition.into_iter()).unwrap();
+        let one = |column| SlowVec::fixed_from(Env::current(), [column].into_iter()).unwrap();
+        let conjuncts = SlowVec::fixed_from(Env::current(), condition.into_iter()).unwrap();
         let mut join = JoinOp::new(kind, conjuncts, [one(0), one(1)]);
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build
@@ -1006,15 +1004,15 @@ mod tests {
     fn builds_by_keys_nothing_above_reads() {
         // Joined on 0 = 1, of which only 2 and 3 are read above: pruned,
         // the join still knows its first side's key is an id.
-        let mut exprs = Exprs::new(Global::current()).unwrap();
-        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
+        let mut exprs = Exprs::new(Env::current()).unwrap();
+        let mut nodes = ExprBuilder::new(Env::current()).unwrap();
         let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
         nodes.node(ExprOp::Eq, a, b).unwrap();
         let condition = exprs.add(nodes.nodes()).unwrap();
-        let conjuncts = SlowVec::fixed_from(Global::current(), [condition].into_iter()).unwrap();
-        let two = |a, b| SlowVec::fixed_from(Global::current(), [a, b].into_iter()).unwrap();
+        let conjuncts = SlowVec::fixed_from(Env::current(), [condition].into_iter()).unwrap();
+        let two = |a, b| SlowVec::fixed_from(Env::current(), [a, b].into_iter()).unwrap();
         let mut join = JoinOp::new(JoinKind::Inner, conjuncts, [two(0, 2), two(1, 3)]);
-        let mut needed = Needed::none(Global::current(), 4, &exprs).unwrap();
+        let mut needed = Needed::none(Env::current(), 4, &exprs).unwrap();
         needed.need(2);
         needed.need(3);
         join.prune(&mut needed);

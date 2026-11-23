@@ -215,16 +215,15 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::column::DataType;
     use crate::context::Context;
-    use crate::global::Global;
+    use crate::env::Env;
 
     #[test]
     fn holds_columns_of_the_same_length() {
-        let global = Global::current();
-        let mut values = Buffer::allocate(global, 3 * 8).unwrap();
+        let env = Env::current();
+        let mut values = Buffer::allocate(env, 3 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
         let column =
-            ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, None)
-                .unwrap();
+            ColumnView::new(&mut Context::new(env, None), DataType::Int64, values, None).unwrap();
 
         let mut batch = RowBatch::new();
         batch.reset(3);

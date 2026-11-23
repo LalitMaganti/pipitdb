@@ -11,7 +11,7 @@ use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::buffer::Buffer;
-use pipit_kernel::global::Global;
+use pipit_kernel::env::Env;
 use pipit_kernel::slow_vec::SlowVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
@@ -25,22 +25,22 @@ pub const LIST_MAX: usize = 64;
 pub const IN_LIST_MAX: usize = 1 << 16;
 
 /// Parses `source` as a query, with the stages in `registry`.
-pub fn parse_query(allocator: &Global, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
+pub fn parse_query(env: &Env, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
+    let mut parser = Parser::new(env, source)?;
     let root = parser.query(registry).and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
 /// Parses `source` as a single expression.
-pub fn parse_expression(allocator: &Global, source: &[u8]) -> Result<Ast, Error> {
-    let mut parser = Parser::new(allocator, source)?;
+pub fn parse_expression(env: &Env, source: &[u8]) -> Result<Ast, Error> {
+    let mut parser = Parser::new(env, source)?;
     let root = parser.expression().and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
 pub(crate) struct Parser<'a> {
     /// What lists too long for the stack are gathered with.
-    allocator: &'a Global,
+    env: &'a Env,
     source: &'a [u8],
     lexer: Lexer<'a>,
     current: Token,
@@ -49,13 +49,13 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(allocator: &'a Global, source: &'a [u8]) -> Result<Parser<'a>, Error> {
+    pub(crate) fn new(env: &'a Env, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
         // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(allocator, BLOCK_BYTES) }
+        let first = unsafe { Buffer::allocate_uninit(env, BLOCK_BYTES) }
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { allocator, source, lexer, current, nodes: Nodes::new(first), failed: None })
+        Ok(Parser { env, source, lexer, current, nodes: Nodes::new(first), failed: None })
     }
 
     /// The token the parser is on.
@@ -351,7 +351,7 @@ impl Parser<'_> {
     fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
         self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let mut items = SlowVec::new(self.allocator, IN_LIST_MAX)?;
+        let mut items = SlowVec::new(self.env, IN_LIST_MAX)?;
         loop {
             let negative = self.current().kind == TokenKind::Minus;
             if negative {
@@ -848,14 +848,14 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let global = Global::current();
-        let ast = parse_expression(global, source.as_bytes()).unwrap();
+        let env = Env::current();
+        let ast = parse_expression(env, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let global = Global::current();
-        let error = parse_expression(global, source.as_bytes()).err().unwrap();
+        let env = Env::current();
+        let error = parse_expression(env, source.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
@@ -863,9 +863,9 @@ mod tests {
     fn running_out_of_memory_comes_before_later_errors() {
         // The first block and the slot table, but not a second block.
         // SAFETY: declared before what's allocated from it, so dropped after.
-        let allocator = unsafe { Global::new(Heap, 2 * BLOCK_BYTES) }.unwrap();
+        let env = unsafe { Env::new(Heap, 2 * BLOCK_BYTES) }.unwrap();
         let source = format!("{}+)", "1+".repeat(BLOCK_BYTES / 8));
-        let error = parse_expression(&allocator, source.as_bytes()).err().unwrap();
+        let error = parse_expression(&env, source.as_bytes()).err().unwrap();
         assert_eq!(error.code, ErrorCode::OutOfMemory);
     }
 
@@ -922,9 +922,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn parses_past_the_first_block() {
-        let global = Global::current();
+        let env = Env::current();
         let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        let ast = parse_expression(global, long.as_bytes()).unwrap();
+        let ast = parse_expression(env, long.as_bytes()).unwrap();
         assert_eq!(ast.node_count() as usize, 2 * crate::ast::BLOCK_NODES - 1);
     }
 
