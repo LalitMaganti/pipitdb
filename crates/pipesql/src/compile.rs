@@ -93,6 +93,16 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.catalog
     }
 
+    /// The bytes of `node`, if it's a string literal, which it adds to the
+    /// statement's literals: as a function's binding reads a pattern.
+    pub fn string_literal(&mut self, node: Node) -> Result<Option<&[u8]>, Error> {
+        if node.tag() != Tag::String {
+            return Ok(None);
+        }
+        let id = crate::expression::string(self, node)?;
+        Ok(Some(self.plan.literal(id)))
+    }
+
     /// The stages and functions queries can use.
     pub fn registry(&self) -> &'q Registry {
         self.registry

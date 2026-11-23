@@ -39,6 +39,7 @@ static REGISTRY: Registry = Registry::new(&[
 .with_functions(&[
     pipit_pipesql::choices::CHOICES,
     pipit_pipesql::string_functions::STRING_FUNCTIONS,
+    pipit_regex::REGEX_FUNCTIONS,
 ]);
 
 /// ClickBench's queries: each one's name, PipeSQL, if pipitdb can run it yet,

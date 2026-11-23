@@ -79,7 +79,8 @@ fn describe(found: &str, error: &Error) -> Message {
         | ErrorCode::ChoicesOfOneType
         | ErrorCode::NumberCondition
         | ErrorCode::ArithmeticOnSomeRows
-        | ErrorCode::ArgumentType => expression(error.code),
+        | ErrorCode::ArgumentType
+        | ErrorCode::InvalidArgument => expression(error.code),
         ErrorCode::UnknownTable
         | ErrorCode::UnknownColumn
         | ErrorCode::AmbiguousColumn
@@ -167,6 +168,10 @@ fn expression(code: ErrorCode) -> (String, String) {
         ErrorCode::ArgumentType => {
             ("a function's argument is of a type it doesn't take".into(), "this call".into())
         }
+        ErrorCode::InvalidArgument => (
+            "a function can't take this argument".into(),
+            "such as a pattern that isn't a valid string literal".into(),
+        ),
         _ => pipit_kernel::failed!(),
     }
 }
