@@ -692,6 +692,27 @@ mod tests {
     }
 
     #[test]
+    fn larger_graphs_get_valid_plans() {
+        for shape in SHAPES {
+            for (count, mixed) in [(20, true), (70, false), (70, true)] {
+                let graph = generate(shape, count, mixed).unwrap();
+                let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
+                let written = cost(&graph, &as_written(crate::global(), &graph).unwrap()).unwrap();
+                assert!(planned.valid.is_ok() && planned.cost <= written.cost);
+            }
+        }
+    }
+
+    #[test]
+    fn disconnected_graphs_take_cross_products() {
+        for count in [5, 70] {
+            let mut graph = generate(Shape::Chain, count, true).unwrap();
+            graph.relations.push(Relation { rows: 3, unfiltered_rows: 3, max_rows: 3 }).unwrap();
+            assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
+        }
+    }
+
+    #[test]
     fn long_graphs_with_few_connected_sets_are_planned_exactly() {
         let graph = left_chain(50);
         let planned = cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap();
