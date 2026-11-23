@@ -2,6 +2,8 @@
 //! frontend binds one to a statement, with what it needs computed once, such
 //! as a compiled pattern, and fixes the types it takes and gives.
 
+#![allow(unsafe_code)]
+
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;

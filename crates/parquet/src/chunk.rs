@@ -1,6 +1,8 @@
 //! `ChunkReader`: a column chunk's values, a page at a time, decoded into
 //! columns a batch at a time.
 
+#![allow(unsafe_code)]
+
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};

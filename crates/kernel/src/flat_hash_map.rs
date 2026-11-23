@@ -7,6 +7,8 @@
 //! compares keys only where those match. The first `CLONES` control bytes
 //! are copied after the last, so a group read near the end needn't wrap.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::mem;

@@ -15,6 +15,8 @@
 //! - `--best FILE`: the best known costs, read and updated.
 //! - `--graph NAME`: prints a graph, such as `star-10-mixed`, and runs nothing.
 
+#![allow(unsafe_code)]
+
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::time::{Duration, Instant};

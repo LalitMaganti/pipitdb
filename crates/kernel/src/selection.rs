@@ -1,5 +1,7 @@
 //! `Selection`: which rows of a batch are kept.
 
+#![allow(unsafe_code)]
+
 use core::mem::MaybeUninit;
 
 use crate::eight::Halves;

@@ -1,5 +1,7 @@
 //! `RowBatch`: up to `BATCH_ROWS_MAX` rows, as columns of the same length.
 
+#![allow(unsafe_code)]
+
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 

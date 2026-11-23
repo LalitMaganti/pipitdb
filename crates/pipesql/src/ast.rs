@@ -4,6 +4,8 @@
 //! index of its first child. Leaves store their token's span instead. See
 //! <https://jhwlr.io/super-flat-ast/>.
 
+#![allow(unsafe_code)]
+
 use crate::error::{ErrorCode, Span};
 use crate::settings::build_setting;
 use core::ptr::NonNull;

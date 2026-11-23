@@ -1,6 +1,8 @@
 //! `RowStore`: the rows a breaker holds on to, to hand back later in any
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
+#![allow(unsafe_code)]
+
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};

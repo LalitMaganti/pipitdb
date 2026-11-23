@@ -1,6 +1,8 @@
 //! `SlabAllocator`, which hands out slots of one size, and the sizes of a
 //! query's slots for its batches.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;

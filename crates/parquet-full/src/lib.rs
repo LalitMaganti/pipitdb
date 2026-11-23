@@ -1,6 +1,8 @@
 //! What the small Parquet reader leaves out, such as compression codecs,
 //! plugged into it as its `Codec`.
 
+#![allow(unsafe_code)]
+
 use pipit_parquet::{Codec, Error};
 
 /// Parquet's codec numbers.

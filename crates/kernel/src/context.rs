@@ -1,6 +1,8 @@
 //! `Context`: what a run's steps share, passed to each as it runs, so what
 //! they share can grow without changing every step's functions.
 
+#![allow(unsafe_code)]
+
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::containers::SmallVec;

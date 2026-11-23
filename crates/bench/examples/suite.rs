@@ -11,6 +11,8 @@
 //! `QUERY` runs only that query, `REPEAT` runs each that many times and times
 //! the last, and `QUIET` doesn't print rows.
 
+#![allow(unsafe_code)]
+
 use std::cell::Cell;
 use std::time::Instant;
 

@@ -9,6 +9,8 @@
 //! transforms after it. A segment's transforms run in place on the batches its
 //! head makes, and each segment's batches are the next operator's input.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;

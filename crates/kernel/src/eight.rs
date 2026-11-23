@@ -2,6 +2,8 @@
 //! instructions, answering as `Halves`. Where a target has none,
 //! `EIGHT_AT_A_TIME` is false and filters don't call them.
 
+#![allow(unsafe_code)]
+
 /// Whether this target compares eight values at once.
 pub(crate) const EIGHT_AT_A_TIME: bool = cfg!(any(
     all(target_arch = "x86_64", target_feature = "avx2"),

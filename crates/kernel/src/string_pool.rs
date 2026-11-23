@@ -1,6 +1,8 @@
 //! `StringPool`: interns strings, handing out compact ids that give each one
 //! back in O(1), ported from Perfetto's.
 
+#![allow(unsafe_code)]
+
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, HEADER_BYTES};
 use crate::containers::{Array, SmallVec};

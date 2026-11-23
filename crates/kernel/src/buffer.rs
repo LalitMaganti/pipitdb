@@ -1,5 +1,7 @@
 //! `Buffer`: a refcounted block of bytes, aligned to 64 bytes or more.
 
+#![allow(unsafe_code)]
+
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;

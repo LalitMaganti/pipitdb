@@ -3,6 +3,8 @@
 //! column buffer taken, and rows that are done with can be let go of a
 //! block at a time.
 
+#![allow(unsafe_code)]
+
 use crate::buffer::Buffer;
 use crate::containers::SmallVec;
 use crate::context::Context;

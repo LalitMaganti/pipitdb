@@ -1,5 +1,7 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
+#![allow(unsafe_code)]
+
 pub mod join_planner;
 
 use pipit_kernel::buffer::Buffer;

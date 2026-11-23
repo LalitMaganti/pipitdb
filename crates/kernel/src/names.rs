@@ -1,5 +1,7 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
+#![allow(unsafe_code)]
+
 use crate::allocator::AllocError;
 use crate::containers::SmallVec;
 use crate::env::Env;

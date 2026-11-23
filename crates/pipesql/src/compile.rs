@@ -2,6 +2,8 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
+#![allow(unsafe_code)]
+
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::Forms;
 use pipit_kernel::containers::SmallVec;

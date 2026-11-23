@@ -3,6 +3,8 @@
 //! `Parser` is the cursor over tokens that every part of the grammar uses, and
 //! writes the tree.
 
+#![allow(unsafe_code)]
+
 use core::mem::MaybeUninit;
 
 use crate::ast::{Ast, DATA_MAX, Node, Nodes, Operator, Tag};
