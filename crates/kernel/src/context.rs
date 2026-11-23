@@ -151,7 +151,7 @@ impl<'a> Context<'a> {
 /// `size_bytes` bytes from `env`, not zeroed.
 fn buffer(env: &Env, kind: Kind, size_bytes: usize) -> Result<Buffer, AllocError> {
     // SAFETY: whoever fills it writes every byte that's read.
-    unsafe { Buffer::allocate_uninit_in(env, kind, size_bytes) }
+    unsafe { Buffer::allocate_uninit(env, kind, size_bytes) }
 }
 
 #[cfg(test)]
