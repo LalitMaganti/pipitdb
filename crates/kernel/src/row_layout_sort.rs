@@ -36,11 +36,14 @@ impl<'a> Rows<'a> {
 
 /// The order rows are already in, as far as it helps.
 struct ExistingOrder {
+    /// Whether the rows are sorted already.
     sorted: bool,
+    /// Whether each row sorts before the one before it.
     strictly_descending: bool,
     /// Where each ascending run starts, then the row count, if there are few:
     /// the first `runs_len`.
     runs: [u32; MAX_MERGED_RUNS + 2],
+    /// How many of `runs` there are.
     runs_len: usize,
 }
 
@@ -260,20 +263,24 @@ impl Sorted {
 /// key they hold: its bytes are `fixed`'s, but for those the word's key
 /// holds.
 pub(crate) struct SlotInWords {
+    /// How the varying bytes of each row are packed in its words.
     packing: Words,
+    /// The slot it reads.
     slot: Slot,
+    /// Whether the slot holds a float.
     float: bool,
-    /// The value's bytes, big-endian, where the key doesn't hold them, and
-    /// its flag's.
+    /// The value's bytes, big-endian, where the key doesn't hold them.
     value: u64,
+    /// The flag's byte, where the key doesn't hold it.
     flag: u8,
-    /// Where the flag is in the key, and its bits there: none if it doesn't
-    /// vary.
+    /// Where the flag is in the key: none if it doesn't vary.
     flag_shift: u32,
+    /// The flag's bits at `flag_shift`: none if it doesn't vary.
     flag_mask: u8,
     /// Each run of the value's bytes the key holds: where it is in the key,
     /// where in the value, and its bits.
     runs: [(u32, u32, u64); 8],
+    /// How many of `runs` there are.
     len: usize,
 }
 

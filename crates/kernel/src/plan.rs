@@ -51,7 +51,9 @@ pub struct SortKey {
 }
 
 pub struct ColumnSchema {
+    /// What queries call it.
     pub name: Name,
+    /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,

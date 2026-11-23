@@ -12,7 +12,9 @@ use crate::env::Env;
 pub(crate) enum Type {
     /// A string's rank among the strings sorted.
     Uint32,
+    /// An integer.
     Int64,
+    /// A float.
     Float64,
 }
 

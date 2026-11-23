@@ -39,7 +39,9 @@ pub struct Buffer {
 /// Sits in front of the bytes, in the same allocation.
 #[repr(C, align(64))]
 struct Header {
+    /// How many `Buffer`s share the bytes.
     references: Cell<u32>,
+    /// How many bytes there are.
     size_bytes: usize,
     /// What the bytes came from.
     env: NonNull<Env>,

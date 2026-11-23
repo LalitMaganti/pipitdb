@@ -24,9 +24,19 @@ use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BY
 /// It lives in memory from the allocator it was made with, so it never
 /// moves.
 pub struct Env {
+    /// Where plans, states, lists and column data of no fixed size come
+    /// from, and the slab allocators' slabs.
+    /// Where plans, states, lists and column data of no fixed size come
+    /// from, and the slab allocators' slabs.
     budget: Budget,
+    /// Slots for a batch's 8-byte values.
+    /// Slots for a batch's 8-byte values.
     values: SlabAllocator<'static>,
+    /// Slots for a batch's 4-byte values.
+    /// Slots for a batch's 4-byte values.
     indices: SlabAllocator<'static>,
+    /// Slots for the small things a batch's columns need.
+    /// Slots for the small things a batch's columns need.
     small: SlabAllocator<'static>,
     /// Each of the allocators above, by `MemoryKind`, so finding one doesn't
     /// branch.
@@ -42,6 +52,8 @@ pub struct Env {
 struct Budget {
     /// The allocator, in the same allocation as the `Env`.
     base: NonNull<dyn Allocator>,
+    /// The most bytes that can be allocated at once.
+    /// The most bytes that can be allocated at once.
     limit: usize,
     /// The bytes allocated now.
     used: Cell<usize>,

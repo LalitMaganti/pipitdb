@@ -37,6 +37,7 @@ pub fn hash_aggregate<'a>(
 /// each aggregate, which is stored next to the group's keys, so memory grows
 /// with the groups, not the rows.
 struct HashAggregate {
+    /// Its keys and aggregates.
     spec: HashAggregateSpec,
     /// How many words of state a group keeps: each aggregate's, one after
     /// another.

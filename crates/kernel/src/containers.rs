@@ -22,10 +22,13 @@ use crate::env::Env;
 
 /// `len` values, zeroed when made.
 pub struct Array<T: Primitive> {
+    /// Where the values start.
     values: NonNull<T>,
+    /// How many values there are.
     len: usize,
     /// What the values came from.
     env: NonNull<Env>,
+    /// Says it owns `T`s, for the drop checker.
     owns: PhantomData<T>,
 }
 
@@ -250,6 +253,7 @@ impl<T> Drop for Box<T> {
 
 /// A value of a type only its maker knows, which it drops.
 pub struct ErasedBox {
+    /// The value, of the type `drop` was made for.
     value: NonNull<()>,
     /// What the value's memory came from.
     env: NonNull<Env>,
@@ -680,9 +684,11 @@ pub(crate) fn address<T>(starts: &[*mut T], width: usize, i: usize) -> *mut T {
 }
 
 pub(crate) struct Blocks<T: Primitive> {
+    /// The blocks, as bytes.
     raw: RawBlocks,
     /// How many values a record is.
     width: usize,
+    /// Says it holds `T`s.
     holds: PhantomData<T>,
 }
 

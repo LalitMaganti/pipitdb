@@ -38,9 +38,9 @@ pub struct Selection {
     prefix: bool,
     /// How many rows the batch has: every kept row is below it.
     rows: u32,
-    // Unless `prefix`, the first `len` are the kept rows, in increasing order;
-    // only those are written. Kept whatever the state, so narrowing never
-    // sets it up again.
+    /// Unless `prefix`, the first `len` are the kept rows, in increasing
+    /// order; only those are written. Kept whatever the state, so narrowing
+    /// never sets it up again.
     indices: [MaybeUninit<u16>; BATCH_ROWS_MAX as usize],
 }
 
@@ -49,6 +49,7 @@ pub struct Selection {
 pub enum Kept<'a> {
     /// The first `len()` rows.
     Prefix,
+    /// No rows.
     None,
     /// These rows, in increasing order.
     Select(&'a [u16]),

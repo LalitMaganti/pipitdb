@@ -328,7 +328,9 @@ impl<'a> DynSource<'a> {
 
 /// A run of a source outside a pipeline, from `DynSource::start`.
 pub struct SourceRun<'s, 'a> {
+    /// The source it runs.
     source: &'s DynSource<'a>,
+    /// The source's state, in `_memory`.
     state: NonNull<u8>,
     /// Holds the state.
     _memory: Array<u8>,

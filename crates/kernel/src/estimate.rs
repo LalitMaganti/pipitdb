@@ -26,6 +26,7 @@ impl RowEstimate {
 /// The rows a node will make, and what's known about their columns.
 #[derive(Clone, Copy, Debug)]
 pub struct Estimate {
+    /// How many rows it will make.
     pub rows: RowEstimate,
     /// When several selective filters run one after another, the rows
     /// expected before the first of them. Each estimates from this count
@@ -37,6 +38,7 @@ pub struct Estimate {
     /// first `key_count` entries. Any more are dropped, which only means
     /// less is known.
     keys: [(ColumnId, Key); KEYS_MAX],
+    /// How many of `keys` are known.
     key_count: u8,
 }
 
