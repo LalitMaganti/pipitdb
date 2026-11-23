@@ -3,7 +3,9 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
-use pipit_kernel::expression::{ComputeItem, ComputeOp, Expr, expr_can_be_null};
+use pipit_kernel::expression::{
+    ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, expr_can_be_null,
+};
 use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
@@ -13,10 +15,11 @@ use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::Compiler;
+use crate::compile::{Compiler, Relation};
 use crate::error::{Error, ErrorCode, Unsupported};
-use crate::expression::{compile_expr, is_null};
+use crate::expression::{add_expr, compile_expr, is_null};
 use crate::keywords::same_word;
+use crate::parser::LIST_MAX;
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -212,7 +215,8 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
 }
 
 /// `[INNER] JOIN t ON c`: each pair of a row so far and a row of table `t`
-/// that condition `c` is true for, with the columns of both.
+/// that condition `c` is true for, with the columns of both. Or `USING (k)`,
+/// as `ON k = t.k`, with `k` once.
 fn compile_inner_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let first = stage.first_child();
     let condition = (compiler.node(first + 2), compiler.node(first + 3));
@@ -238,8 +242,8 @@ fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<()
 /// Joins the rows so far to table `table`, a name or a list of one, named by
 /// the alias in the list `alias` or else its own name, of `kind`, on a
 /// condition given as the lists of an `ON` and a `USING`, one of them
-/// empty, or on none. The scope is both sides' columns, so a name in both is
-/// ambiguous.
+/// empty, or on none. The scope is `USING`'s columns, then the rest of both
+/// sides', so another name in both is ambiguous.
 fn join(
     compiler: &mut Compiler<'_, '_>,
     mut table: Node,
@@ -266,7 +270,7 @@ fn join(
             return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using)));
         }
         Some((_, using)) if using.child_count() != 0 => {
-            return Err(Error::unsupported(Unsupported::Join, compiler.span(using)));
+            Some(using_columns(compiler, &build, using)?)
         }
         Some((on, _)) => {
             compiler.scope.extend_from_slice(&build.columns)?;
@@ -283,6 +287,50 @@ fn join(
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())
+}
+
+/// `USING`'s condition, that each column of the list `using` is equal on
+/// both sides, and its scope: those columns, the rows so far's, then the
+/// rest of `build`'s.
+fn using_columns(
+    compiler: &mut Compiler<'_, '_>,
+    build: &Relation,
+    using: Node,
+) -> Result<Expr, Error> {
+    let allocator = compiler.allocator();
+    let mut nodes = ExprBuilder::new(allocator)?;
+    let mut scope = SlowVec::new(allocator, PLAN_COLUMNS_MAX)?;
+    // Each build column joined on, one for each name in the list.
+    let mut joined = [0; LIST_MAX];
+    for i in 0..using.child_count() {
+        let name = listed_once(compiler, using, i, 0)?;
+        let (left, right) = (compiler.find_column(name)?, compiler.find_in(&build.columns, name)?);
+        let before = (i > 0).then(|| nodes.last());
+        let (a, b) = (nodes.column(left.id)?, nodes.column(right.id)?);
+        let equal = nodes.node(ExprOp::Eq, a, b)?;
+        if let Some(before) = before {
+            nodes.node(ExprOp::And, before, equal)?;
+        }
+        scope.push(left)?;
+        *at_mut!(joined, i as usize) = right.id;
+    }
+    // The rest of the rows so far's, even another name for a column joined
+    // on, or a second copy of one.
+    let joined_on = scope.len();
+    for column in compiler.scope.iter() {
+        let named = |joined: &NamedColumn| (joined.name, joined.id) == (column.name, column.id);
+        if !at!(scope, ..joined_on).iter().any(named) {
+            scope.push(*column)?;
+        }
+    }
+    for column in build.columns.iter() {
+        if !at!(joined, ..using.child_count() as usize).contains(&column.id) {
+            scope.push(*column)?;
+        }
+    }
+    let (expr, _) = add_expr(compiler, &nodes, using)?;
+    compiler.scope = scope;
+    Ok(expr)
 }
 
 /// The one item of `list`.

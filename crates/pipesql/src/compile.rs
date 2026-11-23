@@ -124,6 +124,11 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.find_named(columns, column, name.span())
     }
 
+    /// The one column of `columns` that `name` names, ignoring case.
+    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
+        self.find_named(columns, self.text(name.span()).as_bytes(), name.span())
+    }
+
     /// The one column of `columns` named `text`, ignoring case, for `span`.
     fn find_named(
         &self,
@@ -470,6 +475,29 @@ mod tests {
     }
 
     #[test]
+    fn joins_using_columns() {
+        let names = |query| run(query).into_iter().map(|(name, _)| name).collect::<StdVec<_>>();
+        // The column joined on once, first, then the rest of each side's.
+        let joined = names("FROM t |> RENAME b AS id |> JOIN ids USING (id)");
+        assert_eq!(joined, [&b"id"[..], b"a", b"f", b"s", b"v"]);
+        // A second copy of a column stays.
+        let twice = names("FROM t |> RENAME b AS id |> EXTEND a |> JOIN ids USING (id)");
+        assert_eq!(twice, [&b"id"[..], b"a", b"f", b"s", b"a", b"v"]);
+        assert_eq!(kept("FROM t |> RENAME b AS id |> JOIN ids USING (id) |> SELECT v"), [1.0]);
+        // A left join's comes from the rows so far, so is never null.
+        let null = f64::NEG_INFINITY;
+        let left = run("FROM ids |> RENAME v AS a |> LEFT JOIN t USING (a) |> SELECT a, id, b");
+        let values: StdVec<_> = left.into_iter().map(|(_, values)| values).collect();
+        assert_eq!(values, [[1.0, 2.0, 3.0], [10.0, 11.0, 12.0], [10.0, 20.0, null]]);
+        let two = "FROM t |> RENAME b AS id |> EXTEND a AS v |> JOIN ids USING (id, v) |> SELECT a";
+        assert_eq!(kept(two), [1.0]);
+        assert_eq!(
+            kept("FROM t |> RENAME b AS id, a AS v |> JOIN ids USING (v, id) |> SELECT v"),
+            [1.0]
+        );
+    }
+
+    #[test]
     fn names_columns_by_table_aliases() {
         // A table's name is its alias, and a column keeps its own name.
         assert_eq!(run("FROM t |> SELECT t.a"), [(b"a".to_vec(), [1.0, 2.0].to_vec())]);
@@ -505,7 +533,20 @@ mod tests {
     #[test]
     fn rejects_joins_it_cant_run() {
         assert_eq!(error("FROM t |> JOIN ids"), (ErrorCode::ExpectedWord, 15));
-        assert_eq!(error("FROM t |> JOIN ids USING (id)"), (ErrorCode::Unsupported, 26));
+        assert_eq!(error("FROM t |> JOIN ids USING (id)"), (ErrorCode::UnknownColumn, 26));
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING (id, id)"),
+            (ErrorCode::ListedTwice, 48)
+        );
+        assert_eq!(
+            error("FROM t |> RENAME b AS id |> JOIN ids USING id"),
+            (ErrorCode::ExpectedToken, 43)
+        );
+        let both = error("FROM t |> RENAME b AS id |> JOIN ids ON a = v USING (id)");
+        assert_eq!(both, (ErrorCode::UnexpectedToken, 53));
+        // `s` is a string, and `id` an integer.
+        let types = error("FROM t |> RENAME s AS id |> JOIN ids USING (id)");
+        assert_eq!(types, (ErrorCode::ExpectedOneKind, 44));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> LEFT JOIN ids, n ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
