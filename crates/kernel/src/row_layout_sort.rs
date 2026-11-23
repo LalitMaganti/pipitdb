@@ -416,16 +416,19 @@ pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<S
         fixed = Some(SmallVec::fixed_from(env, rows.get(0).iter().copied())?);
     }
     let batch = BATCH_ROWS_MAX as usize;
-    let mut words = Array::from_chunks(env, count as usize, batch, |start, out| {
-        #[expect(clippy::cast_possible_truncation, reason = "below `count`")]
-        let (from, to) = (start as u32, (start + out.len()) as u32);
-        for (out, r) in out.iter_mut().zip(from..to) {
-            out.write(packing.word(row_layout.get(r), first, r));
-        }
-        if in_words {
-            row_layout.let_go_below(to, true);
-        }
-    })?;
+    // SAFETY: each of `out` is written, as `from..to` is as long.
+    let mut words = unsafe {
+        Array::from_chunks(env, count as usize, batch, |start, out| {
+            #[expect(clippy::cast_possible_truncation, reason = "below `count`")]
+            let (from, to) = (start as u32, (start + out.len()) as u32);
+            for (out, r) in out.iter_mut().zip(from..to) {
+                out.write(packing.word(row_layout.get(r), first, r));
+            }
+            if in_words {
+                row_layout.let_go_below(to, true);
+            }
+        })?
+    };
     if in_words {
         row_layout.free();
     }

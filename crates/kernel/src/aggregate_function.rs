@@ -88,9 +88,13 @@ pub(crate) struct GroupStates<'a> {
 }
 
 impl GroupStates<'_> {
-    /// Where `group`'s state starts. Callers pass only groups that exist.
+    /// Where `group`'s state starts.
+    ///
+    /// # Safety
+    ///
+    /// `group` must exist.
     #[inline]
-    fn state(&self, group: u32) -> *mut i64 {
+    unsafe fn state(&self, group: u32) -> *mut i64 {
         // SAFETY: the group exists, so its record does, with its state in it.
         unsafe { address(self.blocks, self.stride, group as usize).add(self.offset) }
     }

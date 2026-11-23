@@ -54,9 +54,12 @@ impl<T: Primitive> Array<T> {
     }
 
     /// `len` values, written a chunk of up to `chunk` at a time by
-    /// `write(start, out)`, which writes every one of `out`, values `start`
-    /// on.
-    pub fn from_chunks(
+    /// `write(start, out)`, values `start` on.
+    ///
+    /// # Safety
+    ///
+    /// `write` must write every one of `out`.
+    pub unsafe fn from_chunks(
         env: &Env,
         len: usize,
         chunk: usize,
@@ -673,9 +676,12 @@ const FIRST_RECORDS: usize = if cfg!(test) { 1 } else { 1 << 10 };
 const BLOCKS_MAX: usize = 1 << 16;
 
 /// Where record `i` of `width` values starts, given where each block starts.
-/// Callers only pass records whose block exists.
+///
+/// # Safety
+///
+/// Record `i`'s block must exist.
 #[inline]
-pub(crate) fn address<T>(starts: &[*mut T], width: usize, i: usize) -> *mut T {
+pub(crate) unsafe fn address<T>(starts: &[*mut T], width: usize, i: usize) -> *mut T {
     if cfg!(debug_assertions) {
         check!(i >> BLOCK_SHIFT < starts.len());
     }
@@ -786,13 +792,17 @@ impl<T: Primitive> Blocks<T> {
     }
 
     /// Record `i`'s first value, for loops that can't afford a check.
-    /// Callers only pass `i` below the capacity.
+    ///
+    /// # Safety
+    ///
+    /// `i` must be below the capacity.
     #[inline]
-    pub(crate) fn record_ptr(&self, i: usize) -> *mut T {
+    pub(crate) unsafe fn record_ptr(&self, i: usize) -> *mut T {
         if cfg!(debug_assertions) {
             check!(i < self.capacity());
         }
-        address(self.starts(), self.width, i)
+        // SAFETY: below the capacity, so its block exists.
+        unsafe { address(self.starts(), self.width, i) }
     }
 
     /// Record `i`.
