@@ -56,6 +56,23 @@ impl<'a> FixedAllocator<'a> {
         }
     }
 
+    /// Whether no block is handed out, and so the bytes it holds are all
+    /// its chunks', `chunk_bytes`.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.live.get() == 0
+    }
+
+    /// The bytes of the chunks it took.
+    pub(crate) fn chunk_bytes(&self) -> usize {
+        let (mut bytes, mut chunk) = (0, self.chunks.get());
+        while let Some(at) = chunk {
+            // SAFETY: a chunk's first bytes hold its link.
+            let (before, size) = unsafe { at.cast::<Link>().read() };
+            (bytes, chunk) = (bytes + size, before);
+        }
+        bytes
+    }
+
     /// The layout of the `chunk_count`th chunk: four blocks, and the link,
     /// at first, then twice the one before.
     fn chunk_layout(&self) -> Layout {

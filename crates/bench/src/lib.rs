@@ -11,7 +11,7 @@ use pipit_kernel::expression::{
 };
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
-use pipit_kernel::global::Global;
+use pipit_kernel::global::{Global, ThreadGlobal};
 use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
@@ -33,15 +33,14 @@ use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
 
-/// This thread's `Global`, from the system's heap, without a limit, made the
-/// first time it's asked for. Not the kernel's `Global::current`, which needs
+/// This thread's `Global`, as the kernel's `Global::current`, which needs
 /// its `std` feature, and so `std` in the size example, which has none.
 pub fn global() -> &'static Global {
     std::thread_local! {
-        static GLOBAL: &'static Global = Global::leak(pipit_kernel::allocator::Heap, usize::MAX)
-            .unwrap_or_else(|_| panic!("the heap has room for a `Global`"));
+        // SAFETY: kept in a thread-local.
+        static GLOBAL: ThreadGlobal = unsafe { ThreadGlobal::new() };
     }
-    GLOBAL.with(|global| *global)
+    GLOBAL.with(ThreadGlobal::get)
 }
 
 pub mod real;

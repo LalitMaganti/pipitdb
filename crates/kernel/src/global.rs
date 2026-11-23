@@ -32,6 +32,8 @@ pub struct Global {
     allocators: [NonNull<dyn Allocator>; KIND_COUNT],
     /// Frees the block this is in, and the allocator in it.
     free: unsafe fn(NonNull<Global>),
+    /// The bytes of the block this is in.
+    block_bytes: usize,
 }
 
 /// Allocates from the allocator a `Global` was made with while the bytes
@@ -115,6 +117,7 @@ impl Global {
             ];
             (&raw mut (*global).allocators).write(allocators);
             (&raw mut (*global).free).write(free::<A>);
+            (&raw mut (*global).block_bytes).write(layout.size());
         }
         Ok(OwnedGlobal(block.cast()))
     }
@@ -134,24 +137,33 @@ impl Global {
     }
 
     /// This thread's `Global`, from the system's heap, without a limit, made
-    /// the first time it's asked for: for tools, and tests.
+    /// the first time it's asked for, and freed when the thread exits unless
+    /// something allocated from it is still held: for tools, and tests.
+    ///
+    /// Not quite `'static`: a thread-local's destructor that runs after its
+    /// own mustn't use what was allocated from it, as an empty list, which
+    /// holds no memory, would then grow from a freed `Global`.
     #[cfg(any(test, feature = "std"))]
     pub fn current() -> &'static Global {
         std::thread_local! {
-            static CURRENT: &'static Global = {
-                let Ok(global) = Global::leak(crate::allocator::Heap, usize::MAX) else {
-                    failed!()
-                };
-                global
-            };
+            // SAFETY: kept in a thread-local.
+            static CURRENT: ThreadGlobal = unsafe { ThreadGlobal::new() };
         }
-        CURRENT.with(|global| *global)
+        CURRENT.with(ThreadGlobal::get)
     }
 
     /// The allocator memory of `kind` comes from.
     pub fn allocator(&self, kind: Kind) -> &dyn Allocator {
         // SAFETY: each points into this `Global`, which outlives the borrow.
         unsafe { at!(self.allocators, kind as usize).as_ref() }
+    }
+
+    /// Whether nothing allocated from it is held: only its own block and
+    /// its block allocators' chunks are.
+    pub fn holds_nothing(&self) -> bool {
+        let fixed = [&self.values, &self.indices, &self.small];
+        let chunks: usize = fixed.iter().map(|fixed| fixed.chunk_bytes()).sum();
+        fixed.iter().all(|fixed| fixed.is_idle()) && self.used() == self.block_bytes + chunks
     }
 
     /// The bytes allocated now, this included.
@@ -183,6 +195,51 @@ impl Drop for OwnedGlobal {
         // SAFETY: `free` was made for this `Global`'s block, and whoever made
         // it promised nothing allocated from it is left.
         unsafe { (self.free)(self.0) }
+    }
+}
+
+/// Holds a `Global` for a thread, and frees it as `OwnedGlobal::release`
+/// does when the thread exits.
+pub struct ThreadGlobal(core::mem::ManuallyDrop<OwnedGlobal>);
+
+impl ThreadGlobal {
+    /// A `Global` from the system's heap, without a limit.
+    ///
+    /// # Safety
+    ///
+    /// It must be kept in a thread-local, as `get` lends the `Global` for
+    /// as long as the thread lives, under `Global::current`'s rule.
+    pub unsafe fn new() -> ThreadGlobal {
+        // SAFETY: it's released, not dropped, so it's freed only if nothing
+        // allocated from it is held.
+        let Ok(global) = (unsafe { Global::new(crate::allocator::Heap, usize::MAX) }) else {
+            failed!()
+        };
+        ThreadGlobal(core::mem::ManuallyDrop::new(global))
+    }
+
+    /// The `Global`, for as long as the thread lives, as
+    /// `Global::current` says.
+    pub fn get(&self) -> &'static Global {
+        // SAFETY: it's freed only when the thread exits.
+        unsafe { self.0.0.as_ref() }
+    }
+}
+
+impl Drop for ThreadGlobal {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here.
+        unsafe { core::mem::ManuallyDrop::take(&mut self.0) }.release();
+    }
+}
+
+impl OwnedGlobal {
+    /// Frees the `Global` if nothing allocated from it is held, and keeps it
+    /// for good if something is, which can then still use it.
+    pub fn release(self) {
+        if !self.holds_nothing() {
+            core::mem::forget(self);
+        }
     }
 }
 
@@ -303,44 +360,80 @@ mod tests {
         assert!(unsafe { Global::new(Heap, 16) }.is_err());
     }
 
-    /// Hands out memory from one static block, bump by bump, so what's
-    /// allocated from it can be forgotten without leaking heap memory.
-    struct Static;
-
+    /// A static block, which `Bump` hands out, so what's allocated from it
+    /// can be kept for good without leaking heap memory.
     #[repr(align(64))]
     struct Arena {
-        _bytes: [u8; 4096],
+        bytes: core::cell::UnsafeCell<[u8; 4096]>,
+        next: core::sync::atomic::AtomicUsize,
     }
 
-    static mut ARENA: Arena = Arena { _bytes: [0; 4096] };
-    static mut NEXT: usize = 0;
+    // SAFETY: each allocation is a distinct part of the block.
+    unsafe impl Sync for Arena {}
 
-    // SAFETY: each allocation is a distinct part of the block, which lives
-    // for the program; only `checks_nothing_outlives_it` uses it.
-    unsafe impl Allocator for Static {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-            // SAFETY: only one test, on one thread, uses these.
-            unsafe {
-                let start = NEXT.next_multiple_of(layout.align());
-                if start + layout.size() > 4096 {
-                    return Err(AllocError);
-                }
-                NEXT = start + layout.size();
-                NonNull::new((&raw mut ARENA).cast::<u8>().add(start)).ok_or(AllocError)
+    impl Arena {
+        const fn new() -> Arena {
+            Arena {
+                bytes: core::cell::UnsafeCell::new([0; 4096]),
+                next: core::sync::atomic::AtomicUsize::new(0),
             }
+        }
+    }
+
+    /// Hands out an `Arena`, bump by bump, and never takes any back.
+    struct Bump(&'static Arena);
+
+    // SAFETY: each allocation is a distinct part of the arena, which lives
+    // for the program.
+    unsafe impl Allocator for Bump {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+            use core::sync::atomic::Ordering::Relaxed;
+            let start = self.0.next.load(Relaxed).next_multiple_of(layout.align());
+            if start + layout.size() > 4096 {
+                return Err(AllocError);
+            }
+            self.0.next.store(start + layout.size(), Relaxed);
+            // SAFETY: within the block.
+            NonNull::new(unsafe { self.0.bytes.get().cast::<u8>().add(start) }).ok_or(AllocError)
         }
 
         unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
     }
+
+    static OUTLIVED: Arena = Arena::new();
+    static KEPT: Arena = Arena::new();
 
     #[test]
     #[should_panic(expected = "used")]
     fn checks_nothing_outlives_it() {
         // SAFETY: the buffer is forgotten, so never freed through it after
         // the drop, whose check is what's tested.
-        let global = unsafe { Global::new(Static, usize::MAX) }.unwrap();
+        let global = unsafe { Global::new(Bump(&OUTLIVED), usize::MAX) }.unwrap();
         core::mem::forget(Buffer::allocate(&global, 8).unwrap());
         drop(global);
+    }
+
+    #[test]
+    fn released_once_nothing_is_held() {
+        // SAFETY: what's allocated from it is dropped before it's released.
+        let global = unsafe { Global::new(Heap, usize::MAX) }.unwrap();
+        let empty = global.used();
+        drop(Buffer::allocate_in(&global, Kind::Small, 8).unwrap());
+        assert!(global.holds_nothing());
+        assert!(global.used() > empty);
+        global.release();
+    }
+
+    #[test]
+    fn kept_while_something_is_held() {
+        // SAFETY: released, not dropped, so the buffer it keeps is never
+        // freed through a freed `Global`.
+        let global = unsafe { Global::new(Bump(&KEPT), usize::MAX) }.unwrap();
+        let buffer = Buffer::allocate(&global, 8).unwrap();
+        assert!(!global.holds_nothing());
+        global.release();
+        assert_eq!(buffer.as_slice::<u64>(), [0]);
+        core::mem::forget(buffer);
     }
 
     #[test]
