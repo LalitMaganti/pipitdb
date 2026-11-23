@@ -4,8 +4,7 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
-use pipit_kernel::expression::ExprStep;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::expression::ExprBuilder;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -79,8 +78,7 @@ pub struct FunctionRule {
     /// `depth` deep, its result last: steps the kernel has, as `iif`'s
     /// `CASE`, or a call of a function bound to the statement, which
     /// `call_bound` appends.
-    pub compile:
-        fn(&mut Compiler<'_, '_>, Node, usize, &mut SlowVec<ExprStep>) -> Result<(), Error>,
+    pub compile: fn(&mut Compiler<'_, '_>, Node, usize, &mut ExprBuilder) -> Result<(), Error>,
 }
 
 /// Rules, found by keyword, and functions, found by name. A rule's id is

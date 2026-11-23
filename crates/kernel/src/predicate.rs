@@ -717,6 +717,7 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::column::{DataType, Forms};
     use crate::context::Context;
+    use crate::expression::ExprBuilder;
     use crate::selection::Kept;
 
     /// `a` and `b`, with `None` for null.
@@ -810,37 +811,34 @@ mod tests {
     /// `expr` as a kernel expression, added to `exprs`, as a plan holds a
     /// condition.
     fn kernel(exprs: &mut Exprs, expr: &Expr) -> crate::expression::Expr {
-        fn add(expr: &Expr, nodes: &mut StdVec<ExprStep>) -> u32 {
-            let node = |op, a, b, int_value| ExprStep {
-                op,
-                data_type: DataType::Int64,
-                a,
-                b,
-                c: 0,
-                int_value,
-                double_value: 0.0,
-            };
+        fn add(expr: &Expr, nodes: &mut ExprBuilder) -> u32 {
             let added = match *expr {
                 Expr::Greater(column, value) => {
-                    nodes.push(node(ExprOp::Column, column, 0, 0));
-                    nodes.push(node(ExprOp::Constant, 0, 0, value));
-                    let at = u32::try_from(nodes.len()).unwrap();
-                    node(ExprOp::Gt, at - 2, at - 1, 0)
+                    let (column, value) = (nodes.column(column), nodes.int(value));
+                    nodes.node(ExprOp::Gt, column.unwrap(), value.unwrap())
                 }
                 Expr::IsNull(column) => {
-                    nodes.push(node(ExprOp::Column, column, 0, 0));
-                    node(ExprOp::IsNull, u32::try_from(nodes.len()).unwrap() - 1, 0, 0)
+                    let column = nodes.column(column).unwrap();
+                    nodes.node(ExprOp::IsNull, column, 0)
                 }
-                Expr::And(a, b) => node(ExprOp::And, add(a, nodes), add(b, nodes), 0),
-                Expr::Or(a, b) => node(ExprOp::Or, add(a, nodes), add(b, nodes), 0),
-                Expr::Not(a) => node(ExprOp::Not, add(a, nodes), 0, 0),
+                Expr::And(a, b) => {
+                    let (a, b) = (add(a, nodes), add(b, nodes));
+                    nodes.node(ExprOp::And, a, b)
+                }
+                Expr::Or(a, b) => {
+                    let (a, b) = (add(a, nodes), add(b, nodes));
+                    nodes.node(ExprOp::Or, a, b)
+                }
+                Expr::Not(a) => {
+                    let a = add(a, nodes);
+                    nodes.node(ExprOp::Not, a, 0)
+                }
             };
-            nodes.push(added);
-            u32::try_from(nodes.len()).unwrap() - 1
+            added.unwrap()
         }
-        let mut nodes = StdVec::new();
+        let mut nodes = ExprBuilder::new(&Heap).unwrap();
         add(expr, &mut nodes);
-        exprs.add(&nodes).unwrap()
+        exprs.add(nodes.nodes()).unwrap()
     }
 
     /// The predicate testing `conjuncts`, of `exprs`, of columns at their

@@ -862,6 +862,68 @@ pub const PLAN_EXPR_NODES_MAX: usize = 1 << 14;
 /// The most values of all of a plan's `IN` lists.
 pub const PLAN_EXPR_VALUES_MAX: usize = 1 << 20;
 
+/// An expression's nodes, added one at a time, each reading only those
+/// before it: the last is its root. Each method that adds a node returns
+/// where it is, and is out of line, as building runs once a query.
+pub struct ExprBuilder {
+    nodes: SlowVec<ExprStep>,
+}
+
+impl ExprBuilder {
+    pub fn new(allocator: &dyn Allocator) -> Result<ExprBuilder, AllocError> {
+        Ok(ExprBuilder { nodes: SlowVec::new(allocator, EXPR_NODES_MAX)? })
+    }
+
+    /// Adds `node`. Fails if there are `EXPR_NODES_MAX` already.
+    pub fn push(&mut self, node: ExprStep) -> Result<u32, AllocError> {
+        self.nodes.push(node)?;
+        Ok(self.last())
+    }
+
+    /// Adds a node of `op` reading `a` and `b`, as `ExprStep::new`.
+    #[inline(never)]
+    pub fn node(&mut self, op: ExprOp, a: u32, b: u32) -> Result<u32, AllocError> {
+        self.push(ExprStep::new(op, a, b, 0))
+    }
+
+    /// Adds column `column`, an `Int64`.
+    #[inline(never)]
+    pub fn column(&mut self, column: ColumnId) -> Result<u32, AllocError> {
+        self.push(ExprStep::new(ExprOp::Column, column, 0, 0))
+    }
+
+    /// Adds the integer `value`.
+    #[inline(never)]
+    pub fn int(&mut self, value: i64) -> Result<u32, AllocError> {
+        self.push(ExprStep::new(ExprOp::Constant, 0, 0, value))
+    }
+
+    /// Where the last node added is.
+    pub fn last(&self) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let last = self.nodes.len() as u32 - 1;
+        last
+    }
+
+    /// Whether another node would be one too many.
+    pub fn is_full(&self) -> bool {
+        self.nodes.len() == EXPR_NODES_MAX
+    }
+
+    /// Takes the last node off.
+    pub fn pop(&mut self) -> Option<ExprStep> {
+        self.nodes.pop()
+    }
+
+    pub fn nodes(&self) -> &[ExprStep] {
+        &self.nodes
+    }
+
+    pub fn nodes_mut(&mut self) -> &mut [ExprStep] {
+        &mut self.nodes
+    }
+}
+
 /// The nodes of a plan's expressions, each one's together, and the values
 /// of their `IN` lists, which an `In` node's `b` counts from the first of.
 pub struct Exprs {
@@ -1301,6 +1363,12 @@ pub fn check_expr_type(
 }
 
 impl ExprStep {
+    /// A node of `op`, an `Int64`, reading nodes `a` and `b`, or of value
+    /// `int_value`.
+    pub const fn new(op: ExprOp, a: u32, b: u32, int_value: i64) -> ExprStep {
+        ExprStep { op, data_type: DataType::Int64, a, b, c: 0, int_value, double_value: 0.0 }
+    }
+
     /// The nodes this reads, as `a`, `b` and `c` say by its op: the first
     /// of a run, and how many, or one.
     pub(crate) fn operands(&self) -> [(u32, u32); 2] {

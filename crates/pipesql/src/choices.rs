@@ -2,7 +2,7 @@
 //! arguments, so compile to `CASE`, as SQL's does. An embedder registers
 //! them as the set `CHOICES`.
 
-use pipit_kernel::expression::{ExprStep, PRESENT};
+use pipit_kernel::expression::{ExprBuilder, PRESENT};
 use pipit_kernel::slow_vec::SlowVec;
 
 use crate::ast::Node;
@@ -30,7 +30,7 @@ pub const CHOICES: &[FunctionRule] = &[
 fn iif(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
     let values = compile_arguments(compiler, (node, depth), nodes, 3, 3)?;
     let branch = [(*at!(values, 0), *at!(values, 1))];
@@ -42,7 +42,7 @@ fn iif(
 fn coalesce(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut SlowVec<ExprStep>,
+    nodes: &mut ExprBuilder,
     most: u32,
 ) -> Result<(), Error> {
     let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
