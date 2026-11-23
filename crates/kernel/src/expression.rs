@@ -7,11 +7,13 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::filter::Entries;
 use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Column, DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, Op, PlanNode};
+use crate::predicate::{Leaf, Predicate, Set};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -60,6 +62,11 @@ pub enum ExprOp {
     IsNull,
     /// Whether `a` isn't null, as 0 or 1, never null.
     IsNotNull,
+    /// Whether `a` is one of the `c` values from value `b` of the
+    /// expression's values, as 0 or 1: null if `a` is. They're integers, or
+    /// for a string `a`, ids of strings in the statement's literals; in an
+    /// `Expr`, its type says which.
+    In,
     /// `a AND b`, of integers true where they aren't 0, as 0 or 1: null
     /// only where it's unknown, as SQL's is: `NULL AND 0` is 0.
     And,
@@ -120,6 +127,8 @@ pub struct ExprStep {
 /// fails the run.
 pub struct ExprProgram {
     pub steps: SlowVec<ExprStep>,
+    /// Its `In` lists' values, if it has any.
+    pub values: Option<Buffer>,
 }
 
 /// Adds one column to each batch for each program. Programs read only the
@@ -131,11 +140,21 @@ pub struct Compute {
 
 /// What a run of a `Compute` keeps between batches.
 pub struct ComputeState {
-    /// By program, then step, a constant step's value at every row a batch
-    /// can have, made once per run.
-    constants: SlowVec<SlowVec<Option<ColumnView>>>,
+    /// By program, then step, what's made for the step once per run.
+    prepared: SlowVec<SlowVec<Prepared>>,
     /// By step, what each computed for the program last run.
     registers: SlowVec<Option<ColumnView>>,
+}
+
+/// What a run makes for a step once, rather than for each batch.
+enum Prepared {
+    /// Nothing.
+    None,
+    /// A constant step's value at every row a batch can have.
+    Constant(ColumnView),
+    /// An `In` step's list, as a predicate of one leaf on its operand, and
+    /// the sets and entries selecting with it uses.
+    Test { predicate: Predicate, sets: SlowVec<Option<Set>>, entries: SlowVec<Entries> },
 }
 
 impl Transform for Compute {
@@ -143,18 +162,18 @@ impl Transform for Compute {
 
     fn new_state(&self, context: &mut Context) -> Result<ComputeState, Error> {
         let allocator = context.allocator();
-        let mut constants = SlowVec::fixed(allocator, self.programs.len())?;
+        let mut prepared = SlowVec::fixed(allocator, self.programs.len())?;
         let mut steps_max = 0;
         for program in self.programs.iter() {
-            let mut values = SlowVec::fixed(allocator, program.steps.len())?;
+            let mut steps = SlowVec::fixed(allocator, program.steps.len())?;
             for step in program.steps.iter() {
-                values.push(constant(context, step)?)?;
+                steps.push(prepare(context, program, step)?)?;
             }
-            constants.push(values)?;
+            prepared.push(steps)?;
             steps_max = steps_max.max(program.steps.len());
         }
         let registers = SlowVec::fixed_from(allocator, (0..steps_max).map(|_| None))?;
-        Ok(ComputeState { constants, registers })
+        Ok(ComputeState { prepared, registers })
     }
 
     fn process(
@@ -163,12 +182,33 @@ impl Transform for Compute {
         state: &mut ComputeState,
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
-        for (program, constants) in self.programs.iter().zip(state.constants.iter()) {
-            let result = run(context, program, constants, &mut state.registers, batch)?;
+        for (program, prepared) in self.programs.iter().zip(state.prepared.iter_mut()) {
+            let result = run(context, program, prepared, &mut state.registers, batch)?;
             let Ok(()) = batch.push_column(result) else { failed!() };
         }
         Ok(())
     }
+}
+
+/// What a run makes for `step`, one of `program`'s, once.
+fn prepare(
+    context: &mut Context,
+    program: &ExprProgram,
+    step: &ExprStep,
+) -> Result<Prepared, AllocError> {
+    if step.op != ExprOp::In {
+        return Ok(constant(context, step)?.map_or(Prepared::None, Prepared::Constant));
+    }
+    let (column, start, len) = (0, step.b, step.c);
+    let leaf = match at!(program.steps, step.a as usize).data_type {
+        DataType::String => Leaf::InStrings { column, start, len },
+        _ => Leaf::In { column, start, len },
+    };
+    let allocator = context.allocator();
+    let predicate = Predicate::of_leaf(allocator, leaf, program.values.clone())?;
+    let sets = predicate.new_sets(allocator, context.literals())?;
+    let entries = predicate.new_entries(allocator)?;
+    Ok(Prepared::Test { predicate, sets, entries })
 }
 
 /// `step`'s value at every row a batch can have, if it's a constant.
@@ -213,7 +253,7 @@ fn constant(context: &mut Context, step: &ExprStep) -> Result<Option<ColumnView>
 fn run(
     context: &mut Context,
     program: &ExprProgram,
-    constants: &[Option<ColumnView>],
+    prepared: &mut [Prepared],
     registers: &mut [Option<ColumnView>],
     batch: &RowBatch,
 ) -> Result<ColumnView, Error> {
@@ -227,9 +267,10 @@ fn run(
                 column
             }
             ExprOp::Constant | ExprOp::Null => {
-                let Some(constant) = at!(constants, i) else { failed!() };
+                let Prepared::Constant(constant) = at!(prepared, i) else { failed!() };
                 constant.slice(0, rows)
             }
+            ExprOp::In => in_list(context, at_mut!(prepared, i), step, registers)?,
             ExprOp::ToDouble => {
                 let a = register(registers, step.a);
                 let mut values = context.values_buffer(rows as usize * 8)?;
@@ -501,6 +542,40 @@ fn null_test(
     let mut values = context.values_buffer(rows * 8)?;
     present(a.validity(), step.op == ExprOp::IsNull, values.as_mut_slice());
     ColumnView::new(context, DataType::Int64, values, None)
+}
+
+/// Whether `step`'s operand is one of its list at every row, as 0 or 1: null
+/// where the operand is. Tested as a filter tests it, by its predicate.
+#[inline(never)]
+fn in_list(
+    context: &mut Context,
+    test: &mut Prepared,
+    step: &ExprStep,
+    registers: &[Option<ColumnView>],
+) -> Result<ColumnView, AllocError> {
+    let Prepared::Test { predicate, sets, entries } = test else { failed!() };
+    let a = register(registers, step.a);
+    let rows = a.row_count();
+    let mut operand = RowBatch::new();
+    operand.reset(rows);
+    operand.push_borrowed([a]);
+    predicate.select(
+        context.allocator(),
+        context.literals(),
+        sets,
+        &mut [],
+        entries,
+        &mut operand,
+    )?;
+    let mut values = context.values_buffer(rows as usize * 8)?;
+    let out = values.as_mut_slice::<i64>();
+    out.fill(0);
+    let listed = operand.selection();
+    for i in 0..listed.len() {
+        *at_mut!(out, listed.kept().row(i) as usize) = 1;
+    }
+    let validity = validity(context, a, None, None)?;
+    ColumnView::new(context, DataType::Int64, values, validity)
 }
 
 /// `step`'s `AND`, `OR` or `NOT` at every row, as 0 or 1, or null where
@@ -808,6 +883,8 @@ pub const EXPR_NODES_MAX: usize = 1 << 8;
 /// where SQLite would answer with a double.
 pub struct Expr {
     pub nodes: SlowVec<ExprStep>,
+    /// Its `In` lists' values, if it has any.
+    pub values: Option<Buffer>,
 }
 
 /// Why an expression can't be computed: what it needed instead, or memory.
@@ -824,6 +901,8 @@ pub enum ExprError {
     Types,
     /// An integer literal compared with a double which can hold it exactly.
     Inexact,
+    /// A double in a list of integers, as `IN`'s.
+    DoubleIn,
     /// A string, not a number, on the left of `LIKE`.
     Strings,
     /// Integer arithmetic in an argument of `coalesce`, or a branch of
@@ -956,6 +1035,7 @@ impl Typer<'_> {
                 }
             }
             ExprOp::Case => self.type_case(nodes, node),
+            ExprOp::In => self.type_in(node),
             ExprOp::And | ExprOp::Or | ExprOp::Not => {
                 let operands =
                     if node.op == ExprOp::Not { &[node.a][..] } else { &[node.a, node.b] };
@@ -977,6 +1057,25 @@ impl Typer<'_> {
         }
     }
 
+    /// Types `node`, an `In`, whose operand must be of its list's kind:
+    /// integers, or strings.
+    fn type_in(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+        let (a_type, a, _) = *at!(self.nodes, node.a as usize);
+        match a_type {
+            // `NULL IN (...)` is NULL.
+            None => Ok((None, 0)),
+            Some(data_type) if data_type == node.data_type => {
+                let mut test = step(ExprOp::In, DataType::Int64, a, node.b);
+                test.c = node.c;
+                Ok((Some(DataType::Int64), self.add(test)?))
+            }
+            Some(DataType::Float64) if node.data_type == DataType::Int64 => {
+                Err(ExprError::DoubleIn)
+            }
+            Some(_) => Err(ExprError::Kinds),
+        }
+    }
+
     /// Whether computing `node`, one of `nodes`, of type `data_type`, can
     /// fail: only integer arithmetic can, or what reads it.
     fn can_fail(&self, nodes: &[ExprStep], node: &ExprStep, data_type: Option<DataType>) -> bool {
@@ -993,9 +1092,12 @@ impl Typer<'_> {
             | ExprOp::Ge
             | ExprOp::And
             | ExprOp::Or => fails(node.a) || fails(node.b),
-            ExprOp::Like | ExprOp::IsNull | ExprOp::IsNotNull | ExprOp::Not | ExprOp::Argument => {
-                fails(node.a)
-            }
+            ExprOp::Like
+            | ExprOp::IsNull
+            | ExprOp::IsNotNull
+            | ExprOp::Not
+            | ExprOp::In
+            | ExprOp::Argument => fails(node.a),
             // Only its first condition is computed for every row: a `PRESENT`
             // one tests its value.
             ExprOp::Case => {
@@ -1199,7 +1301,7 @@ pub fn type_expr(
     // Unlike Perfetto's, no column is only ever NULL, so the last node's step
     // is the last.
     check!(register as usize == steps.len() - 1);
-    Ok(ExprProgram { steps })
+    Ok(ExprProgram { steps, values: expr.values.clone() })
 }
 
 /// A column a `ComputeOp` adds.
@@ -1226,6 +1328,7 @@ fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
         | ExprError::Kinds
         | ExprError::Types
         | ExprError::Inexact
+        | ExprError::DoubleIn
         | ExprError::Strings
         | ExprError::SomeRows
         | ExprError::Condition
@@ -1348,7 +1451,10 @@ mod tests {
         }
 
         fn program(self) -> ExprProgram {
-            ExprProgram { steps: SlowVec::fixed_from(&Heap, self.0.into_iter()).unwrap() }
+            ExprProgram {
+                steps: SlowVec::fixed_from(&Heap, self.0.into_iter()).unwrap(),
+                values: None,
+            }
         }
     }
 
