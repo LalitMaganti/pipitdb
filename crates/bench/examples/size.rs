@@ -12,9 +12,7 @@ use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::env::Env;
-use pipit_kernel::lower::lower;
-use pipit_kernel::optimize::optimize;
-use pipit_kernel::output_properties::plan_nodes;
+use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_parquet::Uncompressed;
@@ -99,9 +97,7 @@ fn run(env: &Env, files: &[TableFile], query: &[u8]) -> Option<u64> {
         tables.tables.push(DynScannable::new(env, table).ok()?).ok()?;
     }
     let mut plan = compile(env, &REGISTRY, &tables, query).ok()?;
-    optimize(env, &mut plan).ok()?;
-    let planned = plan_nodes(env, &plan).ok()?;
-    let physical = lower(env, &mut plan, &planned).ok()?;
+    let physical = PhysicalPlan::from_logical(env, &mut plan).ok()?;
     let mut execution = physical.start(env).ok()?;
     let mut context = Context::new(env, None);
     let mut batch = RowBatch::new();

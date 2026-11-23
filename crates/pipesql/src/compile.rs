@@ -256,8 +256,7 @@ mod tests {
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
     use pipit_kernel::env::Env;
-    use pipit_kernel::lower::lower;
-    use pipit_kernel::output_properties::plan_nodes;
+    use pipit_kernel::lower::PhysicalPlan;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
     use pipit_kernel::selection::Kept;
@@ -394,8 +393,7 @@ mod tests {
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
         let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let planned = plan_nodes(Env::current(), &plan).unwrap();
-        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
         let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
@@ -465,8 +463,11 @@ mod tests {
         assert_eq!(joined("FROM t |> INNER JOIN ids ON a < v |> SELECT a, v"), less);
         assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = v |> SELECT a"), [1.0]);
         assert_eq!(kept("FROM t |> JOIN ids ON b = id AND a = 2 |> SELECT a"), []);
-        // Conditions that aren't comparisons, which have no keys.
-        assert_eq!(kept("FROM t |> JOIN ids ON a |> SELECT a"), [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        // Conditions that aren't comparisons, which have no keys. The
+        // optimizer picks the sides, so the order isn't fixed.
+        let mut all = kept("FROM t |> JOIN ids ON a |> SELECT a");
+        all.sort_by(f64::total_cmp);
+        assert_eq!(all, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
         assert_eq!(kept("FROM t |> JOIN ids ON s LIKE 'it%' |> SELECT v"), [1.0, 2.0, 3.0]);
         let null = f64::NEG_INFINITY;
         let left = ([10.0, 11.0, 12.0].into(), [1.0, null, null].into());
@@ -478,11 +479,17 @@ mod tests {
         );
         // A condition never true for nulls makes the join inner.
         assert_eq!(kept("FROM ids |> LEFT JOIN t ON id = b |> WHERE a > 0 |> SELECT id"), [10.0]);
-        let product =
-            ([1.0, 2.0, 1.0, 2.0, 1.0, 2.0].into(), [10.0, 10.0, 11.0, 11.0, 12.0, 12.0].into());
-        assert_eq!(joined("FROM t |> CROSS JOIN ids |> SELECT a, id"), product);
+        // The optimizer picks a cross join's sides, so its rows' order isn't
+        // fixed.
+        let (a, id) = joined("FROM t |> CROSS JOIN ids |> SELECT a, id");
+        let mut product: StdVec<(f64, f64)> = a.into_iter().zip(id).collect();
+        product.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        let pairs = [(1.0, 10.0), (1.0, 11.0), (1.0, 12.0), (2.0, 10.0), (2.0, 11.0), (2.0, 12.0)];
+        assert_eq!(product, pairs);
         // Of only the rows so far's columns, so no column of `ids` is held.
-        assert_eq!(kept("FROM t |> CROSS JOIN ids |> SELECT a"), [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        let mut a = kept("FROM t |> CROSS JOIN ids |> SELECT a");
+        a.sort_by(f64::total_cmp);
+        assert_eq!(a, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
     }
 
     #[test]
@@ -743,8 +750,7 @@ mod tests {
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
         let mut plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
-        let planned = plan_nodes(Env::current(), &plan).unwrap();
-        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
         let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
@@ -918,9 +924,7 @@ mod tests {
     fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
         let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        pipit_kernel::optimize::optimize(Env::current(), &mut plan).unwrap();
-        let planned = plan_nodes(Env::current(), &plan).unwrap();
-        let physical = lower(Env::current(), &mut plan, &planned).unwrap();
+        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
         let query = Env::current();
         let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
