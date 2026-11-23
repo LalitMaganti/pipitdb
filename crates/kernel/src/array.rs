@@ -77,20 +77,6 @@ impl<T: Primitive> Array<T> {
         Ok(array)
     }
 
-    /// The values of `values`, in order.
-    pub(crate) fn from_iter(
-        allocator: &dyn Allocator,
-        mut values: impl ExactSizeIterator<Item = T>,
-    ) -> Result<Array<T>, AllocError> {
-        let Some(first) = values.next() else { return Array::allocate(allocator, 0, false) };
-        let len = values.len() + 1;
-        Array::from_fn(
-            allocator,
-            len,
-            |i| if i == 0 { first } else { values.next().unwrap_or(first) },
-        )
-    }
-
     /// Room for `len` values, zeroed if `zeroed`, else unwritten: callers
     /// that don't zero write each value before it's read.
     fn allocate(
@@ -172,7 +158,7 @@ mod tests {
 
     #[test]
     fn holds_exactly_its_values() {
-        let mut array = Array::<u32>::from_iter(&Heap, 0..5).unwrap();
+        let mut array = Array::<u32>::from_fn(&Heap, 5, |i| u32::try_from(i).unwrap()).unwrap();
         array[4] = 9;
         assert_eq!(&*array, &[0, 1, 2, 3, 9]);
         assert!(Array::<u64>::zeroed(&Heap, 0).unwrap().is_empty());
