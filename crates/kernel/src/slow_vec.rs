@@ -184,6 +184,14 @@ impl<T> SlowVec<T> {
         (self.raw.len, self.raw.capacity) = (0, 0);
     }
 
+    /// Empties it, keeping its memory.
+    pub fn clear(&mut self)
+    where
+        T: Copy,
+    {
+        self.raw.len = 0;
+    }
+
     /// Removes the last value, if any.
     pub fn pop(&mut self) -> Option<T> {
         self.raw.len = self.raw.len.checked_sub(1)?;

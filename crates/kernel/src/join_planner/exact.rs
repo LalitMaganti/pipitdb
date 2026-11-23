@@ -71,6 +71,8 @@ struct Exact<'g, 'e, 'l, 'r> {
     full: u64,
     /// While counting, how many more visits there may be.
     visits: usize,
+    /// Whether `plans` has a slot for every set, at the set's own index.
+    dense: bool,
     /// The cheapest tree of each connected set, by `find`.
     plans: SlowVec<Plan>,
     /// For each unit, those an edge of one unit a side joins it to.
@@ -118,6 +120,41 @@ pub(super) fn plan<'g>(
     exact.tree(global, count)
 }
 
+/// The cheapest valid tree of a few units, of `rows` rows, joined by
+/// `links`, whose leaves are the units by index. It tries every split of
+/// every set: for a few units that's as cheap as `DPhyp`, and it chooses
+/// between trees of the same estimated cost the way that measured best.
+/// The units in `single` are one relation of at most one row. `can_run` says
+/// which joins of units can run.
+pub(super) fn solve<'g>(
+    global: &Global,
+    graph: &'g QueryGraph,
+    estimator: &mut Estimator<'g>,
+    links: &[Link],
+    rows: &[f64],
+    single: u64,
+    can_run: CanRun,
+) -> Result<Option<JoinTree>, Error> {
+    let units = rows.len();
+    let mut exact = Exact::new(global, graph, estimator, links, can_run, units, single);
+    exact.dense = true;
+    exact.table(global, rows, 1 << units)?;
+    // Each split of a set is tried once: the left side holds its lowest
+    // unit. Its sides' trees are done, as they're smaller sets.
+    for set in 3..=exact.full {
+        let low = set.isolate_lowest_one();
+        let rest = set ^ low;
+        let mut sub = rest;
+        while sub != 0 {
+            sub = (sub - 1) & rest;
+            if let (Some(left), Some(right)) = (exact.get(sub | low), exact.get(rest ^ sub)) {
+                exact.pair(left, right);
+            }
+        }
+    }
+    exact.tree(global, units)
+}
+
 impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     /// A search of `units` units, joined by `links`, of which those in
     /// `single` are one relation of at most one row.
@@ -142,17 +179,31 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
         }
         let full = u64::MAX >> (UNITS_MAX - units);
         let plans = SlowVec::none(global);
-        Exact { graph, estimator, links, can_run, hyper, single, full, visits: 0, plans, adjacent }
+        let (visits, dense) = (0, false);
+        Exact {
+            graph,
+            estimator,
+            links,
+            can_run,
+            hyper,
+            single,
+            full,
+            visits,
+            dense,
+            plans,
+            adjacent,
+        }
     }
 
     /// Makes room for `sets` sets, and a tree of each unit of `rows` rows.
     fn table(&mut self, global: &Global, rows: &[f64], sets: usize) -> Result<(), Error> {
-        // Half full at most, so that a set is found in a few probes.
-        let len = (2 * sets).next_power_of_two();
+        // Half full at most, so that a set is found in a few probes, or with
+        // a slot for each set.
+        let len = if self.dense { sets } else { (2 * sets).next_power_of_two() };
         self.plans = SlowVec::fixed(global, len)?;
         self.plans.extend_within(repeat_n(EMPTY, len));
         for (i, &rows) in rows.iter().enumerate() {
-            let (set, slot) = (1 << i, self.find(1 << i));
+            let (set, slot) = (1 << i, self.slot(1 << i));
             *at_mut!(self.plans, slot) = Plan { set, cost: 0.0, rows, split: 0 };
         }
         Ok(())
@@ -282,7 +333,6 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     }
 
     /// The slot of `set` in `plans`, or the empty slot it would take.
-    #[inline(never)]
     fn find(&self, set: u64) -> usize {
         let mask = self.plans.len() - 1;
         let hash = (set.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32;
@@ -298,6 +348,13 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
         failed!()
     }
 
+    /// The slot of `set` in `plans`: its own index in a dense table.
+    #[inline(never)]
+    fn slot(&self, set: u64) -> usize {
+        #[expect(clippy::cast_possible_truncation, reason = "a dense table's sets are its indices")]
+        if self.dense { set as usize } else { self.find(set) }
+    }
+
     /// Whether `set` is one unit of at most one row, which may be joined to
     /// anything.
     fn lone(&self, set: u64) -> bool {
@@ -306,7 +363,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
 
     /// The cheapest tree of `set`, if it has one.
     fn get(&self, set: u64) -> Option<Plan> {
-        Some(*at!(self.plans, self.find(set))).filter(|plan| plan.set == set)
+        Some(*at!(self.plans, self.slot(set))).filter(|plan| plan.set == set)
     }
 
     /// Makes the join of plans `l` and `r` the cheapest tree of both, if it
@@ -315,7 +372,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     fn pair(&mut self, l: Plan, r: Plan) {
         let (left, right) = (l.set, r.set);
         let set = left | right;
-        let i = self.find(set);
+        let i = self.slot(set);
         let found = *at!(self.plans, i);
         // A set's rows are estimated from its first valid split.
         let fresh = found.set != set;
@@ -367,7 +424,7 @@ impl<'g, 'e, 'l, 'r> Exact<'g, 'e, 'l, 'r> {
     /// Adds the cheapest tree of `set` to `tree`, and returns its root.
     #[inline(never)]
     fn build(&self, tree: &mut JoinTree, set: u64) -> u32 {
-        let plan = *at!(self.plans, self.find(set));
+        let plan = *at!(self.plans, self.slot(set));
         if set.is_power_of_two() {
             return tree.add(JoinNode::Relation(set.trailing_zeros()), plan.rows);
         }
