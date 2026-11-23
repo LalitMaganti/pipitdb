@@ -252,6 +252,8 @@ fn join(
     condition: Option<(Node, Node)>,
 ) -> Result<(), Error> {
     let probe = compiler.plan.root;
+    let allocator = compiler.allocator();
+    let probe_columns = SlowVec::fixed_from(allocator, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
         table = only(compiler, table)?;
     }
@@ -283,7 +285,8 @@ fn join(
     };
     let allocator = compiler.allocator();
     let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
-    let op = DynOp::new(allocator, JoinOp { kind, condition, build_columns })?;
+    let columns = [probe_columns, build_columns];
+    let op = DynOp::new(allocator, JoinOp::new(kind, condition, columns))?;
     let children = [probe, build.node];
     compiler.plan.add_node(op, &children)?;
     Ok(())

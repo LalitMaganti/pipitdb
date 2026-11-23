@@ -149,7 +149,8 @@ fn join(
     let columns = [probe_k.id, probe_v.id, build_k.id, build_v.id];
     let condition = condition(&mut plan.exprs, on, columns);
     let build_columns = SlowVec::fixed_from(&Heap, [build_k.id, build_v.id].into_iter()).unwrap();
-    let join = JoinOp { kind, condition, build_columns };
+    let probe_columns = SlowVec::fixed_from(&Heap, [probe_k.id, probe_v.id].into_iter()).unwrap();
+    let join = JoinOp::new(kind, condition, [probe_columns, build_columns]);
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(&Heap, join).unwrap(), &children).unwrap();
     if above != Above::Nothing {

@@ -204,8 +204,8 @@ pub trait Op<'c> {
 
     /// Makes the choices that depend on its inputs' estimates, such as which
     /// side of a join to build. By default, there are none.
-    fn choose(&mut self, inputs: &[Estimate]) {
-        let _ = inputs;
+    fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
+        let _ = (exprs, inputs);
     }
 
     /// What this needs of the rows of input `input`. By default, nothing.
@@ -293,7 +293,7 @@ struct OpFunctions<'c> {
     moves_condition: unsafe fn(NonNull<()>, ColumnId) -> Option<u32>,
     split_below: SplitBelow<'c>,
     estimate: unsafe fn(NonNull<()>, &Exprs, &[Estimate]) -> Option<Estimate>,
-    choose: unsafe fn(NonNull<()>, &[Estimate]),
+    choose: unsafe fn(NonNull<()>, &Exprs, &[Estimate]),
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -349,7 +349,7 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         // SAFETY: as for `reads`.
         estimate: |op, exprs, inputs| unsafe { value_of::<T>(op).estimate(exprs, inputs) },
         // SAFETY: as for `prune`.
-        choose: |op, inputs| unsafe { value_mut_of::<T>(op).choose(inputs) },
+        choose: |op, exprs, inputs| unsafe { value_mut_of::<T>(op).choose(exprs, inputs) },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -468,10 +468,10 @@ impl<'c> DynOp<'c> {
         out
     }
 
-    pub(crate) fn choose(&mut self, inputs: &[Estimate]) {
+    pub(crate) fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.choose)(self.op.as_ptr(), inputs) }
+        unsafe { (self.functions.choose)(self.op.as_ptr(), exprs, inputs) }
     }
 
     pub(crate) fn answer(
