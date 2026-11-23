@@ -331,7 +331,7 @@ fn finds_build_rows_by_their_keys() {
             .collect();
     let probe = table(&probe_keys);
     // Ids across batches, each following the last, as a table's are, found
-    // with no array; with a gap, and in another order, found in an array;
+    // with no bitmap; with a gap, and in another order, found by a bitmap;
     // and repeated, hashed.
     let groups: [&[(i64, u32)]; 4] =
         [&[(0, 2048), (2048, 952)], &[(0, 4), (5, 4)], &[(10, 4), (0, 4)], &[(0, 4), (2, 4)]];

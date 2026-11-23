@@ -633,8 +633,7 @@ impl Join<'_> {
         }
         // One integer key, each in one build row, is found by its value.
         if let Sequence::From(min) = held.sequence {
-            let span = u64::from(held.count - 1);
-            held.direct = Some(Direct { min, span, rows: SlowVec::fixed(context.allocator(), 0)? });
+            held.direct = Some(Direct::sequence(min, held.count));
             held.table = None;
         } else if let (true, false, Some(table)) = (self.one_integer(), held.repeats, &held.table) {
             held.direct = Direct::of(context.allocator(), table, held.count)?;

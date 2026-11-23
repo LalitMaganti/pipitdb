@@ -47,6 +47,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod predicate;
 mod radix_sort;
+pub mod rank_bitmap;
 pub mod row_batch;
 mod row_blocks;
 mod row_layout;
