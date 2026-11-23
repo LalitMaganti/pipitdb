@@ -368,6 +368,8 @@ mod tests {
         assert_eq!(error("FROM t |> JOIN ids ON b = id"), (ErrorCode::Unsupported, 15));
         assert_eq!(error("FROM t |> left outer join ids ON b = id"), (ErrorCode::Unsupported, 26));
         assert_eq!(error("FROM t |> CROSS JOIN ids"), (ErrorCode::Unsupported, 21));
+        assert_eq!(error("FROM t |> JOIN ids AS i USING (b)"), (ErrorCode::Unsupported, 15));
+        assert_eq!(error("FROM t |> JOIN ids USING b"), (ErrorCode::ExpectedToken, 25));
         assert_eq!(error("FROM t |> CROSS JOIN ids ON a = id"), (ErrorCode::UnexpectedToken, 25));
         assert_eq!(error("FROM t |> LEFT ids"), (ErrorCode::ExpectedWord, 15));
     }

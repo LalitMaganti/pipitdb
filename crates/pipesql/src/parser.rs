@@ -516,6 +516,14 @@ impl Parser<'_> {
                         Step::Push(Pending::Call(name), 0)
                     }
                 }
+                // `t.x`, a column of alias `t`, as one name.
+                Keyword::None if self.current().kind == TokenKind::Dot => {
+                    self.advance()?;
+                    let column = self.expect(TokenKind::Identifier)?;
+                    let len = column.span.start + column.span.len - token.span.start;
+                    let span = Span { start: token.span.start, len };
+                    Step::Operand(leaf(Token { kind: token.kind, span })?)
+                }
                 Keyword::None => Step::Operand(leaf(token)?),
                 Keyword::Not => Step::Push(Pending::Unary(Operator::Not), NOT),
                 // Over all that follows, as in `count(DISTINCT a)`.
@@ -639,6 +647,7 @@ impl Parser<'_> {
                 Item::List(shared) => self.list_of(shared)?,
                 Item::Clause(words, shared) => self.clause(words, shared, false)?,
                 Item::After(words, shared) => self.clause(words, shared, true)?,
+                Item::Parenthesized(words, shared) => self.parenthesized(words, shared)?,
                 Item::Optional(word) => {
                     if self.at_word(word) {
                         self.advance()?;
@@ -727,6 +736,24 @@ impl Parser<'_> {
             self.advance()?;
         }
         self.list_of(shared)
+    }
+
+    /// As `clause`, not required, with the list in parentheses.
+    fn parenthesized(&mut self, words: &[&str], shared: Shared) -> Result<Node, Error> {
+        let Some(first) = words.first() else { pipit_kernel::failed!() };
+        if !self.at_word(first) {
+            return Ok(self.list(Tag::List, &[]));
+        }
+        for word in words {
+            if !self.at_word(word) {
+                return Err(Error::new(ErrorCode::ExpectedWord, self.current().span));
+            }
+            self.advance()?;
+        }
+        self.expect(TokenKind::LeftParen)?;
+        let list = self.list_of(shared)?;
+        self.expect(TokenKind::RightParen)?;
+        Ok(list)
     }
 
     /// Whether the current token is `word`, ignoring case.
