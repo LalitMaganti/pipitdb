@@ -6,6 +6,7 @@ mod exact;
 mod graph;
 mod greedy;
 mod tree;
+mod windows;
 
 pub use estimate::{Estimator, ROWS_MAX};
 pub use graph::{
@@ -16,14 +17,14 @@ pub use tree::{JoinNode, JoinTree, Node};
 use crate::error::Error;
 use crate::global::Global;
 
-/// The most work greedy ordering does, in edges read. The slowest plan, of
-/// 1,000 relations, takes about 1 s; a soft target.
+/// The most work greedy ordering and windows do, in edges read. The slowest
+/// plan, of 1,000 relations, takes about 1 s; a soft target.
 const WORK_MAX: usize = 1 << 27;
 
 /// Plans the joins of `graph`: exactly if exact search can afford it, or
-/// else greedily. `None` keeps the plan as written: for one or two
-/// relations, which have one plan, or if greedy ordering is stuck, which
-/// hyperedges can cause.
+/// else greedily, improved by windows. `None` keeps the plan as written: for
+/// one or two relations, which have one plan, or if greedy ordering is
+/// stuck, which hyperedges can cause.
 pub fn plan(global: &Global, graph: &QueryGraph) -> Result<Option<JoinTree>, Error> {
     if graph.relations.len() <= 2 {
         return Ok(None);
@@ -33,5 +34,9 @@ pub fn plan(global: &Global, graph: &QueryGraph) -> Result<Option<JoinTree>, Err
         return Ok(Some(tree));
     }
     let mut work = WORK_MAX;
-    greedy::plan(global, graph, &mut estimator, &mut work)
+    let Some(mut tree) = greedy::plan(global, graph, &mut estimator, &mut work)? else {
+        return Ok(None);
+    };
+    windows::improve(global, graph, &mut estimator, &mut tree, &mut work)?;
+    Ok(Some(tree))
 }

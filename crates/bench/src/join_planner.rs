@@ -780,5 +780,9 @@ mod tests {
         let (tree, _) = exhaustive(&graph).unwrap();
         assert!(cost(&graph, &tree).unwrap().valid.is_ok());
         assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
+        // Too big for exact search, so planned greedily, then by windows.
+        let mut graph = generate(Shape::Chain, 70, false).unwrap();
+        graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
+        assert!(cost(&graph, &plan(crate::global(), &graph).unwrap()).unwrap().valid.is_ok());
     }
 }
