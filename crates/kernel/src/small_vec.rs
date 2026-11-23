@@ -1,5 +1,5 @@
-//! `SlowVec`: a growable list of values, in memory from the allocator it was made
-//! with.
+//! `SmallVec`: a growable list of values whose count is bounded by the
+//! query, not by its data, in memory from the `Env` it was made with.
 
 use core::alloc::Layout;
 use core::marker::PhantomData;
@@ -10,21 +10,23 @@ use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
 use crate::env::Env;
 
-/// A list for building things now and then, such as plans and footers. It
-/// stays small rather than fast: what doesn't depend on its values' type is
-/// shared by every `SlowVec`, not copied for each type. Hot loops work on
-/// buffers directly.
+/// A list of things a query has as many of as its text or its constants
+/// say, such as plan nodes, a footer's columns or a pipeline's steps: never
+/// as many as its rows. Data that grows with the rows goes in an `Array`,
+/// if its size is known, or in `Blocks`. It stays small rather than fast:
+/// what doesn't depend on its values' type is shared by every `SmallVec`,
+/// not copied for each type.
 ///
-/// Every `SlowVec` has a most values it can hold, `max`, a power of two. One made
+/// Every `SmallVec` has a most values it can hold, `max`, a power of two. One made
 /// by `new` grows towards it as needed, doubling; one made by `fixed` has room
 /// for `max` from the start, and never grows.
-pub struct SlowVec<T> {
+pub struct SmallVec<T> {
     raw: RawVec,
     values: PhantomData<T>,
 }
 
-/// A `SlowVec`'s memory and counts, which don't depend on its values' type.
-/// The counts of values that fit are `u32`s, so a `SlowVec` is five words.
+/// A `SmallVec`'s memory and counts, which don't depend on its values' type.
+/// The counts of values that fit are `u32`s, so a `SmallVec` is five words.
 struct RawVec {
     /// Room for exactly `capacity` values, the first `len` of them written.
     values: NonNull<u8>,
@@ -38,12 +40,12 @@ struct RawVec {
     max: u32,
 }
 
-impl<T> SlowVec<T> {
-    /// An empty `SlowVec` that can grow to `max` values. It allocates
+impl<T> SmallVec<T> {
+    /// An empty `SmallVec` that can grow to `max` values. It allocates
     /// nothing until a value is added, so never fails: a `Result` only so
     /// callers can treat every constructor alike.
     #[inline]
-    pub fn new(env: &Env, max: usize) -> Result<SlowVec<T>, AllocError> {
+    pub fn new(env: &Env, max: usize) -> Result<SmallVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
         let Ok(max) = u32::try_from(max) else { failed!() };
@@ -54,30 +56,30 @@ impl<T> SlowVec<T> {
             capacity: 0,
             max,
         };
-        Ok(SlowVec { raw, values: PhantomData })
+        Ok(SmallVec { raw, values: PhantomData })
     }
 
-    /// An empty `SlowVec` with room for `len` values, rounded up, that never
+    /// An empty `SmallVec` with room for `len` values, rounded up, that never
     /// grows: for lists whose length is known.
     #[inline]
-    pub fn fixed(env: &Env, len: usize) -> Result<SlowVec<T>, AllocError> {
-        SlowVec::empty(env, len, len)
+    pub fn fixed(env: &Env, len: usize) -> Result<SmallVec<T>, AllocError> {
+        SmallVec::empty(env, len, len)
     }
 
-    /// An empty `SlowVec` that allocates nothing and never grows.
-    pub fn none(env: &Env) -> SlowVec<T> {
+    /// An empty `SmallVec` that allocates nothing and never grows.
+    pub fn none(env: &Env) -> SmallVec<T> {
         let values = NonNull::<Aligned>::dangling().cast();
         let raw = RawVec { values, env: NonNull::from(env), len: 0, capacity: 0, max: 0 };
-        SlowVec { raw, values: PhantomData }
+        SmallVec { raw, values: PhantomData }
     }
 
-    /// `values`, in a `SlowVec` that never grows.
+    /// `values`, in a `SmallVec` that never grows.
     #[inline]
     pub fn fixed_from(
         env: &Env,
         values: impl ExactSizeIterator<Item = T>,
-    ) -> Result<SlowVec<T>, AllocError> {
-        let mut vec = SlowVec::fixed(env, values.len())?;
+    ) -> Result<SmallVec<T>, AllocError> {
+        let mut vec = SmallVec::fixed(env, values.len())?;
         vec.extend_within(values);
         Ok(vec)
     }
@@ -93,29 +95,29 @@ impl<T> SlowVec<T> {
         }
     }
 
-    /// `len` zeros, in a `SlowVec` that never grows. Zeroed by the
+    /// `len` zeros, in a `SmallVec` that never grows. Zeroed by the
     /// allocator, which on fresh pages needn't write them.
     #[inline]
-    pub fn zeroed(env: &Env, len: usize) -> Result<SlowVec<T>, AllocError>
+    pub fn zeroed(env: &Env, len: usize) -> Result<SmallVec<T>, AllocError>
     where
         T: Primitive,
     {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         let mut raw = RawVec::new(env, size_of::<T>(), len, len, true)?;
         raw.len = len;
-        Ok(SlowVec { raw, values: PhantomData })
+        Ok(SmallVec { raw, values: PhantomData })
     }
 
     pub fn capacity(&self) -> usize {
         self.raw.capacity as usize
     }
 
-    /// An empty `SlowVec` with room for `capacity` values, 0 or `max`,
+    /// An empty `SmallVec` with room for `capacity` values, 0 or `max`,
     /// rounded up.
     #[inline]
-    fn empty(env: &Env, capacity: usize, max: usize) -> Result<SlowVec<T>, AllocError> {
+    fn empty(env: &Env, capacity: usize, max: usize) -> Result<SmallVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        Ok(SlowVec {
+        Ok(SmallVec {
             raw: RawVec::new(env, size_of::<T>(), capacity, max, false)?,
             values: PhantomData,
         })
@@ -128,7 +130,7 @@ impl<T> SlowVec<T> {
     }
 
     /// Adds `value` at the end, growing if full. Fails, dropping `value`, if
-    /// the `SlowVec` holds `max` values or can't grow.
+    /// the `SmallVec` holds `max` values or can't grow.
     pub fn push(&mut self, value: T) -> Result<(), AllocError> {
         let slot = self.raw.next_slot(size_of::<T>())?;
         // SAFETY: `next_slot` made room for a value there, and counted it.
@@ -147,7 +149,7 @@ impl<T> SlowVec<T> {
             self.raw.make_room(size_of::<T>(), values.len())?;
         }
         // SAFETY: there is room for `values` from `len`, and they can't
-        // overlap the `SlowVec`, which `values` doesn't borrow.
+        // overlap the `SmallVec`, which `values` doesn't borrow.
         unsafe {
             self.slot(self.raw.len)
                 .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
@@ -226,8 +228,8 @@ impl<T> SlowVec<T> {
     }
 }
 
-/// A type with the strictest alignment a `SlowVec`'s values can have. An
-/// empty `SlowVec` allocates nothing, but its values must still start at an
+/// A type with the strictest alignment a `SmallVec`'s values can have. An
+/// empty `SmallVec` allocates nothing, but its values must still start at an
 /// aligned address, as slices of them need: a dangling pointer to this one
 /// is that address.
 #[repr(align(64))]
@@ -326,7 +328,7 @@ impl RawVec {
     }
 }
 
-impl<T> Deref for SlowVec<T> {
+impl<T> Deref for SmallVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -335,14 +337,14 @@ impl<T> Deref for SlowVec<T> {
     }
 }
 
-impl<T> DerefMut for SlowVec<T> {
+impl<T> DerefMut for SmallVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: as in `deref`, and this is the only reference.
         unsafe { core::slice::from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len) }
     }
 }
 
-impl<T> Drop for SlowVec<T> {
+impl<T> Drop for SmallVec<T> {
     fn drop(&mut self) {
         let values = core::ptr::slice_from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len);
         // SAFETY: the first `len` values were written by `push`, and are
@@ -396,7 +398,7 @@ mod tests {
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&env, 128).unwrap();
+        let mut values = SmallVec::new(&env, 128).unwrap();
         for i in 0..100 {
             assert!(values.push(i).is_ok());
         }
@@ -410,7 +412,7 @@ mod tests {
     fn drops_its_values() {
         let env = Env::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(env, 16).unwrap();
+        let mut values = SmallVec::new(env, 16).unwrap();
         for _ in 0..10 {
             assert!(values.push(value.clone()).is_ok());
         }
@@ -421,13 +423,13 @@ mod tests {
 
     #[test]
     fn gives_the_value_back_if_it_cant_grow() {
-        // An empty `SlowVec` allocates nothing; the second is the room for
+        // An empty `SmallVec` allocates nothing; the second is the room for
         // four.
         let left = Rc::new(Cell::new(2));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&env, 128).unwrap();
+        let mut values = SmallVec::new(&env, 128).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -441,7 +443,7 @@ mod tests {
         let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::fixed(&env, 3).unwrap();
+        let mut values = SmallVec::fixed(&env, 3).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -454,7 +456,7 @@ mod tests {
     #[test]
     fn zeroed_holds_zeros() {
         let env = Env::current();
-        let values = SlowVec::<i64>::zeroed(env, 5).unwrap();
+        let values = SmallVec::<i64>::zeroed(env, 5).unwrap();
         assert_eq!(*values, [0; 5]);
         assert_eq!(values.capacity(), 8);
     }
@@ -480,8 +482,8 @@ mod tests {
         let layouts = Rc::new(RefCell::new(StdVec::new()));
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(Layouts(layouts.clone()), usize::MAX) }.unwrap();
-        drop(SlowVec::<u64>::fixed(&env, 100).unwrap());
-        drop(SlowVec::<u64>::fixed(&env, 1 << 15).unwrap());
+        drop(SmallVec::<u64>::fixed(&env, 100).unwrap());
+        drop(SmallVec::<u64>::fixed(&env, 1 << 15).unwrap());
         // After the `Env`'s own.
         let asked: StdVec<_> =
             layouts.borrow()[1..].iter().map(|l| (l.size(), l.align())).collect();
@@ -494,7 +496,7 @@ mod tests {
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let values = SlowVec::<u64>::new(&env, 16).unwrap();
+        let values = SmallVec::<u64>::new(&env, 16).unwrap();
         assert!(values.is_empty());
     }
 
@@ -502,7 +504,7 @@ mod tests {
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
         let env = Env::current();
-        let _ = SlowVec::<u64>::new(env, 100);
+        let _ = SmallVec::<u64>::new(env, 100);
     }
 
     #[test]
@@ -511,7 +513,7 @@ mod tests {
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&env, 16).unwrap();
+        let mut values = SmallVec::new(&env, 16).unwrap();
         assert!(values.extend_from_slice(&[1_u64, 2, 3]).is_ok());
         values.free();
         assert!(values.is_empty() && live.get() == 1);
@@ -526,7 +528,7 @@ mod tests {
         let allocator = Limited { left: left.clone(), live };
         // SAFETY: declared before what's allocated from it, so dropped after.
         let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
-        let mut values = SlowVec::new(&env, 16).unwrap();
+        let mut values = SmallVec::new(&env, 16).unwrap();
         assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
         assert!(values.extend_from_slice(&[6]).is_ok());
         assert_eq!(*values, [1, 2, 3, 4, 5, 6]);
@@ -540,7 +542,7 @@ mod tests {
     fn retains_and_pops() {
         let env = Env::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(env, 8).unwrap();
+        let mut values = SmallVec::new(env, 8).unwrap();
         for i in 0..6 {
             assert!(values.push((i, value.clone())).is_ok());
         }
@@ -554,7 +556,7 @@ mod tests {
     #[test]
     fn rounds_its_room_up() {
         let env = Env::current();
-        let values = SlowVec::<u64>::fixed(env, 5).unwrap();
+        let values = SmallVec::<u64>::fixed(env, 5).unwrap();
         assert_eq!(values.capacity(), 8);
     }
 }

@@ -4,7 +4,7 @@
 use crate::allocator::AllocError;
 use crate::env::Env;
 use crate::function::DynFunction;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::string_pool::{Id, StringPool};
 
 /// The most functions a statement binds.
@@ -16,7 +16,7 @@ pub struct Statement {
     /// have none.
     literals: Option<StringPool>,
     /// The functions its expressions call, by id: made with the first.
-    functions: Option<SlowVec<DynFunction>>,
+    functions: Option<SmallVec<DynFunction>>,
 }
 
 impl Statement {
@@ -44,7 +44,7 @@ impl Statement {
     ) -> Result<Option<u32>, AllocError> {
         let functions = match &mut self.functions {
             Some(functions) => functions,
-            None => self.functions.insert(SlowVec::new(env, FUNCTIONS_MAX)?),
+            None => self.functions.insert(SmallVec::new(env, FUNCTIONS_MAX)?),
         };
         if functions.len() == FUNCTIONS_MAX {
             return Ok(None);

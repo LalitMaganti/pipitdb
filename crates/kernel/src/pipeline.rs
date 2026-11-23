@@ -21,19 +21,19 @@ use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::step::{DynSource, ErasedBatch, Progress, Step};
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
     source: DynSource<'a>,
-    steps: SlowVec<Step<'a>>,
+    steps: SmallVec<Step<'a>>,
     segment_count: usize,
 }
 
 impl<'a> Pipeline<'a> {
-    pub fn new(source: DynSource<'a>, steps: SlowVec<Step<'a>>) -> Pipeline<'a> {
+    pub fn new(source: DynSource<'a>, steps: SmallVec<Step<'a>>) -> Pipeline<'a> {
         let operators = steps.iter().filter(|step| matches!(step, Step::Operator(_))).count();
         Pipeline { source, steps, segment_count: operators + 1 }
     }
@@ -916,7 +916,7 @@ mod tests {
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
         let env = Env::current();
-        let mut owned = crate::slow_vec::SlowVec::new(env, 8).unwrap();
+        let mut owned = crate::small_vec::SmallVec::new(env, 8).unwrap();
         for step in steps {
             assert!(owned.push(step).is_ok());
         }

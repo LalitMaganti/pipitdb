@@ -10,7 +10,7 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use core::ops::Range;
 
 /// The bits of a row's place that say which row of its batch it is.
@@ -52,7 +52,7 @@ const POSITION_MASK: u64 = (1 << POSITION_SHIFT) - 1;
 /// whole buffers alive.
 pub(crate) struct RowStore {
     /// Each batch held, by its columns.
-    held: SlowVec<GatherSource>,
+    held: SmallVec<GatherSource>,
     /// How many batches are held.
     batches: u32,
     /// How many columns each batch held has.
@@ -62,10 +62,10 @@ pub(crate) struct RowStore {
     dense: u32,
     /// Where each row held after the `dense` ones is: its batch, shifted up
     /// `ROW_BITS`, and its row in it.
-    places: SlowVec<u32>,
+    places: SmallVec<u32>,
     /// By column, the rows being packed, until there are a batch's worth or a
     /// batch is shared after them.
-    packing: SlowVec<Packing>,
+    packing: SmallVec<Packing>,
     /// How many rows are being packed.
     packed: u32,
     /// By column, a bit for whether any batch held has nulls in it; the
@@ -76,29 +76,29 @@ pub(crate) struct RowStore {
     dropped: u64,
     /// By column dropped, a batch's worth of words never read, held in its
     /// place.
-    placeholders: SlowVec<ColumnView>,
+    placeholders: SmallVec<ColumnView>,
     /// By column, a bit for whether `scatter` copied it.
     scattered: u64,
     /// The columns `scatter` copied, in output order: by column copied, a
     /// view of each batch's worth.
-    copies: SlowVec<ColumnView>,
+    copies: SmallVec<ColumnView>,
 }
 
 impl RowStore {
     pub(crate) fn new(env: &Env) -> Result<RowStore, AllocError> {
         Ok(RowStore {
-            held: SlowVec::new(env, 1 << 31)?,
+            held: SmallVec::new(env, 1 << 31)?,
             batches: 0,
             width: 0,
             dense: 0,
-            places: SlowVec::new(env, 1 << 31)?,
-            packing: SlowVec::new(env, 1 << 6)?,
+            places: SmallVec::new(env, 1 << 31)?,
+            packing: SmallVec::new(env, 1 << 6)?,
             packed: 0,
             nullable: 0,
             dropped: 0,
-            placeholders: SlowVec::new(env, 1 << 6)?,
+            placeholders: SmallVec::new(env, 1 << 6)?,
             scattered: 0,
-            copies: SlowVec::new(env, 1 << 24)?,
+            copies: SmallVec::new(env, 1 << 24)?,
         })
     }
 
@@ -449,7 +449,7 @@ fn mark_positions(words: &mut [u64], row_of: impl Fn(u64) -> u32) {
 /// What `scatter` copies columns into: by column copied, then batch of
 /// output rows, a buffer once its first row is taken.
 struct Copies {
-    buffers: SlowVec<Option<Buffer>>,
+    buffers: SmallVec<Option<Buffer>>,
     rows: usize,
     batches: usize,
 }
@@ -457,7 +457,7 @@ struct Copies {
 impl Copies {
     fn new(env: &Env, columns: usize, rows: usize) -> Result<Copies, Error> {
         let batches = rows.div_ceil(BATCH_ROWS_MAX as usize);
-        let buffers = SlowVec::fixed_from(env, (0..columns * batches).map(|_| None))?;
+        let buffers = SmallVec::fixed_from(env, (0..columns * batches).map(|_| None))?;
         Ok(Copies { buffers, rows, batches })
     }
 
@@ -516,7 +516,7 @@ impl Copies {
     /// value that arrived in it goes.
     /// Columns with a bit in `in_order` are left as they are.
     fn put_in_order(&self, env: &Env, words: &[u64], in_order: u64) -> Result<(), Error> {
-        let mut values = SlowVec::<i64>::zeroed(env, 1 << REGION_BITS)?;
+        let mut values = SmallVec::<i64>::zeroed(env, 1 << REGION_BITS)?;
         for first in (0..self.rows).step_by(1 << REGION_BITS) {
             let end = self.rows.min(first + (1 << REGION_BITS));
             for k in (0..self.buffers.len() / self.batches).filter(|k| in_order >> k & 1 == 0) {
@@ -537,8 +537,8 @@ impl Copies {
         &mut self,
         context: &mut Context,
         types: impl Iterator<Item = DataType>,
-    ) -> Result<SlowVec<ColumnView>, Error> {
-        let mut views = SlowVec::fixed(context.env(), self.buffers.len())?;
+    ) -> Result<SmallVec<ColumnView>, Error> {
+        let mut views = SmallVec::fixed(context.env(), self.buffers.len())?;
         for (data_type, buffers) in types.zip(self.buffers.chunks_mut(self.batches)) {
             for buffer in buffers {
                 let Some(buffer) = buffer.take() else { failed!() };
@@ -573,7 +573,7 @@ struct Packing {
     validity: Buffer,
     nulls: bool,
     /// The strings' bytes, for a string column.
-    bytes: Option<SlowVec<u8>>,
+    bytes: Option<SmallVec<u8>>,
     /// How many rows are packed.
     rows: u32,
 }
@@ -585,7 +585,7 @@ impl Packing {
             context.small_buffer(BitSlice::<u8>::words_for(BATCH_ROWS_MAX as usize))?;
         validity.as_mut_slice::<u8>().fill(0);
         let bytes =
-            if data_type.has_bytes() { Some(SlowVec::new(context.env(), 1 << 31)?) } else { None };
+            if data_type.has_bytes() { Some(SmallVec::new(context.env(), 1 << 31)?) } else { None };
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
     }
 

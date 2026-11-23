@@ -55,7 +55,7 @@ mod row_layout_sort;
 mod row_store;
 pub mod scannable;
 pub mod selection;
-pub mod slow_vec;
+pub mod small_vec;
 pub mod sort;
 mod sorted_rows;
 pub mod spill;

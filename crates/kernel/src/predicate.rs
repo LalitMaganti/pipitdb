@@ -19,7 +19,7 @@ use crate::murmur_hash;
 use crate::plan::ColumnId;
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::Transform;
 use crate::string_pool::{Id, StringPool};
 
@@ -79,7 +79,7 @@ pub enum Leaf {
 
 /// Its root is its last node.
 pub struct Predicate {
-    nodes: SlowVec<Node>,
+    nodes: SmallVec<Node>,
     /// The values of its `IN` lists, if it has any: shared by its copies.
     values: Option<Buffer>,
     depth: u32,
@@ -93,14 +93,14 @@ pub type Set = FlatHashMap<filter::Listed, ()>;
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
-    pub fn new(nodes: SlowVec<Node>) -> Predicate {
+    pub fn new(nodes: SmallVec<Node>) -> Predicate {
         Predicate::checked(nodes, None)
     }
 
     /// A predicate of `nodes`, whose `IN` lists are of `values`.
     pub fn with_values(
         env: &Env,
-        nodes: SlowVec<Node>,
+        nodes: SmallVec<Node>,
         values: &[i64],
     ) -> Result<Predicate, AllocError> {
         let mut buffer = None;
@@ -118,7 +118,7 @@ impl Predicate {
         leaf: Leaf,
         values: Option<Buffer>,
     ) -> Result<Predicate, AllocError> {
-        let nodes = SlowVec::fixed_from(env, [Node::Leaf(leaf)].into_iter())?;
+        let nodes = SmallVec::fixed_from(env, [Node::Leaf(leaf)].into_iter())?;
         Ok(Predicate::checked(nodes, values))
     }
 
@@ -129,7 +129,7 @@ impl Predicate {
         &self,
         env: &Env,
         literals: Option<&StringPool>,
-    ) -> Result<SlowVec<Option<Set>>, AllocError> {
+    ) -> Result<SmallVec<Option<Set>>, AllocError> {
         let long = |node: &Node| match *node {
             Node::Leaf(Leaf::In { len, .. } | Leaf::InStrings { len, .. }) => {
                 len as usize > filter::IN_SCAN_MAX
@@ -137,9 +137,9 @@ impl Predicate {
             _ => false,
         };
         if !self.nodes.iter().any(long) {
-            return SlowVec::fixed(env, 0);
+            return SmallVec::fixed(env, 0);
         }
-        let mut sets = SlowVec::fixed(env, self.nodes.len())?;
+        let mut sets = SmallVec::fixed(env, self.nodes.len())?;
         for &node in self.nodes.iter() {
             sets.push(self.set_of(env, literals, node)?)?;
         }
@@ -181,7 +181,7 @@ impl Predicate {
     }
 
     /// A predicate of `nodes`, checked to be one, and of `values`.
-    fn checked(nodes: SlowVec<Node>, values: Option<Buffer>) -> Predicate {
+    fn checked(nodes: SmallVec<Node>, values: Option<Buffer>) -> Predicate {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
         let value_count =
             values.as_ref().map_or(0, |values| values.size_bytes() / size_of::<i64>());
@@ -227,8 +227,8 @@ impl Predicate {
     }
 
     /// Where each node keeps the dictionary entries it found, for `select`.
-    pub fn new_entries(&self, env: &Env) -> Result<SlowVec<Entries>, AllocError> {
-        SlowVec::fixed_from(env, (0..self.nodes.len()).map(|_| Entries::default()))
+    pub fn new_entries(&self, env: &Env) -> Result<SmallVec<Entries>, AllocError> {
+        SmallVec::fixed_from(env, (0..self.nodes.len()).map(|_| Entries::default()))
     }
 
     /// Narrows `batch`'s selection to the rows this is true for, working in
@@ -512,9 +512,9 @@ impl Predicate {
         values: Option<Buffer>,
         column: &dyn Fn(ColumnId) -> (u32, DataType),
         computed_at: u32,
-        computed: &mut SlowVec<Expr>,
+        computed: &mut SmallVec<Expr>,
     ) -> Result<Predicate, AllocError> {
-        let mut nodes = SlowVec::new(env, PREDICATE_NODES_MAX)?;
+        let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX)?;
         let mut root = None;
         for &conjunct in conjuncts {
             let start = conjunct.start;
@@ -539,8 +539,8 @@ struct FromExpr<'e> {
     start: u32,
     column: &'e dyn Fn(ColumnId) -> (u32, DataType),
     computed_at: u32,
-    computed: &'e mut SlowVec<Expr>,
-    nodes: &'e mut SlowVec<Node>,
+    computed: &'e mut SmallVec<Expr>,
+    nodes: &'e mut SmallVec<Node>,
 }
 
 impl FromExpr<'_> {
@@ -645,7 +645,7 @@ impl FromExpr<'_> {
 }
 
 /// Adds `node` to `nodes`, returning where it is.
-fn push(nodes: &mut SlowVec<Node>, node: Node) -> Result<u32, AllocError> {
+fn push(nodes: &mut SmallVec<Node>, node: Node) -> Result<u32, AllocError> {
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
     let at = nodes.len() as u32;
     nodes.push(node)?;
@@ -664,9 +664,9 @@ pub struct Filter {
 /// What a run of a `Filter` keeps between batches.
 pub struct FilterState {
     /// The sets of its predicate's long `IN` lists.
-    sets: SlowVec<Option<Set>>,
+    sets: SmallVec<Option<Set>>,
     /// Where each node keeps the dictionary entries it found.
-    entries: SlowVec<Entries>,
+    entries: SmallVec<Entries>,
     /// What computing keeps.
     compute: Option<ComputeState>,
 }
@@ -767,7 +767,7 @@ mod tests {
     }
 
     /// Adds `expr`'s nodes to `nodes`, children first, returning its own.
-    fn build(expr: &Expr, nodes: &mut SlowVec<Node>) -> u32 {
+    fn build(expr: &Expr, nodes: &mut SmallVec<Node>) -> u32 {
         let node = match *expr {
             Expr::Greater(column, value) => Node::Leaf(Leaf::Compare {
                 column,
@@ -786,7 +786,7 @@ mod tests {
     /// The rows `expr` keeps of `a` and `b`.
     fn predicate_of(expr: &Expr) -> Predicate {
         let env = Env::current();
-        let mut nodes = SlowVec::new(env, PREDICATE_NODES_MAX).unwrap();
+        let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         Predicate::new(nodes)
     }
@@ -850,7 +850,7 @@ mod tests {
     /// ids' positions.
     fn from_kernel(exprs: &Exprs, conjuncts: &[crate::expression::Expr]) -> Predicate {
         let env = Env::current();
-        let mut computed = SlowVec::new(env, 1).unwrap();
+        let mut computed = SmallVec::new(env, 1).unwrap();
         let column = |column| (column, DataType::Int64);
         let predicate =
             Predicate::from_expr(env, exprs, conjuncts, None, &column, 2, &mut computed).unwrap();
@@ -908,7 +908,7 @@ mod tests {
         // One scratch selection per `AND` or `OR` nested in another.
         let depth = |expr: &Expr| {
             let env = Env::current();
-            let mut nodes = SlowVec::new(env, PREDICATE_NODES_MAX).unwrap();
+            let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX).unwrap();
             build(expr, &mut nodes);
             Predicate::new(nodes).depth()
         };
@@ -929,7 +929,7 @@ mod tests {
         let kept = |nodes: &[Node]| {
             // Then 100 to 119, for a list long enough for a set.
             let values: StdVec<i64> = [3, 5, 2, 7, 9, 11].into_iter().chain(100..120).collect();
-            let nodes = SlowVec::fixed_from(env, nodes.iter().copied()).unwrap();
+            let nodes = SmallVec::fixed_from(env, nodes.iter().copied()).unwrap();
             kept_by(&Predicate::with_values(env, nodes, &values).unwrap())
         };
         assert_eq!(kept(&[Node::Leaf(a_in)]), [2, 4, 5]);
@@ -995,7 +995,7 @@ mod tests {
         let string = id(&mut literals, b"b");
         let leaf = Leaf::CompareString { column: 0, comparison, string };
         let nodes = [Node::Leaf(leaf), Node::Not(0)];
-        let nodes = SlowVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
+        let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
         (Predicate::new(nodes.unwrap()), literals)
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
             let mut literals = literals(&[]);
             let pattern = id(&mut literals, b"_");
             let nodes = [Node::Leaf(Leaf::Like { column: 0, pattern }), Node::Not(0)];
-            let nodes = SlowVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
+            let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
             let predicate = Predicate::new(nodes.unwrap());
             let mut entries = predicate.new_entries(env).unwrap();
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
@@ -1081,7 +1081,7 @@ mod tests {
             (23, true, rows_of(&[2, 4])),
         ] {
             let nodes = [Node::Leaf(Leaf::InStrings { column: 0, start: 0, len }), Node::Not(0)];
-            let nodes = SlowVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
+            let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
             let predicate = Predicate::with_values(env, nodes.unwrap(), &ids).unwrap();
             let mut entries = predicate.new_entries(env).unwrap();
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);

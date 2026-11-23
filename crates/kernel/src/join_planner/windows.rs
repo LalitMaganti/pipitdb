@@ -9,7 +9,7 @@ use super::tree::{JoinNode, JoinTree, Node};
 use crate::bitmap::BitSlice;
 use crate::env::Env;
 use crate::error::Error;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// How many subtrees a window joins.
 const WINDOW: usize = 8;
@@ -27,11 +27,11 @@ struct Windows<'a, 'g, 'e, 't> {
     /// How many words a set of relations takes.
     words: usize,
     /// Each node's relations, `words` words a node.
-    sets: SlowVec<u64>,
+    sets: SmallVec<u64>,
     /// For each relation of the window, the subtree it's in.
-    label: SlowVec<u8>,
+    label: SmallVec<u8>,
     /// The edges between the window's subtrees.
-    links: SlowVec<Link>,
+    links: SmallVec<Link>,
 }
 
 /// Improves `tree`, a plan of `graph` whose joins come after their
@@ -45,7 +45,7 @@ pub(super) fn improve<'g>(
 ) -> Result<(), Error> {
     let count = graph.relations.len();
     let words = BitSlice::<u64>::words_for(count);
-    let mut sets = SlowVec::zeroed(env, (tree.nodes.len() + 2) * words)?;
+    let mut sets = SmallVec::zeroed(env, (tree.nodes.len() + 2) * words)?;
     for (node, found) in tree.nodes.iter().enumerate() {
         match found.kind {
             JoinNode::Relation(relation) => {
@@ -65,8 +65,8 @@ pub(super) fn improve<'g>(
         tree,
         words,
         sets,
-        label: SlowVec::zeroed(env, count)?,
-        links: SlowVec::new(env, LIST_MAX)?,
+        label: SmallVec::zeroed(env, count)?,
+        links: SmallVec::new(env, LIST_MAX)?,
     };
     // Joins come after their children, so each window's subtrees have
     // already been improved.

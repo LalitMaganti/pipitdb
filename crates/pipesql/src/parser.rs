@@ -12,7 +12,7 @@ use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::env::Env;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.
@@ -351,7 +351,7 @@ impl Parser<'_> {
     fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
         self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let mut items = SlowVec::new(self.env, IN_LIST_MAX)?;
+        let mut items = SmallVec::new(self.env, IN_LIST_MAX)?;
         loop {
             let negative = self.current().kind == TokenKind::Minus;
             if negative {

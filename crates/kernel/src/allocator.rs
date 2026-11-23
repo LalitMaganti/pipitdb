@@ -22,7 +22,7 @@ const LARGE_BYTES: usize = 1 << 18;
 const HUGE_PAGE_BYTES: usize = 1 << 21;
 
 /// The layout of `bytes` of memory that one owner holds, such as an
-/// `Array`'s or a `SlowVec`'s.
+/// `Array`'s or a `SmallVec`'s.
 ///
 /// From `LARGE_BYTES` up, it's aligned to a page, as a hint to the
 /// allocator: a big block that one owner keeps for a long time, such as a

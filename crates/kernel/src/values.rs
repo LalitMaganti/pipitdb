@@ -5,12 +5,12 @@ use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::Source;
 
 /// Outputs one row: each column's `Int64`.
 pub struct Values {
-    pub values: SlowVec<i64>,
+    pub values: SmallVec<i64>,
 }
 
 impl Source for Values {

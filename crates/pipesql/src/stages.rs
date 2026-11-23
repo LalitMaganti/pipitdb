@@ -12,7 +12,7 @@ use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
 use pipit_kernel::plan::SortKey;
 use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::{Compiler, Relation};
@@ -181,7 +181,7 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
 /// `AS a`: the columns in scope, named by alias `a`, the only one.
 fn compile_as(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     compiler.clear_aliases();
-    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
     compiler.add_alias(compiler.node(stage.first_child()), &scope)
 }
@@ -253,7 +253,7 @@ fn join(
 ) -> Result<(), Error> {
     let probe = compiler.plan.root;
     let env = compiler.env();
-    let probe_columns = SlowVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
+    let probe_columns = SmallVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
         table = only(compiler, table)?;
     }
@@ -284,11 +284,11 @@ fn join(
         }
     };
     let env = compiler.env();
-    let build_columns = SlowVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
+    let build_columns = SmallVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
     let columns = [probe_columns, build_columns];
     let conjuncts = match condition {
         Some(condition) => conjuncts_of(env, &compiler.plan.exprs, condition)?,
-        None => SlowVec::fixed(env, 0)?,
+        None => SmallVec::fixed(env, 0)?,
     };
     let op = DynOp::new(env, JoinOp::new(kind, conjuncts, columns))?;
     let children = [probe, build.node];
@@ -306,7 +306,7 @@ fn using_columns(
 ) -> Result<Expr, Error> {
     let env = compiler.env();
     let mut nodes = ExprBuilder::new(env)?;
-    let mut scope = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     // Each build column joined on, one for each name in the list.
     let mut joined = [0; LIST_MAX];
     for i in 0..using.child_count() {
@@ -367,12 +367,12 @@ fn compile_extend(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Er
 /// The column of each item of `stage`'s list, under its alias if it has
 /// one, after the scope's columns if `extend`, are the new scope.
 fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result<(), Error> {
-    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     if extend {
         scope.extend_from_slice(&compiler.scope)?;
     }
     let list = compiler.node(stage.first_child());
-    let mut computed = SlowVec::fixed(compiler.env(), list.child_count() as usize)?;
+    let mut computed = SmallVec::fixed(compiler.env(), list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let name = match alias {
@@ -412,7 +412,7 @@ fn named(
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
 fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
     for i in 0..list.child_count() {
         let name = listed_once(compiler, list, i, 0)?;
@@ -454,9 +454,9 @@ fn change_in_place(
     renames: bool,
 ) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let mut scope = SlowVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
+    let mut scope = SmallVec::new(compiler.env(), PLAN_COLUMNS_MAX)?;
     scope.extend_from_slice(&compiler.scope)?;
-    let mut computed = SlowVec::fixed(compiler.env(), list.child_count() as usize)?;
+    let mut computed = SmallVec::fixed(compiler.env(), list.child_count() as usize)?;
     let target = u32::from(!renames);
     for i in 0..list.child_count() {
         let found = compiler.find_column(listed_once(compiler, list, i, target)?)?;
@@ -505,7 +505,7 @@ fn value_of(
     compiler: &mut Compiler<'_, '_>,
     value: Node,
     name: Option<Name>,
-    computed: &mut SlowVec<ComputeItem>,
+    computed: &mut SmallVec<ComputeItem>,
 ) -> Result<NamedColumn, Error> {
     if value.tag() == Tag::Name && !is_null(compiler, value) {
         let column = compiler.find_column(value)?;
@@ -525,7 +525,7 @@ fn value_of(
 /// Adds the `ComputeOp` for a stage's `computed` columns, if it has any.
 fn add_compute(
     compiler: &mut Compiler<'_, '_>,
-    computed: SlowVec<ComputeItem>,
+    computed: SmallVec<ComputeItem>,
 ) -> Result<(), Error> {
     if computed.is_empty() {
         return Ok(());
@@ -542,7 +542,7 @@ fn add_compute(
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
     let env = compiler.env();
-    let mut keys = SlowVec::fixed(env, list.child_count() as usize)?;
+    let mut keys = SmallVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let key = compiler.node(list.first_child() + i);
         let column = compiler.node(key.first_child());
@@ -594,8 +594,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let list = compiler.node(stage.first_child());
     let by = compiler.node(stage.first_child() + 1);
     let env = compiler.env();
-    let mut keys = SlowVec::fixed(env, by.child_count() as usize)?;
-    let mut scope = SlowVec::new(env, PLAN_COLUMNS_MAX)?;
+    let mut keys = SmallVec::fixed(env, by.child_count() as usize)?;
+    let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         if key.tag() != Tag::Name {
@@ -609,7 +609,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         keys.push(column.id)?;
         scope.push(named(compiler, column, alias)?)?;
     }
-    let mut aggregates = SlowVec::fixed(env, list.child_count() as usize)?;
+    let mut aggregates = SmallVec::fixed(env, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let (item, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let span = compiler.span(item);

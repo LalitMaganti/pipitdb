@@ -4,7 +4,7 @@
 use crate::allocator::AllocError;
 use crate::bitmap::{BitSlice, Word};
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// The most relations, edges or equivalence sets a graph holds.
 pub(super) const LIST_MAX: usize = 1 << 24;
@@ -18,13 +18,13 @@ pub struct RelationSet {
     /// Relations 0 to 63.
     first: u64,
     /// Relations 64 and up, 64 to a word. Words past the end are empty.
-    rest: SlowVec<u64>,
+    rest: SmallVec<u64>,
 }
 
 impl RelationSet {
     /// An empty set. It allocates nothing until it holds a relation past 63.
     pub fn new(env: &Env) -> Result<RelationSet, AllocError> {
-        Ok(RelationSet { first: 0, rest: SlowVec::new(env, WORDS_MAX)? })
+        Ok(RelationSet { first: 0, rest: SmallVec::new(env, WORDS_MAX)? })
     }
 
     /// Word `i`, which holds relations `64 * i` to `64 * i + 63`.
@@ -225,11 +225,11 @@ pub type Executable = fn(&QueryGraph, &[u64], &[u64]) -> bool;
 /// The relations of a join region and the joins between them.
 pub struct QueryGraph {
     /// The relations, by index.
-    pub relations: SlowVec<Relation>,
+    pub relations: SmallVec<Relation>,
     /// The joins between them.
-    pub edges: SlowVec<JoinEdge>,
+    pub edges: SmallVec<JoinEdge>,
     /// The equivalence sets the joins join on, by index.
-    pub equivalences: SlowVec<EquivalenceSet>,
+    pub equivalences: SmallVec<EquivalenceSet>,
     /// Which joins can run, if not all of them.
     pub executable: Option<Executable>,
 }
@@ -238,9 +238,9 @@ impl QueryGraph {
     /// An empty graph whose joins can all run.
     pub fn new(env: &Env) -> Result<QueryGraph, AllocError> {
         Ok(QueryGraph {
-            relations: SlowVec::new(env, LIST_MAX)?,
-            edges: SlowVec::new(env, LIST_MAX)?,
-            equivalences: SlowVec::new(env, LIST_MAX)?,
+            relations: SmallVec::new(env, LIST_MAX)?,
+            edges: SmallVec::new(env, LIST_MAX)?,
+            equivalences: SmallVec::new(env, LIST_MAX)?,
             executable: None,
         })
     }

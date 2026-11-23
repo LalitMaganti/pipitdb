@@ -23,7 +23,7 @@ use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Selection;
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
@@ -221,15 +221,15 @@ pub fn compute_pipeline(
         let mut case = step(ExprOp::Case, data_type, 2, 1);
         case.c = otherwise;
         let when = step(ExprOp::When, data_type, condition, value);
-        SlowVec::fixed_from(crate::env(), [first, second, when, case].into_iter())
+        SmallVec::fixed_from(crate::env(), [first, second, when, case].into_iter())
     } else {
-        SlowVec::fixed_from(crate::env(), [first, second, step(op, result, 0, 1)].into_iter())
+        SmallVec::fixed_from(crate::env(), [first, second, step(op, result, 0, 1)].into_iter())
     };
     let steps = steps.expect("allocates");
     let programs =
-        SlowVec::fixed_from(crate::env(), [ExprProgram { steps, values: None }].into_iter());
+        SmallVec::fixed_from(crate::env(), [ExprProgram { steps, values: None }].into_iter());
     let compute = Compute { programs: programs.expect("allocates") };
-    let mut owned = SlowVec::fixed(crate::env(), 1).expect("allocates");
+    let mut owned = SmallVec::fixed(crate::env(), 1).expect("allocates");
     let step = Step::Transform(DynTransform::new(crate::env(), compute).expect("allocates"));
     assert!(owned.push(step).is_ok(), "fixed for one");
     let source = DynSource::new(crate::env(), Pair { columns, batches }).expect("allocates");
@@ -394,7 +394,8 @@ pub fn small_plan(rows: u32, query: &str) -> PhysicalPlan<'static> {
 /// operators.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
-    let mut owned = pipit_kernel::slow_vec::SlowVec::fixed(crate::env(), steps).expect("allocates");
+    let mut owned =
+        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), steps).expect("allocates");
     for _ in 0..steps {
         let step = if operators {
             Step::Operator(DynOperator::new(crate::env(), PassOperator).expect("allocates"))
@@ -413,7 +414,7 @@ pub fn nested_pipeline(batches: u32) -> Pipeline<'static> {
     let inner = pass_pipeline(batches, 0, false).into_source(crate::env()).expect("allocates");
     Pipeline::new(
         inner,
-        pipit_kernel::slow_vec::SlowVec::fixed(crate::env(), 0).expect("allocates"),
+        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), 0).expect("allocates"),
     )
 }
 
@@ -443,7 +444,7 @@ pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static>
     let source = table.scan(crate::env(), columns, &[], None).expect("allocates");
     Pipeline::new(
         source,
-        pipit_kernel::slow_vec::SlowVec::fixed(crate::env(), 0).expect("allocates"),
+        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), 0).expect("allocates"),
     )
 }
 
@@ -588,7 +589,7 @@ pub fn ipad_predicate() -> (Predicate, StringPool) {
     let string = literals.intern_string(crate::env(), Some(b"iPad")).expect("allocates");
     let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, string };
     let nodes =
-        SlowVec::fixed_from(crate::env(), [Node::Leaf(leaf)].into_iter()).expect("allocates");
+        SmallVec::fixed_from(crate::env(), [Node::Leaf(leaf)].into_iter()).expect("allocates");
     (Predicate::new(nodes), literals)
 }
 
@@ -614,7 +615,7 @@ pub fn predicate(shape: &str) -> Predicate {
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
     Predicate::new(
-        pipit_kernel::slow_vec::SlowVec::fixed_from(crate::env(), nodes.iter().copied())
+        pipit_kernel::small_vec::SmallVec::fixed_from(crate::env(), nodes.iter().copied())
             .expect("allocates"),
     )
 }
@@ -741,9 +742,9 @@ fn join_op(exprs: &mut Exprs, [utid, dur]: [u32; 2], [id, tid]: [u32; 2]) -> Dyn
     nodes.node(ExprOp::Eq, a, b).expect("allocates");
     let condition = Some(exprs.add(nodes.nodes()).expect("allocates"));
     let columns =
-        |list: [u32; 2]| SlowVec::fixed_from(crate::env(), list.into_iter()).expect("allocates");
+        |list: [u32; 2]| SmallVec::fixed_from(crate::env(), list.into_iter()).expect("allocates");
     let columns = [columns([utid, dur]), columns([id, tid])];
-    let conjuncts = SlowVec::fixed_from(crate::env(), condition.into_iter()).expect("allocates");
+    let conjuncts = SmallVec::fixed_from(crate::env(), condition.into_iter()).expect("allocates");
     let op = JoinOp::new(JoinKind::Inner, conjuncts, columns);
     DynOp::new(crate::env(), op).expect("allocates")
 }
@@ -846,7 +847,7 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
 
     let mut plan = LogicalPlan::new(crate::env()).expect("allocates");
     let scan_of = |plan: &mut LogicalPlan<'static>, table, names: [&str; 2]| {
-        let mut reads = SlowVec::fixed(crate::env(), 2).expect("allocates");
+        let mut reads = SmallVec::fixed(crate::env(), 2).expect("allocates");
         let mut bound = [None; 2];
         for (i, name) in (0..).zip(names) {
             let binding = plan.add_column(name, DataType::Int64, false).expect("allocates");

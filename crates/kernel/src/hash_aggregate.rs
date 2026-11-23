@@ -18,7 +18,7 @@ use crate::group_table::{GroupTable, KEYS_MAX};
 use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::{Breaker, DynOperator};
 use crate::string_pool::CACHED_SLOTS;
 
@@ -47,13 +47,13 @@ struct State {
     /// The groups, by their keys.
     groups: GroupTable,
     /// With no keys, the state of the single group.
-    total: SlowVec<i64>,
+    total: SmallVec<i64>,
     /// Whether any input row was read.
     consumed: bool,
     /// For each aggregate, which groups have seen a value.
-    seen: SlowVec<SeenBytes>,
+    seen: SmallVec<SeenBytes>,
     /// For each `DISTINCT` aggregate, the values of each group it's read.
-    distinct: SlowVec<Option<FlatHashMap<GroupValue, ()>>>,
+    distinct: SmallVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
 }
@@ -225,13 +225,13 @@ impl Breaker for HashAggregate {
             self.spec.nullable_keys,
             self.state_words,
         )?;
-        let mut total = SlowVec::new(env, self.state_words.next_power_of_two().max(1))?;
+        let mut total = SmallVec::new(env, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
-        let mut seen = SlowVec::fixed(env, self.spec.aggregates.len())?;
+        let mut seen = SmallVec::fixed(env, self.spec.aggregates.len())?;
         for _ in 0..self.spec.aggregates.len() {
             seen.push(SeenBytes::new(env)?)?;
         }
-        let mut distinct = SlowVec::fixed(env, self.spec.aggregates.len())?;
+        let mut distinct = SmallVec::fixed(env, self.spec.aggregates.len())?;
         for call in self.spec.aggregates.iter() {
             check!(!call.distinct || call.function != Function::CountStar);
             check!(!call.distinct || string_extreme(*call).is_none());
@@ -513,10 +513,10 @@ mod tests {
             input_type: DataType::Int64,
         });
         HashAggregateSpec {
-            key_columns: SlowVec::fixed_from(env, keys.iter().copied()).unwrap(),
+            key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
             string_keys: 0,
             nullable_keys: u64::MAX,
-            aggregates: SlowVec::fixed_from(env, aggregates).unwrap(),
+            aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
         }
     }
 
@@ -527,7 +527,7 @@ mod tests {
         spec: HashAggregateSpec,
     ) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let env = Env::current();
-        let mut steps = SlowVec::new(env, 1).unwrap();
+        let mut steps = SmallVec::new(env, 1).unwrap();
         assert!(steps.push(Step::Operator(hash_aggregate(env, spec).unwrap())).is_ok());
         let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
         let query = Env::current();
@@ -688,10 +688,10 @@ mod tests {
                 input_type: DataType::String,
             });
             HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(env, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(env, calls.into_iter()).unwrap(),
+                aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
             }
         };
         let digits = ["9", "10", "5", "100", "7"].map(|text| Some(String::from(text)));
@@ -782,10 +782,10 @@ mod tests {
                 input_type: DataType::Int64,
             });
             let spec = HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(env, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(env, aggregates).unwrap(),
+                aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
             };
             let out = run(rows, spec).unwrap();
             let mean = out[0][keys.len()].map(|bits| f64::from_bits(bits.cast_unsigned()));
@@ -802,10 +802,10 @@ mod tests {
             input_type: DataType::Int64,
         };
         let spec = HashAggregateSpec {
-            key_columns: SlowVec::fixed_from(env, [].into_iter()).unwrap(),
+            key_columns: SmallVec::fixed_from(env, [].into_iter()).unwrap(),
             string_keys: 0,
             nullable_keys: u64::MAX,
-            aggregates: SlowVec::fixed_from(env, [call].into_iter()).unwrap(),
+            aggregates: SmallVec::fixed_from(env, [call].into_iter()).unwrap(),
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
     }
@@ -829,10 +829,10 @@ mod tests {
                 input_type: DataType::Int64,
             });
             HashAggregateSpec {
-                key_columns: SlowVec::fixed_from(env, keys.iter().copied()).unwrap(),
+                key_columns: SmallVec::fixed_from(env, keys.iter().copied()).unwrap(),
                 string_keys: 0,
                 nullable_keys: u64::MAX,
-                aggregates: SlowVec::fixed_from(env, calls.into_iter()).unwrap(),
+                aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
             }
         };
         // Repeats within and across batches, a null, row 3 of each batch

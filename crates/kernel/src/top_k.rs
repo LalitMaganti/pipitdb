@@ -11,7 +11,7 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::sorted_rows::{KeyColumn, SortKey, SortedRows, lay_out_keys_from};
 use crate::step::{Breaker, DynOperator};
 
@@ -27,7 +27,7 @@ use crate::step::{Breaker, DynOperator};
 /// they arrive, so on most inputs pruning soon becomes rare.
 pub fn top_k<'a>(
     env: &Env,
-    keys: SlowVec<SortKey>,
+    keys: SmallVec<SortKey>,
     count: u32,
     publish: Option<u32>,
 ) -> Result<DynOperator<'a>, AllocError> {
@@ -35,7 +35,7 @@ pub fn top_k<'a>(
 }
 
 struct TopK {
-    keys: SlowVec<SortKey>,
+    keys: SmallVec<SortKey>,
     count: u32,
     publish: Option<u32>,
 }
@@ -45,16 +45,16 @@ struct TopK {
 struct Kept {
     rows: SortedRows,
     cutoff: Option<Cutoff>,
-    keys: SlowVec<u8>,
+    keys: SmallVec<u8>,
     emitted: u32,
 }
 
 /// The last row kept: its keys laid out, and by key, where the strings of its
 /// string keys are in `bytes`, if not null.
 struct Cutoff {
-    keys: SlowVec<u8>,
-    strings: SlowVec<Option<(usize, usize)>>,
-    bytes: SlowVec<u8>,
+    keys: SmallVec<u8>,
+    strings: SmallVec<Option<(usize, usize)>>,
+    bytes: SmallVec<u8>,
 }
 
 impl Breaker for TopK {
@@ -66,7 +66,7 @@ impl Breaker for TopK {
         }
         let env = context.env();
         let rows = SortedRows::new(env)?;
-        let keys = SlowVec::new(env, 1 << 31)?;
+        let keys = SmallVec::new(env, 1 << 31)?;
         Ok(Kept { rows, cutoff: None, keys, emitted: 0 })
     }
 
@@ -192,12 +192,12 @@ impl TopK {
         first.flush(context)?;
         let last = self.count - 1;
         let env = context.env();
-        let keys = SlowVec::fixed_from(env, first.keys_of(last).iter().copied())?;
+        let keys = SmallVec::fixed_from(env, first.keys_of(last).iter().copied())?;
         if let Some(slot) = self.publish {
             context.set_cutoff(slot, decode(first.layout().slot(0), &keys, false));
         }
-        let mut strings = SlowVec::fixed(env, self.keys.len())?;
-        let mut bytes = SlowVec::new(env, 1 << 31)?;
+        let mut strings = SmallVec::fixed(env, self.keys.len())?;
+        let mut bytes = SmallVec::new(env, 1 << 31)?;
         for column in first.key_columns() {
             let string = column.string().and_then(|column| first.string(column, last));
             strings.push(string.map(|string| (bytes.len(), string.len())))?;

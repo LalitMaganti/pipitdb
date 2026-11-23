@@ -173,7 +173,7 @@ mod tests {
 
     use crate::env::Env;
     use crate::filter::Comparison;
-    use crate::slow_vec::SlowVec;
+    use crate::small_vec::SmallVec;
 
     /// A predicate on one column, to build and to evaluate by hand.
     #[derive(Clone)]
@@ -211,7 +211,7 @@ mod tests {
         }
     }
 
-    fn build(expr: &Expr, nodes: &mut SlowVec<Node>) -> u32 {
+    fn build(expr: &Expr, nodes: &mut SmallVec<Node>) -> u32 {
         let node = match expr {
             &Expr::Compare(comparison, value) => {
                 Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
@@ -261,7 +261,7 @@ mod tests {
         let values = (-2..=8).chain([i64::MIN, i64::MAX]);
         let mut said = 0;
         for expr in leaves.iter().chain(&first).chain(&second) {
-            let mut nodes = SlowVec::new(env, 64).unwrap();
+            let mut nodes = SmallVec::new(env, 64).unwrap();
             build(expr, &mut nodes);
             let condition = Condition::new(0, &Predicate::new(nodes));
             assert_eq!(condition.nulls, reference(expr, None) == Some(true));
@@ -279,7 +279,7 @@ mod tests {
         }
         // Every comparison, and most of what's made of them, is one range.
         assert!(leaves.iter().all(|leaf| {
-            let mut nodes = SlowVec::new(env, 64).unwrap();
+            let mut nodes = SmallVec::new(env, 64).unwrap();
             build(leaf, &mut nodes);
             !matches!(Condition::new(0, &Predicate::new(nodes)).values, Values::Ranges)
         }));
@@ -290,7 +290,7 @@ mod tests {
     fn may_keep_rows_within_bounds_only_if_a_value_there_is_kept() {
         let env = Env::current();
         let condition = |expr: &Expr| {
-            let mut nodes = SlowVec::new(env, 8).unwrap();
+            let mut nodes = SmallVec::new(env, 8).unwrap();
             build(expr, &mut nodes);
             Condition::new(0, &Predicate::new(nodes))
         };

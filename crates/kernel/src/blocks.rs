@@ -8,7 +8,7 @@ use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::buffer::Primitive;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// How many records a block holds, as a power of two, so a record's block
 /// is its number shifted. A block of 8-byte values is `width` times 2 MB, so
@@ -42,12 +42,12 @@ pub(crate) struct Blocks<T: Primitive> {
 }
 
 /// What `Blocks` keeps that doesn't depend on its values' type, shared by
-/// every `Blocks`, as `SlowVec` shares its code.
+/// every `Blocks`, as `SmallVec` shares its code.
 struct RawBlocks {
     /// The blocks, as bytes: their alignment suits any `Primitive`.
-    arrays: SlowVec<Array<u8>>,
+    arrays: SmallVec<Array<u8>>,
     /// Where each of `arrays` starts.
-    starts: SlowVec<*mut u8>,
+    starts: SmallVec<*mut u8>,
     /// How many bytes a record is.
     record_bytes: usize,
     /// How many records the first block has room for: `BLOCK_RECORDS` once
@@ -93,8 +93,8 @@ impl<T: Primitive> Blocks<T> {
     pub(crate) fn new(env: &Env, width: usize) -> Result<Blocks<T>, AllocError> {
         check!(width > 0);
         let raw = RawBlocks {
-            arrays: SlowVec::new(env, BLOCKS_MAX)?,
-            starts: SlowVec::new(env, BLOCKS_MAX)?,
+            arrays: SmallVec::new(env, BLOCKS_MAX)?,
+            starts: SmallVec::new(env, BLOCKS_MAX)?,
             record_bytes: width * size_of::<T>(),
             first: 0,
             len: 0,

@@ -7,7 +7,7 @@ use pipit_kernel::expression::{
     check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 use pipit_kernel::string_pool::Id;
 
 use crate::ast::{Node, Operator, Tag};
@@ -229,12 +229,12 @@ pub fn compile_arguments(
     nodes: &mut ExprBuilder,
     fewest: u32,
     most: u32,
-) -> Result<SlowVec<u32>, Error> {
+) -> Result<SmallVec<u32>, Error> {
     let count = node.child_count() - 1;
     if count < fewest || count > most {
         return Err(Error::new(ErrorCode::ArgumentCount, compiler.span(node)));
     }
-    let mut values = SlowVec::fixed(compiler.env(), count as usize)?;
+    let mut values = SmallVec::fixed(compiler.env(), count as usize)?;
     for i in 1..=count {
         compile(compiler, compiler.node(node.first_child() + i), depth + 1, nodes)?;
         values.push(nodes.last())?;
@@ -322,7 +322,7 @@ fn case(
         Some(nodes.last())
     };
     // Each `WHEN`'s condition and value.
-    let mut branches = SlowVec::fixed(compiler.env(), (count as usize - 2) / 2)?;
+    let mut branches = SmallVec::fixed(compiler.env(), (count as usize - 2) / 2)?;
     for i in (1..count - 1).step_by(2) {
         compile(compiler, child(compiler, i), depth + 1, nodes)?;
         let mut condition = nodes.last();
@@ -427,7 +427,7 @@ pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> 
     if !inside.windows(2).any(|pair| pair == b"''") {
         return Ok(compiler.plan.add_literal(env, inside)?);
     }
-    let mut unquoted = SlowVec::fixed(env, inside.len())?;
+    let mut unquoted = SmallVec::fixed(env, inside.len())?;
     let mut quote = false;
     for &byte in inside {
         // The second quote of each `''` is the one kept.

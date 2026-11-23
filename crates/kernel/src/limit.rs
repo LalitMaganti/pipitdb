@@ -125,7 +125,7 @@ mod tests {
     use crate::env::Env;
     use crate::pipeline::Pipeline;
     use crate::selection::Kept;
-    use crate::slow_vec::SlowVec;
+    use crate::small_vec::SmallVec;
     use crate::step::{DynSource, Source};
 
     /// `batches` batches of two rows, counting up from 0, counting in
@@ -165,7 +165,7 @@ mod tests {
         let env = Env::current();
         let pulled = Cell::new(0);
         let source = DynSource::new(env, Counting { batches: 5, pulled: &pulled }).unwrap();
-        let mut steps = SlowVec::new(env, 1).unwrap();
+        let mut steps = SmallVec::new(env, 1).unwrap();
         let limit = DynOperator::new(env, Limit { count, offset }).unwrap();
         assert!(steps.push(Step::Operator(limit)).is_ok());
         let pipeline = Pipeline::new(source, steps);

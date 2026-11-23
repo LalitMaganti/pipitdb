@@ -5,7 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// What a slot holds.
 #[derive(Clone, Copy)]
@@ -39,13 +39,13 @@ pub(crate) struct Slot {
 /// starts with 0xFF if the row has a value and 0 if not; a descending slot's
 /// bits are inverted.
 pub(crate) struct RowLayout {
-    slots: SlowVec<Slot>,
+    slots: SmallVec<Slot>,
     stride: u32,
 }
 
 impl RowLayout {
     pub(crate) fn new(env: &Env, columns: &[Column]) -> Result<RowLayout, AllocError> {
-        let mut slots = SlowVec::fixed(env, columns.len())?;
+        let mut slots = SmallVec::fixed(env, columns.len())?;
         let mut stride = 0_u32;
         for column in columns {
             let Ok(offset) = u16::try_from(stride) else { return Err(AllocError) };

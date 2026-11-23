@@ -4,12 +4,12 @@
 use crate::allocator::AllocError;
 use crate::bitmap::Bitmap;
 use crate::env::Env;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// Bits, with how many are set before each word of them.
 pub struct RankBitmap {
     bits: Bitmap,
-    before: SlowVec<u32>,
+    before: SmallVec<u32>,
 }
 
 impl RankBitmap {
@@ -23,7 +23,7 @@ impl RankBitmap {
         for at in set {
             bits.set(at);
         }
-        let mut before = SlowVec::fixed_from(env, bits.words().iter().map(|_| 0))?;
+        let mut before = SmallVec::fixed_from(env, bits.words().iter().map(|_| 0))?;
         let mut count = 0;
         for (before, word) in before.iter_mut().zip(bits.words()) {
             *before = count;

@@ -6,7 +6,7 @@ use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::DataType;
 use pipit_kernel::env::Env;
 use pipit_kernel::names::{Name, Names};
-use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::small_vec::SmallVec;
 
 use crate::Error;
 use crate::thrift::{Cursor, STRUCT, Value};
@@ -90,11 +90,11 @@ pub struct ParquetFile {
     /// The columns' names.
     names: Names,
     /// The columns, in order.
-    columns: SlowVec<Column>,
+    columns: SmallVec<Column>,
     /// How many rows each row group has.
-    group_rows: SlowVec<u64>,
+    group_rows: SmallVec<u64>,
     /// Row group by row group, a chunk for each column.
-    chunks: SlowVec<Chunk>,
+    chunks: SmallVec<Chunk>,
 }
 
 /// The magic bytes at the start and end of every Parquet file.
@@ -148,9 +148,9 @@ impl ParquetFile {
 fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     let (Ok(mut names), Ok(mut columns), Ok(mut group_rows), Ok(mut chunks)) = (
         Names::new(env, 1 << 16),
-        SlowVec::new(env, COLUMNS_MAX),
-        SlowVec::new(env, GROUPS_MAX),
-        SlowVec::new(env, CHUNKS_MAX),
+        SmallVec::new(env, COLUMNS_MAX),
+        SmallVec::new(env, GROUPS_MAX),
+        SmallVec::new(env, CHUNKS_MAX),
     ) else {
         return Some(Err(Error::OutOfMemory));
     };
@@ -205,7 +205,7 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
 fn schema(
     c: &mut Cursor<'_>,
     names: &mut Names,
-    columns: &mut SlowVec<Column>,
+    columns: &mut SmallVec<Column>,
 ) -> Option<Result<(), Error>> {
     let (_, len) = c.list()?;
     // `SchemaElement`s: its type, repetition, name, children's count, and

@@ -16,7 +16,7 @@ use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// A column to sort by, and its direction.
 #[derive(Clone, Copy)]
@@ -47,7 +47,7 @@ pub(crate) struct SortedRows {
     /// their types.
     layout: Option<RowLayout>,
     /// Each key's column, once the first batch says.
-    columns: SlowVec<KeyColumn>,
+    columns: SmallVec<KeyColumn>,
     /// Each row's keys, until they're sorted and nothing is decoded from
     /// them, once the first batch says how long they are.
     keys: Option<RowBlocks>,
@@ -65,7 +65,7 @@ impl SortedRows {
     pub(crate) fn new(env: &Env) -> Result<SortedRows, AllocError> {
         Ok(SortedRows {
             layout: None,
-            columns: SlowVec::new(env, 1 << 6)?,
+            columns: SmallVec::new(env, 1 << 6)?,
             keys: None,
             rows: RowStore::new(env)?,
             decoded: 0,
@@ -158,7 +158,7 @@ impl SortedRows {
         if self.layout.is_none() {
             // Every key is laid out as nullable, as whether a column has nulls
             // can change from batch to batch.
-            let mut columns = SlowVec::fixed(env, keys.len())?;
+            let mut columns = SmallVec::fixed(env, keys.len())?;
             for key in keys {
                 let (column, data_type) = (key.column, data_type(key));
                 self.columns.push(KeyColumn { column, data_type })?;
@@ -323,7 +323,7 @@ impl SortedRows {
         // each block let go of as soon as scatter is past its rows.
         let mut decode = None;
         if let (Some(layout), true) = (&self.layout, self.decoded != 0) {
-            let mut slots = SlowVec::fixed(context.env(), self.decoded.count_ones() as usize)?;
+            let mut slots = SmallVec::fixed(context.env(), self.decoded.count_ones() as usize)?;
             for column in bits(self.decoded) {
                 let k = first_key(&self.columns, column);
                 let (slot, float) =

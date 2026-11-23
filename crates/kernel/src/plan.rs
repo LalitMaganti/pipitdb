@@ -28,7 +28,7 @@ use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, 
 use crate::predicate::{Filter, Predicate, compared_with};
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
 use crate::string_pool::Id;
@@ -173,7 +173,7 @@ pub trait Op<'c> {
     fn materialize(
         &self,
         env: &Env,
-        columns: SlowVec<(ColumnId, Forms)>,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         let _ = (env, columns);
         failed!()
@@ -259,7 +259,7 @@ pub enum Given {
 
 /// The parts of a condition, all of which must be true: the top-level
 /// conjuncts of an expression, or of several.
-pub type Conjuncts = SlowVec<Expr>;
+pub type Conjuncts = SmallVec<Expr>;
 
 type GiveCondition = unsafe fn(NonNull<()>, &Exprs, &Env, ColumnId) -> Result<Given, AllocError>;
 
@@ -272,7 +272,7 @@ type SplitBelow<'c> =
     unsafe fn(NonNull<()>, &Exprs, &Env, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
 
 type Materialize<'c> =
-    unsafe fn(NonNull<()>, &Env, SlowVec<(ColumnId, Forms)>) -> Result<DynOp<'c>, AllocError>;
+    unsafe fn(NonNull<()>, &Env, SmallVec<(ColumnId, Forms)>) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
 /// `Env`, and the functions that know its type.
@@ -429,7 +429,7 @@ impl<'c> DynOp<'c> {
     pub(crate) fn materialize(
         &self,
         env: &Env,
-        columns: SlowVec<(ColumnId, Forms)>,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.materialize)(self.op.as_ptr(), env, columns) }
@@ -530,13 +530,13 @@ pub struct LogicalPlan<'c> {
     /// The columns' names.
     pub names: Names,
     /// Indexed by `ColumnId`.
-    pub columns: SlowVec<ColumnSchema>,
+    pub columns: SmallVec<ColumnSchema>,
     /// Indexed by `PlanNodeId`.
-    pub nodes: SlowVec<PlanNode<'c>>,
+    pub nodes: SmallVec<PlanNode<'c>>,
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
     /// The columns of the result, in order.
-    pub output: SlowVec<NamedColumn>,
+    pub output: SmallVec<NamedColumn>,
     /// The nodes of its expressions.
     pub exprs: Exprs,
     /// What its runs read through their context, such as its literals.
@@ -547,10 +547,10 @@ impl<'c> LogicalPlan<'c> {
     pub fn new(env: &Env) -> Result<LogicalPlan<'c>, AllocError> {
         Ok(LogicalPlan {
             names: Names::new(env, PLAN_NAME_BYTES_MAX)?,
-            columns: SlowVec::new(env, PLAN_COLUMNS_MAX)?,
-            nodes: SlowVec::new(env, PLAN_NODES_MAX)?,
+            columns: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+            nodes: SmallVec::new(env, PLAN_NODES_MAX)?,
             root: 0,
-            output: SlowVec::new(env, PLAN_COLUMNS_MAX)?,
+            output: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
             exprs: Exprs::new(env)?,
             statement: Statement::default(),
         })
@@ -633,14 +633,14 @@ pub struct ScanOp<'c> {
     /// What it reads.
     scannable: &'c DynScannable<'c>,
     /// The scannable's columns it reads, and what each is bound to.
-    columns: SlowVec<ScanColumn>,
+    columns: SmallVec<ScanColumn>,
     /// Conditions the plan pushed down from filters above, if any, which the
     /// scannable may use to skip: the filters still test every row.
-    conditions: Option<SlowVec<Condition>>,
+    conditions: Option<SmallVec<Condition>>,
 }
 
 impl<'c> ScanOp<'c> {
-    pub fn new(scannable: &'c DynScannable<'c>, columns: SlowVec<ScanColumn>) -> ScanOp<'c> {
+    pub fn new(scannable: &'c DynScannable<'c>, columns: SmallVec<ScanColumn>) -> ScanOp<'c> {
         ScanOp { scannable, columns, conditions: None }
     }
 }
@@ -706,7 +706,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
             if exprs.nodes(*conjunct).iter().any(|node| node.op == ExprOp::In) {
                 continue;
             }
-            let mut computed = SlowVec::new(env, EXPR_NODES_MAX)?;
+            let mut computed = SmallVec::new(env, EXPR_NODES_MAX)?;
             let predicate = Predicate::from_expr(
                 env,
                 exprs,
@@ -722,7 +722,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
             let condition = Condition::new(scanned.column, &predicate);
             let conditions = match &mut self.conditions {
                 Some(conditions) => conditions,
-                None => self.conditions.insert(SlowVec::new(env, CONDITIONS_MAX)?),
+                None => self.conditions.insert(SmallVec::new(env, CONDITIONS_MAX)?),
             };
             conditions.push(condition).map_err(|_| AllocError)?;
         }
@@ -732,7 +732,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn materialize(
         &self,
         env: &Env,
-        columns: SlowVec<(ColumnId, Forms)>,
+        columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         DynOp::new(env, MaterializeOp { scannable: self.scannable, columns })
     }
@@ -812,7 +812,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
 /// made lazy, for the rows each keeps, each in one of the forms with it.
 pub struct MaterializeOp<'c> {
     scannable: &'c DynScannable<'c>,
-    columns: SlowVec<(ColumnId, Forms)>,
+    columns: SmallVec<(ColumnId, Forms)>,
 }
 
 impl<'c> Op<'c> for MaterializeOp<'c> {
@@ -838,9 +838,9 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
         let positions = self.columns.iter().map(|&(column, _)| lowering.query_position(column));
-        let positions = SlowVec::fixed_from(lowering.env(), positions)?;
+        let positions = SmallVec::fixed_from(lowering.env(), positions)?;
         let forms = self.columns.iter().map(|&(_, forms)| forms);
-        let forms = SlowVec::fixed_from(lowering.env(), forms)?;
+        let forms = SmallVec::fixed_from(lowering.env(), forms)?;
         let transform = self.scannable.materialize(lowering.env(), positions, forms)?;
         lowering.add_operator(Step::Transform(transform))
     }
@@ -863,7 +863,7 @@ impl FilterOp {
 pub fn conjuncts_of(env: &Env, exprs: &Exprs, condition: Expr) -> Result<Conjuncts, AllocError> {
     let mut count = 0;
     conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
-    let mut parts = SlowVec::fixed(env, count)?;
+    let mut parts = SmallVec::fixed(env, count)?;
     conjuncts(exprs.nodes(condition), condition.root, &mut |root| {
         parts.extend_within(core::iter::once(Expr { root, ..condition }));
     });
@@ -884,7 +884,7 @@ fn kept(
         return Ok(None);
     }
     let kept = conjuncts.iter().copied().filter(|&conjunct| keep(conjunct));
-    let mut parts = SlowVec::fixed(env, count)?;
+    let mut parts = SmallVec::fixed(env, count)?;
     parts.extend_within(kept);
     Ok(Some(parts))
 }
@@ -935,7 +935,7 @@ impl<'c> Op<'c> for FilterOp {
             }
         };
         // Each conjunct's place, found once.
-        let mut places = SlowVec::fixed(env, self.conjuncts.len())?;
+        let mut places = SmallVec::fixed(env, self.conjuncts.len())?;
         places.extend_within(self.conjuncts.iter().map(|&conjunct| part(conjunct)));
         let place = |conjunct: Expr| {
             let at = self.conjuncts.iter().position(|&c| c == conjunct).unwrap_or(0);
@@ -1024,7 +1024,7 @@ impl<'c> Op<'c> for FilterOp {
             let Some(position) = rows.position_of(column) else { failed!() };
             (position, rows.type_of(column))
         };
-        let mut computed = SlowVec::new(env, EXPR_NODES_MAX)?;
+        let mut computed = SmallVec::new(env, EXPR_NODES_MAX)?;
         let at = rows.column_count();
         let conjuncts = &self.conjuncts;
         let predicate = Predicate::from_expr(
@@ -1041,7 +1041,7 @@ impl<'c> Op<'c> for FilterOp {
         }
         let mut compute = None;
         if !computed.is_empty() {
-            let mut programs = SlowVec::fixed(env, computed.len())?;
+            let mut programs = SmallVec::fixed(env, computed.len())?;
             for &part in computed.iter() {
                 let nodes = exprs.nodes(part);
                 let program = match type_expr(env, rows, nodes, values.clone(), true) {

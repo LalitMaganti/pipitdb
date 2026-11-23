@@ -21,7 +21,7 @@ use crate::plan::{ColumnId, Op, PlanNode};
 use crate::predicate::{Leaf, Predicate, Set};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 use crate::step::{DynTransform, Step, Transform};
 use crate::string_pool::Id;
 
@@ -131,7 +131,7 @@ pub struct ExprStep {
 /// in SQLite. An integer overflow, which SQLite would answer with a double,
 /// fails the run.
 pub struct ExprProgram {
-    pub steps: SlowVec<ExprStep>,
+    pub steps: SmallVec<ExprStep>,
     /// Its `In` lists' values, if it has any.
     pub values: Option<Buffer>,
 }
@@ -140,16 +140,16 @@ pub struct ExprProgram {
 /// columns the batch came with, which mustn't be lazy, and the batch must
 /// have room for a column more for each.
 pub struct Compute {
-    pub programs: SlowVec<ExprProgram>,
+    pub programs: SmallVec<ExprProgram>,
 }
 
 /// What a run of a `Compute` keeps between batches.
 pub struct ComputeState {
     /// By program, then step, what's made for the step once per run, all
     /// in one list.
-    prepared: SlowVec<Prepared>,
+    prepared: SmallVec<Prepared>,
     /// By step, what each computed for the program last run.
-    registers: SlowVec<Option<ColumnView>>,
+    registers: SmallVec<Option<ColumnView>>,
 }
 
 /// What a run makes for a step once, rather than for each batch.
@@ -161,7 +161,7 @@ enum Prepared {
     /// An `In` or `Like` step's test, as a predicate of one leaf on its
     /// operand, as a filter tests it, and the sets and entries selecting
     /// with it uses.
-    Test { predicate: Predicate, sets: SlowVec<Option<Set>>, entries: SlowVec<Entries> },
+    Test { predicate: Predicate, sets: SmallVec<Option<Set>>, entries: SmallVec<Entries> },
 }
 
 impl Transform for Compute {
@@ -174,13 +174,13 @@ impl Transform for Compute {
             steps += program.steps.len();
             steps_max = steps_max.max(program.steps.len());
         }
-        let mut prepared = SlowVec::fixed(env, steps)?;
+        let mut prepared = SmallVec::fixed(env, steps)?;
         for program in self.programs.iter() {
             for step in program.steps.iter() {
                 prepared.push(prepare(context, program, step)?)?;
             }
         }
-        let registers = SlowVec::fixed_from(env, (0..steps_max).map(|_| None))?;
+        let registers = SmallVec::fixed_from(env, (0..steps_max).map(|_| None))?;
         Ok(ComputeState { prepared, registers })
     }
 
@@ -878,12 +878,12 @@ pub const PLAN_EXPR_VALUES_MAX: usize = 1 << 20;
 /// before it: the last is its root. Each method that adds a node returns
 /// where it is, and is out of line, as building runs once a query.
 pub struct ExprBuilder {
-    nodes: SlowVec<ExprStep>,
+    nodes: SmallVec<ExprStep>,
 }
 
 impl ExprBuilder {
     pub fn new(env: &Env) -> Result<ExprBuilder, AllocError> {
-        Ok(ExprBuilder { nodes: SlowVec::new(env, EXPR_NODES_MAX)? })
+        Ok(ExprBuilder { nodes: SmallVec::new(env, EXPR_NODES_MAX)? })
     }
 
     /// Adds `node`. Fails if there are `EXPR_NODES_MAX` already.
@@ -939,14 +939,14 @@ impl ExprBuilder {
 /// The nodes of a plan's expressions, each one's together, and the values
 /// of their `IN` lists, which an `In` node's `b` counts from the first of.
 pub struct Exprs {
-    nodes: SlowVec<ExprStep>,
-    values: SlowVec<i64>,
+    nodes: SmallVec<ExprStep>,
+    values: SmallVec<i64>,
 }
 
 impl Exprs {
     pub fn new(env: &Env) -> Result<Exprs, AllocError> {
-        let values = SlowVec::new(env, PLAN_EXPR_VALUES_MAX)?;
-        Ok(Exprs { nodes: SlowVec::new(env, PLAN_EXPR_NODES_MAX)?, values })
+        let values = SmallVec::new(env, PLAN_EXPR_VALUES_MAX)?;
+        Ok(Exprs { nodes: SmallVec::new(env, PLAN_EXPR_NODES_MAX)?, values })
     }
 
     /// Adds the expression of `nodes`, which read only each other, the last
@@ -1067,7 +1067,7 @@ struct Typer<'t> {
     /// Each column's type.
     type_of: &'t dyn Fn(ColumnId) -> DataType,
     /// The rows the program reads, and its steps so far, if building one.
-    build: Option<(&'t OutputProperties, &'t mut SlowVec<ExprStep>)>,
+    build: Option<(&'t OutputProperties, &'t mut SmallVec<ExprStep>)>,
     /// By node, its type, the register holding it, and whether computing it
     /// can fail. A bare NULL has no type of its own: it takes the type of
     /// whatever it meets.
@@ -1510,7 +1510,7 @@ pub fn type_expr(
     condition: bool,
 ) -> Result<ExprProgram, ExprError> {
     // Each node takes at most three steps, and a NULL result one more.
-    let mut steps = SlowVec::new(env, 4 * EXPR_NODES_MAX)?;
+    let mut steps = SmallVec::new(env, 4 * EXPR_NODES_MAX)?;
     let type_of = |column| rows.type_of(column);
     let table = [(None, 0, false); EXPR_NODES_MAX];
     let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes: table };
@@ -1537,7 +1537,7 @@ pub struct ComputeItem {
 /// `EXTEND` and `SET` add for an item which is more than a column. Those
 /// stages add it, so it has no syntax of its own.
 pub struct ComputeOp {
-    pub items: SlowVec<ComputeItem>,
+    pub items: SmallVec<ComputeItem>,
 }
 
 /// An error typing the expression of `column`, as lowering reports it.
@@ -1611,7 +1611,7 @@ impl<'c> Op<'c> for ComputeOp {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
         let env = lowering.env();
-        let mut programs = SlowVec::fixed(env, self.items.len())?;
+        let mut programs = SmallVec::fixed(env, self.items.len())?;
         for item in self.items.iter() {
             let (nodes, values) = (lowering.exprs().nodes(item.expr), lowering.expr_values());
             let program = type_expr(env, lowering.query_rows(), nodes, values, false)
@@ -1684,14 +1684,14 @@ mod tests {
 
         fn program(self) -> ExprProgram {
             ExprProgram {
-                steps: SlowVec::fixed_from(Env::current(), self.0.into_iter()).unwrap(),
+                steps: SmallVec::fixed_from(Env::current(), self.0.into_iter()).unwrap(),
                 values: None,
             }
         }
     }
 
     fn compute(programs: impl ExactSizeIterator<Item = ExprProgram>) -> Compute {
-        Compute { programs: SlowVec::fixed_from(Env::current(), programs).unwrap() }
+        Compute { programs: SmallVec::fixed_from(Env::current(), programs).unwrap() }
     }
 
     /// `program`'s column of `batch`, at its kept rows, as words, or the

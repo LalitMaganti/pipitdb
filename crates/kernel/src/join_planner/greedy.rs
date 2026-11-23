@@ -8,7 +8,7 @@ use super::tree::{JoinNode, JoinTree};
 use crate::bitmap::BitSlice;
 use crate::env::Env;
 use crate::error::Error;
-use crate::slow_vec::SlowVec;
+use crate::small_vec::SmallVec;
 
 /// No node, tree or edge.
 const NONE: u32 = u32::MAX;
@@ -55,11 +55,11 @@ struct Greedy<'g, 'e> {
     /// How many words a set of relations takes.
     words: usize,
     /// The forest's nodes.
-    nodes: SlowVec<Node>,
+    nodes: SmallVec<Node>,
     /// Each node's relations, `words` words a node.
-    sets: SlowVec<u64>,
+    sets: SmallVec<u64>,
     /// The graph's edges.
-    edges: SlowVec<Edge>,
+    edges: SmallVec<Edge>,
     /// The first of the hyperedges, linked through `Edge::next`, or `NONE`.
     /// A hyperedge with the same sides as the one linked before it is left
     /// out, as it can't change whether a join is valid.
@@ -81,9 +81,9 @@ pub(super) fn plan<'g>(
         graph,
         estimator,
         words,
-        nodes: SlowVec::fixed(env, 2 * count - 1)?,
-        sets: SlowVec::zeroed(env, (2 * count - 1) * words)?,
-        edges: SlowVec::fixed(env, graph.edges.len())?,
+        nodes: SmallVec::fixed(env, 2 * count - 1)?,
+        sets: SmallVec::zeroed(env, (2 * count - 1) * words)?,
+        edges: SmallVec::fixed(env, graph.edges.len())?,
         hypers: NONE,
     };
     #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]
