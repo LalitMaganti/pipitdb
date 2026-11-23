@@ -92,6 +92,13 @@ pub struct Bounds {
     pub max: i64,
 }
 
+impl Bounds {
+    /// How many integers lie within them.
+    pub fn count(self) -> u64 {
+        self.max.abs_diff(self.min).saturating_add(1)
+    }
+}
+
 /// Rows of values in Arrow's layout: values, and an optional validity bitmap
 /// with one bit per value, set if it isn't null. As DuckDB's vectors, rows
 /// map to values in one of three forms: each to its own (flat), all to one

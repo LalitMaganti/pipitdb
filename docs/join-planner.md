@@ -91,12 +91,20 @@ appear in the other. Each rule names its source.
 | Anti | left × (1 − match) | The rows a semi join drops, so semi + anti = left |
 
 - **Domains without distinct counts.** A unique column's domain is exact.
+  A column whose least and greatest values are known, as Parquet's
+  statistics give them, can take at most the values between them, and at
+  most its relation's rows before filters: DuckDB bounds it the same way.
   Otherwise, until metadata gives distinct counts, the domain is taken as
   the rows of the smaller relation, which assumes the smaller side holds a
   key. This is an assumption to replace with metadata, not a rule.
-- **Filters.** Equality on a non-unique column keeps rows ÷ (2 log₂ rows),
-  Perfetto's heuristic. It has no grounding and is replaced by distinct
-  counts once metadata provides them. It is a documented divergence.
+- **Filters.** A column of known bounds compared with an integer keeps the
+  share of its bounds the comparison covers, as if its values were spread
+  evenly, and the comparison narrows the bounds, so `a >= x AND a < y`
+  keeps the share from `x` to `y`. DataFusion estimates ranges the same
+  way. Otherwise, equality on a non-unique column keeps rows ÷ (2 log₂
+  rows), Perfetto's heuristic. It has no grounding and is replaced by
+  distinct counts once metadata provides them. Both are documented
+  divergences.
 - **Cross products.** left × right, with no division.
 
 ## Budgets

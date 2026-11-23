@@ -53,6 +53,19 @@ impl Comparison {
         }
     }
 
+    /// The least and greatest of the integers this holds for against
+    /// `value`; none for `NotEqual`, which holds for two ranges.
+    pub fn range(self, value: i64) -> Option<(i64, i64)> {
+        Some(match self {
+            Comparison::Equal => (value, value),
+            Comparison::NotEqual => return None,
+            Comparison::Less => (i64::MIN, value.checked_sub(1)?),
+            Comparison::LessEqual => (i64::MIN, value),
+            Comparison::Greater => (value.checked_add(1)?, i64::MAX),
+            Comparison::GreaterEqual => (value, i64::MAX),
+        })
+    }
+
     /// The comparison true for exactly the non-null rows this is false for.
     /// Floats are ordered totally, so this holds for them too.
     pub fn negated(self) -> Comparison {

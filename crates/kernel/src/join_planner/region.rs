@@ -209,13 +209,21 @@ fn graph(
             *at_mut!(set_of, column as usize) = set;
         }
     }
-    // A set's domain: the rows of a relation the set's column is unique in,
-    // before filters, or else the fewest rows of its relations.
+    // A set's domain: the fewest values any of its columns can take. A
+    // column of known bounds takes at most those within them, and at most
+    // its relation's rows before filters, as DuckDB has it; a unique column
+    // takes those rows; any other column is assumed to take as many values
+    // as its relation has rows.
     for equality in equalities {
         for (&column, &relation) in equality.columns.iter().zip(&equality.relations) {
             let estimate = at!(estimates, *at!(leaves, relation as usize) as usize);
             let rows = estimate.rows;
-            let bound = if estimate.key(column) >= Key::Unique { rows.max } else { rows.estimated };
+            let span = estimate.span(column);
+            let bound = match span {
+                Some(span) => span.min(rows.max),
+                None if estimate.key(column) >= Key::Unique => rows.max,
+                None => rows.estimated,
+            };
             let set = at_mut!(graph.equivalences, *at!(set_of, column as usize) as usize);
             set.domain = set.domain.min(bound.max(1));
         }
@@ -313,4 +321,131 @@ fn columns_of(
         (0..relation_of.len()).filter(|&c| of(at!(relation_of, c))).map(|c| c as ColumnId),
     );
     Ok(columns)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::format;
+    use alloc::string::String;
+
+    use super::*;
+    use crate::column::{Bounds, DataType, Forms};
+    use crate::context::Context;
+    use crate::expression::{ExprBuilder, ExprOp};
+    use crate::plan::{ScanColumn, ScanOp, conjuncts_of};
+    use crate::row_batch::RowBatch;
+    use crate::scannable::{DynScannable, Scannable, Summary};
+
+    /// A table of `rows` rows and two columns, which it says only through
+    /// `summary`: each column's values lie in its `bounds`, if known.
+    struct Summarized {
+        rows: i64,
+        bounds: [Option<Bounds>; 2],
+    }
+
+    impl Scannable for Summarized {
+        type State<'s>
+            = ()
+        where
+            Self: 's;
+        type Loader = ();
+
+        fn column_count(&self) -> u32 {
+            2
+        }
+
+        fn column_name(&self, _: u32) -> &'static str {
+            "a"
+        }
+
+        fn column_type(&self, _: u32) -> DataType {
+            DataType::Int64
+        }
+
+        fn open(&self, _: &mut Context, _: &[(u32, Forms)]) -> Result<(), Error> {
+            Ok(())
+        }
+
+        fn next(&self, _: &mut Context, (): &mut (), _: &mut RowBatch) -> Result<bool, Error> {
+            Ok(false)
+        }
+
+        fn summary(&self, column: Option<u32>) -> Option<Summary> {
+            let bounds = column.and_then(|column| *at!(self.bounds, column as usize));
+            Some(Summary { rows: self.rows, bounds })
+        }
+    }
+
+    /// The order the planner joins `tables` in, joined along a chain, each
+    /// table's second column to the next's first, as nested tables by their
+    /// rows.
+    fn planned(tables: &[DynScannable<'_>]) -> String {
+        let env = Env::current();
+        let mut plan = LogicalPlan::new(env).unwrap();
+        let mut root: Option<(PlanNodeId, SmallVec<ColumnId>)> = None;
+        let mut previous = 0;
+        for table in tables {
+            let a = plan.add_column("a", DataType::Int64, false).unwrap();
+            let b = plan.add_column("b", DataType::Int64, false).unwrap();
+            let scanned = [a, b].into_iter().zip(0..2).map(|(binding, column)| ScanColumn {
+                column,
+                binding,
+                forms: Forms::FLAT,
+            });
+            let columns = SmallVec::fixed_from(env, scanned).unwrap();
+            let scan = DynOp::new(env, ScanOp::new(table, columns)).unwrap();
+            let scan = plan.add_node(scan, &[]).unwrap();
+            plan.output.push(a).unwrap();
+            let Some((left, left_columns)) = root.take() else {
+                root = Some((scan, SmallVec::fixed_from(env, [a.id, b.id].into_iter()).unwrap()));
+                previous = b.id;
+                continue;
+            };
+            let mut nodes = ExprBuilder::new(env).unwrap();
+            let (x, y) = (nodes.column(previous).unwrap(), nodes.column(a.id).unwrap());
+            nodes.node(ExprOp::Eq, x, y).unwrap();
+            let condition = plan.exprs.add(nodes.nodes()).unwrap();
+            let conjuncts = conjuncts_of(env, &plan.exprs, condition).unwrap();
+            let mut all = SmallVec::new(env, PLAN_COLUMNS_MAX).unwrap();
+            for &column in left_columns.iter().chain(&[a.id, b.id]) {
+                all.push(column).unwrap();
+            }
+            let right = SmallVec::fixed_from(env, [a.id, b.id].into_iter()).unwrap();
+            let join = JoinOp::new(env, Kind::Inner, conjuncts, [left_columns, right]).unwrap();
+            let join = plan.add_node(DynOp::new(env, join).unwrap(), &[left, scan]).unwrap();
+            root = Some((join, all));
+            previous = b.id;
+        }
+        crate::optimize::optimize(env, &mut plan).unwrap();
+        shape(&plan, plan.root)
+    }
+
+    /// The joins under `node` as nested tables, each by its rows.
+    fn shape(plan: &LogicalPlan<'_>, node: PlanNodeId) -> String {
+        let node = at!(plan.nodes, node as usize);
+        if node.children.is_empty() {
+            return format!("{}", node.op.summary(None).unwrap().rows);
+        }
+        let mut sides = node.children.iter().map(|&child| shape(plan, child));
+        let (Some(a), Some(b)) = (sides.next(), sides.next()) else { failed!() };
+        // In either order: each join chooses its build side later.
+        if a < b { format!("({a} {b})") } else { format!("({b} {a})") }
+    }
+
+    #[test]
+    fn bounds_a_domain_by_the_values_its_columns_can_take() {
+        // A chain 1000 - 500 - 2000: the first join's key has 5 values, so
+        // joining the 1000 and the 500 first makes 100,000 rows.
+        let table =
+            |rows, bounds| DynScannable::new(Env::current(), Summarized { rows, bounds }).unwrap();
+        let few = Some(Bounds { min: 1, max: 5 });
+        let order = |known: bool| {
+            let few = few.filter(|_| known);
+            planned(&[table(1000, [None, few]), table(500, [few, None]), table(2000, [None, None])])
+        };
+        // Without bounds, a key is taken to have as many values as the
+        // smaller side has rows.
+        assert_eq!(order(false), "((1000 500) 2000)");
+        assert_eq!(order(true), "((2000 500) 1000)");
+    }
 }
