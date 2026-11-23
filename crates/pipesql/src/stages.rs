@@ -3,7 +3,8 @@
 
 use pipit_kernel::aggregate::{Aggregate, AggregateOp, Function};
 use pipit_kernel::column::DataType;
-use pipit_kernel::expression::{ComputeItem, ComputeOp, expr_can_be_null};
+use pipit_kernel::expression::{ComputeItem, ComputeOp, Expr, expr_can_be_null};
+use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
 use pipit_kernel::order_by::OrderByOp;
@@ -104,7 +105,7 @@ pub const JOIN: Rule = Rule {
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
     ],
-    compile: compile_join,
+    compile: compile_inner_join,
 };
 
 pub const INNER_JOIN: Rule = Rule {
@@ -116,7 +117,7 @@ pub const INNER_JOIN: Rule = Rule {
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
     ],
-    compile: compile_join,
+    compile: compile_inner_join,
 };
 
 pub const LEFT_JOIN: Rule = Rule {
@@ -129,14 +130,14 @@ pub const LEFT_JOIN: Rule = Rule {
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
     ],
-    compile: compile_join,
+    compile: compile_left_join,
 };
 
 pub const CROSS_JOIN: Rule = Rule {
     keyword: "cross",
     point: Point::Stage,
     items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["as"], Shared::Name)],
-    compile: compile_join,
+    compile: compile_cross_join,
 };
 
 /// Selecting and filtering rows.
@@ -187,20 +188,22 @@ fn alias_or(compiler: &Compiler<'_, '_>, alias: Node, table: Node) -> Result<Nod
     if alias.child_count() == 0 { Ok(table) } else { only(compiler, alias) }
 }
 
-/// `WHERE c`: keeps the rows condition `c` is true for: an integer, true
-/// where it isn't 0, as a comparison is.
-fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let node = compiler.node(stage.first_child());
+/// The condition `node`, `ON`'s or `WHERE`'s: an integer, true where it
+/// isn't 0, as a comparison is.
+fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, Error> {
     let (condition, data_type) = compile_expr(compiler, node)?;
     match data_type {
-        DataType::Int64 => {}
-        DataType::String => {
-            return Err(Error::new(ErrorCode::NumberCondition, compiler.span(node)));
-        }
+        DataType::Int64 => Ok(condition),
+        DataType::String => Err(Error::new(ErrorCode::NumberCondition, compiler.span(node))),
         DataType::Float64 => {
-            return Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(node)));
+            Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(node)))
         }
     }
+}
+
+/// `WHERE c`: keeps the rows condition `c` is true for.
+fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
     let allocator = compiler.allocator();
     let filter = DynOp::new(allocator, FilterOp::new(allocator, &compiler.plan.exprs, condition)?)?;
     let children = [compiler.plan.root];
@@ -208,10 +211,78 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     Ok(())
 }
 
-/// `[INNER] JOIN t ON c`, `LEFT [OUTER] JOIN t ON c` and `CROSS JOIN t`,
-/// which can't be run yet.
-fn compile_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    Err(Error::unsupported(Unsupported::Join, compiler.span(stage)))
+/// `[INNER] JOIN t ON c`: each pair of a row so far and a row of table `t`
+/// that condition `c` is true for, with the columns of both.
+fn compile_inner_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    let condition = (compiler.node(first + 2), compiler.node(first + 3));
+    let (table, alias) = (compiler.node(first), compiler.node(first + 1));
+    join(compiler, table, alias, JoinKind::Inner, Some(condition))
+}
+
+/// `LEFT [OUTER] JOIN t ON c`: as `JOIN`, and each row so far that `c` is
+/// true for with no row of `t`, with nulls for `t`'s columns.
+fn compile_left_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    let condition = (compiler.node(first + 3), compiler.node(first + 4));
+    let (table, alias) = (compiler.node(first + 1), compiler.node(first + 2));
+    join(compiler, table, alias, JoinKind::Left, Some(condition))
+}
+
+/// `CROSS JOIN t`: each pair of a row so far and a row of table `t`.
+fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
+    let first = stage.first_child();
+    join(compiler, compiler.node(first), compiler.node(first + 1), JoinKind::Inner, None)
+}
+
+/// Joins the rows so far to table `table`, a name or a list of one, named by
+/// the alias in the list `alias` or else its own name, of `kind`, on a
+/// condition given as the lists of an `ON` and a `USING`, one of them
+/// empty, or on none. The scope is both sides' columns, so a name in both is
+/// ambiguous.
+fn join(
+    compiler: &mut Compiler<'_, '_>,
+    mut table: Node,
+    alias: Node,
+    kind: JoinKind,
+    condition: Option<(Node, Node)>,
+) -> Result<(), Error> {
+    let probe = compiler.plan.root;
+    if table.tag() == Tag::List {
+        table = only(compiler, table)?;
+    }
+    let build = compiler.compile_relation(table)?;
+    compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
+    if kind == JoinKind::Left {
+        for column in build.columns.iter() {
+            at_mut!(compiler.plan.columns, column.id as usize).nullable = true;
+        }
+    }
+    let condition = match condition {
+        Some((on, using)) if on.child_count() == 0 && using.child_count() == 0 => {
+            return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
+        }
+        Some((on, using)) if on.child_count() != 0 && using.child_count() != 0 => {
+            return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using)));
+        }
+        Some((_, using)) if using.child_count() != 0 => {
+            return Err(Error::unsupported(Unsupported::Join, compiler.span(using)));
+        }
+        Some((on, _)) => {
+            compiler.scope.extend_from_slice(&build.columns)?;
+            Some(condition_expr(compiler, only(compiler, on)?)?)
+        }
+        None => {
+            compiler.scope.extend_from_slice(&build.columns)?;
+            None
+        }
+    };
+    let allocator = compiler.allocator();
+    let build_columns = SlowVec::fixed_from(allocator, build.columns.iter().map(|c| c.id))?;
+    let op = DynOp::new(allocator, JoinOp { kind, condition, build_columns })?;
+    let children = [probe, build.node];
+    compiler.plan.add_node(op, &children)?;
+    Ok(())
 }
 
 /// The one item of `list`.
