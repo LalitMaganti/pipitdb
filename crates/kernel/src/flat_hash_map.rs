@@ -13,7 +13,8 @@ use core::mem;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::array::Array;
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::env::Env;
 use crate::murmur_hash;
 
@@ -208,7 +209,7 @@ struct Base {
     /// A control byte for each slot, then copies of the first `CLONES`, then
     /// the slots: owned here, and reached through `ctrl` and `slots`.
     #[expect(dead_code, reason = "owns the memory")]
-    storage: Buffer,
+    storage: Array<u8>,
     /// Where the control bytes start in `storage`, kept as Perfetto keeps
     /// `ctrl_`, so lookups needn't find them.
     ctrl: NonNull<u8>,
@@ -236,7 +237,7 @@ impl Base {
         let bytes = slot.size().checked_mul(capacity).and_then(|size| size.checked_add(slots_at));
         // SAFETY: the control bytes are written below, and a slot only once
         // a key is put in it, before it's read.
-        let storage = unsafe { Buffer::allocate_uninit(env, bytes.ok_or(AllocError)?)? };
+        let storage = unsafe { Array::<u8>::uninit(env, bytes.ok_or(AllocError)?)? };
         let ctrl = storage.as_non_null();
         // SAFETY: within the storage.
         let slots = unsafe { ctrl.add(slots_at) };

@@ -14,8 +14,9 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::boxed::Box;
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
@@ -184,7 +185,7 @@ struct Run<'p> {
     /// ended, so the loop pays for failures only where segments end.
     failed: Cell<Option<Error>>,
     /// Frees `memory`.
-    _buffer: Buffer,
+    _memory: Array<u8>,
 }
 
 /// Makes a run of `pipeline`, a `Pipeline`, at `state`, as a source's state.
@@ -237,13 +238,11 @@ impl<'p> Run<'p> {
             failed!();
         };
         // SAFETY: what follows writes every byte it reads.
-        let mut buffer = unsafe { Buffer::allocate_uninit(context.env(), layout.size())? };
-        let Some(memory) = NonNull::new(buffer.as_mut_ptr::<u8>()) else {
-            failed!();
-        };
+        let owned = unsafe { Array::<u8>::uninit(context.env(), layout.size())? };
+        let memory = owned.as_non_null();
         let failed = Cell::new(None);
         let mut run =
-            Run { pipeline, memory, slots, source_state: 0, made: 0, failed, _buffer: buffer };
+            Run { pipeline, memory, slots, source_state: 0, made: 0, failed, _memory: owned };
         let mut failed = None;
         // SAFETY: the memory was allocated with this layout, so it has room
         // for each state at its offset, and for the slots.
@@ -490,6 +489,7 @@ impl Drop for Run<'_> {
 
 #[cfg(test)]
 mod tests {
+    use crate::buffer::Buffer;
     use alloc::rc::Rc;
     use alloc::vec::Vec;
 

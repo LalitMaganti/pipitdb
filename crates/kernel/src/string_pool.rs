@@ -2,6 +2,7 @@
 //! back in O(1), ported from Perfetto's.
 
 use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::buffer::{Buffer, HEADER_BYTES};
 use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
@@ -132,7 +133,7 @@ struct Store {
     /// How many bytes of the last block are written.
     block_end: usize,
     /// Each string too large for a block, with a nul after it.
-    large_strings: SmallVec<Buffer>,
+    large_strings: SmallVec<Array<u8>>,
 }
 
 /// A string's hash, which the index takes as already hashed, its id, and
@@ -348,9 +349,9 @@ impl Store {
     #[inline(never)]
     fn insert_large_string(&mut self, env: &Env, str: &[u8]) -> Result<Id, AllocError> {
         // Zeroed, so the nul is already there.
-        let mut buffer = Buffer::allocate(env, str.len() + 1)?;
-        at_mut!(buffer.as_mut_slice::<u8>(), ..str.len()).copy_from_slice(str);
-        self.large_strings.push(buffer)?;
+        let mut bytes = Array::zeroed(env, str.len() + 1)?;
+        at_mut!(bytes, ..str.len()).copy_from_slice(str);
+        self.large_strings.push(bytes)?;
         Ok(Id::large_string(self.large_strings.len() - 1))
     }
 
@@ -375,7 +376,7 @@ impl Store {
 
     #[inline(never)]
     fn get_large_string(&self, id: Id) -> &[u8] {
-        let bytes = at!(self.large_strings, id.large_string_index() as usize).as_slice::<u8>();
+        let bytes = &**at!(self.large_strings, id.large_string_index() as usize);
         at!(bytes, ..bytes.len() - 1)
     }
 }

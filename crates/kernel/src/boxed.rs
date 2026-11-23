@@ -6,36 +6,50 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::array::{allocate_bytes, free_bytes};
+use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::env::Env;
 
-/// The value lives in a `Buffer`, which also remembers the `Env`, so a
-/// `Box` isn't generic over it.
+/// The value lives in memory taken as an `Array`'s is, and remembers its
+/// `Env`, so a `Box` isn't generic over it. It holds no length, as an
+/// `Array` would: a `Box<T>`'s is a `T`'s.
 pub struct Box<T> {
-    buffer: Buffer,
     value: NonNull<T>,
+    env: NonNull<Env>,
 }
 
 impl<T> Box<T> {
     pub fn new(env: &Env, value: T) -> Result<Box<T>, AllocError> {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        // SAFETY: the value is written before anything reads it.
-        let mut buffer = unsafe { Buffer::allocate_uninit(env, size_of::<T>())? };
-        let value_ptr = buffer.as_mut_non_null().cast::<T>();
-        // SAFETY: the buffer has room for a `T`, aligned for it.
+        let value_ptr = match size_of::<T>() {
+            0 => NonNull::dangling(),
+            bytes => allocate_bytes(env, bytes, false)?.cast::<T>(),
+        };
+        // SAFETY: there's room for a `T`, aligned for it.
         unsafe { value_ptr.write(value) };
-        Ok(Box { buffer, value: value_ptr })
+        Ok(Box { value: value_ptr, env: NonNull::from(env) })
     }
 
     /// Forgets the value's type, keeping what's needed to drop it.
     pub fn erase(self) -> ErasedBox {
         let this = ManuallyDrop::new(self);
-        // SAFETY: `this` is never used or dropped again, so the buffer moves
-        // out once.
-        let buffer = unsafe { core::ptr::read(&raw const this.buffer) };
-        // SAFETY: only called with this value, once.
-        let drop = |value: NonNull<()>| unsafe { value.cast::<T>().drop_in_place() };
-        ErasedBox { _buffer: buffer, value: this.value.cast(), drop }
+        ErasedBox { value: this.value.cast(), env: this.env, drop: drop_and_free::<T> }
+    }
+}
+
+/// Drops the `T` at `value` and frees its memory.
+///
+/// # Safety
+///
+/// `value` must be a `Box<T>`'s, from `env`, and not used again.
+unsafe fn drop_and_free<T>(value: NonNull<()>, env: &Env) {
+    let value = value.cast::<T>();
+    // SAFETY: as the caller promises.
+    unsafe {
+        value.drop_in_place();
+        if size_of::<T>() != 0 {
+            free_bytes(env, value.cast(), size_of::<T>());
+        }
     }
 }
 
@@ -57,18 +71,19 @@ impl<T> DerefMut for Box<T> {
 
 impl<T> Drop for Box<T> {
     fn drop(&mut self) {
-        // SAFETY: the value was written by `new`, and is dropped once: freeing
-        // the buffer doesn't drop it.
-        unsafe { self.value.drop_in_place() };
+        // SAFETY: the value is this `Box`'s, from its `Env`, which outlives
+        // it, and isn't used again.
+        unsafe { drop_and_free::<T>(self.value.cast(), self.env.as_ref()) };
     }
 }
 
 /// A value of a type only its maker knows, which it drops.
 pub struct ErasedBox {
-    // Holds the value, and frees it after `drop` runs.
-    _buffer: Buffer,
     value: NonNull<()>,
-    drop: unsafe fn(NonNull<()>),
+    /// What the value's memory came from.
+    env: NonNull<Env>,
+    /// Drops the value and frees its memory.
+    drop: unsafe fn(NonNull<()>, &Env),
 }
 
 impl ErasedBox {
@@ -80,8 +95,9 @@ impl ErasedBox {
 
 impl Drop for ErasedBox {
     fn drop(&mut self) {
-        // SAFETY: `drop` was made for the value's type, and runs once.
-        unsafe { (self.drop)(self.value) }
+        // SAFETY: `drop` was made for the value's type, runs once, and the
+        // `Env` outlives what's allocated from it.
+        unsafe { (self.drop)(self.value, self.env.as_ref()) }
     }
 }
 

@@ -146,9 +146,13 @@ struct Aligned;
 const _: () = assert!(align_of::<Aligned>() == BUFFER_ALIGNMENT_BYTES);
 
 /// `bytes` of memory, zeroed if `zeroed`. Out of line, and of no type, so
-/// every `Array` shares it.
+/// every `Array` and `Box` shares it.
 #[inline(never)]
-fn allocate_bytes(env: &Env, bytes: usize, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
+pub(crate) fn allocate_bytes(
+    env: &Env,
+    bytes: usize,
+    zeroed: bool,
+) -> Result<NonNull<u8>, AllocError> {
     let layout = layout(bytes)?;
     if zeroed { env.allocate_zeroed(layout) } else { env.allocate(layout) }
 }
@@ -159,7 +163,7 @@ fn allocate_bytes(env: &Env, bytes: usize, zeroed: bool) -> Result<NonNull<u8>, 
 ///
 /// They must be from `allocate_bytes`, with `env`.
 #[inline(never)]
-unsafe fn free_bytes(env: &Env, values: NonNull<u8>, bytes: usize) {
+pub(crate) unsafe fn free_bytes(env: &Env, values: NonNull<u8>, bytes: usize) {
     let Ok(layout) = layout(bytes) else { failed!() };
     // SAFETY: as the caller promises.
     unsafe { env.deallocate(values, layout) };
