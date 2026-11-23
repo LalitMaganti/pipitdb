@@ -15,7 +15,6 @@ use pipit_kernel::expression::{
     Compute, ExprBuilder, ExprOp, ExprProgram, ExprStep, Exprs, PRESENT,
 };
 use pipit_kernel::filter::{self, Comparison, Value};
-use pipit_kernel::flat_hash_map::FlatHashMap;
 use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::pipeline::{Execution, Pipeline};
@@ -405,17 +404,6 @@ pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'s
     Pipeline::new(DynSource::new(crate::env(), Repeat::new(batches)).expect("allocates"), owned)
 }
 
-/// `batches` full batches read through a pipeline run as a source, as a
-/// join reads its build side.
-#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn nested_pipeline(batches: u32) -> Pipeline<'static> {
-    let inner = pass_pipeline(batches, 0, false).into_source(crate::env()).expect("allocates");
-    Pipeline::new(
-        inner,
-        pipit_kernel::containers::SmallVec::fixed(crate::env(), 0).expect("allocates"),
-    )
-}
-
 /// `row_groups` full row groups, with four columns. Kept for the rest of the
 /// run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
@@ -487,21 +475,6 @@ pub fn run_filter(
 /// Keeps values over 500: about half.
 pub fn greater(column: &ColumnView, selection: &mut Selection) {
     filter::compare(column, Comparison::Greater, Value::Int64(500), selection, None);
-}
-
-/// A map whose keys are the first `len` even numbers.
-#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn hash_map(len: i64) -> FlatHashMap<i64, ()> {
-    let mut map = FlatHashMap::for_len(crate::env(), 0).expect("allocates");
-    for key in 0..len {
-        map.insert(crate::env(), key * 2, ()).expect("allocates");
-    }
-    map
-}
-
-/// How many of the numbers below `count` `map` has.
-pub fn find_keys(map: &FlatHashMap<i64, ()>, count: i64) -> u64 {
-    (0..count).map(|key| u64::from(map.find(key).is_some())).sum()
 }
 
 /// `count` strings of 8 digits, one after another, `distinct` of them

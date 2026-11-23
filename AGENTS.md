@@ -21,7 +21,7 @@
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
 - Prefer a few smoke tests over testing every combination.
 - Develop, debug and profile with `--profile profiling`, which is built as `speed` is but with thin LTO, so it rebuilds quickly. `release`, `speed` and `bench` use fat LTO: keep them for size, which `release` measures, and for benchmark numbers.
-- Add benchmarks for hot code to `crates/bench`: wall-clock ones with criterion, and instruction counts with gungraun, which CI checks against `crates/bench/instructions/ci.json`. Counts differ between machines, so each has its own file there; `ci.json` takes the counts CI prints.
+- Judge speed by whole queries, small and big, run end to end: that's what users wait for. CI checks gungraun's instruction counts of such queries, in `crates/bench/benches/instructions.rs`, against `crates/bench/instructions/ci.json`. Counts differ between machines, so each has its own file there; `ci.json` takes the counts CI prints. A benchmark of one part, such as one operator over a few batches, is for investigating, with criterion in `wall_clock.rs`: don't add one to CI, or shape a design to avoid regressing one.
 - Use new APIs from `crates/bench/examples/size.rs`, which CI checks against a size budget per architecture.
 - Commit titles are prefixed with the area, e.g. `kernel:`.
 
