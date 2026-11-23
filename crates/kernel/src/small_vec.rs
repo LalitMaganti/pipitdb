@@ -1,12 +1,13 @@
 //! `SmallVec`: a growable list of values whose count is bounded by the
 //! query, not by its data, in memory from the `Env` it was made with.
 
-use core::alloc::Layout;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::array::Array;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
 use crate::env::Env;
 
@@ -26,16 +27,14 @@ pub struct SmallVec<T> {
 }
 
 /// A `SmallVec`'s memory and counts, which don't depend on its values' type.
-/// The counts of values that fit are `u32`s, so a `SmallVec` is five words.
+/// Its counts are `u32`s, so a `SmallVec` is four words.
 struct RawVec {
-    /// Room for exactly `capacity` values, the first `len` of them written.
-    values: NonNull<u8>,
-    /// What `values` came from.
-    env: NonNull<Env>,
+    /// Room for a power of two values, or none before any are added, the
+    /// first `len` of them written. Dropped by `SmallVec`'s drop, so a
+    /// `SmallVec` is dropped in one call.
+    memory: ManuallyDrop<Array<u8>>,
     /// How many values there are.
-    len: usize,
-    /// How many values fit: a power of two, or 0 before any are added.
-    capacity: u32,
+    len: u32,
     /// The most values that can ever fit, a power of two.
     max: u32,
 }
@@ -49,13 +48,7 @@ impl<T> SmallVec<T> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
         let Ok(max) = u32::try_from(max) else { failed!() };
-        let raw = RawVec {
-            values: NonNull::<Aligned>::dangling().cast(),
-            env: NonNull::from(env),
-            len: 0,
-            capacity: 0,
-            max,
-        };
+        let raw = RawVec { memory: ManuallyDrop::new(Array::empty(env)), len: 0, max };
         Ok(SmallVec { raw, values: PhantomData })
     }
 
@@ -68,8 +61,7 @@ impl<T> SmallVec<T> {
 
     /// An empty `SmallVec` that allocates nothing and never grows.
     pub fn none(env: &Env) -> SmallVec<T> {
-        let values = NonNull::<Aligned>::dangling().cast();
-        let raw = RawVec { values, env: NonNull::from(env), len: 0, capacity: 0, max: 0 };
+        let raw = RawVec { memory: ManuallyDrop::new(Array::empty(env)), len: 0, max: 0 };
         SmallVec { raw, values: PhantomData }
     }
 
@@ -88,15 +80,15 @@ impl<T> SmallVec<T> {
     /// growing: an iterator can claim a wrong length, so it can't overrun.
     #[inline]
     pub fn extend_within(&mut self, values: impl Iterator<Item = T>) {
-        for value in values.take(self.raw.capacity as usize - self.raw.len) {
+        for value in values.take(self.capacity() - self.raw.len()) {
             // SAFETY: `len` is below the capacity.
-            unsafe { self.slot(self.raw.len).write(value) };
+            unsafe { self.slot(self.raw.len()).write(value) };
             self.raw.len += 1;
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.raw.capacity as usize
+        self.raw.memory.len() / size_of::<T>()
     }
 
     /// An empty `SmallVec` with room for `capacity` values, 0 or `max`,
@@ -110,7 +102,7 @@ impl<T> SmallVec<T> {
     /// Where value `i` goes.
     fn slot(&self, i: usize) -> NonNull<T> {
         // SAFETY: callers only ask for places within the capacity.
-        unsafe { self.raw.values.cast::<T>().add(i) }
+        unsafe { self.raw.memory.as_non_null().cast::<T>().add(i) }
     }
 
     /// Adds `value` at the end, growing if full. Fails, dropping `value`, if
@@ -129,16 +121,16 @@ impl<T> SmallVec<T> {
     where
         T: Copy,
     {
-        if values.len() > self.raw.capacity as usize - self.raw.len {
+        if values.len() > self.capacity() - self.raw.len() {
             self.raw.make_room(size_of::<T>(), values.len())?;
         }
         // SAFETY: there is room for `values` from `len`, and they can't
         // overlap the `SmallVec`, which `values` doesn't borrow.
         unsafe {
-            self.slot(self.raw.len)
+            self.slot(self.raw.len())
                 .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
         };
-        self.raw.len += values.len();
+        self.raw.set_len(self.raw.len() + values.len());
         Ok(())
     }
 
@@ -148,13 +140,13 @@ impl<T> SmallVec<T> {
     where
         T: Primitive,
     {
-        if count > self.raw.capacity as usize - self.raw.len {
+        if count > self.capacity() - self.raw.len() {
             self.raw.make_room(size_of::<T>(), count)?;
         }
         // SAFETY: there is room for `count` values from `len`, and zero bits
         // are a valid `Primitive`.
-        unsafe { self.slot(self.raw.len).write_bytes(0, count) };
-        self.raw.len += count;
+        unsafe { self.slot(self.raw.len()).write_bytes(0, count) };
+        self.raw.set_len(self.raw.len() + count);
         Ok(())
     }
 
@@ -164,10 +156,9 @@ impl<T> SmallVec<T> {
     where
         T: Primitive,
     {
-        // SAFETY: the values need no dropping, and aren't used again.
-        unsafe { self.raw.free(size_of::<T>()) };
-        self.raw.values = NonNull::<Aligned>::dangling().cast();
-        (self.raw.len, self.raw.capacity) = (0, 0);
+        // The values need no dropping.
+        self.raw.replace(Array::empty(self.raw.memory.env()));
+        self.raw.len = 0;
     }
 
     /// Empties it, keeping its memory.
@@ -183,12 +174,12 @@ impl<T> SmallVec<T> {
         self.raw.len = self.raw.len.checked_sub(1)?;
         // SAFETY: the value at the old last place was written, and is no
         // longer counted, so it's moved out once.
-        Some(unsafe { self.slot(self.raw.len).read() })
+        Some(unsafe { self.slot(self.raw.len()).read() })
     }
 
     /// Keeps the values `keep` says to, in order, dropping the rest.
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
-        let len = self.raw.len;
+        let len = self.raw.len();
         // Counted as empty while values move, so a panic in `keep` leaks
         // rather than drops twice.
         self.raw.len = 0;
@@ -208,42 +199,52 @@ impl<T> SmallVec<T> {
                 }
             }
         }
-        self.raw.len = kept;
+        self.raw.set_len(kept);
     }
 }
 
-/// A type with the strictest alignment a `SmallVec`'s values can have. An
-/// empty `SmallVec` allocates nothing, but its values must still start at an
-/// aligned address, as slices of them need: a dangling pointer to this one
-/// is that address.
-#[repr(align(64))]
-struct Aligned;
-
-// `repr(align)` takes only a literal, so this checks it's the buffers'
-// alignment.
-const _: () = assert!(align_of::<Aligned>() == BUFFER_ALIGNMENT_BYTES);
-
-/// The layout of the memory for `capacity` values of `item` bytes each.
-#[inline(never)]
-fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
-    crate::allocator::layout(item.checked_mul(capacity).ok_or(AllocError)?)
-}
-
 impl RawVec {
-    /// Room for `capacity` values of `item` bytes, and at most `max`, which is at least `capacity`: both rounded up to a
-    /// power of two, but for a `capacity` of 0.
+    /// Room for `capacity` values of `item` bytes, and at most `max`, which
+    /// is at least `capacity`: both rounded up to a power of two, but for a
+    /// `capacity` of 0.
     #[inline(never)]
     fn new(env: &Env, item: usize, capacity: usize, max: usize) -> Result<RawVec, AllocError> {
         let capacity = if capacity == 0 { 0 } else { capacity.next_power_of_two() };
         let Ok(max) = u32::try_from(max.next_power_of_two()) else { return Err(AllocError) };
-        let values = match capacity {
-            // Nothing to allocate; aligned for any value, as slices need.
-            0 => NonNull::<Aligned>::dangling().cast(),
-            _ => env.allocate(layout(item, capacity)?)?,
-        };
+        // SAFETY: a `SmallVec` reads only the values below `len`, which it
+        // has written.
+        let memory = unsafe { RawVec::room(env, item, capacity)? };
+        Ok(RawVec { memory: ManuallyDrop::new(memory), len: 0, max })
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Frees the memory, without dropping the values in it, for `memory`.
+    fn replace(&mut self, memory: Array<u8>) {
+        // SAFETY: the old memory isn't used again.
+        unsafe { ManuallyDrop::drop(&mut self.memory) };
+        self.memory = ManuallyDrop::new(memory);
+    }
+
+    /// Counts `len` values, at most `max`.
+    fn set_len(&mut self, len: usize) {
+        check!(len <= self.max as usize);
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
-        let capacity = capacity as u32;
-        Ok(RawVec { values, env: NonNull::from(env), len: 0, capacity, max })
+        let len = len as u32;
+        self.len = len;
+    }
+
+    /// Unwritten memory for `capacity` values of `item` bytes.
+    ///
+    /// # Safety
+    ///
+    /// As for `Array::uninit`: no value may be read before it's written.
+    unsafe fn room(env: &Env, item: usize, capacity: usize) -> Result<Array<u8>, AllocError> {
+        let bytes = item.checked_mul(capacity).ok_or(AllocError)?;
+        // SAFETY: upheld by the caller.
+        unsafe { Array::uninit(env, bytes) }
     }
 
     /// Where the next value of `item` bytes goes, growing if full, and
@@ -251,11 +252,11 @@ impl RawVec {
     /// only that write.
     #[inline(never)]
     fn next_slot(&mut self, item: usize) -> Result<NonNull<u8>, AllocError> {
-        if self.len == self.capacity as usize {
+        if self.len() * item == self.memory.len() {
             self.make_room(item, 1)?;
         }
         // SAFETY: there's room for a value at `len`.
-        let slot = unsafe { self.values.add(self.len * item) };
+        let slot = unsafe { self.memory.as_non_null().add(self.len() * item) };
         self.len += 1;
         Ok(slot)
     }
@@ -265,42 +266,24 @@ impl RawVec {
     #[cold]
     #[inline(never)]
     fn make_room(&mut self, item: usize, additional: usize) -> Result<(), AllocError> {
-        let needed = self.len.checked_add(additional).ok_or(AllocError)?;
+        let needed = self.len().checked_add(additional).ok_or(AllocError)?;
         if needed > self.max as usize {
             return Err(AllocError);
         }
         // Powers of two up to `max` stay powers of two up to `max`.
-        let doubled = if self.capacity == 0 { 4 } else { self.capacity as usize * 2 };
+        let capacity = self.memory.len() / item;
+        let doubled = if capacity == 0 { 4 } else { capacity * 2 };
         let capacity = doubled.max(needed.next_power_of_two()).min(self.max as usize);
-        // SAFETY: an `Env` outlives what's allocated from it.
-        let to = unsafe { self.env.as_ref() }.allocate(layout(item, capacity)?)?;
+        // SAFETY: the first `len` values are copied in below, and the rest
+        // are read only once written.
+        let to = unsafe { RawVec::room(self.memory.env(), item, capacity)? };
         // SAFETY: both hold at least `len` values. They're moved, not
-        // dropped.
-        unsafe { to.copy_from_nonoverlapping(self.values, self.len * item) };
-        // SAFETY: the old values are moved out, and nothing uses them again.
-        unsafe { self.free(item) };
-        self.values = to;
-        #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
-        let capacity = capacity as u32;
-        self.capacity = capacity;
-        Ok(())
-    }
-
-    /// Frees the memory, without dropping what's in it. Out of line, as
-    /// every type's `drop` calls it.
-    ///
-    /// # Safety
-    ///
-    /// Nothing may use the values again; `item` is their size.
-    #[inline(never)]
-    unsafe fn free(&mut self, item: usize) {
-        if self.capacity == 0 {
-            return;
+        // dropped, and the old memory is freed when replaced.
+        unsafe {
+            to.as_non_null().copy_from_nonoverlapping(self.memory.as_non_null(), self.len() * item);
         }
-        let Ok(layout) = layout(item, self.capacity as usize) else { failed!() };
-        // SAFETY: allocated with this layout from this `Env`, which
-        // outlives it.
-        unsafe { self.env.as_ref().deallocate(self.values, layout) };
+        self.replace(to);
+        Ok(())
     }
 }
 
@@ -309,25 +292,26 @@ impl<T> Deref for SmallVec<T> {
 
     fn deref(&self) -> &[T] {
         // SAFETY: the first `len` values were written by `push`.
-        unsafe { core::slice::from_raw_parts(self.slot(0).as_ptr(), self.raw.len) }
+        unsafe { core::slice::from_raw_parts(self.slot(0).as_ptr(), self.raw.len()) }
     }
 }
 
 impl<T> DerefMut for SmallVec<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: as in `deref`, and this is the only reference.
-        unsafe { core::slice::from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len()) }
     }
 }
 
 impl<T> Drop for SmallVec<T> {
+    #[inline(never)]
     fn drop(&mut self) {
-        let values = core::ptr::slice_from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len);
+        let values = core::ptr::slice_from_raw_parts_mut(self.slot(0).as_ptr(), self.raw.len());
         // SAFETY: the first `len` values were written by `push`, and are
         // dropped once, then their memory is freed.
         unsafe {
             values.drop_in_place();
-            self.raw.free(size_of::<T>());
+            ManuallyDrop::drop(&mut self.raw.memory);
         }
     }
 }
@@ -340,7 +324,9 @@ mod tests {
     use core::ptr::NonNull;
 
     use super::*;
-    use crate::allocator::{Heap, PAGE_BYTES};
+    use core::alloc::Layout;
+
+    use crate::allocator::{Allocator, Heap, PAGE_BYTES};
 
     /// Allows `left` allocations, counting those still live. An `Env`
     /// over it takes one, for itself, and holds it while it lives.

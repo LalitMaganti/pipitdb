@@ -8,7 +8,7 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator, layout};
-use crate::buffer::Primitive;
+use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
 use crate::env::Env;
 
 /// `len` values, zeroed when made.
@@ -64,12 +64,39 @@ impl<T: Primitive> Array<T> {
         Ok(array)
     }
 
+    /// No values, which allocates nothing.
+    pub(crate) fn empty(env: &Env) -> Array<T> {
+        let values = NonNull::<Aligned>::dangling().cast();
+        Array { values, len: 0, env: NonNull::from(env), owns: PhantomData }
+    }
+
+    /// Room for `len` values, not written.
+    ///
+    /// # Safety
+    ///
+    /// No value may be read before it's written.
+    pub(crate) unsafe fn uninit(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
+        Array::allocate(env, len, false)
+    }
+
+    /// The `Env` the values came from.
+    pub(crate) fn env(&self) -> &Env {
+        // SAFETY: an `Env` outlives what's allocated from it.
+        unsafe { self.env.as_ref() }
+    }
+
+    /// Where the values start, for writing values that aren't `T`, such as
+    /// a `SmallVec`'s.
+    pub(crate) fn as_non_null(&self) -> NonNull<T> {
+        self.values
+    }
+
     /// Room for `len` values, zeroed if `zeroed`, else unwritten: callers
     /// that don't zero write each value before it's read.
     fn allocate(env: &Env, len: usize, zeroed: bool) -> Result<Array<T>, AllocError> {
         let bytes = size_of::<T>().checked_mul(len).ok_or(AllocError)?;
         let values = match bytes {
-            0 => NonNull::dangling(),
+            0 => return Ok(Array::empty(env)),
             _ => allocate_bytes(env, bytes, zeroed)?.cast(),
         };
         Ok(Array { values, len, env: NonNull::from(env), owns: PhantomData })
@@ -94,6 +121,8 @@ impl<T: Primitive> DerefMut for Array<T> {
 }
 
 impl<T: Primitive> Drop for Array<T> {
+    /// Out of line, so dropping one, or a `SmallVec`, is a call.
+    #[inline(never)]
     fn drop(&mut self) {
         let bytes = size_of::<T>() * self.len;
         if bytes != 0 {
@@ -103,6 +132,18 @@ impl<T: Primitive> Drop for Array<T> {
         }
     }
 }
+
+/// A type with the strictest alignment an `Array`'s values can have, even
+/// when it holds another type's, as a `SmallVec`'s does. An empty one
+/// allocates nothing, but its values must still start at an aligned
+/// address, as slices of them need: a dangling pointer to this is that
+/// address.
+#[repr(align(64))]
+struct Aligned;
+
+// `repr(align)` takes only a literal, so this checks it's the buffers'
+// alignment.
+const _: () = assert!(align_of::<Aligned>() == BUFFER_ALIGNMENT_BYTES);
 
 /// `bytes` of memory, zeroed if `zeroed`. Out of line, and of no type, so
 /// every `Array` shares it.
