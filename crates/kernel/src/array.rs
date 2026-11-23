@@ -12,7 +12,7 @@ use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
 use crate::env::Env;
 
 /// `len` values, zeroed when made.
-pub(crate) struct Array<T: Primitive> {
+pub struct Array<T: Primitive> {
     values: NonNull<T>,
     len: usize,
     /// What the values came from.
@@ -23,12 +23,12 @@ pub(crate) struct Array<T: Primitive> {
 impl<T: Primitive> Array<T> {
     /// `len` zeroes: fresh memory from the system is zero already, so a big
     /// one costs nothing to make.
-    pub(crate) fn zeroed(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
+    pub fn zeroed(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
         Array::allocate(env, len, true)
     }
 
     /// `len` values, value `i` being `value(i)`, each written once.
-    pub(crate) fn from_fn(
+    pub fn from_fn(
         env: &Env,
         len: usize,
         mut value: impl FnMut(usize) -> T,
@@ -44,7 +44,7 @@ impl<T: Primitive> Array<T> {
     /// `len` values, written a chunk of up to `chunk` at a time by
     /// `write(start, out)`, which writes every one of `out`, values `start`
     /// on.
-    pub(crate) fn from_chunks(
+    pub fn from_chunks(
         env: &Env,
         len: usize,
         chunk: usize,
@@ -65,7 +65,7 @@ impl<T: Primitive> Array<T> {
     }
 
     /// No values, which allocates nothing.
-    pub(crate) fn empty(env: &Env) -> Array<T> {
+    pub fn empty(env: &Env) -> Array<T> {
         let values = NonNull::<Aligned>::dangling().cast();
         Array { values, len: 0, env: NonNull::from(env), owns: PhantomData }
     }
@@ -75,19 +75,19 @@ impl<T: Primitive> Array<T> {
     /// # Safety
     ///
     /// No value may be read before it's written.
-    pub(crate) unsafe fn uninit(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
+    pub unsafe fn uninit(env: &Env, len: usize) -> Result<Array<T>, AllocError> {
         Array::allocate(env, len, false)
     }
 
     /// The `Env` the values came from.
-    pub(crate) fn env(&self) -> &Env {
+    pub fn env(&self) -> &Env {
         // SAFETY: an `Env` outlives what's allocated from it.
         unsafe { self.env.as_ref() }
     }
 
     /// Where the values start, for writing values that aren't `T`, such as
     /// a `SmallVec`'s.
-    pub(crate) fn as_non_null(&self) -> NonNull<T> {
+    pub fn as_non_null(&self) -> NonNull<T> {
         self.values
     }
 

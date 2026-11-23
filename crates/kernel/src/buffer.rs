@@ -105,17 +105,6 @@ impl Buffer {
         Ok(Buffer { data })
     }
 
-    /// Allocates `size_bytes` bytes, without zeroing them, from the allocator
-    /// `self` came from.
-    ///
-    /// # Safety
-    ///
-    /// As for `allocate_uninit`.
-    pub unsafe fn allocate_uninit_like(&self, size_bytes: usize) -> Result<Buffer, AllocError> {
-        // SAFETY: upheld by the caller.
-        unsafe { Buffer::allocate_uninit(self.env(), self.header().kind, size_bytes) }
-    }
-
     /// What the bytes came from.
     pub fn env(&self) -> &Env {
         // SAFETY: an `Env` outlives what's allocated from it.
@@ -290,17 +279,6 @@ mod tests {
         assert!(env.used() > empty);
         drop(clone);
         assert_eq!(env.used(), empty);
-    }
-
-    #[test]
-    fn allocates_like_another_buffer() {
-        let env = Env::current();
-        let buffer = Buffer::allocate_in(env, Kind::Small, 8).unwrap();
-        // SAFETY: the bytes aren't read.
-        let other = unsafe { buffer.allocate_uninit_like(16) }.unwrap();
-        assert_eq!(other.size_bytes(), 16);
-        assert_eq!(other.header().kind, Kind::Small);
-        drop((buffer, other));
     }
 
     #[test]
