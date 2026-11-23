@@ -1032,6 +1032,9 @@ pub trait Word: Copy {
 
     /// With bit `bit` cleared.
     fn without(self, bit: usize) -> Self;
+
+    /// How many bits are set.
+    fn count_ones(self) -> u32;
 }
 
 macro_rules! word {
@@ -1052,6 +1055,11 @@ macro_rules! word {
             #[inline]
             fn without(self, bit: usize) -> Self {
                 self & !(1 << bit)
+            }
+
+            #[inline]
+            fn count_ones(self) -> u32 {
+                <$t>::count_ones(self)
             }
         }
     )*};
@@ -1125,6 +1133,11 @@ impl<W: Word> BitSlice<W> {
     #[inline]
     pub fn words(&self) -> &[W] {
         &self.0
+    }
+
+    /// How many bits are set.
+    pub fn count_ones(&self) -> u32 {
+        self.0.iter().map(|&word| word.count_ones()).sum()
     }
 }
 

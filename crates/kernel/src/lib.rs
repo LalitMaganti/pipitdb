@@ -37,6 +37,7 @@ mod murmur_hash;
 pub mod names;
 pub mod optimize;
 pub mod order_by;
+mod ordered;
 pub mod output_properties;
 pub mod pipeline;
 pub mod plan;

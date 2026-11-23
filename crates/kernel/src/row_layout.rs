@@ -6,6 +6,7 @@
 use crate::allocator::AllocError;
 use crate::containers::SmallVec;
 use crate::env::Env;
+use crate::ordered::{key_value, ordered, ordered_if};
 
 /// What a slot holds.
 #[derive(Clone, Copy)]
@@ -130,10 +131,7 @@ pub(crate) fn decode_value(slot: Slot, bytes: &[u8], float: bool) -> i64 {
     let invert = if slot.descending { u64::MAX } else { 0 };
     let mut be = [0; 8];
     be.copy_from_slice(bytes);
-    let bits = (u64::from_be_bytes(be) ^ invert).cast_signed() ^ i64::MIN;
-    // A negative float's bits but its sign were flipped by `Word::encode`.
-    let flip = if float { ((bits >> 63).cast_unsigned() >> 1).cast_signed() } else { 0 };
-    bits ^ flip
+    key_value(u64::from_be_bytes(be), invert, float)
 }
 
 fn value_size(data_type: Type) -> u32 {
@@ -175,9 +173,7 @@ impl Encode for Word {
     const SIZE: usize = 8;
     /// As `f64`'s if a float, and `i64`'s if not.
     fn encode(self) -> u64 {
-        let negative_float = (self.bits >> 63).cast_unsigned() >> 1;
-        let flip = if self.float { negative_float } else { 0 };
-        (self.bits ^ flip.cast_signed()).encode()
+        ordered_if(self.bits, self.float).encode()
     }
 }
 
@@ -186,8 +182,7 @@ impl Encode for f64 {
     /// A negative float's bits but its sign are flipped too, so they order
     /// backwards.
     fn encode(self) -> u64 {
-        let bits = self.to_bits().cast_signed();
-        (bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()).encode()
+        ordered(self.to_bits().cast_signed()).encode()
     }
 }
 
