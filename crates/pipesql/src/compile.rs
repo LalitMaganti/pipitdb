@@ -862,6 +862,20 @@ mod tests {
     }
 
     #[test]
+    fn runs_long_chains_of_stages() {
+        // A filter can't move below a limit, so each stays a node.
+        let limits = |n: usize| format!("FROM t{}", " |> LIMIT 9 |> WHERE a > 1".repeat(n));
+        // Two nodes a stage pair, under a projection and over a scan.
+        let deepest = (pipit_kernel::lower::PLAN_DEPTH_MAX - 2) / 2;
+        assert_eq!(kept(&format!("{} |> SELECT a", limits(deepest))), [2.0]);
+        let deep = limits(pipit_kernel::lower::PLAN_DEPTH_MAX);
+        let catalog = catalog();
+        let mut plan = compile(Env::current(), &REGISTRY, &catalog, deep.as_bytes()).unwrap();
+        let lowered = PhysicalPlan::from_logical(Env::current(), &mut plan);
+        assert_eq!(lowered.err(), Some(pipit_kernel::lower::LowerError::TooDeep));
+    }
+
+    #[test]
     fn reports_what_it_cant_compile() {
         assert_eq!(error("FROM u"), (ErrorCode::UnknownTable, 5));
         // Conditions a predicate can't test are typed as expressions.

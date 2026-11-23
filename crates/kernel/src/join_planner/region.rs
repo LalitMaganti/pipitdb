@@ -2,7 +2,7 @@
 //! plan, and rebuilding it in the order planned.
 
 use crate::allocator::AllocError;
-use crate::containers::SmallVec;
+use crate::containers::{SmallVec, SpillVec};
 use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::Estimate;
@@ -18,9 +18,17 @@ use super::{
 /// No relation, or no node.
 const NONE: u32 = u32::MAX;
 
+/// The most relations a region the planner reorders has, a bit each of a
+/// word. A bigger one keeps the order it's written in.
+const RELATIONS_MAX: usize = 64;
+
 /// The most nodes a region's join tree has: a leaf for each relation, and a
 /// join for each but one.
-const TREE_MAX: usize = 2 * crate::plan::PLAN_NODES_MAX;
+const TREE_MAX: usize = 2 * RELATIONS_MAX;
+
+/// How many nodes' parents finding regions holds in place, as most plans
+/// have no more.
+const NODES_INLINE: usize = 64;
 
 /// An equality between two columns, of different relations, that a join in
 /// a region requires.
@@ -43,18 +51,12 @@ pub(crate) fn plan_regions(
     estimates: &[Estimate],
 ) -> Result<bool, AllocError> {
     let count = plan.nodes.len();
-    // Each node's parent, `NONE` for the root and unreachable nodes.
-    let mut parents = [NONE; PLAN_NODES_MAX];
-    let mut pending = [0; PLAN_NODES_MAX];
-    let mut waiting = 1;
-    *at_mut!(pending, 0) = plan.root;
-    while waiting > 0 {
-        waiting -= 1;
-        let id = *at!(pending, waiting);
-        for &child in at!(plan.nodes, id as usize).children.iter() {
+    // Each node's parent, `NONE` for the root. Every node is reachable, as
+    // the passes before remove those that aren't.
+    let mut parents = SpillVec::<u32, NODES_INLINE>::filled(env, PLAN_NODES_MAX, count, NONE)?;
+    for (id, node) in (0..).zip(plan.nodes.iter()) {
+        for &child in node.children.iter() {
             *at_mut!(parents, child as usize) = id;
-            *at_mut!(pending, waiting) = child;
-            waiting += 1;
         }
     }
     let mut changed = false;
@@ -64,9 +66,7 @@ pub(crate) fn plan_regions(
         let parent = *at!(parents, id as usize);
         let is_plannable = |id| plannable(&plan.exprs, &at!(plan.nodes, id as usize).op);
         // A region is planned from its root, which no plannable join reads.
-        let reachable = id == plan.root || parent != NONE;
-        let root = is_plannable(id) && (parent == NONE || !is_plannable(parent));
-        if reachable && root {
+        if is_plannable(id) && (parent == NONE || !is_plannable(parent)) {
             changed |= plan_region(env, plan, estimates, id, parent)?;
         }
     }
@@ -110,7 +110,7 @@ fn plan_region(
             }
         }
     }
-    if leaves.len() <= 2 {
+    if leaves.len() <= 2 || leaves.len() > RELATIONS_MAX {
         return Ok(false);
     }
     // Each column's relation, by the joins' lists of each child's columns.
@@ -247,7 +247,7 @@ fn rebuild(
     let nodes = &tree.nodes;
     check!(!nodes.is_empty() && nodes.len() < TREE_MAX);
     // Each tree node's plan node, and the relations under it, a bit each: a
-    // region has at most `PLAN_NODES_MAX` relations.
+    // region has at most `RELATIONS_MAX` relations.
     let mut built = [(NONE, 0_u64); TREE_MAX];
     let mut slots = joins.iter().copied();
     // The tree's nodes, each after its sides, from the root, which is last.

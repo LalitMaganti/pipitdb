@@ -680,7 +680,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn small_graphs_are_planned_optimally() {
         for shape in SHAPES {
             for (count, mixed) in [(2, false), (3, true), (7, false), (10, true)] {
@@ -693,7 +692,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn larger_graphs_get_valid_plans() {
         for shape in SHAPES {
             for (count, mixed) in [(20, true), (70, false), (70, true)] {
@@ -706,7 +704,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn disconnected_graphs_take_cross_products() {
         for count in [5, 70] {
             let mut graph = generate(Shape::Chain, count, true).unwrap();
@@ -766,7 +763,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn plans_keep_to_joins_that_can_run() {
         // A chain of 3, whose first two relations can't be joined directly.
         let mut graph = QueryGraph::new(crate::env()).unwrap();

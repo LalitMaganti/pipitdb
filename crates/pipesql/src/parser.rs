@@ -10,9 +10,9 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use crate::settings::build_setting;
 use pipit_kernel::containers::SpillVec;
 use pipit_kernel::env::Env;
+use pipit_kernel::settings::build_setting;
 
 /// How deeply operators, parentheses and calls can nest: by default as
 /// deeply as DuckDB's parser allows. Each waiting argument counts as a

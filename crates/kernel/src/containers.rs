@@ -816,6 +816,13 @@ impl<'e, T: Copy, const N: usize> SpillVec<'e, T, N> {
         unsafe { &*(core::ptr::from_ref(written) as *const [T]) }
     }
 
+    /// Removes the last value and returns it, if any.
+    pub fn pop(&mut self) -> Option<T> {
+        let last = *self.last()?;
+        self.truncate(self.len() - 1);
+        Some(last)
+    }
+
     /// Keeps the first `len` values.
     pub fn truncate(&mut self, len: usize) {
         check!(len <= self.len());

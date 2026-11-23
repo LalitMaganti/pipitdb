@@ -2,7 +2,7 @@
 
 /// `value`, a decimal number set at build time, or `default` if it isn't set.
 /// Fails the build if it isn't a number.
-pub(crate) const fn build_setting(value: Option<&str>, default: usize) -> usize {
+pub const fn build_setting(value: Option<&str>, default: usize) -> usize {
     let Some(value) = value else { return default };
     let digits = value.as_bytes();
     assert!(!digits.is_empty(), "build settings must be decimal numbers");

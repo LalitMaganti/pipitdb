@@ -32,12 +32,13 @@ jobs:
       - run: cargo test
       - run: cargo test -p pipitdb-pipesql --features diagnostics
       # Small blocks, so the tests also cover growing and running out of them,
-      # and shallow nesting, so they cover setting it.
+      # and shallow nesting and plans, so they cover setting them.
       - run: cargo test -p pipitdb-pipesql
         env:
           PIPIT_AST_BLOCK_BYTES: 4096
           PIPIT_AST_BLOCK_SLOTS: 4
           PIPIT_NESTING_MAX: 64
+          PIPIT_PLAN_DEPTH_MAX: 64
       # Spilling to S3 needs sockets, which Wasm doesn't have.
       - run: cargo build --release --target wasm32-unknown-unknown --workspace --exclude pipitdb-s3
 
