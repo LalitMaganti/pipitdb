@@ -649,7 +649,9 @@ fn fetch_ahead(
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
         let group = (slot & !salt(slot)) as usize;
         if group != 0 {
-            prefetch(address(starts, stride, group - 1).cast_const());
+            // SAFETY: a slot holds its group plus one, and a group in a slot
+            // has a record, so its block exists.
+            prefetch(unsafe { address(starts, stride, group - 1) }.cast_const());
         }
     }
 }
