@@ -755,9 +755,9 @@ impl<'c> Op<'c> for ScanOp<'c> {
         self.scannable.summary(scanned)
     }
 
-    /// The table's row count, and which of the columns read are keys. If the
-    /// scan took pushed-down conditions, it may skip rows, so no key is
-    /// known to be a sequence. It doesn't reduce its row count for those
+    /// The table's row count, which of the columns read are keys, and the
+    /// bounds of those it knows the bounds of. If the scan took pushed-down
+    /// conditions, it may skip rows, so no key is known to be a sequence. It doesn't reduce its row count for those
     /// conditions: the filters they were copied from already do.
     fn estimate(&self, _: &Exprs, _: &[Estimate]) -> Option<Estimate> {
         let summary = self.scannable.summary(None);
@@ -765,6 +765,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let mut out = Estimate::of(rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly));
         for scanned in self.columns.iter() {
             out.add_key(scanned.binding.id, self.scannable.column_key(scanned.column));
+            let summary = self.scannable.summary(Some(scanned.column));
+            if let Some(bounds) = summary.and_then(|summary| summary.bounds) {
+                out.add_bounds(scanned.binding.id, bounds);
+            }
         }
         if self.conditions.as_ref().is_some_and(|conditions| !conditions.is_empty()) {
             out.demote_ids();
@@ -986,7 +990,9 @@ impl<'c> Op<'c> for FilterOp {
     }
 
     /// Its input's estimate, less the rows its conjuncts are expected to
-    /// drop, by the rules Perfetto's dataframe planner uses for its filters.
+    /// drop: for a column of known bounds compared with an integer, the
+    /// share of its bounds the comparison keeps; for the rest, by the rules
+    /// Perfetto's dataframe planner uses for its filters.
     fn estimate(&self, exprs: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
         let mut out = *inputs.first()?;
         out.demote_ids();
@@ -995,6 +1001,25 @@ impl<'c> Op<'c> for FilterOp {
             let node = at!(nodes, conjunct.root as usize);
             let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column);
             let constant = |i: u32| nodes.get(i as usize).is_some_and(|n| n.op == ExprOp::Constant);
+            let integer = |i: u32| {
+                let node = nodes.get(i as usize)?;
+                (node.op == ExprOp::Constant && node.data_type == DataType::Int64)
+                    .then_some(node.int_value)
+            };
+            // A column compared with an integer, the comparison read with the
+            // column on its left.
+            let compared = match (column(node.a), column(node.b), node.op.comparison()) {
+                (Some(c), None, Some(op)) => integer(node.b).map(|v| (c.a, op, v)),
+                (None, Some(c), Some(op)) => integer(node.a).map(|v| (c.a, op.flipped(), v)),
+                _ => None,
+            };
+            if let Some((c, op, v)) = compared
+                && out.span(c).is_some()
+                && let Some((min, max)) = op.range(v)
+            {
+                out.keep_within(c, min, max);
+                continue;
+            }
             match node.op {
                 ExprOp::Eq => match (column(node.a), column(node.b)) {
                     (Some(c), None) if constant(node.b) => out.keep_equal(c.a),

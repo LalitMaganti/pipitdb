@@ -3,6 +3,7 @@
 //! rules Perfetto's dataframe planner uses to estimate the rows a query
 //! leaves. Each op works out its estimate from its inputs' estimates.
 
+use crate::column::Bounds;
 use crate::plan::ColumnId;
 use crate::scannable::Key;
 
@@ -40,10 +41,17 @@ pub struct Estimate {
     keys: [(ColumnId, Key); KEYS_MAX],
     /// How many of `keys` are known.
     key_count: u8,
+    /// The columns whose values are known to lie within bounds, and those
+    /// bounds: the first `bounded_count` entries. Any more are dropped.
+    bounds: [(ColumnId, Bounds); BOUNDS_MAX],
+    bounded_count: u8,
 }
 
 /// The most keys an `Estimate` knows of.
 const KEYS_MAX: usize = 4;
+
+/// The most columns an `Estimate` knows the bounds of.
+const BOUNDS_MAX: usize = 16;
 
 impl Estimate {
     /// Nothing known.
@@ -52,6 +60,8 @@ impl Estimate {
         selective_base: None,
         keys: [(0, Key::None); KEYS_MAX],
         key_count: 0,
+        bounds: [(0, Bounds { min: 0, max: 0 }); BOUNDS_MAX],
+        bounded_count: 0,
     };
 
     /// `rows` rows, with nothing known about their columns.
@@ -76,6 +86,24 @@ impl Estimate {
 
     pub(crate) fn known_keys(&self) -> &[(ColumnId, Key)] {
         at!(self.keys, ..self.key_count as usize)
+    }
+
+    /// Records that `column`'s values lie within `bounds`, if there's room.
+    pub fn add_bounds(&mut self, column: ColumnId, bounds: Bounds) {
+        let Some(slot) = self.bounds.get_mut(self.bounded_count as usize) else { return };
+        *slot = (column, bounds);
+        self.bounded_count += 1;
+    }
+
+    /// How many values `column` can take, if its bounds are known: as many
+    /// as lie within them.
+    pub fn span(&self, column: ColumnId) -> Option<u64> {
+        let &(_, bounds) = self.known_bounds().iter().find(|&&(c, _)| c == column)?;
+        Some(bounds.count())
+    }
+
+    fn known_bounds(&self) -> &[(ColumnId, Bounds)] {
+        at!(self.bounds, ..self.bounded_count as usize)
     }
 
     /// For an op that may drop rows: its keys stay unique, but a sequence
@@ -109,6 +137,31 @@ impl Estimate {
         self.keep_values(column, 1);
     }
 
+    /// Applies a filter keeping the rows where `column` is from `min` to
+    /// `max`. If its bounds are known, the rows kept are the share of them
+    /// that range covers, as if its values were spread evenly, and it
+    /// narrows them; otherwise, as `keep_some`.
+    pub fn keep_within(&mut self, column: ColumnId, min: i64, max: i64) {
+        let count = self.bounded_count as usize;
+        let Some((_, bounds)) =
+            at_mut!(self.bounds, ..count).iter_mut().find(|(c, _)| *c == column)
+        else {
+            return self.keep_some();
+        };
+        let before = bounds.count();
+        let after = Bounds { min: bounds.min.max(min), max: bounds.max.min(max) };
+        let kept = if after.min > after.max { 0 } else { after.count() };
+        *bounds = after;
+        #[expect(clippy::cast_possible_truncation, reason = "at most the rows")]
+        #[expect(clippy::cast_precision_loss, reason = "an estimate")]
+        #[expect(clippy::cast_sign_loss, reason = "a share of the rows")]
+        let rows = (self.rows.estimated as f64 * (kept as f64 / before as f64)) as u64;
+        self.rows.estimated = rows.max(1).min(self.rows.estimated);
+        if self.key(column) >= Key::Unique {
+            self.rows.max = self.rows.max.min(kept);
+        }
+    }
+
     /// Applies a filter keeping the rows where `column` has one of `count`
     /// values: `keep_equal`'s estimate for each of them.
     pub fn keep_in(&mut self, column: ColumnId, count: u64) {
@@ -140,6 +193,24 @@ impl Estimate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_the_share_of_a_columns_bounds_a_range_covers() {
+        let mut years = Estimate::of(RowEstimate::exactly(73_000));
+        years.add_bounds(0, Bounds { min: 1900, max: 2099 });
+        let mut one = years;
+        one.keep_within(0, 2000, 2000);
+        assert_eq!(one.rows.estimated, 365);
+        // A second range on the same column narrows the first.
+        let mut decade = years;
+        decade.keep_within(0, 2000, i64::MAX);
+        decade.keep_within(0, i64::MIN, 2009);
+        assert_eq!(decade.rows.estimated, 3650);
+        assert_eq!(decade.span(0), Some(10));
+        // Without bounds, a range keeps half.
+        years.keep_within(1, 0, 10);
+        assert_eq!(years.rows.estimated, 36_500);
+    }
 
     #[test]
     fn filters_keep_fewer_rows_the_more_selective_they_are() {
