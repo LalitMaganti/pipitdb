@@ -706,15 +706,16 @@ pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
     plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
 }
 
-/// The op joining slices to threads on `utid = id`, which outputs `tid`.
+/// The op joining slices to threads on `utid = id`, which outputs `dur`
+/// and `tid`.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-fn join_op(exprs: &mut Exprs, utid: u32, id: u32, tid: u32) -> DynOp<'static> {
+fn join_op(exprs: &mut Exprs, [utid, dur]: [u32; 2], [id, tid]: [u32; 2]) -> DynOp<'static> {
     let mut nodes = ExprBuilder::new(&Heap).expect("allocates");
     let (a, b) = (nodes.column(utid).expect("allocates"), nodes.column(id).expect("allocates"));
     nodes.node(ExprOp::Eq, a, b).expect("allocates");
     let condition = Some(exprs.add(nodes.nodes()).expect("allocates"));
-    let build_columns = SlowVec::fixed_from(&Heap, [tid].into_iter()).expect("allocates");
-    let op = JoinOp { kind: JoinKind::Inner, condition, build_columns };
+    let columns = |list: [u32; 2]| SlowVec::fixed_from(&Heap, list.into_iter()).expect("allocates");
+    let op = JoinOp::new(JoinKind::Inner, condition, [columns([utid, dur]), columns([id, tid])]);
     DynOp::new(&Heap, op).expect("allocates")
 }
 
@@ -831,7 +832,7 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
     if joined != Joined::No {
         let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
         let children = [probe, build];
-        let op = join_op(&mut plan.exprs, utid.id, id.id, tid.id);
+        let op = join_op(&mut plan.exprs, [utid.id, dur.id], [id.id, tid.id]);
         plan.add_node(op, &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }

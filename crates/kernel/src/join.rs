@@ -1,5 +1,6 @@
 //! `JoinOp`: a join of its two children on any condition. The build side,
-//! its second child, runs as a pipeline of its own and is held whole first.
+//! the child planning chooses, runs as a pipeline of its own and is held
+//! whole first.
 //! Without keys the condition requires equal on both sides, it's tested on
 //! every pair of rows: a nested loop. With them, the build side is hashed by
 //! them, and only the pairs of equal keys are tested. With one integer key,
@@ -11,9 +12,10 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
+use crate::estimate::Estimate;
 use crate::expression::{
     Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep, Exprs, check_expr_type,
-    columns_of, constant, mark_expr_columns, type_expr,
+    columns_of, conjuncts, constant, mark_expr_columns, type_expr,
 };
 use crate::filter::{self, Comparison, Range, Value};
 use crate::group_table::{GroupTable, NONE};
@@ -24,6 +26,7 @@ use crate::plan::{ColumnId, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
 use crate::row_store::RowStore;
+use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
 use crate::slow_vec::SlowVec;
 use crate::step::{DynOperator, DynSource, Operator, Progress, Step, Transform};
@@ -41,21 +44,62 @@ pub enum JoinKind {
     Left,
 }
 
-/// Outputs the probe side's columns, then `build_columns`.
+/// Outputs the probe side's columns, then the build side's it outputs.
 pub struct JoinOp {
     /// Which rows it outputs.
-    pub kind: JoinKind,
+    kind: JoinKind,
     /// Which pairs of rows are joined, an `Int64` true where it isn't 0 or
     /// null: every pair if none, a cross join.
-    pub condition: Option<Expr>,
-    /// The build side's columns it outputs.
-    pub build_columns: SlowVec<ColumnId>,
+    condition: Option<Expr>,
+    /// Each child's columns it outputs.
+    columns: [SlowVec<ColumnId>; 2],
+    /// Which child is the build side: the second, unless planning chooses
+    /// the first.
+    build: u32,
 }
 
 impl JoinOp {
+    /// A join of `kind` on `condition`, outputting `columns` of each child.
+    pub fn new(kind: JoinKind, condition: Option<Expr>, columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
+        JoinOp { kind, condition, columns, build: 1 }
+    }
+
+    fn probe(&self) -> u32 {
+        1 - self.build
+    }
+
+    /// The build side's columns it outputs.
+    fn build_columns(&self) -> &[ColumnId] {
+        at!(self.columns, self.build as usize)
+    }
+
     fn is_build_column(&self, column: ColumnId) -> bool {
         #[expect(clippy::manual_contains, reason = "`contains` unrolls for long slices")]
-        self.build_columns.iter().any(|&c| c == column)
+        self.build_columns().iter().any(|&c| c == column)
+    }
+
+    /// The best key either side has among the equalities at the top of its
+    /// condition: what decides which side to build.
+    fn side_keys(&self, exprs: &Exprs, inputs: &[Estimate]) -> [Key; 2] {
+        let mut keys = [Key::None; 2];
+        let Some(condition) = self.condition else { return keys };
+        let nodes = exprs.nodes(condition);
+        conjuncts(nodes, condition.root, &mut |conjunct| {
+            let node = at!(nodes, conjunct as usize);
+            let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column);
+            let (Some(a), Some(b)) = (column(node.a), column(node.b)) else { return };
+            if node.op != ExprOp::Eq {
+                return;
+            }
+            for (side, key) in keys.iter_mut().enumerate() {
+                for column in [a.a, b.a] {
+                    if at!(self.columns, side).iter().any(|&c| c == column) {
+                        *key = (*key).max(at!(inputs, side).key(column));
+                    }
+                }
+            }
+        });
+        keys
     }
 
     /// The build columns, then if `tested`, the other columns of `build` the
@@ -76,7 +120,7 @@ impl JoinOp {
                 count += 1;
             }
         };
-        for &column in self.build_columns.iter() {
+        for &column in self.build_columns() {
             add(column);
         }
         if let Some(condition) = self.condition.filter(|_| tested) {
@@ -102,9 +146,11 @@ impl JoinOp {
 }
 
 impl<'c> Op<'c> for JoinOp {
-    /// Keeps the build columns needed above.
+    /// Keeps the columns needed above.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        self.build_columns.retain(|&column| needed.is_needed(column));
+        for columns in &mut self.columns {
+            columns.retain(|&column| needed.is_needed(column));
+        }
         self.reads(needed);
         Pruned::Keep
     }
@@ -114,8 +160,10 @@ impl<'c> Op<'c> for JoinOp {
         if let Some(condition) = self.condition {
             mark_expr_columns(condition, reads);
         }
-        for &column in self.build_columns.iter() {
-            reads.need(column);
+        for columns in &self.columns {
+            for &column in columns.iter() {
+                reads.need(column);
+            }
         }
     }
 
@@ -139,9 +187,34 @@ impl<'c> Op<'c> for JoinOp {
     /// A left join outputs a probe row whatever its build rows are.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
         if !self.is_build_column(column) {
-            return Some(0);
+            return Some(self.probe());
         }
-        (self.kind == JoinKind::Inner).then_some(1)
+        (self.kind == JoinKind::Inner).then_some(self.build)
+    }
+
+    /// An inner join builds the side whose key is best, an id first, as
+    /// it's never hashed, then a unique key, as each probe row then has one
+    /// build row; then the side with fewer rows, by planning's estimates.
+    /// A left join builds its second child, as it outputs every row of its
+    /// first.
+    fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
+        let &[first, second] = inputs else { failed!() };
+        if self.kind != JoinKind::Inner {
+            return;
+        }
+        let [left, right] = self.side_keys(exprs, inputs);
+        // A better key, then fewer rows; as written if nothing tells them apart.
+        let rank = |key, input: &Estimate| (key, u64::MAX - input.rows.estimated);
+        self.build = u32::from(rank(left, &first) <= rank(right, &second));
+    }
+
+    /// As many rows as the probe side, or fewer, and its keys but for ids,
+    /// as rows may be dropped. Not the build side's: one build row may be
+    /// joined to many.
+    fn estimate(&self, _: &Exprs, inputs: &[Estimate]) -> Option<Estimate> {
+        let mut out = at!(inputs, self.probe() as usize).after_filters();
+        out.demote_ids();
+        Some(out)
     }
 
     /// The probe side's columns, as they are. The build side's it outputs
@@ -169,8 +242,9 @@ impl<'c> Op<'c> for JoinOp {
     /// The probe side's columns, less some rows, then the build columns of
     /// an inner or left join, whose rows come out by build row, in no order.
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
-        let (held, count) = self.held(c.exprs(), c.input(1), true);
-        let pairs = self.pairs(c.input(0), c.input(1), at!(held, ..count))?;
+        let (probe, build) = (self.probe(), self.build);
+        let (held, count) = self.held(c.exprs(), c.input(build), true);
+        let pairs = self.pairs(c.input(probe), c.input(build), at!(held, ..count))?;
         if let Some(condition) = self.condition {
             let nodes = c.exprs().nodes(condition);
             let data_type = check_expr_type(nodes, &|column| pairs.type_of(column));
@@ -180,7 +254,7 @@ impl<'c> Op<'c> for JoinOp {
                 return Err(LowerError::WrongType(column.map_or(0, |node| node.a)));
             }
         }
-        let mut out = self.pairs(c.input(0), c.input(1), &self.build_columns)?;
+        let mut out = self.pairs(c.input(probe), c.input(build), self.build_columns())?;
         out.arrangements = Arrangements::NONE;
         out.drop_rows();
         out.scan = None;
@@ -194,8 +268,8 @@ impl<'c> Op<'c> for JoinOp {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 2);
         let allocator = lowering.allocator();
-        let (build, rows) = lowering.lower_side(node, 1)?;
-        lowering.lower_input(node, 0)?;
+        let (build, rows) = lowering.lower_side(node, self.build)?;
+        lowering.lower_input(node, self.probe())?;
         let probe = lowering.query_rows();
         let mut condition = None;
         let mut keys = None;
@@ -231,10 +305,10 @@ impl<'c> Op<'c> for JoinOp {
             *at = position(column);
         }
         let mut build_types = [DataType::Int64; BATCH_COLUMNS_MAX as usize];
-        for (data_type, &column) in build_types.iter_mut().zip(self.build_columns.iter()) {
+        for (data_type, &column) in build_types.iter_mut().zip(self.build_columns()) {
             *data_type = rows.type_of(column);
         }
-        let (held, outputs) = (held.len(), self.build_columns.len());
+        let (held, outputs) = (held.len(), self.build_columns().len());
         let join = Join {
             kind: self.kind,
             build,
