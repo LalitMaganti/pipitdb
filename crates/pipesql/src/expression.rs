@@ -129,24 +129,10 @@ fn compile(
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
     }
     let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
-    let push = |compiler: &Compiler<'_, '_>, nodes: &mut ExprBuilder, added| {
-        push_node(nodes, added, node, compiler)
-    };
-    match node.tag() {
-        Tag::Name if is_null(compiler, node) => {
-            push(compiler, nodes, ExprStep::new(ExprOp::Null, 0, 0, 0))?;
-        }
-        Tag::Name => {
-            let column = compiler.find_column(node)?.id;
-            push(compiler, nodes, ExprStep::new(ExprOp::Column, column, 0, 0))?;
-        }
-        Tag::Integer => {
-            push(
-                compiler,
-                nodes,
-                ExprStep::new(ExprOp::Constant, 0, 0, integer(compiler, node, false)?),
-            )?;
-        }
+    let step = match node.tag() {
+        Tag::Name if is_null(compiler, node) => ExprStep::new(ExprOp::Null, 0, 0, 0),
+        Tag::Name => ExprStep::new(ExprOp::Column, compiler.find_column(node)?.id, 0, 0),
+        Tag::Integer => ExprStep::new(ExprOp::Constant, 0, 0, integer(compiler, node, false)?),
         Tag::Float => {
             return Err(Error::unsupported(Unsupported::Decimal, node.span()));
         }
@@ -154,14 +140,18 @@ fn compile(
             let id = string(compiler, node)?;
             let mut constant = ExprStep::new(ExprOp::Constant, id.raw_id(), 0, 0);
             constant.data_type = DataType::String;
-            push(compiler, nodes, constant)?;
+            constant
         }
-        Tag::Unary if node.operator() == Operator::Negate => negate(compiler, node, depth, nodes)?,
+        Tag::Unary if node.operator() == Operator::Negate => {
+            return negate(compiler, node, depth, nodes);
+        }
         Tag::Unary => unary(compiler, node, depth, nodes)?,
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
-        Tag::Binary if node.operator() == Operator::In => in_list(compiler, node, depth, nodes)?,
-        Tag::Call => (compiler.registry().call)(compiler, node, depth, nodes)?,
-        Tag::Case => case(compiler, node, depth, nodes)?,
+        Tag::Binary if node.operator() == Operator::In => {
+            return in_list(compiler, node, depth, nodes);
+        }
+        Tag::Call => return (compiler.registry().call)(compiler, node, depth, nodes),
+        Tag::Case => return case(compiler, node, depth, nodes),
         Tag::Binary => {
             let op = match node.operator() {
                 Operator::Add => ExprOp::Add,
@@ -187,11 +177,11 @@ fn compile(
             compile(compiler, child(compiler, 0), depth + 1, nodes)?;
             let a = nodes.last();
             compile(compiler, child(compiler, 1), depth + 1, nodes)?;
-            let b = nodes.last();
-            push(compiler, nodes, ExprStep::new(op, a, b, 0))?;
+            ExprStep::new(op, a, nodes.last(), 0)
         }
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
-    }
+    };
+    push_node(nodes, step, node, compiler)?;
     Ok(())
 }
 
@@ -353,14 +343,14 @@ fn case(
     push_case(compiler, node, nodes, &branches, otherwise)
 }
 
-/// Appends the nodes of `x IS [NOT] NULL` or `NOT x`, the node `node`,
-/// `depth` deep.
+/// Appends the nodes of `x` in `x IS [NOT] NULL` or `NOT x`, the node
+/// `node`, `depth` deep, and returns the step computing it.
 fn unary(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
     nodes: &mut ExprBuilder,
-) -> Result<(), Error> {
+) -> Result<ExprStep, Error> {
     let op = match node.operator() {
         Operator::IsNull => ExprOp::IsNull,
         Operator::IsNotNull => ExprOp::IsNotNull,
@@ -368,19 +358,18 @@ fn unary(
         _ => return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(node))),
     };
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
-    let a = nodes.last();
-    push_node(nodes, ExprStep::new(op, a, 0, 0), node, compiler)?;
-    Ok(())
+    Ok(ExprStep::new(op, nodes.last(), 0, 0))
 }
 
-/// Appends the nodes of `x LIKE 'pattern'`, the node `node`, `depth` deep.
-/// The pattern must be a string literal, as Perfetto's `GLOB`'s must.
+/// Appends the nodes of `x` in `x LIKE 'pattern'`, the node `node`, `depth`
+/// deep, and returns the step computing it. The pattern must be a string
+/// literal, as Perfetto's `GLOB`'s must.
 fn like(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
     depth: usize,
     nodes: &mut ExprBuilder,
-) -> Result<(), Error> {
+) -> Result<ExprStep, Error> {
     let pattern = compiler.node(node.first_child() + 1);
     if pattern.tag() != Tag::String {
         return Err(Error::unsupported(Unsupported::SelectExpression, compiler.span(pattern)));
@@ -388,8 +377,7 @@ fn like(
     compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
     let a = nodes.last();
     let pattern = string(compiler, pattern)?;
-    push_node(nodes, ExprStep::new(ExprOp::Like, a, pattern.raw_id(), 0), node, compiler)?;
-    Ok(())
+    Ok(ExprStep::new(ExprOp::Like, a, pattern.raw_id(), 0))
 }
 
 /// Appends the nodes of `-x`, the `Negate` node `node`, `depth` deep.
