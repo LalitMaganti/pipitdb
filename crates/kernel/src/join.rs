@@ -69,6 +69,23 @@ impl JoinOp {
     }
 
     /// The build side's columns it outputs.
+    /// Which child `column`, of one, is from.
+    fn child_of(&self, column: ColumnId) -> u32 {
+        if self.is_build_column(column) { self.build } else { self.probe() }
+    }
+
+    /// Whether it outputs the probe rows no build row matched: a left join
+    /// that builds its second child.
+    fn keeps_probe(&self) -> bool {
+        self.kind == JoinKind::Left && self.build == 1
+    }
+
+    /// Whether it outputs the build rows no probe row matched: a left join
+    /// that builds its first child.
+    fn keeps_build(&self) -> bool {
+        self.kind == JoinKind::Left && self.build == 0
+    }
+
     fn build_columns(&self) -> &[ColumnId] {
         at!(self.columns, self.build as usize)
     }
@@ -138,7 +155,7 @@ impl JoinOp {
     ) -> Result<OutputProperties, LowerError> {
         let mut pairs = *probe;
         for &id in held {
-            let nullable = self.kind == JoinKind::Left || build.nullable_of(id);
+            let nullable = self.keeps_probe() || build.nullable_of(id);
             pairs.push_column(Column { id, data_type: build.type_of(id), nullable })?;
         }
         Ok(pairs)
@@ -182,26 +199,20 @@ impl<'c> Op<'c> for JoinOp {
         if key { Forms::FLAT | Forms::SEQUENCE } else { Forms::FLAT }
     }
 
-    /// A condition on a probe-side column can be applied to the probe side,
-    /// and for an inner join, one on a build-side column to the build side.
-    /// A left join outputs a probe row whatever its build rows are.
+    /// A condition on a child's column can be applied to that child, but
+    /// for a left join's second: the join outputs each row of its first
+    /// whatever rows of its second it has.
     fn moves_condition(&self, column: ColumnId) -> Option<u32> {
-        if !self.is_build_column(column) {
-            return Some(self.probe());
-        }
-        (self.kind == JoinKind::Inner).then_some(self.build)
+        let child = self.child_of(column);
+        (self.kind == JoinKind::Inner || child == 0).then_some(child)
     }
 
-    /// An inner join builds the side whose key is best, an id first, as
-    /// it's never hashed, then a unique key, as each probe row then has one
-    /// build row; then the side with fewer rows, by planning's estimates.
-    /// A left join builds its second child, as it outputs every row of its
-    /// first.
+    /// Builds the side whose key is best, an id first, as it's never
+    /// hashed, then a unique key, as each probe row then has one build row;
+    /// then the side with fewer rows, by planning's estimates. A left join
+    /// that builds its first child outputs its unmatched rows at the end.
     fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
         let &[first, second] = inputs else { failed!() };
-        if self.kind != JoinKind::Inner {
-            return;
-        }
         let [left, right] = self.side_keys(exprs, inputs);
         // A better key, then fewer rows; as written if nothing tells them apart.
         let rank = |key, input: &Estimate| (key, u64::MAX - input.rows.estimated);
@@ -233,7 +244,7 @@ impl<'c> Op<'c> for JoinOp {
         _: &dyn Allocator,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        if self.kind == JoinKind::Left && self.is_build_column(column) {
+        if self.kind == JoinKind::Left && self.child_of(column) == 1 {
             return Ok(Given::Stop);
         }
         Ok(Given::Passed(None))
@@ -254,7 +265,11 @@ impl<'c> Op<'c> for JoinOp {
                 return Err(LowerError::WrongType(column.map_or(0, |node| node.a)));
             }
         }
-        let mut out = self.pairs(c.input(probe), c.input(build), self.build_columns())?;
+        let mut out = *c.input(probe);
+        if self.keeps_build() {
+            out.make_nullable();
+        }
+        let mut out = self.pairs(&out, c.input(build), self.build_columns())?;
         out.arrangements = Arrangements::NONE;
         out.drop_rows();
         out.scan = None;
@@ -309,6 +324,10 @@ impl<'c> Op<'c> for JoinOp {
             *data_type = rows.type_of(column);
         }
         let (held, outputs) = (held.len(), self.build_columns().len());
+        let mut probe_types = SlowVec::fixed(allocator, probe.column_count() as usize)?;
+        if self.keeps_build() {
+            probe_types.extend_within(probe.types());
+        }
         let join = Join {
             kind: self.kind,
             build,
@@ -318,6 +337,8 @@ impl<'c> Op<'c> for JoinOp {
             outputs,
             condition,
             keys,
+            keeps_build: self.keeps_build(),
+            probe_types,
         };
         lowering.add_operator(Step::Operator(DynOperator::new(allocator, join)?))
     }
@@ -418,6 +439,10 @@ struct Join<'c> {
     condition: Option<Compute>,
     /// The keys it hashes by, if any.
     keys: Option<Keys>,
+    /// Whether it outputs the build rows no probe row matched, at the end,
+    /// with nulls of `probe_types` for the probe side's columns.
+    keeps_build: bool,
+    probe_types: SlowVec<DataType>,
 }
 
 /// What a run of a `Join` keeps.
@@ -458,6 +483,12 @@ struct Held {
     paired: SlowVec<u32>,
     /// What computing the condition keeps.
     condition: Option<ComputeState>,
+    /// When it keeps the build rows: a bit for each, set once a probe row
+    /// matched it; the next it hasn't looked at for output at the end; and
+    /// a null column of each probe column's type, a batch long.
+    build_matched: SlowVec<u64>,
+    unmatched: u32,
+    probe_nulls: SlowVec<ColumnView>,
 }
 
 /// The most a key can be above the smallest for `Direct` to find build
@@ -627,6 +658,17 @@ fn consecutive(key: &ColumnView, count: u32, sequence: Sequence) -> Option<i64> 
     }
 }
 
+/// A null column of each of `types`, a batch long.
+fn null_columns(context: &mut Context, types: &[DataType]) -> Result<SlowVec<ColumnView>, Error> {
+    let mut nulls = SlowVec::fixed(context.allocator(), types.len())?;
+    for &data_type in types {
+        let step = ExprStep { data_type, ..ExprStep::new(ExprOp::Null, 0, 0, 0) };
+        let Some(null) = constant(context, &step)? else { failed!() };
+        nulls.push(null)?;
+    }
+    Ok(nulls)
+}
+
 /// Group `group`'s last build row, which its payload holds plus one, or
 /// `NONE`.
 fn last_of(table: &GroupTable, group: u32) -> u32 {
@@ -647,6 +689,11 @@ fn selected(selection: &Selection) -> &[u16] {
 }
 
 impl Join<'_> {
+    /// Whether it outputs the probe rows no build row matched.
+    fn keeps_probe(&self) -> bool {
+        self.kind == JoinKind::Left && !self.keeps_build
+    }
+
     /// Holds every row of the build side, and with keys, finds each one's
     /// group.
     fn drain(&self, context: &mut Context, held: &mut Held) -> Result<(), Error> {
@@ -697,6 +744,10 @@ impl Join<'_> {
             if held.direct.is_some() {
                 held.table = None;
             }
+        }
+        if self.keeps_build {
+            let words = held.count.div_ceil(64) as usize;
+            held.build_matched = SlowVec::zeroed(context.allocator(), words)?;
         }
         held.rows.flush(context)
     }
@@ -890,7 +941,7 @@ impl Join<'_> {
         held.started = false;
         output.copy_from(input);
         let matched = &held.matched;
-        let left = self.kind == JoinKind::Left;
+        let left = self.keeps_probe();
         output.selection_mut().retain(|row| left && !is_matched(matched, row));
         for null in held.nulls.iter() {
             let null = null.slice(0, input.row_count());
@@ -905,20 +956,8 @@ impl Operator for Join<'_> {
     fn new_state(&self, context: &mut Context) -> Result<Held, Error> {
         let allocator = context.allocator();
         let rows = RowStore::new(allocator)?;
-        let mut nulls = SlowVec::fixed(allocator, self.outputs)?;
-        for &data_type in at!(self.build_types, ..self.outputs) {
-            let step = ExprStep {
-                op: ExprOp::Null,
-                data_type,
-                a: 0,
-                b: 0,
-                c: 0,
-                int_value: 0,
-                double_value: 0.0,
-            };
-            let Some(null) = constant(context, &step)? else { failed!() };
-            nulls.push(null)?;
-        }
+        let nulls = null_columns(context, at!(self.build_types, ..self.outputs))?;
+        let probe_nulls = null_columns(context, &self.probe_types)?;
         let condition = match &self.condition {
             Some(condition) => Some(condition.new_state(context)?),
             None => None,
@@ -945,6 +984,9 @@ impl Operator for Join<'_> {
             nulls,
             paired: SlowVec::zeroed(allocator, BATCH_ROWS_MAX as usize)?,
             condition,
+            build_matched: SlowVec::zeroed(allocator, 0)?,
+            unmatched: 0,
+            probe_nulls,
         })
     }
 
@@ -959,7 +1001,7 @@ impl Operator for Join<'_> {
             self.drain(context, held)?;
         }
         // No probe row can be joined.
-        if held.count == 0 && self.kind == JoinKind::Inner {
+        if held.count == 0 && !self.keeps_probe() {
             return Ok(Progress::Done);
         }
         if !held.started {
@@ -971,16 +1013,20 @@ impl Operator for Join<'_> {
             self.pair(context, held, output)?;
             let selection = output.selection();
             // Only a left join outputs rows by whether they matched.
-            for i in (0..selection.len()).filter(|_| self.kind == JoinKind::Left) {
+            for i in (0..selection.len()).filter(|_| self.keeps_probe()) {
                 let kept = selection.kept().row(i);
                 *at_mut!(held.matched, kept as usize / 64) |= 1 << (kept % 64);
+            }
+            for i in (0..selection.len()).filter(|_| self.keeps_build) {
+                let build = *at!(held.paired, selection.kept().row(i) as usize);
+                *at_mut!(held.build_matched, build as usize / 64) |= 1 << (build % 64);
             }
             if selection.is_empty() {
                 continue;
             }
-            // An inner join has nothing to add once no row has a build row
-            // left: as when each has one, N:1.
-            if self.kind == JoinKind::Inner && !more {
+            // A join that doesn't keep probe rows has nothing to add once no
+            // row has a build row left: as when each has one, N:1.
+            if !self.keeps_probe() && !more {
                 held.started = false;
                 return Ok(Progress::NeedInput);
             }
@@ -990,7 +1036,85 @@ impl Operator for Join<'_> {
         Ok(Progress::NeedInput)
     }
 
-    fn finish(&self, _: &mut Context, _: &mut Held, _: &mut RowBatch) -> Result<Progress, Error> {
-        Ok(Progress::NeedInput)
+    /// Outputs the build rows no probe row matched, if it keeps them, with
+    /// nulls for the probe side's columns, a batch at a time.
+    fn finish(
+        &self,
+        context: &mut Context,
+        held: &mut Held,
+        output: &mut RowBatch,
+    ) -> Result<Progress, Error> {
+        if !self.keeps_build {
+            return Ok(Progress::NeedInput);
+        }
+        if !held.drained {
+            self.drain(context, held)?;
+        }
+        let mut count = 0;
+        while held.unmatched < held.count && count < BATCH_ROWS_MAX {
+            let row = held.unmatched;
+            held.unmatched += 1;
+            if *at!(held.build_matched, row as usize / 64) >> (row % 64) & 1 == 0 {
+                *at_mut!(held.paired, count as usize) = row;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Ok(Progress::NeedInput);
+        }
+        output.reset(count);
+        for null in held.probe_nulls.iter() {
+            let Ok(()) = output.push_column(null.slice(0, count)) else { failed!() };
+        }
+        let mut build = RowBatch::new();
+        held.rows.gather_held(context, &mut build, at!(held.paired, ..count as usize))?;
+        for c in 0..self.outputs {
+            #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
+            let column = build.column(c as u32).clone();
+            let Ok(()) = output.push_column(column) else { failed!() };
+        }
+        let more = held.unmatched < held.count;
+        Ok(if more { Progress::MoreOutput } else { Progress::NeedInput })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::Heap;
+    use crate::estimate::RowEstimate;
+    use crate::expression::ExprBuilder;
+
+    /// The child a join of `kind` on `a = b` builds, given its children's
+    /// rows and keys.
+    fn built(kind: JoinKind, first: (u64, Key), second: (u64, Key)) -> u32 {
+        let mut exprs = Exprs::new(&Heap).unwrap();
+        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
+        nodes.node(ExprOp::Eq, a, b).unwrap();
+        let condition = Some(exprs.add(nodes.nodes()).unwrap());
+        let estimate = |(rows, key): (u64, Key), column| {
+            let mut estimate = Estimate::of(RowEstimate::exactly(rows));
+            estimate.add_key(column, key);
+            estimate
+        };
+        let one = |column| SlowVec::fixed_from(&Heap, [column].into_iter()).unwrap();
+        let mut join = JoinOp::new(kind, condition, [one(0), one(1)]);
+        join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
+        join.build
+    }
+
+    #[test]
+    fn builds_the_side_with_the_better_key_then_fewer_rows() {
+        let (few, many) = (10, 1_000_000);
+        for kind in [JoinKind::Inner, JoinKind::Left] {
+            // An id, even if bigger, then a unique key, then fewer rows.
+            assert_eq!(built(kind, (many, Key::Id), (few, Key::Unique)), 0);
+            assert_eq!(built(kind, (many, Key::Unique), (few, Key::None)), 0);
+            assert_eq!(built(kind, (few, Key::None), (many, Key::None)), 0);
+            assert_eq!(built(kind, (many, Key::None), (few, Key::None)), 1);
+            // As written when nothing tells them apart.
+            assert_eq!(built(kind, (few, Key::Id), (few, Key::Id)), 1);
+        }
     }
 }
