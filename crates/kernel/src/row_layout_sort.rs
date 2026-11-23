@@ -12,6 +12,7 @@ use core::cmp::Ordering;
 use crate::allocator::AllocError;
 use crate::containers::{Array, SmallVec};
 use crate::env::Env;
+use crate::ordered::key_value;
 use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
@@ -354,9 +355,7 @@ impl SlotInWords {
         let ((from, to, mask), float) = (*at!(self.runs, 0), self.float);
         for (out, &word) in out.iter_mut().zip(words) {
             let value = self.value | (self.packing.key(word) >> from & mask) << to;
-            let bits = (value ^ invert).cast_signed() ^ i64::MIN;
-            let flip = if float { ((bits >> 63).cast_unsigned() >> 1).cast_signed() } else { 0 };
-            *out = bits ^ flip;
+            *out = key_value(value, invert, float);
         }
         true
     }
@@ -382,12 +381,7 @@ impl SlotInWords {
         if self.slot.nullable && flag ^ invert as u8 == 0 {
             return None;
         }
-        let bits = (value ^ invert).cast_signed() ^ i64::MIN;
-        if !self.float {
-            return Some(bits);
-        }
-        // A negative float's bits but its sign were flipped by `Word::encode`.
-        Some(bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed())
+        Some(key_value(value, invert, self.float))
     }
 }
 

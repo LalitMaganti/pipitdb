@@ -17,6 +17,7 @@ use crate::eight;
 use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key};
 use crate::murmur_hash;
+use crate::ordered::ordered;
 use crate::selection::Selection;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -404,7 +405,7 @@ impl Entries {
             let values = column.values();
             let mut bits = Array::zeroed(env, BitSlice::<u64>::words_for(values.len() as usize))?;
             set(values, &mut bits);
-            self.matched = bits.iter().map(|word| word.count_ones()).sum();
+            self.matched = BitSlice::of(&bits).count_ones();
             if self.matched == 1 {
                 for (word, &set) in (0..).zip(bits.iter()) {
                     if set != 0 {
@@ -635,8 +636,7 @@ fn float_key(value: f64) -> i64 {
         return i64::MAX;
     }
     // Adding 0 turns -0 into 0.
-    let bits = (value + 0.0).to_bits().cast_signed();
-    bits ^ ((bits >> 63).cast_unsigned() >> 1).cast_signed()
+    ordered((value + 0.0).to_bits().cast_signed())
 }
 
 /// As `retain`, but also drops the null rows of `column`, with a loop that
