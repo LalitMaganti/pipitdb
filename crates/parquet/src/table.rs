@@ -77,12 +77,18 @@ impl<'a> Rows<'a> {
         group: usize,
     ) -> Result<(), Error> {
         let (index, file) = (file, at!(table.files, file));
-        for &(column, _) in columns {
+        // Each column's reader from the last row group, if there was one,
+        // keeps its buffers.
+        for (i, &(column, _)) in columns.iter().enumerate() {
             let c = column as usize;
             let chunk = file.footer.chunk(group, c);
             let column = *at!(file.footer.columns(), c);
-            let reader = ChunkReader::new(file.source, table.codecs, column, chunk)?;
-            self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
+            if let Some(reader) = self.readers.get_mut(i) {
+                reader.restart(file.source, table.codecs, column, chunk)?;
+            } else {
+                let reader = ChunkReader::new(file.source, table.codecs, column, chunk)?;
+                self.readers.push(reader).map_err(|_| Error::OutOfMemory)?;
+            }
         }
         (self.started, self.left) = (true, file.footer.group_rows(group));
         self.file = u32::try_from(index).map_err(|_| Error::Unsupported)?;
@@ -112,7 +118,6 @@ impl<'a> Rows<'a> {
                 if self.left > 0 {
                     return Err(Error::Corrupt);
                 }
-                self.readers.retain(|_| false);
                 self.started = false;
                 return Ok(false);
             }
@@ -384,17 +389,20 @@ impl<'a> Scannable for ParquetTable<'a> {
                 }
                 let column = *at!(file.footer.columns(), c);
                 let chunk = file.footer.chunk(group, c);
-                let mut reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
-                // Past the dictionary page, if any, so data pages can be
-                // gone to.
-                reader.page_left(context)?;
-                if let Some(at) = found {
-                    *at_mut!(loader.readers, at) = (key, reader);
+                let at = if let Some(at) = found {
+                    let (was, reader) = at_mut!(loader.readers, at);
+                    reader.restart(file.source, self.codecs, column, chunk)?;
+                    *was = key;
                     at
                 } else {
+                    let reader = ChunkReader::new(file.source, self.codecs, column, chunk)?;
                     loader.readers.push((key, reader)).map_err(|_| Error::OutOfMemory)?;
                     loader.readers.len() - 1
-                }
+                };
+                // Past the dictionary page, if any, so data pages can be
+                // gone to.
+                at_mut!(loader.readers, at).1.page_left(context)?;
+                at
             }
         };
         let reader = &mut at_mut!(loader.readers, at).1;
