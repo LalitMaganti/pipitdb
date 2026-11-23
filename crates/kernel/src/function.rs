@@ -15,9 +15,6 @@ use crate::env::Env;
 use crate::erase::value_of;
 use crate::error::Error;
 
-/// The most arguments a call has.
-pub const ARGUMENTS_MAX: usize = 8;
-
 pub trait Function {
     /// Computes it at every row of a batch from its arguments' columns, of
     /// the types it was bound with: null where any argument is, and only
