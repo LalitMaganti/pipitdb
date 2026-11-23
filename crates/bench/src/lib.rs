@@ -45,8 +45,11 @@ pub fn env() -> &'static Env {
 
 pub mod real;
 
-static REGISTRY: Registry =
-    Registry::new(&[pipit_pipesql::stages::RELATIONAL, pipit_pipesql::stages::AGGREGATION]);
+static REGISTRY: Registry = Registry::new(&[
+    pipit_pipesql::stages::RELATIONAL,
+    pipit_pipesql::stages::AGGREGATION,
+    pipit_pipesql::stages::JOINS,
+]);
 
 /// Queries shaped like real ones, repeated `count` times.
 pub fn typical_queries(count: usize) -> String {
