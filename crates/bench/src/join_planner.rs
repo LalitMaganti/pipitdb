@@ -485,39 +485,6 @@ pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
     Ok(tree)
 }
 
-/// A query graph of `count` tables. If `star`, each table joins the first
-/// one; if not, each joins the one before it. Each join is many-to-one on the
-/// smaller table's key.
-#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn join_graph(star: bool, count: u32) -> QueryGraph {
-    let mut graph = QueryGraph::new(crate::env()).expect("allocates");
-    for relation in 0..count {
-        let rows = 100 + u64::from(relation) * 2_654_435_761 % 100_000;
-        graph
-            .relations
-            .push(Relation { rows, unfiltered_rows: rows, max_rows: rows })
-            .expect("allocates");
-        let Some(before) = relation.checked_sub(1) else { continue };
-        let other = if star { 0 } else { before };
-        let domain = rows.min(graph.relations.get(other as usize).expect("added").rows);
-        graph.equivalences.push(EquivalenceSet { domain }).expect("allocates");
-        let (left, right) = (
-            relation_set([other]).expect("allocates"),
-            relation_set([relation]).expect("allocates"),
-        );
-        let edge = JoinEdge { left, right, kind: JoinKind::Inner, equivalence: before };
-        graph.edges.push(edge).expect("allocates");
-    }
-    graph
-}
-
-/// Plans the joins of `graph`, and returns how many nodes the plan has, or 0
-/// if it keeps the written order.
-pub fn plan_joins(graph: &QueryGraph) -> usize {
-    pipit_kernel::join_planner::plan(crate::env(), graph)
-        .map_or(0, |tree| tree.map_or(0, |tree| tree.nodes.len()))
-}
-
 /// The planner's tree for `graph`, or the written order where it keeps that.
 pub fn plan(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
     pipit_kernel::join_planner::plan(env, graph)?.map_or_else(|| as_written(env, graph), Ok)

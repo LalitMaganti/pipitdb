@@ -1,43 +1,30 @@
 //! Instruction-count benchmarks, run under Valgrind by gungraun. CI fails a PR
 //! that makes any of them slower than its base by more than the set limit.
+//!
+//! Each runs whole queries, small and big, as a user would: what users wait
+//! for. Parts measured alone, such as one operator over a few batches, belong
+//! in `wall_clock.rs`, to investigate with, not here.
 
 use std::hint::black_box;
 
 use gungraun::prelude::*;
 use pipit_file::source::FileSource;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::join_planner::QueryGraph;
 use pipit_kernel::lower::PhysicalPlan;
-use pipit_kernel::pipeline::Pipeline;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_parquet::table::ParquetTable;
 use pipit_parquet_full::Codecs;
-use pipitdb_bench::{count_nodes, count_tokens, expression, long_text, typical_queries};
 
-#[library_benchmark]
-#[bench::typical(typical_queries(100))]
-#[bench::long_text(long_text(100))]
-fn lexer(source: String) -> u32 {
-    black_box(count_tokens(black_box(source.as_bytes())))
-}
-
-#[library_benchmark]
-#[bench::expression(expression(100))]
-fn parser(source: String) -> u32 {
-    black_box(count_nodes(black_box(source.as_bytes())))
-}
-
-library_benchmark_group!(name = lexer_group, benchmarks = [lexer]);
 #[library_benchmark]
 #[bench::typical(pipitdb_bench::queries(100))]
 fn query(source: String) -> u32 {
     black_box(pipitdb_bench::count_query_nodes(black_box(&source)))
 }
 
-library_benchmark_group!(name = parser_group, benchmarks = [parser, query]);
+library_benchmark_group!(name = parser_group, benchmarks = [query]);
 
-/// Finds one row of a small table by its id, without and with planning it:
-/// what a query costs before any rows are read.
+/// Finds one row of a small table by its id, from the query's text: what a
+/// query costs before any rows are read.
 const POINT: &str = "FROM t |> WHERE id = 42 |> SELECT a, b";
 
 #[library_benchmark]
@@ -46,37 +33,7 @@ fn small(catalog: &'static dyn Catalog, query: &str) -> u64 {
     black_box(pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)))
 }
 
-#[library_benchmark]
-#[bench::point(pipitdb_bench::small_plan(100, POINT))]
-#[bench::order(pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b"))]
-fn small_planned(plan: PhysicalPlan<'static>) -> u64 {
-    black_box(pipitdb_bench::run_plan(black_box(&plan)))
-}
-
-library_benchmark_group!(name = small_group, benchmarks = [small, small_planned]);
-
-// Planning the joins of 2 to 16 tables, as a star and as a chain. Most
-// queries join few tables, so planning them has to be cheap.
-#[library_benchmark]
-#[bench::star_2(pipitdb_bench::join_planner::join_graph(true, 2))]
-#[bench::star_3(pipitdb_bench::join_planner::join_graph(true, 3))]
-#[bench::star_5(pipitdb_bench::join_planner::join_graph(true, 5))]
-#[bench::star_8(pipitdb_bench::join_planner::join_graph(true, 8))]
-#[bench::star_12(pipitdb_bench::join_planner::join_graph(true, 12))]
-#[bench::star_13(pipitdb_bench::join_planner::join_graph(true, 13))]
-#[bench::star_16(pipitdb_bench::join_planner::join_graph(true, 16))]
-#[bench::chain_2(pipitdb_bench::join_planner::join_graph(false, 2))]
-#[bench::chain_3(pipitdb_bench::join_planner::join_graph(false, 3))]
-#[bench::chain_5(pipitdb_bench::join_planner::join_graph(false, 5))]
-#[bench::chain_8(pipitdb_bench::join_planner::join_graph(false, 8))]
-#[bench::chain_12(pipitdb_bench::join_planner::join_graph(false, 12))]
-#[bench::chain_13(pipitdb_bench::join_planner::join_graph(false, 13))]
-#[bench::chain_16(pipitdb_bench::join_planner::join_graph(false, 16))]
-fn join_planner(graph: QueryGraph) -> usize {
-    black_box(pipitdb_bench::join_planner::plan_joins(black_box(&graph)))
-}
-
-library_benchmark_group!(name = join_planner_group, benchmarks = [join_planner]);
+library_benchmark_group!(name = small_group, benchmarks = [small]);
 
 // Perfetto's `filter_benchmark.cc`, on the same 2^20 rows, planned first.
 #[library_benchmark]
@@ -88,46 +45,11 @@ fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
 
-// Perfetto's `expression_benchmark.cc`, over 16 batches.
-#[library_benchmark]
-#[bench::int_add(pipitdb_bench::perfetto_expression(0, 16))]
-#[bench::int_mul(pipitdb_bench::perfetto_expression(1, 16))]
-#[bench::int_div(pipitdb_bench::perfetto_expression(2, 16))]
-#[bench::int_add_nullable(pipitdb_bench::perfetto_expression(3, 16))]
-#[bench::int_div_nullable(pipitdb_bench::perfetto_expression(4, 16))]
-#[bench::double_add(pipitdb_bench::perfetto_expression(5, 16))]
-#[bench::double_mul(pipitdb_bench::perfetto_expression(6, 16))]
-#[bench::int_lt(pipitdb_bench::perfetto_expression(7, 16))]
-#[bench::int_ne(pipitdb_bench::perfetto_expression(8, 16))]
-#[bench::int_lt_nullable(pipitdb_bench::perfetto_expression(9, 16))]
-#[bench::double_lt(pipitdb_bench::perfetto_expression(10, 16))]
-#[bench::is_null(pipitdb_bench::perfetto_expression(11, 16))]
-#[bench::is_not_null(pipitdb_bench::perfetto_expression(12, 16))]
-#[bench::coalesce_int(pipitdb_bench::perfetto_expression(13, 16))]
-#[bench::iif_int(pipitdb_bench::perfetto_expression(14, 16))]
-#[bench::iif_int_nullable(pipitdb_bench::perfetto_expression(15, 16))]
-fn perfetto_expression(pipeline: Pipeline<'static>) -> u64 {
-    black_box(pipitdb_bench::run(black_box(&pipeline)))
-}
-
-library_benchmark_group!(
-    name = perfetto_filter_group,
-    benchmarks = [perfetto_filter, perfetto_expression]
-);
-
-#[library_benchmark]
-#[bench::source(pipitdb_bench::pass_pipeline(1000, 0, false))]
-#[bench::transforms(pipitdb_bench::pass_pipeline(1000, 4, false))]
-#[bench::operators(pipitdb_bench::pass_pipeline(1000, 4, true))]
-#[bench::nested(pipitdb_bench::nested_pipeline(1000))]
-fn pipeline(pipeline: Pipeline<'static>) -> u64 {
-    black_box(pipitdb_bench::run(black_box(&pipeline)))
-}
+library_benchmark_group!(name = perfetto_filter_group, benchmarks = [perfetto_filter]);
 
 // 64K slices joined to 4K threads by id: stored as a sequence, shuffled, or
-// spread far apart, against scanning the slices alone.
+// spread far apart.
 #[library_benchmark]
-#[bench::scan(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::No))]
 #[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Ids))]
 #[bench::shuffled(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Shuffled))]
 #[bench::spread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Spread))]
@@ -135,65 +57,7 @@ fn join(plan: PhysicalPlan<'static>) -> u64 {
     black_box(pipitdb_bench::run_plan(black_box(&plan)))
 }
 
-#[library_benchmark]
-#[bench::table(pipitdb_bench::scan_pipeline(pipitdb_bench::table(1000)))]
-fn scan(pipeline: Pipeline<'static>) -> u64 {
-    black_box(pipitdb_bench::run(black_box(&pipeline)))
-}
-
-#[library_benchmark]
-#[bench::greater(pipitdb_bench::filter_column(false), pipitdb_bench::greater)]
-#[bench::greater_nulls(pipitdb_bench::filter_column(true), pipitdb_bench::greater)]
-fn filter(
-    column: pipit_kernel::column::ColumnView,
-    filter: fn(&pipit_kernel::column::ColumnView, &mut pipit_kernel::selection::Selection),
-) -> u64 {
-    black_box(pipitdb_bench::run_filter(black_box(&column), 100, filter))
-}
-
-#[library_benchmark]
-#[bench::and(pipitdb_bench::predicate("and"))]
-#[bench::or(pipitdb_bench::predicate("or"))]
-#[bench::not(pipitdb_bench::predicate("not"))]
-fn predicate(predicate: pipit_kernel::predicate::Predicate) -> u64 {
-    let column = pipitdb_bench::filter_column(false);
-    black_box(pipitdb_bench::run_predicate(black_box(&predicate), None, &column, 100))
-}
-
-#[library_benchmark]
-#[bench::find(pipitdb_bench::hash_map(1000))]
-fn flat_hash_map(map: pipit_kernel::flat_hash_map::FlatHashMap<i64, ()>) -> u64 {
-    black_box(pipitdb_bench::find_keys(black_box(&map), 4000))
-}
-
-#[library_benchmark]
-#[bench::repeats(pipitdb_bench::strings(10_000, 100))]
-#[bench::distinct(pipitdb_bench::strings(10_000, 10_000))]
-fn string_pool_intern(strings: Vec<u8>) -> usize {
-    black_box(pipitdb_bench::intern_strings(black_box(&strings)).1.len())
-}
-
-#[library_benchmark]
-#[bench::distinct(pipitdb_bench::intern_strings(&pipitdb_bench::strings(10_000, 10_000)))]
-fn string_pool_get(
-    (pool, ids): (pipit_kernel::string_pool::StringPool, Vec<pipit_kernel::string_pool::Id>),
-) -> usize {
-    black_box(pipitdb_bench::get_strings(black_box(&pool), black_box(&ids)))
-}
-
-library_benchmark_group!(
-    name = pipeline_group,
-    benchmarks = [
-        pipeline,
-        scan,
-        join,
-        filter,
-        predicate,
-        flat_hash_map,
-        string_pool_intern,
-        string_pool_get
-    ]
-);
+library_benchmark_group!(name = join_group, benchmarks = [join]);
 
 /// The table `hits`, over ClickBench's first file.
 struct Hits(DynScannable<'static>);
@@ -265,11 +129,9 @@ library_benchmark_group!(name = clickbench_group, benchmarks = [clickbench]);
 // ClickBench file is, and that it must be there.
 main!(
     config = LibraryBenchmarkConfig::default().pass_through_env("PIPIT_CLICKBENCH");
-    library_benchmark_groups = lexer_group,
-    parser_group,
+    library_benchmark_groups = parser_group,
     small_group,
-    join_planner_group,
     perfetto_filter_group,
-    pipeline_group,
+    join_group,
     clickbench_group
 );
