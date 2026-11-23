@@ -5,26 +5,30 @@
 
 #![allow(unsafe_code)]
 
-use core::mem::MaybeUninit;
-
 use crate::ast::{Ast, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use pipit_kernel::containers::SmallVec;
+use pipit_kernel::containers::SpillVec;
 use pipit_kernel::env::Env;
+use pipit_kernel::settings::build_setting;
 
-/// How deeply operators, parentheses and calls can nest. Each waiting
-/// argument counts as a level.
-pub const NESTING_MAX: usize = 64;
+/// How deeply operators, parentheses and calls can nest: by default as
+/// deeply as DuckDB's parser allows. Each waiting argument counts as a
+/// level. Compiling takes up to about 500 bytes of stack a level. Set at
+/// build time with `PIPIT_NESTING_MAX`.
+pub const NESTING_MAX: usize = build_setting(option_env!("PIPIT_NESTING_MAX"), 1000);
 
-/// How many stages a query, or items a list, can have: as many as a plan
-/// has columns.
-pub const LIST_MAX: usize = pipit_kernel::plan::PLAN_COLUMNS_MAX;
+const _: () = assert!(NESTING_MAX >= 2, "PIPIT_NESTING_MAX must be at least 2");
 
-/// How many values an `IN` list can have.
-pub const IN_LIST_MAX: usize = 1 << 16;
+/// How many stages a query, or items a list, can have: as many as a node
+/// can count.
+pub const LIST_MAX: usize = DATA_MAX as usize;
+
+/// How many items of a list are gathered in place, as most lists have no
+/// more. A longer list's are gathered in memory from the `Env`.
+const LIST_INLINE: usize = 64;
 
 /// Parses `source` as a query, with the stages in `registry`.
 pub fn parse_query(env: &Env, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
@@ -41,7 +45,7 @@ pub fn parse_expression(env: &Env, source: &[u8]) -> Result<Ast, Error> {
 }
 
 pub(crate) struct Parser<'a> {
-    /// What lists too long for the stack are gathered with.
+    /// What the tree's blocks, and lists too long for the stack, come from.
     env: &'a Env,
     /// The query's text.
     source: &'a [u8],
@@ -135,7 +139,7 @@ impl<'a> Parser<'a> {
     fn push(&mut self, node: Node) {
         self.nodes.push(node);
         if self.nodes.needs_block()
-            && let Err(code) = self.nodes.grow()
+            && let Err(code) = self.nodes.grow(self.env)
         {
             self.failed.get_or_insert(Error::new(code, self.current.span));
         }
@@ -255,38 +259,36 @@ struct Frame {
     min_power: u8,
 }
 
-/// The frames waiting for operands. Bounded, as the parser doesn't recurse.
-/// Frames from `depth` up are unwritten, so making one costs nothing.
-struct Stack {
-    frames: [MaybeUninit<Frame>; NESTING_MAX],
-    depth: usize,
+/// How many frames are held in place: as many as most expressions nest, so
+/// parsing them allocates nothing.
+const FRAMES_INLINE: usize = 64;
+
+/// The frames waiting for operands, the innermost last. The parser doesn't
+/// recurse, so its depth costs memory, not stack.
+struct Stack<'e> {
+    frames: SpillVec<'e, Frame, FRAMES_INLINE>,
 }
 
-impl Stack {
-    fn new() -> Stack {
-        Stack { frames: [const { MaybeUninit::uninit() }; NESTING_MAX], depth: 0 }
+impl<'e> Stack<'e> {
+    fn new(env: &'e Env) -> Stack<'e> {
+        Stack { frames: SpillVec::new(env, NESTING_MAX) }
     }
 
     fn push(&mut self, pending: Pending, min_power: u8, token: Token) -> Result<(), Error> {
-        if self.depth == NESTING_MAX {
+        if self.frames.len() == NESTING_MAX {
             return Err(Error::new(ErrorCode::NestingTooDeep, token.span));
         }
-        at_mut!(self.frames, self.depth).write(Frame { pending, min_power });
-        self.depth += 1;
-        Ok(())
+        Ok(self.frames.push(Frame { pending, min_power })?)
     }
 
     /// The frames, bottom first.
     fn frames(&self) -> &[Frame] {
-        // SAFETY: `push` keeps `depth` within `frames`, the first `depth` were
-        // written, and `MaybeUninit<Frame>` is laid out as `Frame`.
-        unsafe { core::slice::from_raw_parts(self.frames.as_ptr().cast(), self.depth) }
+        &self.frames
     }
 
     /// Keeps the bottom `depth` frames.
     fn truncate(&mut self, depth: usize) {
-        check!(depth <= self.depth);
-        self.depth = depth;
+        self.frames.truncate(depth);
     }
 }
 
@@ -294,7 +296,7 @@ impl Parser<'_> {
     /// Parses an expression, stopping at the first token that can't continue
     /// it. Returns its root, which is not in the tree yet.
     pub(crate) fn expression(&mut self) -> Result<Node, Error> {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(self.env);
         let mut min_power = 0;
         'operand: loop {
             let token = self.advance()?;
@@ -334,7 +336,7 @@ impl Parser<'_> {
                     }
                     Ended::No => {}
                 }
-                stack.truncate(stack.depth - 1);
+                stack.truncate(stack.frames().len() - 1);
                 min_power = frame.min_power;
                 operand = match frame.pending {
                     Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand]),
@@ -357,38 +359,28 @@ impl Parser<'_> {
     }
 
     /// `operand IN (1, -2, 'a')`, from the `IN`. The list holds literals
-    /// only, so it can be long without nesting: they're gathered as they're
-    /// read, and written next to each other once it ends.
+    /// only.
     fn in_list(&mut self, operand: Node) -> Result<Node, Error> {
         self.advance()?;
         self.expect(TokenKind::LeftParen)?;
-        let mut items = SmallVec::new(self.env, IN_LIST_MAX)?;
-        loop {
-            let negative = self.current().kind == TokenKind::Minus;
+        let list = self.items(Tag::List, TokenKind::Comma, &mut |parser, _| {
+            let negative = parser.current().kind == TokenKind::Minus;
             if negative {
-                self.advance()?;
+                parser.advance()?;
             }
-            let token = self.advance()?;
+            let token = parser.advance()?;
             let number = matches!(token.kind, TokenKind::Integer | TokenKind::Float);
             if !number && (negative || token.kind != TokenKind::String) {
                 return Err(Error::new(ErrorCode::ExpectedExpression, token.span));
             }
-            let mut item = leaf(token)?;
-            if negative {
-                item = self.operation(Tag::Unary, Operator::Negate, &[item]);
-            }
-            if items.len() == IN_LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, token.span));
-            }
-            items.push(item)?;
-            let token = self.advance()?;
-            match token.kind {
-                TokenKind::RightParen => break,
-                TokenKind::Comma => {}
-                _ => return Err(Error::expected(TokenKind::RightParen, token.span)),
-            }
-        }
-        let list = self.list(Tag::List, &items);
+            let item = leaf(token)?;
+            Ok(if negative {
+                parser.operation(Tag::Unary, Operator::Negate, &[item])
+            } else {
+                item
+            })
+        })?;
+        self.expect(TokenKind::RightParen)?;
         Ok(self.operation(Tag::Binary, Operator::In, &[operand, list]))
     }
 
@@ -410,7 +402,7 @@ impl Parser<'_> {
     /// Pops a call and its arguments off `stack`, `last` being its last
     /// argument, and writes them to the tree. Returns the call and the binding
     /// power to go back to.
-    fn call(&mut self, stack: &mut Stack, last: Node) -> (Node, u8) {
+    fn call(&mut self, stack: &mut Stack<'_>, last: Node) -> (Node, u8) {
         let frames = stack.frames();
         let mut call = frames.len() - 1;
         while let Pending::Argument(_) = at!(frames, call).pending {
@@ -433,7 +425,7 @@ impl Parser<'_> {
     /// its operand.
     fn push_pending(
         &mut self,
-        stack: &mut Stack,
+        stack: &mut Stack<'_>,
         pending: Pending,
         min_power: u8,
         token: Token,
@@ -459,7 +451,12 @@ impl Parser<'_> {
     /// Ends `operand` as an argument of the call, or a part of the `CASE`,
     /// that `frame`, the top of `stack`, is part of, at the token after it:
     /// another follows, or the call or `CASE` closes.
-    fn end_part(&mut self, stack: &mut Stack, frame: Frame, operand: Node) -> Result<Ended, Error> {
+    fn end_part(
+        &mut self,
+        stack: &mut Stack<'_>,
+        frame: Frame,
+        operand: Node,
+    ) -> Result<Ended, Error> {
         match frame.pending {
             Pending::Case | Pending::CasePart(..) => {
                 let token = self.advance()?;
@@ -509,7 +506,7 @@ impl Parser<'_> {
     /// writes them to the tree: its subject, each condition and value, and
     /// its `ELSE`'s value, an empty node for one it hasn't. Returns the `CASE`
     /// and the binding power to go back to.
-    fn case(&mut self, stack: &mut Stack, last: Node, before: Keyword) -> (Node, u8) {
+    fn case(&mut self, stack: &mut Stack<'_>, last: Node, before: Keyword) -> (Node, u8) {
         let frames = stack.frames();
         let mut case = frames.len() - 1;
         while let Pending::CasePart(..) = at!(frames, case).pending {
@@ -655,18 +652,10 @@ fn leaf(token: Token) -> Result<Node, Error> {
 impl Parser<'_> {
     /// Parses a query, returning its root, which is not in the tree yet.
     pub(crate) fn query(&mut self, registry: &Registry) -> Result<Node, Error> {
-        let mut stages = SmallVec::new(self.env, LIST_MAX)?;
-        loop {
-            if stages.len() == LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
-            }
-            let point = if stages.is_empty() { Point::Source } else { Point::Stage };
-            stages.push(self.stage(registry, point)?)?;
-            if self.current().kind != TokenKind::Pipe {
-                return Ok(self.list(Tag::Query, &stages));
-            }
-            self.advance()?;
-        }
+        self.items(Tag::Query, TokenKind::Pipe, &mut |parser, first| {
+            let point = if first { Point::Source } else { Point::Stage };
+            parser.stage(registry, point)
+        })
     }
 
     fn stage(&mut self, registry: &Registry, point: Point) -> Result<Node, Error> {
@@ -753,17 +742,7 @@ impl Parser<'_> {
 
     /// One or more `shared`, separated by commas.
     fn list_of(&mut self, shared: Shared) -> Result<Node, Error> {
-        let mut items = SmallVec::new(self.env, LIST_MAX)?;
-        loop {
-            if items.len() == LIST_MAX {
-                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
-            }
-            items.push(self.shared(shared)?)?;
-            if self.current().kind != TokenKind::Comma {
-                return Ok(self.list(Tag::List, &items));
-            }
-            self.advance()?;
-        }
+        self.items(Tag::List, TokenKind::Comma, &mut |parser, _| parser.shared(shared))
     }
 
     /// `words`, then one or more `shared`. If the first word isn't next, an
@@ -808,6 +787,28 @@ impl Parser<'_> {
     fn at_word(&self, word: &str) -> bool {
         let current = self.current();
         current.kind == TokenKind::Identifier && same_word(self.text(current), word.as_bytes())
+    }
+
+    /// Items `item` parses, whether each is the first, separated by
+    /// `separator`, as a `tag` node.
+    fn items(
+        &mut self,
+        tag: Tag,
+        separator: TokenKind,
+        item: &mut dyn FnMut(&mut Self, bool) -> Result<Node, Error>,
+    ) -> Result<Node, Error> {
+        let mut items = SpillVec::<Node, LIST_INLINE>::new(self.env, LIST_MAX);
+        loop {
+            if items.len() == LIST_MAX {
+                return Err(Error::new(ErrorCode::ListTooLong, self.current().span));
+            }
+            let next = item(self, items.is_empty())?;
+            items.push(next)?;
+            if self.current().kind != separator {
+                return Ok(self.list(tag, &items));
+            }
+            self.advance()?;
+        }
     }
 
     /// Writes `children` to the tree, and returns a `tag` node holding them.
@@ -895,7 +896,7 @@ mod tests {
             parse("NOT a IN (-1, 6) AND b in ('x')"),
             "(And (Not (In a (List (Negate 1) 6))) (In b (List 'x')))"
         );
-        // Lists hold only literals, and can be longer than calls can.
+        // Lists hold only literals, and can be as long as other lists.
         let long = (0..1000).map(|i| format!("{i}")).collect::<alloc::vec::Vec<_>>().join(", ");
         assert!(parse(&format!("a IN ({long})")).starts_with("(In a (List 0 1 2 "));
         assert_eq!(error("a IN ()"), (ErrorCode::ExpectedExpression, 6));
@@ -905,6 +906,22 @@ mod tests {
         assert_eq!(error("a IN 1"), (ErrorCode::ExpectedToken, 5));
         // `IN` and `IS` are only keywords after an operand.
         assert_eq!(parse("in IN (1) OR is IS NULL"), "(Or (In in (List 1)) (IsNull is))");
+    }
+
+    #[test]
+    fn parses_lists_and_queries_longer_than_a_batch_is_wide() {
+        static REGISTRY: Registry = Registry::new(&[crate::stages::RELATIONAL]);
+        let items: alloc::vec::Vec<String> = (0..1000).map(|i| format!("c{i}")).collect();
+        // Each stage's list is gathered above the query's stages so far.
+        let wheres = "|> SELECT a, b ".repeat(100);
+        let source = format!("FROM t {wheres}|> SELECT {}", items.join(", "));
+        let ast = parse_query(Env::current(), &REGISTRY, source.as_bytes()).unwrap();
+        let query = ast.node(ast.root());
+        assert_eq!(query.child_count(), 102);
+        let last = ast.node(query.first_child() + 101);
+        assert_eq!(ast.node(last.first_child()).child_count(), 1000);
+        let second = ast.node(query.first_child() + 1);
+        assert_eq!(ast.node(second.first_child()).child_count(), 2);
     }
 
     #[test]
@@ -954,7 +971,10 @@ mod tests {
         assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
         assert_eq!(error("a b"), (ErrorCode::UnexpectedToken, 2));
         assert_eq!(error("a AND"), (ErrorCode::ExpectedExpression, 5));
-        assert_eq!(error(&"(".repeat(NESTING_MAX + 1)), (ErrorCode::NestingTooDeep, 64));
+        assert_eq!(
+            error(&"(".repeat(NESTING_MAX + 1)),
+            (ErrorCode::NestingTooDeep, u32::try_from(NESTING_MAX).unwrap())
+        );
         assert_eq!(error("f(a b"), (ErrorCode::ExpectedToken, 4));
         assert_eq!(error("f(a,"), (ErrorCode::ExpectedExpression, 4));
         let many = format!("f({})", vec!["a"; NESTING_MAX + 1].join(","));

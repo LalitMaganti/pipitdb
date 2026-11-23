@@ -7,8 +7,8 @@
 #![allow(unsafe_code)]
 
 use crate::error::{ErrorCode, Span};
-use crate::settings::build_setting;
 use core::ptr::NonNull;
+use pipit_kernel::settings::build_setting;
 
 use pipit_kernel::allocator::AllocError;
 use pipit_kernel::buffer::Primitive;
@@ -302,15 +302,15 @@ impl Nodes {
         self.count as usize & BLOCK_MASK == 0
     }
 
-    /// Allocates the next block, from the `Env` the first block came from.
+    /// Allocates the next block, from `env`, which the first came from.
     #[cold]
-    pub(crate) fn grow(&mut self) -> Result<(), ErrorCode> {
+    pub(crate) fn grow(&mut self, env: &Env) -> Result<(), ErrorCode> {
         if self.rest.len() == BLOCK_SLOTS - 1 {
             return Err(ErrorCode::QueryTooLarge);
         }
         // SAFETY: nodes are read only below `count`, once written.
-        let block = unsafe { Array::uninit(self.first.env(), BLOCK_NODES) }
-            .map_err(|_| ErrorCode::OutOfMemory)?;
+        let block =
+            unsafe { Array::uninit(env, BLOCK_NODES) }.map_err(|_| ErrorCode::OutOfMemory)?;
         let current = block.as_non_null();
         self.rest.push(block).map_err(|_| ErrorCode::OutOfMemory)?;
         self.current = current;
@@ -341,7 +341,7 @@ mod tests {
         for i in 0..count {
             nodes.push(Node::leaf(Tag::Name, Span { start: i, len: 1 }));
             if nodes.needs_block() {
-                nodes.grow().unwrap();
+                nodes.grow(env).unwrap();
             }
         }
         for i in 0..count {

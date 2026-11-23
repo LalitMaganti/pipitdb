@@ -336,13 +336,18 @@ pub type Planned = SmallVec<PlannedNode>;
 
 /// What an op derives its output from.
 pub struct DeriveContext<'p, 'c> {
+    env: &'p Env,
     plan: &'p LogicalPlan<'c>,
     planned: &'p mut Planned,
     self_: PlanNodeId,
-    env: &'p Env,
 }
 
 impl<'p> DeriveContext<'p, '_> {
+    /// What deriving allocates from.
+    pub fn env(&self) -> &'p Env {
+        self.env
+    }
+
     /// The plan's expressions.
     pub fn exprs(&self) -> &Exprs {
         &self.plan.exprs
@@ -351,11 +356,6 @@ impl<'p> DeriveContext<'p, '_> {
     /// The id of the node being derived.
     pub fn node(&self) -> PlanNodeId {
         self.self_
-    }
-
-    /// What outputs' columns are allocated from.
-    pub fn env(&self) -> &'p Env {
-        self.env
     }
 
     /// What is known of input `i` once its needs are met.
@@ -521,7 +521,7 @@ fn plan_node_inputs(
         input.meet(planned, &node.op.needs(i))?;
     }
     planned.push(PlannedNode { inputs, output: OutputProperties::NONE, cutoff: None })?;
-    let mut derive = DeriveContext { plan, planned, self_: id, env };
+    let mut derive = DeriveContext { env, plan, planned, self_: id };
     let output = node.op.derive(&mut derive)?;
     at_mut!(planned, id as usize).output = output;
     Ok(())

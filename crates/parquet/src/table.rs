@@ -149,13 +149,8 @@ impl<'a> Rows<'a> {
                 _ => None,
             };
             if batch.selection().is_empty() {
-                for (i, (reader, &(_, forms))) in self.readers.iter_mut().zip(columns).enumerate() {
-                    if tested.as_ref().is_some_and(|&(c, _)| c == i) {
-                        continue;
-                    }
-                    if forms.contains(Forms::LAZY) {
-                        reader.pass(rows as usize);
-                    } else {
+                for (i, reader) in self.readers.iter_mut().enumerate() {
+                    if tested.as_ref().is_none_or(|&(c, _)| c != i) {
                         reader.skip(context, rows as usize)?;
                     }
                 }
@@ -172,7 +167,7 @@ impl<'a> Rows<'a> {
                         let row = u32::try_from(row).map_err(|_| Error::Corrupt)?;
                         let handle =
                             Handle { file: self.file, group: self.group, column, row, header };
-                        reader.pass(rows as usize);
+                        reader.skip(context, rows as usize)?;
                         ColumnView::lazy(context, reader.data_type(), &handle.bytes(), rows)?
                     }
                     None => reader.read(context, rows as usize, forms)?,
@@ -687,7 +682,7 @@ mod tests {
             compare(Comparison::LessEqual, max),
             Node::And(0, 1),
         ];
-        Predicate::new(SmallVec::fixed_from(env, nodes.into_iter()).unwrap())
+        Predicate::new(env, SmallVec::fixed_from(env, nodes.into_iter()).unwrap()).unwrap()
     }
 
     #[test]

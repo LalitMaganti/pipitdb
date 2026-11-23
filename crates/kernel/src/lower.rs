@@ -13,6 +13,7 @@ use crate::optimize::optimize;
 use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
+use crate::settings::build_setting;
 use crate::sort::sort;
 use crate::statement::Statement;
 use crate::step::{DynSource, Step};
@@ -27,6 +28,8 @@ pub enum LowerError {
     TooManyColumns,
     /// An op reads a column of a type it doesn't take.
     WrongType(ColumnId),
+    /// The plan is deeper than `PLAN_DEPTH_MAX`.
+    TooDeep,
 }
 
 impl From<AllocError> for LowerError {
@@ -36,7 +39,11 @@ impl From<AllocError> for LowerError {
 }
 
 /// The most steps a pipeline from a plan can have.
-pub const LOWERED_STEPS_MAX: usize = 1 << 6;
+pub const LOWERED_STEPS_MAX: usize = 1 << 16;
+
+/// How deep a plan can be. Lowering recurses, as Perfetto's does, taking
+/// stack for each level. Set at build time with `PIPIT_PLAN_DEPTH_MAX`.
+pub const PLAN_DEPTH_MAX: usize = build_setting(option_env!("PIPIT_PLAN_DEPTH_MAX"), 1000);
 
 /// A column of a plan's result: its name, and its position in the batches
 /// the pipeline makes.
@@ -105,6 +112,8 @@ pub struct Lowering<'p, 'c> {
     /// The most columns a step's batches need beyond the rows planning knows
     /// of, such as a filter's computed columns.
     width: u32,
+    /// How many nodes are being lowered, each within the last.
+    depth: usize,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -131,11 +140,16 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     fn lower_node(&mut self, id: PlanNodeId) -> Result<(), LowerError> {
+        if self.depth == PLAN_DEPTH_MAX {
+            return Err(LowerError::TooDeep);
+        }
         let (plan, planned) = (self.plan, self.planned);
         let node = at!(plan.nodes, id as usize);
         let output = &at!(planned, id as usize).output;
         self.rows = output;
+        self.depth += 1;
         node.op.lower(node, self)?;
+        self.depth -= 1;
         self.rows = output;
         Ok(())
     }
@@ -246,6 +260,7 @@ pub fn lower<'c>(
         rows: &at!(planned, plan.root as usize).output,
         expr_values: None,
         width: 0,
+        depth: 0,
     };
     let values = plan.exprs.values();
     if !values.is_empty() {

@@ -227,14 +227,6 @@ impl<'s> ChunkReader<'s> {
         self.skip(context, row - read)
     }
 
-    /// Passes over the next `rows` rows of the page being read, which
-    /// hasn't been read from, only counting them: it can't be read from
-    /// after, but can be gone back to.
-    pub fn pass(&mut self, rows: usize) {
-        check!(rows <= self.position.left && !self.position.started);
-        self.position.left -= rows;
-    }
-
     /// Passes over the next `rows` rows, which must be in the page being
     /// read, without decoding their values. A page that hasn't been read from
     /// isn't read until one of its rows is, so skipping all its rows doesn't
@@ -1068,7 +1060,7 @@ mod tests {
             while passing.page_left(&mut context).unwrap() > 0 {
                 let rows = passing.page_left(&mut context).unwrap().min(300);
                 places.push((passing.place(), row, rows.min(50)));
-                passing.pass(rows);
+                passing.skip(&mut context, rows).unwrap();
                 row += rows;
             }
             assert_eq!(row, 2048);

@@ -296,7 +296,7 @@ impl<'c> Op<'c> for JoinOp {
         let pairs = self.pairs(c.env(), c.input(probe), c.input(build), at!(held, ..count))?;
         for &condition in self.conjuncts.iter() {
             let nodes = c.exprs().nodes(condition);
-            let data_type = check_expr_type(nodes, &|column| pairs.type_of(column));
+            let data_type = check_expr_type(c.env(), nodes, &|column| pairs.type_of(column));
             if data_type != Ok(DataType::Int64) {
                 // Named by the first column it reads.
                 let column = nodes.iter().find(|node| node.op == ExprOp::Column);

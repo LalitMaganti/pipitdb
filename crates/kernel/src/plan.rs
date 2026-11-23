@@ -35,7 +35,7 @@ use crate::string_pool::Id;
 /// The most columns a plan can have.
 pub const PLAN_COLUMNS_MAX: usize = 1 << 10;
 /// The most nodes a plan can have.
-pub const PLAN_NODES_MAX: usize = 1 << 6;
+pub const PLAN_NODES_MAX: usize = 1 << 16;
 /// The most bytes a plan's names take.
 pub const PLAN_NAME_BYTES_MAX: usize = 1 << 14;
 

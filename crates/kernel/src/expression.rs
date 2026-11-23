@@ -2,7 +2,7 @@
 //! one; `ComputeOp`, the op that adds columns computed by them; and
 //! `Compute`, the transform that runs it.
 
-use crate::containers::{BitSlice, SmallVec};
+use crate::containers::{BitSlice, SmallVec, SpillVec};
 use core::ops::BitOr;
 
 use crate::allocator::AllocError;
@@ -866,8 +866,13 @@ fn nonzero(divisor: Option<(&[i64], bool)>, at: usize, count: usize) -> u64 {
         .fold(0, |nonzero, (k, &word)| nonzero | u64::from(word << u32::from(doubles) != 0) << k)
 }
 
-/// The most nodes an `Expr` has, so typing one needs only the stack.
-pub const EXPR_NODES_MAX: usize = 1 << 8;
+/// The most nodes an `Expr` has: more than other engines' default limits on
+/// a whole query, such as 50,000.
+pub const EXPR_NODES_MAX: usize = 1 << 16;
+
+/// How many nodes typing an expression holds in place, so typing most needs
+/// only the stack.
+const EXPR_NODES_INLINE: usize = 1 << 8;
 
 /// A scalar expression over the columns of a row, as a plan holds it: column
 /// references, literals, NULL and arithmetic. Its nodes are in its plan's
@@ -892,7 +897,7 @@ pub struct Expr {
 }
 
 /// The most nodes of all of a plan's expressions.
-pub const PLAN_EXPR_NODES_MAX: usize = 1 << 14;
+pub const PLAN_EXPR_NODES_MAX: usize = 1 << 20;
 
 /// The most values of all of a plan's `IN` lists.
 pub const PLAN_EXPR_VALUES_MAX: usize = 1 << 20;
@@ -1087,15 +1092,22 @@ const fn step(op: ExprOp, data_type: DataType, a: u32, b: u32) -> ExprStep {
 /// appends the steps computing them to a program. Without them it only
 /// checks, as compiling does.
 struct Typer<'t> {
+    /// What its lists, longer than it holds in place, come from.
+    env: &'t Env,
     /// Each column's type.
     type_of: &'t dyn Fn(ColumnId) -> DataType,
     /// The rows the program reads, and its steps so far, if building one.
     build: Option<(&'t OutputProperties, &'t mut SmallVec<ExprStep>)>,
     /// By node, its type, the register holding it, and whether computing it
     /// can fail. A bare NULL has no type of its own: it takes the type of
-    /// whatever it meets.
-    nodes: [(Option<DataType>, u32, bool); EXPR_NODES_MAX],
+    /// whatever it meets. Until a node is typed, its flag says whether the
+    /// root reads it.
+    nodes: &'t mut [Typed],
 }
+
+/// A node's type, the register holding it, and whether computing it can
+/// fail, as `Typer` finds them.
+type Typed = (Option<DataType>, u32, bool);
 
 impl Typer<'_> {
     /// The type of the expression's result.
@@ -1103,9 +1115,9 @@ impl Typer<'_> {
     fn run(&mut self, nodes: &[ExprStep]) -> Result<Option<DataType>, ExprError> {
         check!(!nodes.is_empty() && nodes.len() <= EXPR_NODES_MAX);
         // Only what the root reads: the nodes before it can be others'.
-        let reached = reached(nodes);
+        mark_reached(nodes, self.nodes);
         for (i, node) in nodes.iter().enumerate() {
-            if *at!(reached, i) {
+            if at!(self.nodes, i).2 {
                 let (data_type, register) = self.type_node(nodes, node)?;
                 let fails = self.can_fail(nodes, node, data_type);
                 *at_mut!(self.nodes, i) = (data_type, register, fails);
@@ -1296,14 +1308,14 @@ impl Typer<'_> {
         let Some(data_type) = one_type(types)? else { return Ok((None, 0)) };
         // Each branch's condition and value, then its `When`s together, as
         // the `Case` reads them.
-        let mut branches = [(0, 0); EXPR_NODES_MAX];
-        for (k, when) in whens.iter().enumerate() {
+        let mut branches = SpillVec::<(u32, u32), EXPR_NODES_INLINE>::new(self.env, EXPR_NODES_MAX);
+        for when in whens {
             let condition = if when.a == PRESENT { PRESENT } else { self.condition(when.a)? };
-            *at_mut!(branches, k) = (condition, self.materialize(when.b, data_type)?);
+            branches.push((condition, self.materialize(when.b, data_type)?))?;
         }
         let otherwise = self.materialize(node.c, data_type)?;
         let mut first = None;
-        for &(condition, value) in at!(branches, ..whens.len()) {
+        for &(condition, value) in branches.iter() {
             let when = self.add(step(ExprOp::When, data_type, condition, value))?;
             first.get_or_insert(when);
         }
@@ -1424,13 +1436,44 @@ pub fn expr_can_be_null(nodes: &[ExprStep], nullable_of: &dyn Fn(ColumnId) -> bo
     })
 }
 
+/// Types `nodes` and, given the rows they read and the steps so far, adds
+/// the steps computing the last: as a condition if `condition`. Returns its
+/// type and the register holding it. Shared, so both callers make and free
+/// the table of what it finds in one place.
+#[inline(never)]
+fn type_nodes(
+    env: &Env,
+    type_of: &dyn Fn(ColumnId) -> DataType,
+    build: Option<(&OutputProperties, &mut SmallVec<ExprStep>)>,
+    nodes: &[ExprStep],
+    condition: bool,
+) -> Result<(DataType, u32), ExprError> {
+    let mut found = SpillVec::<Typed, EXPR_NODES_INLINE>::filled(
+        env,
+        EXPR_NODES_MAX,
+        nodes.len(),
+        (None, 0, false),
+    )?;
+    let building = build.is_some();
+    let mut typer = Typer { env, type_of, build, nodes: &mut found };
+    // A result which is only ever NULL is a column of Int64 nulls.
+    let data_type = typer.run(nodes)?.unwrap_or(DataType::Int64);
+    if !building {
+        return Ok((data_type, 0));
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let root = nodes.len() as u32 - 1;
+    let register =
+        if condition { typer.condition(root)? } else { typer.materialize(root, data_type)? };
+    Ok((data_type, register))
+}
+
 pub fn check_expr_type(
+    env: &Env,
     nodes: &[ExprStep],
     type_of: &dyn Fn(ColumnId) -> DataType,
 ) -> Result<DataType, ExprError> {
-    let mut typer = Typer { type_of, build: None, nodes: [(None, 0, false); EXPR_NODES_MAX] };
-    // A result which is only ever NULL is a column of Int64 nulls.
-    Ok(typer.run(nodes)?.unwrap_or(DataType::Int64))
+    Ok(type_nodes(env, type_of, None, nodes, false)?.0)
 }
 
 impl ExprStep {
@@ -1475,19 +1518,19 @@ impl ExprStep {
     }
 }
 
-/// The nodes the last of `nodes` reads, and it: marked from the last back,
-/// as a node's operands come before it.
-fn reached(nodes: &[ExprStep]) -> [bool; EXPR_NODES_MAX] {
-    let mut reached = [false; EXPR_NODES_MAX];
-    *at_mut!(reached, nodes.len() - 1) = true;
+/// Flags in `found` the nodes the last of `nodes` reads, and it: from the
+/// last back, as a node's operands come before it.
+fn mark_reached(nodes: &[ExprStep], found: &mut [Typed]) {
+    at_mut!(found, nodes.len() - 1).2 = true;
     for (i, node) in nodes.iter().enumerate().rev() {
-        if *at!(reached, i) {
+        if at!(found, i).2 {
             for (start, len) in node.operands() {
-                at_mut!(reached, start as usize..(start + len) as usize).fill(true);
+                for typed in at_mut!(found, start as usize..(start + len) as usize) {
+                    typed.2 = true;
+                }
             }
         }
     }
-    reached
 }
 
 /// Node `node`'s top-level conjuncts, the parts of its `AND`s, of `nodes`:
@@ -1535,13 +1578,7 @@ pub fn type_expr(
     // Each node takes at most three steps, and a NULL result one more.
     let mut steps = SmallVec::new(env, 4 * EXPR_NODES_MAX)?;
     let type_of = |column| rows.type_of(column);
-    let table = [(None, 0, false); EXPR_NODES_MAX];
-    let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes: table };
-    let result = typer.run(nodes)?.unwrap_or(DataType::Int64);
-    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let root = nodes.len() as u32 - 1;
-    let register =
-        if condition { typer.condition(root)? } else { typer.materialize(root, result)? };
+    let (_, register) = type_nodes(env, &type_of, Some((rows, &mut steps)), nodes, condition)?;
     // Unlike Perfetto's, no column is only ever NULL, so the last node's step
     // is the last.
     check!(register as usize == steps.len() - 1);
@@ -1618,7 +1655,7 @@ impl<'c> Op<'c> for ComputeOp {
         let exprs = c.exprs();
         for item in self.items.iter() {
             let nodes = exprs.nodes(item.expr);
-            let data_type = check_expr_type(nodes, &|column| input.type_of(column))
+            let data_type = check_expr_type(c.env(), nodes, &|column| input.type_of(column))
                 .map_err(|error| lower_error(error, item.output))?;
             let nullable = expr_can_be_null(nodes, &|column| input.nullable_of(column));
             out.push_column(c.env(), Column { id: item.output, data_type, nullable })?;

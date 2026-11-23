@@ -11,7 +11,7 @@ use crate::compile::Compiler;
 use crate::error::Error;
 use crate::expression::{CallFunction, call_function, no_function};
 use crate::keywords::{KeywordTable, same_word};
-use crate::settings::build_setting;
+use pipit_kernel::settings::build_setting;
 
 /// How many keywords a registry has room for. Set at build time with
 /// `PIPIT_STAGE_SLOTS`.
