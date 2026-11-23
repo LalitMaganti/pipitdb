@@ -31,8 +31,15 @@ pub struct ChunkReader<'s> {
     end: u64,
     /// Where reading is.
     position: Position,
-    /// The body of the page last read, and where it starts in the file.
-    page: Option<(u64, Buffer)>,
+    /// Where the body of the page last read starts in the file, and its
+    /// length.
+    page: Option<(u64, usize)>,
+    /// The buffer it's in, which can be longer: reused for the next page,
+    /// and the next chunk's, unless a column views it.
+    body: Option<Buffer>,
+    /// The buffer a compressed page's bytes were last read into, reused
+    /// likewise.
+    stored: Option<Buffer>,
     /// The chunk's dictionary page's body and how many values it has, once
     /// its header is read.
     dictionary_page: Option<(Body, usize)>,
@@ -108,6 +115,7 @@ struct Dictionary {
 impl<'s> ChunkReader<'s> {
     /// A reader of `chunk`, of `column`, which decompresses pages with
     /// `codecs`.
+    #[inline(never)]
     pub fn new(
         source: &'s dyn ByteSource,
         codecs: &'s dyn Codec,
@@ -143,8 +151,23 @@ impl<'s> ChunkReader<'s> {
             page,
             dictionary_page,
             dictionary,
+            body: None,
+            stored: None,
             scratch: None,
         })
+    }
+
+    /// As `new`, keeping this reader's buffers for the new chunk's pages.
+    pub fn restart(
+        &mut self,
+        source: &'s dyn ByteSource,
+        codecs: &'s dyn Codec,
+        column: Column,
+        chunk: &Chunk,
+    ) -> Result<(), Error> {
+        let old = core::mem::replace(self, ChunkReader::new(source, codecs, column, chunk)?);
+        (self.body, self.stored, self.scratch) = (old.body, old.stored, old.scratch);
+        Ok(())
     }
 
     /// How many rows are left in the page being read, moving to the next
@@ -220,8 +243,8 @@ impl<'s> ChunkReader<'s> {
             return Ok(());
         }
         self.body(context)?;
-        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
-        let page = body.as_slice::<u8>();
+        let (Some((_, len)), Some(body)) = (self.page, &self.body) else { pipit_kernel::failed!() };
+        let page = at!(body.as_slice::<u8>(), ..len);
         let (column, data_type) = (self.column, self.data_type);
         let position = &mut self.position;
         position.advance(context, column, data_type, &mut self.scratch, page, rows)
@@ -245,8 +268,8 @@ impl<'s> ChunkReader<'s> {
             return self.read(context, rows, forms);
         }
         self.body(context)?;
-        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
-        let page = body.as_slice::<u8>();
+        let (Some((_, len)), Some(body)) = (self.page, &self.body) else { pipit_kernel::failed!() };
+        let page = at!(body.as_slice::<u8>(), ..len);
         let position = &mut self.position;
         let decoded = scratch(context, &mut self.scratch)?.as_mut_slice();
         let (validity, valid) =
@@ -313,8 +336,8 @@ impl<'s> ChunkReader<'s> {
     ) -> Result<ColumnView, Error> {
         check!(rows <= self.position.left && rows <= BATCH_ROWS_MAX as usize);
         self.body(context)?;
-        let Some((_, body)) = &self.page else { pipit_kernel::failed!() };
-        let page = body.as_slice::<u8>();
+        let (Some((_, len)), Some(body)) = (self.page, &self.body) else { pipit_kernel::failed!() };
+        let page = at!(body.as_slice::<u8>(), ..len);
         let position = &mut self.position;
         let decoded = scratch(context, &mut self.scratch)?.as_mut_slice();
         let (validity, valid) =
@@ -415,12 +438,17 @@ impl<'s> ChunkReader<'s> {
             self.dictionary(context)?;
         }
         let body = self.position.body;
-        if !matches!(&self.page, Some((at, _)) if *at == body.at) {
-            self.page = Some((body.at, self.read_body(context, body)?));
+        if !matches!(self.page, Some((at, _)) if at == body.at) {
+            self.page = None;
+            let into = self.body.take();
+            let (buffer, len) = self.read_body(context, body, into)?;
+            (self.page, self.body) = (Some((body.at, len)), Some(buffer));
         }
         if !self.position.started {
-            let Some((_, page)) = &self.page else { pipit_kernel::failed!() };
-            let bytes = page.as_slice::<u8>();
+            let (Some((_, len)), Some(page)) = (self.page, &self.body) else {
+                pipit_kernel::failed!()
+            };
+            let bytes = at!(page.as_slice::<u8>(), ..len);
             let position = &mut self.position;
             // An optional column's definition levels come first, after their
             // length.
@@ -449,8 +477,8 @@ impl<'s> ChunkReader<'s> {
     /// Decodes the chunk's dictionary.
     fn dictionary(&mut self, context: &mut Context) -> Result<(), Error> {
         let (body, count) = self.dictionary_page.ok_or(Error::Corrupt)?;
-        let body = self.read_body(context, body)?;
-        let page = body.as_slice::<u8>();
+        let (body, len) = self.read_body(context, body, None)?;
+        let page = at!(body.as_slice::<u8>(), ..len);
         let count32 = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         // The values, then a null.
         let mut nulls = context.bytes_buffer((count + 1).div_ceil(8))?;
@@ -490,17 +518,28 @@ impl<'s> ChunkReader<'s> {
         Ok(())
     }
 
-    /// A page's body, decompressed if it's stored compressed.
-    fn read_body(&self, context: &Context, body: Body) -> Result<Buffer, Error> {
-        let stored = self.read_bytes(context, body.at, body.len)?;
+    /// A page's body, decompressed if it's stored compressed, in `into` if
+    /// it can be reused, and its length.
+    fn read_body(
+        &mut self,
+        context: &Context,
+        body: Body,
+        into: Option<Buffer>,
+    ) -> Result<(Buffer, usize), Error> {
+        let len = usize::try_from(body.len).map_err(|_| Error::Corrupt)?;
         if self.codec == 0 {
-            return Ok(stored);
+            let mut page = reusable(context, into, len)?;
+            self.source.read(body.at, at_mut!(page.as_mut_slice::<u8>(), ..len))?;
+            return Ok((page, len));
         }
+        let mut stored = reusable(context, self.stored.take(), len)?;
+        self.source.read(body.at, at_mut!(stored.as_mut_slice::<u8>(), ..len))?;
         let size = usize::try_from(body.size).map_err(|_| Error::Corrupt)?;
-        // SAFETY: decompressing writes every byte, or fails.
-        let mut page = unsafe { Buffer::allocate_uninit(context.allocator(), size)? };
-        self.codecs.decompress(self.codec, stored.as_slice(), page.as_mut_slice())?;
-        Ok(page)
+        let mut page = reusable(context, into, size)?;
+        let (from, to) = (at!(stored.as_slice(), ..len), at_mut!(page.as_mut_slice(), ..size));
+        self.codecs.decompress(self.codec, from, to)?;
+        self.stored = Some(stored);
+        Ok((page, size))
     }
 
     /// `len` bytes of the chunk from `at`.
@@ -528,6 +567,16 @@ impl<'s> ChunkReader<'s> {
             }
             window *= 4;
         }
+    }
+}
+
+/// `buffer` if nothing else holds it and it has `len` bytes, else a new one
+/// of `len`.
+fn reusable(context: &Context, buffer: Option<Buffer>, len: usize) -> Result<Buffer, Error> {
+    match buffer {
+        Some(buffer) if buffer.is_unique() && buffer.size_bytes() >= len => Ok(buffer),
+        // SAFETY: what's read from it is written first, or fails.
+        _ => Ok(unsafe { Buffer::allocate_uninit(context.allocator(), len)? }),
     }
 }
 

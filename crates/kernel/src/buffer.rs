@@ -211,7 +211,7 @@ impl Buffer {
     }
 
     /// Whether this is the only reference to the bytes.
-    pub(crate) fn is_unique(&self) -> bool {
+    pub fn is_unique(&self) -> bool {
         self.header().references.get() == 1
     }
 
