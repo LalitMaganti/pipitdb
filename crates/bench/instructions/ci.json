@@ -24,7 +24,7 @@
   "filter.greater_nulls": 888271,
   "flat_hash_map.find": 209240,
   "join.scan": 7876,
-  "join.shuffled": 5208565,
+  "join.shuffled": 3053300,
   "join.slice_thread": 1323545,
   "join.spread": 9026246,
   "join_planner.chain_12": 156957,
