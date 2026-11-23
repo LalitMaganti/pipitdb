@@ -16,6 +16,7 @@ pub use graph::{
 pub(crate) use region::plan_regions;
 pub use tree::{JoinNode, JoinTree, Node};
 
+use crate::containers::Array;
 use crate::env::Env;
 use crate::error::Error;
 
@@ -38,7 +39,8 @@ pub fn plan(env: &Env, graph: &QueryGraph) -> Result<Option<JoinTree>, Error> {
     if graph.relations.len() <= 2 {
         return Ok(None);
     }
-    let mut estimator = Estimator::new(env, graph)?;
+    let mut stamps = Array::zeroed(env, Estimator::stamps(graph.equivalences.len()))?;
+    let mut estimator = Estimator::new(&graph.equivalences, &mut stamps);
     if let Some(tree) = exact::plan(env, graph, &mut estimator)? {
         return Ok(Some(tree));
     }

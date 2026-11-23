@@ -382,7 +382,7 @@ mod tests {
 
     /// The first join greedy ordering makes in `graph`.
     fn first_join(graph: &QueryGraph) -> JoinNode {
-        let mut estimator = Estimator::new(Env::current(), graph).unwrap();
+        let mut estimator = Estimator::new(&graph.equivalences, &mut []);
         let mut work = 1 << 20;
         let tree = plan(Env::current(), graph, &mut estimator, &mut work).unwrap().unwrap();
         at!(tree.nodes, graph.relations.len()).kind

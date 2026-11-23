@@ -410,7 +410,8 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
     let invalid = |why| Ok(Costed { cost: ROWS_MAX, valid: Err(why) });
     let Some(order) = post_order(tree) else { return invalid(Invalid::Shape) };
     let connected = is_connected(graph)?;
-    let mut estimator = Estimator::new(crate::env(), graph).map_err(fail)?;
+    let mut stamps = vec![0; Estimator::stamps(graph.equivalences.len())];
+    let mut estimator = Estimator::new(&graph.equivalences, &mut stamps);
     // Each node's relations and rows.
     let mut sets: Vec<Option<RelationSet>> = (0..order.len()).map(|_| None).collect();
     let mut rows = vec![0.0; order.len()];
@@ -463,7 +464,8 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
 /// baseline plans are measured against.
 pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
     let count = graph.relations.len();
-    let mut estimator = Estimator::new(env, graph)?;
+    let mut stamps = vec![0; Estimator::stamps(graph.equivalences.len())];
+    let mut estimator = Estimator::new(&graph.equivalences, &mut stamps);
     let mut tree = JoinTree::new(env, count)?;
     let (mut joined, mut root, mut rows) = (RelationSet::new(env)?, 0, 0.0);
     #[expect(clippy::cast_possible_truncation, reason = "at most `u32::MAX`")]
@@ -507,12 +509,12 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
     let (mut best, mut rows, mut split) =
         (vec![f64::INFINITY; subsets], vec![0.0_f64; subsets], vec![0_u32; subsets]);
     for (relation, found) in graph.relations.iter().enumerate() {
-        best[1 << relation] = 0.0;
         #[expect(clippy::cast_precision_loss, reason = "an estimate")]
         let found = found.rows as f64;
-        rows[1 << relation] = found;
+        (best[1 << relation], rows[1 << relation]) = (0.0, found);
     }
-    let mut estimator = Estimator::new(crate::env(), graph).map_err(fail)?;
+    let mut stamps = vec![0; Estimator::stamps(graph.equivalences.len())];
+    let mut estimator = Estimator::new(&graph.equivalences, &mut stamps);
     #[expect(clippy::cast_possible_truncation, reason = "at most 2^20 subsets")]
     for set in 1..subsets as u32 {
         let within: Vec<_> = edges.iter().filter(|edge| (edge.0 | edge.1) & !set == 0).collect();
