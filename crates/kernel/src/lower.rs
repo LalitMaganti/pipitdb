@@ -11,12 +11,14 @@ use crate::expression::Exprs;
 use crate::names::{Name, Names};
 use crate::optimize::optimize;
 use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
-use crate::pipeline::{Execution, Pipeline};
-use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
+use crate::pipeline::{Execution, Pipeline, SinkId, SinkPipeline};
+use crate::plan::{
+    ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId, SortKey,
+};
 use crate::settings::build_setting;
 use crate::sort::sort;
 use crate::statement::Statement;
-use crate::step::{DynSource, Step};
+use crate::step::{DynSink, DynSource, Sink, Step};
 use crate::top_k::top_k;
 
 /// Why a plan couldn't be planned or lowered.
@@ -56,6 +58,8 @@ pub struct OutputColumn {
 /// Read-only once built, so it can be run any number of times.
 pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
+    /// The pipelines that end in sinks, which its steps read by id.
+    sinks: SmallVec<SinkPipeline<'c>>,
     names: Names,
     columns: SmallVec<OutputColumn>,
     statement: Statement,
@@ -79,7 +83,7 @@ impl<'c> PhysicalPlan<'c> {
 
     /// Starts a run, as `Pipeline::start` does, of its statement.
     pub fn start<'r>(&'r self, env: &'r Env) -> Result<Execution<'r>, Error> {
-        self.pipeline.start(env, Some(&self.statement))
+        self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks)
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
@@ -111,6 +115,8 @@ pub struct Lowering<'p, 'c> {
     expr_values: Option<Buffer>,
     /// How many nodes are being lowered, each within the last.
     depth: usize,
+    /// The pipelines that end in sinks, by id.
+    sinks: SmallVec<SinkPipeline<'c>>,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -174,14 +180,14 @@ impl<'p, 'c> Lowering<'p, 'c> {
     }
 
     /// Lowers input `input` of `node`, the node being lowered, as a pipeline
-    /// of its own, as Perfetto's `AddSidePipeline` does: a source for an op
-    /// that reads that input whole, such as a join's build side. Returns it,
-    /// and what is known of its rows.
+    /// of its own, as Perfetto's `AddSidePipeline` does, for an op that reads
+    /// that input whole, such as a join's build side: to end in a sink,
+    /// added with `add_sink`. Returns it, and what is known of its rows.
     pub fn lower_side(
         &mut self,
         node: &PlanNode<'c>,
         input: u32,
-    ) -> Result<(DynSource<'c>, &'p OutputProperties), LowerError> {
+    ) -> Result<(Pipeline<'c>, &'p OutputProperties), LowerError> {
         let side = SmallVec::new(self.env, LOWERED_STEPS_MAX)?;
         let (source, steps, rows) =
             (self.source.take(), core::mem::replace(&mut self.steps, side), self.rows);
@@ -191,8 +197,27 @@ impl<'p, 'c> Lowering<'p, 'c> {
         self.rows = rows;
         lowered?;
         let Some(side_source) = side_source else { failed!() };
-        let pipeline = Pipeline::new(side_source, side_steps);
-        Ok((pipeline.into_source(self.env)?, side_rows))
+        Ok((Pipeline::new(side_source, side_steps), side_rows))
+    }
+
+    /// Ends `pipeline`, from `lower_side`, in `sink`. Returns the sink's id,
+    /// which the step that reads what it builds gets it by, with
+    /// `with_built`.
+    pub fn add_sink<T: Sink + 'c>(
+        &mut self,
+        pipeline: Pipeline<'c>,
+        sink: T,
+    ) -> Result<SinkId<T>, LowerError> {
+        let sink = DynSink::new(self.env, sink)?;
+        Ok(SinkId::new(self.add_dyn_sink(SinkPipeline { pipeline, sink })?))
+    }
+
+    /// As `add_sink`, of any type, returning its id.
+    fn add_dyn_sink(&mut self, pipeline: SinkPipeline<'c>) -> Result<u32, LowerError> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let id = self.sinks.len() as u32;
+        self.sinks.push(pipeline)?;
+        Ok(id)
     }
 
     /// How many of its first rows the open sort just below outputs, if it
@@ -252,6 +277,7 @@ pub fn lower<'c>(
         rows: &at!(planned, plan.root as usize).output,
         expr_values: None,
         depth: 0,
+        sinks: SmallVec::new(env, PLAN_NODES_MAX)?,
     };
     let values = plan.exprs.values();
     if !values.is_empty() {
@@ -269,7 +295,8 @@ pub fn lower<'c>(
     }
     let Some(source) = lowering.source else { failed!() };
     let pipeline = Pipeline::new(source, lowering.steps);
-    Ok(PhysicalPlan { pipeline, names, columns, statement: plan.take_statement() })
+    let (sinks, statement) = (lowering.sinks, plan.take_statement());
+    Ok(PhysicalPlan { pipeline, sinks, names, columns, statement })
 }
 
 #[cfg(test)]

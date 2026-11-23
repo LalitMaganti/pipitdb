@@ -142,6 +142,40 @@ impl<B: Breaker> Operator for B {
     }
 }
 
+/// Consumes every batch of the pipeline it ends, building what a step of
+/// another pipeline reads once it's finalized, such as a join's hash table
+/// of its build side. Each run of the pipeline consumes into a local state
+/// of its own, combined into the shared one when that run ends.
+pub trait Sink {
+    /// What it builds, which what reads it gets once it's finalized.
+    type State;
+    /// What a run of its pipeline builds, until it's combined.
+    type Local;
+
+    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
+
+    fn new_local(&self, context: &mut Context) -> Result<Self::Local, Error>;
+
+    fn consume(
+        &self,
+        context: &mut Context,
+        local: &mut Self::Local,
+        input: &RowBatch,
+    ) -> Result<(), Error>;
+
+    /// Moves what `local` holds into `state`, once its run ends. `local` is
+    /// dropped after.
+    fn combine(
+        &self,
+        context: &mut Context,
+        state: &mut Self::State,
+        local: &mut Self::Local,
+    ) -> Result<(), Error>;
+
+    /// Called once, after every run is combined.
+    fn finalize(&self, context: &mut Context, state: &mut Self::State) -> Result<(), Error>;
+}
+
 /// What an operator did with its input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -223,6 +257,7 @@ pub(crate) type NewState = unsafe fn(NonNull<()>, &mut Context, NonNull<u8>) -> 
 pub type DynSource<'a> = Erased<'a, SourceNext>;
 pub type DynTransform<'a> = Erased<'a, TransformProcess>;
 pub type DynOperator<'a> = Erased<'a, OperatorFunctions>;
+pub type DynSink<'a> = Erased<'a, SinkFunctions>;
 
 pub(crate) type TransformProcess =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<(), Error>;
@@ -246,6 +281,19 @@ pub struct OperatorFunctions {
         unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &RowBatch, &mut RowBatch) -> Executed,
     finish: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Executed,
 }
+
+/// A sink's functions besides those of its shared state, which its
+/// `StepFunctions` has: those of its local state, and what a run calls.
+pub struct SinkFunctions {
+    pub(crate) local_layout: Layout,
+    new_local: NewState,
+    drop_local: unsafe fn(NonNull<u8>),
+    consume: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &RowBatch) -> Sunk,
+    combine: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, NonNull<u8>) -> Sunk,
+    finalize: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>) -> Sunk,
+}
+
+type Sunk = Result<(), Error>;
 
 impl<'a, F> Erased<'a, F> {
     /// A step from a table of functions for its type, named `name` for tests
@@ -333,6 +381,42 @@ impl<'a, T: Operator + 'a> Functions<'a, T> {
     };
 }
 
+impl<'a, T: Sink + 'a> Functions<'a, T> {
+    const SINK: StepFunctions<SinkFunctions> = StepFunctions {
+        state_layout: Layout::new::<T::State>(),
+        // SAFETY: only called with this sink and its states, as is each below.
+        new_state: |sink, context, state| unsafe {
+            let made = value_of::<T>(sink).new_state(context)?;
+            write_state(state, made);
+            Ok(())
+        },
+        drop_state: drop_state::<T::State>,
+        run: SinkFunctions {
+            local_layout: Layout::new::<T::Local>(),
+            // SAFETY: as above.
+            new_local: |sink, context, local| unsafe {
+                let made = value_of::<T>(sink).new_local(context)?;
+                write_state(local, made);
+                Ok(())
+            },
+            drop_local: drop_state::<T::Local>,
+            // SAFETY: as above.
+            consume: |sink, context, local, input| unsafe {
+                value_of::<T>(sink).consume(context, state_of::<T::Local>(local), input)
+            },
+            // SAFETY: as above.
+            combine: |sink, context, state, local| unsafe {
+                let (state, local) = (state_of::<T::State>(state), state_of::<T::Local>(local));
+                value_of::<T>(sink).combine(context, state, local)
+            },
+            // SAFETY: as above.
+            finalize: |sink, context, state| unsafe {
+                value_of::<T>(sink).finalize(context, state_of::<T::State>(state))
+            },
+        },
+    };
+}
+
 impl<'a> DynSource<'a> {
     pub fn new<T: Source + 'a>(env: &Env, source: T) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -344,20 +428,6 @@ impl<'a> DynSource<'a> {
             #[cfg(test)]
             name: type_name::<T>(),
         })
-    }
-
-    /// A run of this source outside a pipeline, such as of a join's build
-    /// side, which the join drains: its state, in memory from `context`'s
-    /// `Env`.
-    pub fn start<'s>(&'s self, context: &mut Context) -> Result<SourceRun<'s, 'a>, Error> {
-        let size_bytes = self.functions.state_layout.size().max(1);
-        // SAFETY: `new_state` writes the state, and nothing reads the rest.
-        let memory = unsafe { Array::<u8>::uninit(context.env(), size_bytes)? };
-        let state = memory.as_non_null();
-        // SAFETY: the memory has the state's size, and alignment, which
-        // `new` checked is at most a buffer's.
-        unsafe { (self.functions.new_state)(self.step.as_ptr(), context, state)? };
-        Ok(SourceRun { source: self, state, _memory: memory })
     }
 
     /// # Safety
@@ -373,32 +443,6 @@ impl<'a> DynSource<'a> {
         // SAFETY: `run` matches `step`'s type, and the caller upholds the
         // rest.
         unsafe { (self.functions.run)(self.step.as_ptr(), context, state, batch) }
-    }
-}
-
-/// A run of a source outside a pipeline, from `DynSource::start`.
-pub struct SourceRun<'s, 'a> {
-    /// The source it runs.
-    source: &'s DynSource<'a>,
-    /// The source's state, in `_memory`.
-    state: NonNull<u8>,
-    /// Holds the state.
-    _memory: Array<u8>,
-}
-
-impl<'a> SourceRun<'_, 'a> {
-    /// Fills `batch` with the next batch, or returns false when none are
-    /// left.
-    pub fn next(&mut self, context: &mut Context, batch: &mut RowBatch<'a>) -> Result<bool, Error> {
-        // SAFETY: `start` made the state.
-        unsafe { self.source.next(context, self.state, batch) }
-    }
-}
-
-impl Drop for SourceRun<'_, '_> {
-    fn drop(&mut self) {
-        // SAFETY: `start` made the state, which is dropped once.
-        unsafe { (self.source.functions.drop_state)(self.state) }
     }
 }
 
@@ -467,6 +511,126 @@ impl<'a> DynOperator<'a> {
     ) -> Executed {
         // SAFETY: as in `DynSource::next`.
         unsafe { (self.functions.run.finish)(self.step.as_ptr(), context, state, output) }
+    }
+}
+
+impl<'a> DynSink<'a> {
+    pub fn new<T: Sink + 'a>(env: &Env, sink: T) -> Result<DynSink<'a>, AllocError> {
+        const {
+            assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES);
+            assert!(align_of::<T::Local>() <= BUFFER_ALIGNMENT_BYTES);
+        };
+        let step = Box::new(env, sink)?.erase();
+        let functions = &Functions::<'a, T>::SINK;
+        Ok(Erased {
+            step,
+            functions,
+            #[cfg(test)]
+            name: type_name::<T>(),
+        })
+    }
+
+    /// A new local state, for a run of its pipeline.
+    pub(crate) fn new_local(&self, context: &mut Context) -> Result<OwnedState, Error> {
+        let run = &self.functions.run;
+        let made = (run.local_layout, run.new_local, run.drop_local);
+        // SAFETY: `new_local` makes a local state of this sink, of its
+        // layout, which `drop_local` drops.
+        unsafe { OwnedState::new(context, self.step.as_ptr(), made) }
+    }
+
+    /// Its new shared state.
+    pub(crate) fn new_shared(&self, context: &mut Context) -> Result<OwnedState, Error> {
+        let functions = self.functions;
+        let made = (functions.state_layout, functions.new_state, functions.drop_state);
+        // SAFETY: as in `new_local`, for its shared state.
+        unsafe { OwnedState::new(context, self.step.as_ptr(), made) }
+    }
+
+    /// # Safety
+    ///
+    /// `local` must be one of this sink's local states, from `new_local`.
+    pub(crate) unsafe fn consume(
+        &self,
+        context: &mut Context,
+        local: &OwnedState,
+        input: &RowBatch,
+    ) -> Result<(), Error> {
+        // SAFETY: as in `DynSource::next`.
+        unsafe { (self.functions.run.consume)(self.step.as_ptr(), context, local.state, input) }
+    }
+
+    /// # Safety
+    ///
+    /// `state` and `local` must be this sink's, from `new_shared` and
+    /// `new_local`.
+    pub(crate) unsafe fn combine(
+        &self,
+        context: &mut Context,
+        state: &OwnedState,
+        local: &OwnedState,
+    ) -> Result<(), Error> {
+        let (step, combine) = (self.step.as_ptr(), self.functions.run.combine);
+        // SAFETY: as in `DynSource::next`.
+        unsafe { combine(step, context, state.state, local.state) }
+    }
+
+    /// # Safety
+    ///
+    /// `state` must be this sink's, from `new_shared`.
+    pub(crate) unsafe fn finalize(
+        &self,
+        context: &mut Context,
+        state: &OwnedState,
+    ) -> Result<(), Error> {
+        // SAFETY: as in `DynSource::next`.
+        unsafe { (self.functions.run.finalize)(self.step.as_ptr(), context, state.state) }
+    }
+}
+
+/// A step's state outside a run's memory, such as a sink's, in memory of its
+/// own from an `Env`: dropped with it.
+pub(crate) struct OwnedState {
+    /// Where the state is, in `_memory`.
+    state: NonNull<u8>,
+    /// Drops it.
+    drop: unsafe fn(NonNull<u8>),
+    /// Holds it.
+    _memory: Array<u8>,
+}
+
+impl OwnedState {
+    /// A state of `layout`, which `new` makes for `step`, and `drop` drops.
+    ///
+    /// # Safety
+    ///
+    /// `new` must make a value of `layout`, or fail without making one, and
+    /// `drop` must drop that value.
+    #[inline(never)]
+    unsafe fn new(
+        context: &mut Context,
+        step: NonNull<()>,
+        (layout, new, drop): (Layout, NewState, unsafe fn(NonNull<u8>)),
+    ) -> Result<OwnedState, Error> {
+        check!(layout.align() <= BUFFER_ALIGNMENT_BYTES);
+        // SAFETY: `new` writes the state, and nothing reads the rest.
+        let memory = unsafe { Array::<u8>::uninit(context.env(), layout.size().max(1))? };
+        let state = memory.as_non_null();
+        // SAFETY: upheld by the caller.
+        unsafe { new(step, context, state)? };
+        Ok(OwnedState { state, drop, _memory: memory })
+    }
+
+    /// Where the state is.
+    pub(crate) fn as_ptr(&self) -> NonNull<u8> {
+        self.state
+    }
+}
+
+impl Drop for OwnedState {
+    fn drop(&mut self) {
+        // SAFETY: `new` made the state, which is dropped once.
+        unsafe { (self.drop)(self.state) }
     }
 }
 

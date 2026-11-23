@@ -3,13 +3,18 @@
 
 #![allow(unsafe_code)]
 
+use core::ptr::NonNull;
+
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::containers::SmallVec;
 use crate::env::{Env, MemoryKind};
 use crate::function::DynFunction;
+use crate::pipeline::SinkPipeline;
+use crate::plan::PLAN_NODES_MAX;
 use crate::selection::Selection;
 use crate::statement::Statement;
+use crate::step::OwnedState;
 use crate::string_pool::StringPool;
 
 /// The most scratch selections a run can have.
@@ -33,6 +38,11 @@ pub struct Context<'a> {
     /// published one, so its scan can skip rows that sort after it. Made
     /// when first reserved: most runs publish none.
     cutoffs: Option<SmallVec<Option<i64>>>,
+    /// The plan's pipelines that end in sinks, by id.
+    sinks: &'a [SinkPipeline<'a>],
+    /// By sink id, the sink's state once the run has built it. Made when
+    /// first built: most runs build none.
+    built: Option<SmallVec<Option<OwnedState>>>,
 }
 
 impl<'a> Context<'a> {
@@ -45,7 +55,43 @@ impl<'a> Context<'a> {
             literals: statement.and_then(Statement::literals),
             functions: statement.map_or(&[], Statement::functions),
             cutoffs: None,
+            sinks: &[],
+            built: None,
         }
+    }
+
+    /// As `new`, of a plan whose pipelines that end in sinks are `sinks`.
+    pub(crate) fn with_sinks(
+        env: &'a Env,
+        statement: Option<&'a Statement>,
+        sinks: &'a [SinkPipeline<'a>],
+    ) -> Context<'a> {
+        Context { sinks, ..Context::new(env, statement) }
+    }
+
+    /// The pipeline that ends in sink `id`.
+    pub(crate) fn sink_pipeline(&self, id: u32) -> &'a SinkPipeline<'a> {
+        at!(self.sinks, id as usize)
+    }
+
+    /// Sink `id`'s state, if the run has built it.
+    pub(crate) fn built(&self, id: u32) -> Option<NonNull<u8>> {
+        Some(self.built.as_deref()?.get(id as usize)?.as_ref()?.as_ptr())
+    }
+
+    /// Keeps `state`, sink `id`'s, built, until the run ends.
+    pub(crate) fn keep_built(&mut self, id: u32, state: OwnedState) -> Result<(), AllocError> {
+        let built = match &mut self.built {
+            Some(built) => built,
+            None => self.built.insert(SmallVec::new(self.env, PLAN_NODES_MAX)?),
+        };
+        while built.len() <= id as usize {
+            built.push(None)?;
+        }
+        let slot = at_mut!(built, id as usize);
+        check!(slot.is_none());
+        *slot = Some(state);
+        Ok(())
     }
 
     /// The strings the statement's conditions compare with, if it has any.
