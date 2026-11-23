@@ -831,6 +831,14 @@ mod tests {
         let mut grouped = kept("FROM t |> AGGREGATE sum(f) AS x GROUP BY a |> SELECT x");
         grouped.sort_by(f64::total_cmp);
         assert_eq!(grouped, [0.5, 2.5]);
+        // Of expressions, and by one, as if computed by an `EXTEND` first.
+        let expressions = run("FROM t |> AGGREGATE sum(a + 1) AS x, max(f * 2) AS y");
+        assert_eq!(expressions, [(b"x".to_vec(), [5.0].to_vec()), (b"y".to_vec(), [5.0].to_vec())]);
+        let mut by = run("FROM t |> AGGREGATE sum(b) AS total GROUP BY a * 10 AS k");
+        assert_eq!(by.remove(0).0, b"k");
+        let mut totals = by.remove(0).1;
+        totals.sort_by(f64::total_cmp);
+        assert_eq!(totals, [10.0, 20.0]);
         let distinct = (b"count(DISTINCT a)".to_vec(), [2.0].to_vec());
         assert_eq!(run("FROM t |> AGGREGATE count(DISTINCT a)"), [distinct]);
         // Each `a` is a group, of one row; the keys come first.
@@ -992,9 +1000,13 @@ mod tests {
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
         assert_eq!(error("FROM t |> AGGREGATE count(DISTINCT *)"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::ExpectedName, 24));
+        assert_eq!(
+            error("FROM t |> AGGREGATE count(*) GROUP BY a + 1"),
+            (ErrorCode::ExpectedName, 38)
+        );
         assert_eq!(error("FROM t |> WHERE DISTINCT a"), (ErrorCode::ExpectedExpression, 16));
     }
 

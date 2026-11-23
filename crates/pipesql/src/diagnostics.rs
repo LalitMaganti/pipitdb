@@ -228,8 +228,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             ("`LIMIT` and `OFFSET` take an integer".into(), "not an integer".into())
         }
         what if what == Unsupported::Aggregate as u16 => (
-            "only functions of a column, or `count(*)`, can be aggregated yet".into(),
-            "not a function of a column".into(),
+            "only calls of aggregate functions, or `count(*)`, can be aggregated".into(),
+            "not an aggregate function's call".into(),
         ),
         what if what == Unsupported::AggregateType as u16 => (
             "strings can't be summed or averaged".into(),
@@ -239,8 +239,8 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
             ("only columns can be sorted by yet".into(), "not a column".into())
         }
         what if what == Unsupported::GroupKey as u16 => (
-            "only integer and string columns can be grouped by yet".into(),
-            "not an integer or string column".into(),
+            "only integers and strings can be grouped by yet".into(),
+            "not an integer or string".into(),
         ),
         what if what == Unsupported::DoubleCondition as u16 => (
             "only comparisons and integers can be conditions yet".into(),
