@@ -13,7 +13,7 @@ use crate::statement::Statement;
 use crate::string_pool::StringPool;
 
 /// The most scratch selections a run can have.
-pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 6;
+pub const SCRATCH_SELECTIONS_MAX: usize = 1 << 10;
 
 /// The most cutoffs a run's `TopK`s can publish: more are not published.
 pub const CUTOFFS_MAX: u32 = 1 << 6;

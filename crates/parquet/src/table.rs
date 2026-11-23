@@ -687,7 +687,7 @@ mod tests {
             compare(Comparison::LessEqual, max),
             Node::And(0, 1),
         ];
-        Predicate::new(SmallVec::fixed_from(env, nodes.into_iter()).unwrap())
+        Predicate::new(env, SmallVec::fixed_from(env, nodes.into_iter()).unwrap()).unwrap()
     }
 
     #[test]

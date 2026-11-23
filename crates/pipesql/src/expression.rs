@@ -4,8 +4,7 @@
 use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprBuilder, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX,
-    check_expr_type,
+    Expr, ExprBuilder, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::string_pool::Id;
@@ -14,6 +13,7 @@ use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
+use crate::parser::NESTING_MAX;
 use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
@@ -35,7 +35,7 @@ pub fn add_expr(
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
-    let data_type = check_expr_type(nodes.nodes(), &type_of).map_err(|error| {
+    let data_type = check_expr_type(compiler.env(), nodes.nodes(), &type_of).map_err(|error| {
         let span = compiler.span(node);
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
@@ -124,9 +124,10 @@ fn compile(
     depth: usize,
     nodes: &mut ExprBuilder,
 ) -> Result<(), Error> {
-    // An expression is at least as large as it is deep.
-    if depth == EXPR_NODES_MAX {
-        return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
+    // Each level recurses, so as deep as the parser lets a query nest: a
+    // chain of operators is as deep as it is long, but nests no deeper.
+    if depth == NESTING_MAX {
+        return Err(Error::new(ErrorCode::NestingTooDeep, compiler.span(node)));
     }
     let child = |compiler: &Compiler<'_, '_>, i: u32| compiler.node(node.first_child() + i);
     let step = match node.tag() {

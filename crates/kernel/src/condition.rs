@@ -7,7 +7,7 @@ use crate::filter::{Range, Value};
 use crate::predicate::{Leaf, Node, Predicate};
 
 /// The most conditions a scan has.
-pub const CONDITIONS_MAX: usize = 64;
+pub const CONDITIONS_MAX: usize = 1 << 16;
 
 /// What the rows of one of a scannable's columns must meet: the filters'
 /// conjuncts that read only it. Scannables use it to skip what can't meet
@@ -263,7 +263,7 @@ mod tests {
         for expr in leaves.iter().chain(&first).chain(&second) {
             let mut nodes = SmallVec::new(env, 64).unwrap();
             build(expr, &mut nodes);
-            let condition = Condition::new(0, &Predicate::new(nodes));
+            let condition = Condition::new(0, &Predicate::new(env, nodes).unwrap());
             assert_eq!(condition.nulls, reference(expr, None) == Some(true));
             let within = |v: i64| match condition.values {
                 Values::None => Some(false),
@@ -281,7 +281,10 @@ mod tests {
         assert!(leaves.iter().all(|leaf| {
             let mut nodes = SmallVec::new(env, 64).unwrap();
             build(leaf, &mut nodes);
-            !matches!(Condition::new(0, &Predicate::new(nodes)).values, Values::Ranges)
+            !matches!(
+                Condition::new(0, &Predicate::new(env, nodes).unwrap()).values,
+                Values::Ranges
+            )
         }));
         assert!(said * 2 > first.len() + second.len());
     }
@@ -292,7 +295,7 @@ mod tests {
         let condition = |expr: &Expr| {
             let mut nodes = SmallVec::new(env, 8).unwrap();
             build(expr, &mut nodes);
-            Condition::new(0, &Predicate::new(nodes))
+            Condition::new(0, &Predicate::new(env, nodes).unwrap())
         };
         let between = |min, max| Bounds { min, max };
         let above_3 = condition(&Expr::Compare(Comparison::Greater, 3));
