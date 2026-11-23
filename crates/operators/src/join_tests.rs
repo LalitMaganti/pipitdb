@@ -167,7 +167,8 @@ fn join(
         Some(condition) => conjuncts_of(Env::current(), &plan.exprs, condition).unwrap(),
         None => SmallVec::fixed(Env::current(), 0).unwrap(),
     };
-    let join = JoinOp::new(kind, conjuncts, [probe_columns, build_columns]);
+    let join =
+        JoinOp::new(Env::current(), kind, conjuncts, [probe_columns, build_columns]).unwrap();
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(Env::current(), join).unwrap(), &children).unwrap();
     if above != Above::Nothing {
@@ -446,7 +447,7 @@ fn joined_in_order(
             SmallVec::fixed_from(Env::current(), [k.id, v.id].into_iter()).unwrap(),
         ];
         let conjuncts = conjuncts_of(Env::current(), &plan.exprs, condition).unwrap();
-        let join = JoinOp::new(JoinKind::Inner, conjuncts, sides);
+        let join = JoinOp::new(Env::current(), JoinKind::Inner, conjuncts, sides).unwrap();
         let join =
             plan.add_node(DynOp::new(Env::current(), join).unwrap(), &[probe, node]).unwrap();
         probe_columns.extend([k.id, v.id]);

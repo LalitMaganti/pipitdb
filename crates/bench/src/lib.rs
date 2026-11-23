@@ -742,7 +742,7 @@ fn join_op(exprs: &mut Exprs, [utid, dur]: [u32; 2], [id, tid]: [u32; 2]) -> Dyn
         |list: [u32; 2]| SmallVec::fixed_from(crate::env(), list.into_iter()).expect("allocates");
     let columns = [columns([utid, dur]), columns([id, tid])];
     let conjuncts = SmallVec::fixed_from(crate::env(), condition.into_iter()).expect("allocates");
-    let op = JoinOp::new(JoinKind::Inner, conjuncts, columns);
+    let op = JoinOp::new(crate::env(), JoinKind::Inner, conjuncts, columns).expect("allocates");
     DynOp::new(crate::env(), op).expect("allocates")
 }
 
