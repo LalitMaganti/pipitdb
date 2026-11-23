@@ -12,7 +12,7 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::Estimate;
-use crate::filter::Entries;
+use crate::filter::{Comparison, Entries};
 use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
@@ -92,6 +92,34 @@ pub enum ExprOp {
     /// The statement's function `c`, called with the `b` `Argument`s from
     /// step `a`.
     Call,
+}
+
+impl ExprOp {
+    /// The comparison it makes, if it's one.
+    pub fn comparison(self) -> Option<Comparison> {
+        Some(match self {
+            ExprOp::Eq => Comparison::Equal,
+            ExprOp::Ne => Comparison::NotEqual,
+            ExprOp::Lt => Comparison::Less,
+            ExprOp::Le => Comparison::LessEqual,
+            ExprOp::Gt => Comparison::Greater,
+            ExprOp::Ge => Comparison::GreaterEqual,
+            _ => return None,
+        })
+    }
+}
+
+impl From<Comparison> for ExprOp {
+    fn from(comparison: Comparison) -> ExprOp {
+        match comparison {
+            Comparison::Equal => ExprOp::Eq,
+            Comparison::NotEqual => ExprOp::Ne,
+            Comparison::Less => ExprOp::Lt,
+            Comparison::LessEqual => ExprOp::Le,
+            Comparison::Greater => ExprOp::Gt,
+            Comparison::GreaterEqual => ExprOp::Ge,
+        }
+    }
 }
 
 /// A `When`'s condition for the rows where its value isn't null.
@@ -495,6 +523,7 @@ fn compare_each<T: Copy>(x: &[T], y: &[T], o: &mut [i64], f: impl Fn(T, T) -> bo
 /// As `compare_numbers`, for strings, by their bytes, at the rows where
 /// neither is null: others' views may not be of their bytes.
 fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
+    let Some(comparison) = op.comparison() else { failed!() };
     let (left, right) = (a.string_values(), b.string_values());
     for (row, o) in o.iter_mut().enumerate() {
         #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
@@ -503,13 +532,7 @@ fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
             *o = 0;
             continue;
         }
-        let order = left.get(row).cmp(right.get(row));
-        *o = i64::from(match op {
-            ExprOp::Eq => order.is_eq(),
-            ExprOp::Ne => order.is_ne(),
-            ExprOp::Lt => order.is_lt(),
-            _ => order.is_le(),
-        });
+        *o = i64::from(comparison.holds(left.get(row).cmp(right.get(row))));
     }
 }
 

@@ -29,7 +29,7 @@ pub enum Comparison {
 
 impl Comparison {
     /// Whether it holds for a cell ordered `order` against the value.
-    fn holds(self, order: Ordering) -> bool {
+    pub(crate) fn holds(self, order: Ordering) -> bool {
         match self {
             Comparison::Equal => order.is_eq(),
             Comparison::NotEqual => order.is_ne(),
@@ -47,6 +47,19 @@ impl Comparison {
             Comparison::Greater => Comparison::Less,
             Comparison::GreaterEqual => Comparison::LessEqual,
             Comparison::Equal | Comparison::NotEqual => self,
+        }
+    }
+
+    /// The comparison true for exactly the non-null rows this is false for.
+    /// Floats are ordered totally, so this holds for them too.
+    pub fn negated(self) -> Comparison {
+        match self {
+            Comparison::Equal => Comparison::NotEqual,
+            Comparison::NotEqual => Comparison::Equal,
+            Comparison::Less => Comparison::GreaterEqual,
+            Comparison::LessEqual => Comparison::Greater,
+            Comparison::Greater => Comparison::LessEqual,
+            Comparison::GreaterEqual => Comparison::Less,
         }
     }
 }

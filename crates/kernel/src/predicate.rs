@@ -338,12 +338,12 @@ impl Leaf {
     ) -> Result<(), AllocError> {
         match self {
             Leaf::Compare { column, comparison, value } => {
-                let comparison = if want { comparison } else { negated(comparison) };
+                let comparison = if want { comparison } else { comparison.negated() };
                 let column = at!(inputs.columns, column as usize);
                 filter::compare(column, comparison, value, selection, dropped);
             }
             Leaf::CompareString { column, comparison, string } => {
-                let comparison = if want { comparison } else { negated(comparison) };
+                let comparison = if want { comparison } else { comparison.negated() };
                 let string = literal(inputs.literals, i64::from(string.raw_id()));
                 let column = at!(inputs.columns, column as usize);
                 if !matches!(column.form(), Form::Dictionary(_)) {
@@ -431,19 +431,6 @@ fn literal(literals: Option<&StringPool>, id: i64) -> &[u8] {
     let Ok(id) = u32::try_from(id) else { failed!() };
     let Some(string) = literals.and_then(|literals| literals.get(Id::raw(id))) else { failed!() };
     string
-}
-
-/// The comparison true for exactly the non-null rows `comparison` is false
-/// for. Floats are ordered totally, so this holds for them too.
-fn negated(comparison: Comparison) -> Comparison {
-    match comparison {
-        Comparison::Equal => Comparison::NotEqual,
-        Comparison::NotEqual => Comparison::Equal,
-        Comparison::Less => Comparison::GreaterEqual,
-        Comparison::LessEqual => Comparison::Greater,
-        Comparison::Greater => Comparison::LessEqual,
-        Comparison::GreaterEqual => Comparison::Less,
-    }
 }
 
 /// What every test of `column` in a filter of `conjuncts` compares it with,
@@ -607,14 +594,7 @@ impl FromExpr<'_> {
                 }
             }
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
-                let comparison = match step.op {
-                    ExprOp::Eq => Comparison::Equal,
-                    ExprOp::Ne => Comparison::NotEqual,
-                    ExprOp::Lt => Comparison::Less,
-                    ExprOp::Le => Comparison::LessEqual,
-                    ExprOp::Gt => Comparison::Greater,
-                    _ => Comparison::GreaterEqual,
-                };
+                let Some(comparison) = step.op.comparison() else { failed!() };
                 // A constant on the left is as one on the right the other way.
                 let ((column, data_type), constant, comparison) =
                     match (column(step.a), column(step.b)) {
