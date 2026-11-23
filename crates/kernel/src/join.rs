@@ -76,6 +76,19 @@ impl JoinOp {
         JoinOp { kind, conjuncts, columns, outputs, build: 1 }
     }
 
+    pub(crate) fn kind(&self) -> JoinKind {
+        self.kind
+    }
+
+    pub(crate) fn conjuncts(&self) -> &[Expr] {
+        &self.conjuncts
+    }
+
+    /// Child `child`'s columns, all of them.
+    pub(crate) fn all_columns(&self, child: usize) -> &[ColumnId] {
+        at!(self.columns, child)
+    }
+
     fn probe(&self) -> u32 {
         1 - self.build
     }
@@ -178,6 +191,10 @@ impl JoinOp {
 }
 
 impl<'c> Op<'c> for JoinOp {
+    fn as_join(&self) -> Option<&JoinOp> {
+        Some(self)
+    }
+
     /// Keeps the columns needed above.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
         for (columns, outputs) in self.columns.iter().zip(&mut self.outputs) {
@@ -396,7 +413,7 @@ impl JoinOp {
 
 /// The columns `nodes`, a conjunct, requires equal, if it's an equality of
 /// two columns.
-fn equality(nodes: &[ExprStep]) -> Option<[ColumnId; 2]> {
+pub(crate) fn equality(nodes: &[ExprStep]) -> Option<[ColumnId; 2]> {
     let root = nodes.last()?;
     let column = |i: u32| nodes.get(i as usize).filter(|n| n.op == ExprOp::Column).map(|n| n.a);
     (root.op == ExprOp::Eq).then_some([column(root.a)?, column(root.b)?])

@@ -4,8 +4,10 @@
 
 use crate::allocator::AllocError;
 use crate::column::Forms;
+use crate::estimate::Estimate;
 use crate::expression::Exprs;
 use crate::global::Global;
+use crate::join_planner::plan_regions;
 use crate::plan::{
     Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
@@ -18,8 +20,13 @@ pub fn optimize(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(), Al
     place_filters(allocator, plan)?;
     push_down_conditions(allocator, plan)?;
     // Runs after pushdown, which can make scans skip rows, and before
-    // forms, which depend on what is chosen here.
-    choose_by_estimates(allocator, plan)?;
+    // forms, which depend on what is chosen here. Joins planned in a new
+    // order choose again, and keep only the columns needed.
+    let estimates = choose_by_estimates(allocator, plan)?;
+    if plan_regions(allocator, plan, &estimates)? {
+        prune_columns(allocator, plan)?;
+        choose_by_estimates(allocator, plan)?;
+    }
     choose_forms(allocator, plan)
 }
 
@@ -241,11 +248,11 @@ fn bypass(plan: &mut LogicalPlan<'_>, id: PlanNodeId, child: PlanNodeId) {
 
 /// Works out each node's estimate from its children's, from the scans up,
 /// and lets each op make the choices that depend on them, such as which
-/// side of a join to build.
+/// side of a join to build. Returns the estimates.
 pub fn choose_by_estimates(
     allocator: &Global,
     plan: &mut LogicalPlan<'_>,
-) -> Result<(), AllocError> {
+) -> Result<SlowVec<Estimate>, AllocError> {
     let mut estimates = SlowVec::fixed(allocator, plan.nodes.len())?;
     let mut inputs = SlowVec::new(allocator, PLAN_NODES_MAX)?;
     let exprs = &plan.exprs;
@@ -258,7 +265,7 @@ pub fn choose_by_estimates(
         node.op.choose(exprs, &inputs);
         estimates.push(node.op.estimate(exprs, &inputs))?;
     }
-    Ok(())
+    Ok(estimates)
 }
 
 /// Each node's parent, and which of its children it is; `None` for the

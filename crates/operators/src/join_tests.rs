@@ -3,6 +3,8 @@
 
 extern crate std;
 
+use std::format;
+use std::string::{String, ToString};
 use std::vec;
 use std::vec::Vec;
 
@@ -400,4 +402,151 @@ fn builds_the_smaller_side_of_a_left_join() {
             expected(first, second, JoinKind::Left, On::Equal, Above::Nothing)
         );
     }
+}
+
+/// Joins `tables` in the written order `order`: each table after the first
+/// to those before it, on `a.v = b.k` for each edge `(a, b)` between them.
+/// Returns each output row's `v`s, by table, sorted, and the optimized plan's
+/// joins as a nested list of tables, each join's in order.
+fn joined_in_order(
+    tables: &[DynScannable<'_>],
+    order: &[usize],
+    edges: &[(usize, usize)],
+) -> (Vec<Vec<i64>>, String) {
+    let mut plan = LogicalPlan::new(Global::current()).unwrap();
+    let mut columns = vec![None; tables.len()];
+    let mut root = None;
+    for &table in order {
+        let (node, [k, v]) = scan(&mut plan, &tables[table]);
+        columns[table] = Some((k, v));
+        let Some(probe) = root else {
+            root = Some((node, vec![k.id, v.id]));
+            continue;
+        };
+        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
+        for &(a, b) in edges {
+            let (Some((_, av)), Some((bk, _))) = (columns[a], columns[b]) else { continue };
+            if a != table && b != table {
+                continue;
+            }
+            let before = (!nodes.nodes().is_empty()).then(|| nodes.last());
+            let (x, y) = (nodes.column(av.id).unwrap(), nodes.column(bk.id).unwrap());
+            let equal = nodes.node(ExprOp::Eq, x, y).unwrap();
+            if let Some(before) = before {
+                nodes.node(ExprOp::And, before, equal).unwrap();
+            }
+        }
+        let condition = plan.exprs.add(nodes.nodes()).unwrap();
+        let (probe, mut probe_columns) = probe;
+        let sides = [
+            SlowVec::fixed_from(Global::current(), probe_columns.iter().copied()).unwrap(),
+            SlowVec::fixed_from(Global::current(), [k.id, v.id].into_iter()).unwrap(),
+        ];
+        let conjuncts = conjuncts_of(Global::current(), &plan.exprs, condition).unwrap();
+        let join = JoinOp::new(JoinKind::Inner, conjuncts, sides);
+        let join =
+            plan.add_node(DynOp::new(Global::current(), join).unwrap(), &[probe, node]).unwrap();
+        probe_columns.extend([k.id, v.id]);
+        root = Some((join, probe_columns));
+    }
+    let vs: Vec<NamedColumn> = columns.iter().map(|c| c.unwrap().1).collect();
+    for &v in &vs {
+        plan.output.push(v).unwrap();
+    }
+    optimize(Global::current(), &mut plan).unwrap();
+    // Each scan's table, by its rows: every table has a different number.
+    let rows: Vec<i64> = tables.iter().map(|t| t.summary(None).unwrap().rows).collect();
+    // A scan is the only node without children here.
+    let scans = |node: u32| {
+        let node = &plan.nodes[node as usize];
+        let scanned = node.op.summary(None).filter(|_| node.children.is_empty());
+        scanned.map(|summary| rows.iter().position(|&r| r == summary.rows).unwrap())
+    };
+    let tree = shape(&plan, plan.root, &scans);
+    let planned = plan_nodes(Global::current(), &plan).unwrap();
+    let physical = lower(Global::current(), &mut plan, &planned).unwrap();
+    let mut execution = physical.start(Global::current()).unwrap();
+    let mut batch = RowBatch::new();
+    let mut rows = Vec::new();
+    let positions: Vec<u32> = physical.columns().iter().map(|column| column.position).collect();
+    while execution.next(&mut batch).unwrap() {
+        let selection = batch.selection();
+        for row in (0..selection.len()).map(|i| selection.kept().row(i)) {
+            rows.push(positions.iter().map(|&p| batch.column(p).int64s()[row as usize]).collect());
+        }
+    }
+    rows.sort_unstable();
+    (rows, tree)
+}
+
+/// The joins under `node` of `plan` as a nested list of tables, which
+/// `scans` gives each scan's.
+fn shape(plan: &LogicalPlan<'_>, node: u32, scans: &dyn Fn(u32) -> Option<usize>) -> String {
+    if let Some(table) = scans(node) {
+        return table.to_string();
+    }
+    let children = &plan.nodes[node as usize].children;
+    // In either order: each join chooses its build side later.
+    let mut parts: Vec<String> = children.iter().map(|&c| shape(plan, c, scans)).collect();
+    parts.sort_unstable();
+    format!("({})", parts.join(" "))
+}
+
+/// What `joined_in_order` should give: every combination of rows each edge
+/// holds for, by brute force.
+fn joined_expected(keys: &[Vec<Option<i64>>], edges: &[(usize, usize)]) -> Vec<Vec<i64>> {
+    // A table's `v` is its row number, and its `k` is given.
+    let mut rows: Vec<Vec<i64>> = vec![vec![]];
+    for (table, table_keys) in keys.iter().enumerate() {
+        let mut next = Vec::new();
+        for row in &rows {
+            for (v, &k) in (0..).zip(table_keys) {
+                let holds = edges.iter().all(|&(a, b)| match (a == table, b == table) {
+                    // `a.v = b.k`, once both are in.
+                    (false, true) if a < table => k == Some(row[a]),
+                    (true, false) if b < table => {
+                        Some(v) == keys[b][usize::try_from(row[b]).unwrap()]
+                    }
+                    _ => true,
+                });
+                if holds {
+                    let mut row = row.clone();
+                    row.push(v);
+                    next.push(row);
+                }
+            }
+        }
+        rows = next;
+    }
+    rows.sort_unstable();
+    rows
+}
+
+#[test]
+fn plans_the_order_of_several_joins() {
+    // Four tables of very different sizes, each `v` its row number, joined
+    // along a chain: 0.v = 1.k, 1.v = 2.k, 2.v = 3.k. Any order it's
+    // written in gives the same rows, and the same plan.
+    // Without distinct counts, a join is estimated to make as many rows as
+    // its larger side, so these sizes have one cheapest plan.
+    let sizes = [3000, 40, 900, 2000];
+    let keys: Vec<Vec<Option<i64>>> = (0..4_u8)
+        .map(|t| {
+            (0..sizes[usize::from(t)])
+                .map(|i| (i % 13 != 4).then_some((i * 7 + i64::from(t)) % 50))
+                .collect()
+        })
+        .collect();
+    let tables: Vec<DynScannable<'static>> = keys.iter().map(|keys| table(keys)).collect();
+    let edges = [(0, 1), (1, 2), (2, 3)];
+    let expected = joined_expected(&keys, &edges);
+    let mut trees = Vec::new();
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 2, 0, 3], [2, 1, 3, 0]] {
+        let (rows, tree) = joined_in_order(&tables, &order, &edges);
+        assert_eq!(rows, expected, "{order:?}");
+        trees.push(tree);
+    }
+    assert!(trees.iter().all(|tree| *tree == trees[0]), "{trees:?}");
+    // The two smallest first, as they make the fewest rows.
+    assert_eq!(trees[0], "(((1 2) 3) 0)");
 }

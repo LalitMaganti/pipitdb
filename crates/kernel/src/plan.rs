@@ -20,6 +20,7 @@ use crate::expression::{
 use crate::function::DynFunction;
 use crate::global::Global;
 use crate::inline_vec::InlineVec;
+use crate::join::JoinOp;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
 use crate::optimize::{Needed, Pruned};
@@ -203,6 +204,12 @@ pub trait Op<'c> {
         None
     }
 
+    /// This, if it's a join: what the join planner reorders. By default,
+    /// it isn't.
+    fn as_join(&self) -> Option<&JoinOp> {
+        None
+    }
+
     /// Makes the choices that depend on its inputs' estimates, such as which
     /// side of a join to build. By default, there are none.
     fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
@@ -291,6 +298,7 @@ struct OpFunctions<'c> {
     split_below: SplitBelow<'c>,
     estimate: unsafe fn(NonNull<()>, &Exprs, &[Estimate]) -> Option<Estimate>,
     choose: unsafe fn(NonNull<()>, &Exprs, &[Estimate]),
+    as_join: unsafe fn(NonNull<()>) -> Option<NonNull<JoinOp>>,
     // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
     needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
     derive: for<'p> unsafe fn(
@@ -347,6 +355,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         estimate: |op, exprs, inputs| unsafe { value_of::<T>(op).estimate(exprs, inputs) },
         // SAFETY: as for `prune`.
         choose: |op, exprs, inputs| unsafe { value_mut_of::<T>(op).choose(exprs, inputs) },
+        // SAFETY: as for `reads`.
+        as_join: |op| unsafe { value_of::<T>(op).as_join().map(NonNull::from) },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
         // SAFETY: as for `reads`.
@@ -469,6 +479,12 @@ impl<'c> DynOp<'c> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
         unsafe { (self.functions.choose)(self.op.as_ptr(), exprs, inputs) }
+    }
+
+    pub(crate) fn as_join(&self) -> Option<&JoinOp> {
+        // SAFETY: the function matches the op's type, and the join it
+        // returns is the op, which lives as long as `self`.
+        unsafe { (self.functions.as_join)(self.op.as_ptr()).map(|join| join.as_ref()) }
     }
 
     pub(crate) fn answer(
