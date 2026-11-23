@@ -116,7 +116,7 @@ fn string_extreme(call: AggregateCall) -> Option<StringExtreme> {
 fn state_words(call: AggregateCall) -> usize {
     match string_extreme(call) {
         Some(_) => StringExtreme::STATE_WORDS,
-        None => make_aggregate_function(call.function).state_words(),
+        None => make_aggregate_function(call.function, call.input_type).state_words(),
     }
 }
 
@@ -282,7 +282,7 @@ impl Breaker for HashAggregate {
                 extreme.update(context, column, input.select(), rows, numbers, states)?;
                 continue;
             }
-            let function = make_aggregate_function(call.function);
+            let function = make_aggregate_function(call.function, call.input_type);
             let mut buffers = AggregateInputLoader::default();
             let mut loaded = AggregateInput { values: &[], valid: None, rows };
             if function.reads_input() {
@@ -354,7 +354,7 @@ impl Breaker for HashAggregate {
                 let Ok(()) = output.push_column(column) else { failed!() };
                 continue;
             }
-            let function = make_aggregate_function(call.function);
+            let function = make_aggregate_function(call.function, call.input_type);
             // Without keys there is always one group, even with no rows. In
             // that case it has no value.
             let seen = if function.tracks_seen() {

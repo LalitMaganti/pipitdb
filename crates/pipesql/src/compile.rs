@@ -824,6 +824,13 @@ mod tests {
         let least = (b"min(a)".to_vec(), [1.0].to_vec());
         assert_eq!(run("FROM t |> AGGREGATE count(*), SUM(b), min(a)"), [count, sum, least]);
         assert_eq!(run("FROM t |> AGGREGATE avg(b)"), [(b"avg(b)".to_vec(), [15.0].to_vec())]);
+        // Doubles, of 0.5 and 2.5, without keys and in a group each.
+        let doubles = "FROM t |> AGGREGATE sum(f), avg(f), min(f), max(f)";
+        let values: StdVec<StdVec<f64>> = run(doubles).into_iter().map(|(_, v)| v).collect();
+        assert_eq!(values, [[3.0], [1.5], [0.5], [2.5]]);
+        let mut grouped = kept("FROM t |> AGGREGATE sum(f) AS x GROUP BY a |> SELECT x");
+        grouped.sort_by(f64::total_cmp);
+        assert_eq!(grouped, [0.5, 2.5]);
         let distinct = (b"count(DISTINCT a)".to_vec(), [2.0].to_vec());
         assert_eq!(run("FROM t |> AGGREGATE count(DISTINCT a)"), [distinct]);
         // Each `a` is a group, of one row; the keys come first.
@@ -985,8 +992,6 @@ mod tests {
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> AGGREGATE sum(f)"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> AGGREGATE min(f)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE sum(a + 1)"), (ErrorCode::Unsupported, 20));
         assert_eq!(error("FROM t |> AGGREGATE count(*) GROUP BY f"), (ErrorCode::Unsupported, 38));
         assert_eq!(error("FROM t |> AGGREGATE count(DISTINCT *)"), (ErrorCode::Unsupported, 20));
