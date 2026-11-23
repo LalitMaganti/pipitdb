@@ -152,6 +152,19 @@ impl<'a> RowBatch<'a> {
         unsafe { at!(self.columns, index as usize).assume_init_ref() }
     }
 
+    /// Drops the last column.
+    pub fn pop_column(&mut self) {
+        check!(self.column_count > 0);
+        self.column_count -= 1;
+        let (index, bit) = (self.column_count as usize, 1 << self.column_count);
+        if self.borrowed & bit == 0 {
+            // SAFETY: the column was initialized, and the count no longer
+            // covers it, so it's dropped once.
+            unsafe { at_mut!(self.columns, index).assume_init_drop() };
+        }
+        self.borrowed &= !bit;
+    }
+
     /// Replaces column `index` with `column`, of as many rows.
     pub fn set_column(&mut self, index: u32, column: ColumnView) {
         check!(index < self.column_count && column.row_count() == self.row_count);

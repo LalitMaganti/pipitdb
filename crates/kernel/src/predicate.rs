@@ -7,12 +7,15 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
+use crate::column::DataType;
 use crate::column::{ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
+use crate::expression::{Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep};
 use crate::filter::{self, Comparison, Entries, Value};
 use crate::flat_hash_map::FlatHashMap;
 use crate::murmur_hash;
+use crate::plan::ColumnId;
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -20,7 +23,7 @@ use crate::step::Transform;
 use crate::string_pool::{Id, StringPool};
 
 /// The most nodes a predicate can have.
-pub const PREDICATE_NODES_MAX: usize = 1 << 6;
+pub const PREDICATE_NODES_MAX: usize = EXPR_NODES_MAX;
 
 /// A node of a predicate. Children come before their parents.
 #[derive(Clone, Copy, Debug)]
@@ -222,174 +225,6 @@ impl Predicate {
         self.depth
     }
 
-    /// The conjuncts, the parts of its top-level `AND`s, that read only
-    /// `column`, joined by `AND`, or `None` if there are none.
-    pub fn conjuncts_on(
-        &self,
-        allocator: &dyn Allocator,
-        column: u32,
-    ) -> Result<Option<Predicate>, AllocError> {
-        let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
-        let goes = |node| self.reads_only(node, column);
-        #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
-        let root = self.copy_where(self.nodes.len() as u32 - 1, &goes, &mut nodes, None)?;
-        if root.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(Predicate::checked(nodes, self.values.clone())))
-    }
-
-    /// Splits its top-level conjuncts by where they can go. A conjunct whose
-    /// columns `place` puts all in the same input, 0 or 1, goes to that
-    /// input; any other stays. Returns the conjuncts that stay, then those
-    /// for input 0, then for input 1, each joined by `AND`, or `None` if
-    /// there are none.
-    pub fn split(
-        &self,
-        allocator: &dyn Allocator,
-        place: impl Fn(u32) -> Option<u32>,
-    ) -> Result<[Option<Predicate>; 3], AllocError> {
-        #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
-        let root = self.nodes.len() as u32 - 1;
-        // In the order returned: those that stay, then those for each input.
-        let mut parts = [const { None }; 3];
-        for (part, input) in parts.iter_mut().zip([None, Some(0), Some(1)]) {
-            let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
-            let goes = |node| self.place_of(node, &place) == input;
-            if self.copy_where(root, &goes, &mut nodes, None)?.is_some() {
-                *part = Some(Predicate::checked(nodes, self.values.clone()));
-            }
-        }
-        Ok(parts)
-    }
-
-    /// The input `place` puts all the columns node `node` reads in, if
-    /// they're all in the same one.
-    fn place_of(&self, node: u32, place: &impl Fn(u32) -> Option<u32>) -> Option<u32> {
-        match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => place(leaf.column()).filter(|&input| input < 2),
-            Node::And(a, b) | Node::Or(a, b) => {
-                let input = self.place_of(a, place)?;
-                (self.place_of(b, place) == Some(input)).then_some(input)
-            }
-            Node::Not(a) => self.place_of(a, place),
-        }
-    }
-
-    /// Copies the conjuncts under node `node` that `goes` accepts into
-    /// `nodes`, joining each to `root`, those copied so far, by `AND`.
-    /// Returns the new root.
-    fn copy_where(
-        &self,
-        node: u32,
-        goes: &dyn Fn(u32) -> bool,
-        nodes: &mut SlowVec<Node>,
-        root: Option<u32>,
-    ) -> Result<Option<u32>, AllocError> {
-        if let Node::And(a, b) = *at!(self.nodes, node as usize) {
-            let root = self.copy_where(a, goes, nodes, root)?;
-            return self.copy_where(b, goes, nodes, root);
-        }
-        if !goes(node) {
-            return Ok(root);
-        }
-        let copied = self.copy(node, nodes)?;
-        Ok(Some(match root {
-            Some(root) => push(nodes, Node::And(root, copied))?,
-            None => copied,
-        }))
-    }
-
-    /// Whether node `node` reads only `column`.
-    fn reads_only(&self, node: u32, column: u32) -> bool {
-        match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => leaf.column() == column,
-            Node::And(a, b) | Node::Or(a, b) => {
-                self.reads_only(a, column) && self.reads_only(b, column)
-            }
-            Node::Not(a) => self.reads_only(a, column),
-        }
-    }
-
-    /// Copies node `node` and those under it to `nodes`, returning where it
-    /// is there.
-    fn copy(&self, node: u32, nodes: &mut SlowVec<Node>) -> Result<u32, AllocError> {
-        let copied = match *at!(self.nodes, node as usize) {
-            Node::Leaf(leaf) => Node::Leaf(leaf),
-            Node::And(a, b) => Node::And(self.copy(a, nodes)?, self.copy(b, nodes)?),
-            Node::Or(a, b) => Node::Or(self.copy(a, nodes)?, self.copy(b, nodes)?),
-            Node::Not(a) => Node::Not(self.copy(a, nodes)?),
-        };
-        push(nodes, copied)
-    }
-
-    /// Whether every condition it has on `column` compares it with a string,
-    /// and it has one.
-    pub fn compares_only_strings(&self, column: u32) -> bool {
-        self.only(column, |leaf| {
-            matches!(leaf, Leaf::CompareString { .. } | Leaf::Like { .. } | Leaf::InStrings { .. })
-        })
-    }
-
-    /// Whether every condition it has on `column` compares it with an
-    /// integer or tests it for null, and it has one.
-    pub fn compares_only_integers(&self, column: u32) -> bool {
-        self.only(column, |leaf| {
-            matches!(leaf, Leaf::Compare { value: Value::Int64(_), .. } | Leaf::IsNull { .. })
-        })
-    }
-
-    /// Whether every condition it has on `column` is one `is`, and it has
-    /// one.
-    fn only(&self, column: u32, is: impl Fn(&Leaf) -> bool) -> bool {
-        let leaves = self.nodes.iter().filter_map(|node| match *node {
-            Node::Leaf(leaf) => Some(leaf),
-            Node::And(..) | Node::Or(..) | Node::Not(_) => None,
-        });
-        let mut on_column = leaves.filter(|leaf| leaf.column() == column).peekable();
-        on_column.peek().is_some() && on_column.all(|leaf| is(&leaf))
-    }
-
-    /// The columns its comparisons and `IS NULL`s read, maybe more than once.
-    pub fn columns(&self) -> impl Iterator<Item = u32> + '_ {
-        self.nodes.iter().filter_map(|node| match *node {
-            Node::Leaf(leaf) => Some(leaf.column()),
-            Node::And(..) | Node::Or(..) | Node::Not(_) => None,
-        })
-    }
-
-    /// A copy that reads column `renumber(c)` wherever this reads `c`, such
-    /// as a plan's column ids turned into positions in batches.
-    pub fn renumbered(
-        &self,
-        allocator: &dyn Allocator,
-        renumber: impl Fn(u32) -> u32,
-    ) -> Result<Predicate, AllocError> {
-        let nodes = self.nodes.iter().map(|&node| match node {
-            Node::Leaf(Leaf::Compare { column, comparison, value }) => {
-                Node::Leaf(Leaf::Compare { column: renumber(column), comparison, value })
-            }
-            Node::Leaf(Leaf::CompareString { column, comparison, string }) => {
-                Node::Leaf(Leaf::CompareString { column: renumber(column), comparison, string })
-            }
-            Node::Leaf(Leaf::Like { column, pattern }) => {
-                Node::Leaf(Leaf::Like { column: renumber(column), pattern })
-            }
-            Node::Leaf(Leaf::IsNull { column }) => {
-                Node::Leaf(Leaf::IsNull { column: renumber(column) })
-            }
-            Node::Leaf(Leaf::In { column, start, len }) => {
-                Node::Leaf(Leaf::In { column: renumber(column), start, len })
-            }
-            Node::Leaf(Leaf::InStrings { column, start, len }) => {
-                Node::Leaf(Leaf::InStrings { column: renumber(column), start, len })
-            }
-            node => node,
-        });
-        let nodes = SlowVec::fixed_from(allocator, nodes)?;
-        Ok(Predicate::checked(nodes, self.values.clone()))
-    }
-
     /// Where each node keeps the dictionary entries it found, for `select`.
     pub fn new_entries(&self, allocator: &dyn Allocator) -> Result<SlowVec<Entries>, AllocError> {
         SlowVec::fixed_from(allocator, (0..self.nodes.len()).map(|_| Entries::default()))
@@ -488,18 +323,6 @@ struct Inputs<'b> {
 }
 
 impl Leaf {
-    /// The column it reads.
-    fn column(self) -> u32 {
-        match self {
-            Leaf::Compare { column, .. }
-            | Leaf::CompareString { column, .. }
-            | Leaf::Like { column, .. }
-            | Leaf::IsNull { column }
-            | Leaf::In { column, .. }
-            | Leaf::InStrings { column, .. } => column,
-        }
-    }
-
     /// Narrows `selection` to the rows this, node `node`, is `want` for,
     /// writing the rows it drops to `dropped`, if given. A dictionary
     /// column's entries, given only to string comparisons, are each tested
@@ -622,6 +445,177 @@ fn negated(comparison: Comparison) -> Comparison {
     }
 }
 
+/// What every test of `column` in a filter of `expr` compares it with, if
+/// one kind: strings, or integers, which tests for null count as. Only
+/// those take a dictionary, or a sequence: see `FilterOp::accepts`.
+pub fn compared_with(expr: &Expr, column: ColumnId) -> Option<DataType> {
+    let reads = |i: u32| {
+        let node = at!(expr.nodes, i as usize);
+        node.op == ExprOp::Column && node.a == column
+    };
+    let constant = |i: u32| {
+        let node = at!(expr.nodes, i as usize);
+        (node.op == ExprOp::Constant).then_some(node.data_type)
+    };
+    // The kind of test node `node` is of the column at its operand `read`.
+    let kind = |node: &ExprStep, read: u32| match node.op {
+        ExprOp::And | ExprOp::Or | ExprOp::Not | ExprOp::IsNull | ExprOp::IsNotNull => {
+            Some(DataType::Int64)
+        }
+        ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
+            constant(if read == node.a { node.b } else { node.a })
+        }
+        ExprOp::Like => Some(DataType::String),
+        ExprOp::In if node.data_type == DataType::String => Some(DataType::String),
+        _ => None,
+    };
+    // A condition that's the column itself tests it as an integer.
+    let mut found = reads(expr.root()).then_some(Some(DataType::Int64));
+    for node in expr.nodes.iter() {
+        for (first, count) in node.operands() {
+            for read in (first..first + count).filter(|&read| reads(read)) {
+                let tested = kind(node, read);
+                found = Some(match found {
+                    Some(before) if before != tested => None,
+                    _ => tested,
+                });
+            }
+        }
+    }
+    found.flatten()
+}
+
+impl Predicate {
+    /// The predicate a filter of `expr` tests, reading each column `c` at
+    /// `column(c)`, its position and type. A node it can't test as a leaf,
+    /// such as `a < b`, it reads as a column from position `computed_at` on,
+    /// and adds to `computed`: the filter computes those first, as 0, 1 or
+    /// null, and keeps the rows where they aren't 0, as SQL does.
+    pub fn from_expr(
+        allocator: &dyn Allocator,
+        expr: &Expr,
+        column: &dyn Fn(ColumnId) -> (u32, DataType),
+        computed_at: u32,
+        computed: &mut SlowVec<u32>,
+    ) -> Result<Predicate, AllocError> {
+        // At most one for each of its nodes: `IS NOT NULL` takes two for its two.
+        let mut nodes = SlowVec::fixed(allocator, expr.nodes.len())?;
+        let mut from = FromExpr { expr, column, computed_at, computed, nodes: &mut nodes };
+        from.add(expr.root())?;
+        Ok(Predicate::checked(nodes, expr.values.clone()))
+    }
+}
+
+/// Turns an `Expr` into a predicate's nodes, as `Predicate::from_expr`.
+struct FromExpr<'e> {
+    expr: &'e Expr,
+    column: &'e dyn Fn(ColumnId) -> (u32, DataType),
+    computed_at: u32,
+    computed: &'e mut SlowVec<u32>,
+    nodes: &'e mut SlowVec<Node>,
+}
+
+impl FromExpr<'_> {
+    /// Adds node `node`'s predicate nodes, and returns its own.
+    fn add(&mut self, node: u32) -> Result<u32, AllocError> {
+        let step = *at!(self.expr.nodes, node as usize);
+        let added = match step.op {
+            ExprOp::And | ExprOp::Or => {
+                let (a, b) = (self.add(step.a)?, self.add(step.b)?);
+                if step.op == ExprOp::And { Node::And(a, b) } else { Node::Or(a, b) }
+            }
+            ExprOp::Not => Node::Not(self.add(step.a)?),
+            _ => {
+                if let Some(leaf) = self.leaf(&step) {
+                    // `IS NOT NULL` is `NOT` of its leaf, `IS NULL`.
+                    if step.op != ExprOp::IsNotNull {
+                        return push(self.nodes, Node::Leaf(leaf));
+                    }
+                    Node::Not(push(self.nodes, Node::Leaf(leaf))?)
+                } else {
+                    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+                    let at = self.computed_at + self.computed.len() as u32;
+                    self.computed.push(node)?;
+                    let (comparison, value) = (Comparison::NotEqual, Value::Int64(0));
+                    Node::Leaf(Leaf::Compare { column: at, comparison, value })
+                }
+            }
+        };
+        push(self.nodes, added)
+    }
+
+    /// The leaf testing `step`, if a predicate can: an integer column itself,
+    /// a column compared with a constant, or `LIKE`, `IS NULL`, `IS NOT
+    /// NULL`'s null test or `IN` of a column.
+    fn leaf(&self, step: &ExprStep) -> Option<Leaf> {
+        let node = |i: u32| *at!(self.expr.nodes, i as usize);
+        let column = |i: u32| {
+            let read = node(i);
+            (read.op == ExprOp::Column).then(|| (self.column)(read.a))
+        };
+        match step.op {
+            ExprOp::Column => {
+                let (column, data_type) = (self.column)(step.a);
+                let value = Value::Int64(0);
+                (data_type == DataType::Int64).then_some(Leaf::Compare {
+                    column,
+                    comparison: Comparison::NotEqual,
+                    value,
+                })
+            }
+            ExprOp::Like => {
+                let (column, _) = column(step.a)?;
+                Some(Leaf::Like { column, pattern: Id::raw(step.b) })
+            }
+            ExprOp::IsNull | ExprOp::IsNotNull => Some(Leaf::IsNull { column: column(step.a)?.0 }),
+            ExprOp::In => {
+                let (column, data_type) = column(step.a)?;
+                let (start, len) = (step.b, step.c);
+                match data_type {
+                    _ if data_type != step.data_type => None,
+                    DataType::Int64 => Some(Leaf::In { column, start, len }),
+                    DataType::String => Some(Leaf::InStrings { column, start, len }),
+                    DataType::Float64 => None,
+                }
+            }
+            ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
+                let comparison = match step.op {
+                    ExprOp::Eq => Comparison::Equal,
+                    ExprOp::Ne => Comparison::NotEqual,
+                    ExprOp::Lt => Comparison::Less,
+                    ExprOp::Le => Comparison::LessEqual,
+                    ExprOp::Gt => Comparison::Greater,
+                    _ => Comparison::GreaterEqual,
+                };
+                // A constant on the left is as one on the right the other way.
+                let ((column, data_type), constant, comparison) =
+                    match (column(step.a), column(step.b)) {
+                        (Some(read), None) => (read, node(step.b), comparison),
+                        (None, Some(read)) => (read, node(step.a), comparison.flipped()),
+                        _ => return None,
+                    };
+                if constant.op != ExprOp::Constant {
+                    return None;
+                }
+                #[expect(clippy::cast_precision_loss, reason = "typing checked it's exact")]
+                let value = match (data_type, constant.data_type) {
+                    (DataType::String, DataType::String) => {
+                        let string = Id::raw(constant.a);
+                        return Some(Leaf::CompareString { column, comparison, string });
+                    }
+                    (DataType::Int64, DataType::Int64) => Value::Int64(constant.int_value),
+                    (DataType::Float64, DataType::Int64) => {
+                        Value::Float64(constant.int_value as f64)
+                    }
+                    _ => return None,
+                };
+                Some(Leaf::Compare { column, comparison, value })
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Adds `node` to `nodes`, returning where it is.
 fn push(nodes: &mut SlowVec<Node>, node: Node) -> Result<u32, AllocError> {
     #[expect(clippy::cast_possible_truncation, reason = "at most `PREDICATE_NODES_MAX`")]
@@ -633,6 +627,9 @@ fn push(nodes: &mut SlowVec<Node>, node: Node) -> Result<u32, AllocError> {
 /// Narrows each batch's selection to the rows `predicate` is true for. The
 /// predicate reads columns by their position in batches.
 pub struct Filter {
+    /// Computes what `predicate` reads after a batch's own columns, which
+    /// are dropped once it's tested.
+    pub compute: Option<Compute>,
     pub predicate: Predicate,
 }
 
@@ -642,6 +639,8 @@ pub struct FilterState {
     sets: SlowVec<Option<Set>>,
     /// Where each node keeps the dictionary entries it found.
     entries: SlowVec<Entries>,
+    /// What computing keeps.
+    compute: Option<ComputeState>,
 }
 
 impl Transform for Filter {
@@ -651,7 +650,12 @@ impl Transform for Filter {
         context.reserve_selections(self.predicate.depth() as usize)?;
         let allocator = context.allocator();
         let sets = self.predicate.new_sets(allocator, context.literals())?;
-        Ok(FilterState { sets, entries: self.predicate.new_entries(allocator)? })
+        let entries = self.predicate.new_entries(allocator)?;
+        let compute = match &self.compute {
+            Some(compute) => Some(compute.new_state(context)?),
+            None => None,
+        };
+        Ok(FilterState { sets, entries, compute })
     }
 
     fn process(
@@ -660,16 +664,20 @@ impl Transform for Filter {
         state: &mut FilterState,
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
+        let FilterState { sets, entries, compute } = state;
+        let computed = match (&self.compute, compute) {
+            (Some(compute), Some(state)) => {
+                compute.process(context, state, batch)?;
+                compute.programs.len()
+            }
+            _ => 0,
+        };
         let (allocator, literals) = (context.allocator(), context.literals());
-        let FilterState { sets, entries } = state;
-        Ok(self.predicate.select(
-            allocator,
-            literals,
-            sets,
-            context.selections(),
-            entries,
-            batch,
-        )?)
+        self.predicate.select(allocator, literals, sets, context.selections(), entries, batch)?;
+        for _ in 0..computed {
+            batch.pop_column();
+        }
+        Ok(())
     }
 }
 
@@ -772,23 +780,73 @@ mod tests {
         }
     }
 
+    /// `expr` as a kernel expression, as a plan holds a condition.
+    fn kernel(expr: &Expr) -> crate::expression::Expr {
+        fn add(expr: &Expr, nodes: &mut StdVec<ExprStep>) -> u32 {
+            let node = |op, a, b, int_value| ExprStep {
+                op,
+                data_type: DataType::Int64,
+                a,
+                b,
+                c: 0,
+                int_value,
+                double_value: 0.0,
+            };
+            let added = match *expr {
+                Expr::Greater(column, value) => {
+                    nodes.push(node(ExprOp::Column, column, 0, 0));
+                    nodes.push(node(ExprOp::Constant, 0, 0, value));
+                    let at = u32::try_from(nodes.len()).unwrap();
+                    node(ExprOp::Gt, at - 2, at - 1, 0)
+                }
+                Expr::IsNull(column) => {
+                    nodes.push(node(ExprOp::Column, column, 0, 0));
+                    node(ExprOp::IsNull, u32::try_from(nodes.len()).unwrap() - 1, 0, 0)
+                }
+                Expr::And(a, b) => node(ExprOp::And, add(a, nodes), add(b, nodes), 0),
+                Expr::Or(a, b) => node(ExprOp::Or, add(a, nodes), add(b, nodes), 0),
+                Expr::Not(a) => node(ExprOp::Not, add(a, nodes), 0, 0),
+            };
+            nodes.push(added);
+            u32::try_from(nodes.len()).unwrap() - 1
+        }
+        let mut nodes = StdVec::new();
+        add(expr, &mut nodes);
+        let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
+        crate::expression::Expr { nodes, values: None }
+    }
+
+    /// The predicate testing `expr`, of columns at their ids' positions.
+    fn from_kernel(expr: &crate::expression::Expr) -> Predicate {
+        let mut computed = SlowVec::new(&Heap, 1).unwrap();
+        let column = |column| (column, DataType::Int64);
+        let predicate = Predicate::from_expr(&Heap, expr, &column, 2, &mut computed).unwrap();
+        assert!(computed.is_empty());
+        predicate
+    }
+
     #[test]
-    fn copies_the_conjuncts_on_a_column() {
+    fn tests_what_a_filter_gives_a_column() {
+        use crate::plan::{FilterOp, Given, Op};
         const A2: Expr = Expr::Greater(0, 2);
         const A4_OR_NULL: Expr = Expr::Or(&Expr::Greater(0, 4), &Expr::IsNull(0));
         const EITHER: Expr = Expr::Or(&A2, &Expr::Greater(1, 2));
         // `(a > 2 AND b IS NULL) AND (a > 4 OR a IS NULL) AND (a > 2 OR b > 2)`.
         const ALL: Expr =
             Expr::And(&Expr::And(&Expr::And(&A2, &Expr::IsNull(1)), &A4_OR_NULL), &EITHER);
-        let predicate = predicate_of(&ALL);
-        let on_a = predicate.conjuncts_on(&Heap, 0).unwrap().unwrap();
-        assert!(on_a.columns().all(|column| column == 0));
-        assert_eq!(kept_by(&on_a), kept(&Expr::And(&A2, &A4_OR_NULL)));
+        assert_eq!(kept_by(&from_kernel(&kernel(&ALL))), kept(&ALL));
+        let given = |expr: &Expr, column| {
+            let mut filter = FilterOp { condition: kernel(expr) };
+            let Given::Passed(condition) = filter.give_condition(&Heap, column).unwrap() else {
+                panic!("a filter passes on its child's rows")
+            };
+            condition.map(|condition| kept_by(&from_kernel(&condition)))
+        };
+        assert_eq!(given(&ALL, 0), Some(kept(&Expr::And(&A2, &A4_OR_NULL))));
         // None reads only a column it doesn't read.
-        assert!(predicate.conjuncts_on(&Heap, 2).unwrap().is_none());
+        assert_eq!(given(&ALL, 2), None);
         // One conjunct on the column is all of it.
-        let all = predicate_of(&A4_OR_NULL).conjuncts_on(&Heap, 0).unwrap().unwrap();
-        assert_eq!(kept_by(&all), kept(&A4_OR_NULL));
+        assert_eq!(given(&A4_OR_NULL, 0), Some(kept(&A4_OR_NULL)));
     }
 
     #[test]
@@ -1016,27 +1074,38 @@ mod tests {
 
     #[test]
     fn takes_dictionaries_only_of_columns_it_compares_with_strings() {
-        let string = id(&mut literals(&[]), b"b");
-        let leaves = [
-            Leaf::CompareString { column: 0, comparison: Comparison::Equal, string },
-            Leaf::Compare { column: 1, comparison: Comparison::Equal, value: Value::Int64(1) },
-            Leaf::CompareString { column: 2, comparison: Comparison::Equal, string },
-            Leaf::IsNull { column: 2 },
-        ];
+        let step = |op, data_type, a, b| ExprStep {
+            op,
+            data_type,
+            a,
+            b,
+            c: 0,
+            int_value: 1,
+            double_value: 0.0,
+        };
+        let (int, string) = (DataType::Int64, DataType::String);
+        // `s = 'b' AND n = 1 AND (t = 'b' AND t IS NULL)`, of columns 0, 1 and 2.
         let nodes = [
-            Node::Leaf(leaves[0]),
-            Node::Leaf(leaves[1]),
-            Node::Leaf(leaves[2]),
-            Node::Leaf(leaves[3]),
-            Node::And(0, 1),
-            Node::And(2, 3),
-            Node::And(4, 5),
+            step(ExprOp::Column, int, 0, 0),
+            step(ExprOp::Constant, string, 0, 0),
+            step(ExprOp::Eq, int, 0, 1),
+            step(ExprOp::Column, int, 1, 0),
+            step(ExprOp::Constant, int, 0, 0),
+            step(ExprOp::Eq, int, 3, 4),
+            step(ExprOp::Column, int, 2, 0),
+            step(ExprOp::Constant, string, 0, 0),
+            step(ExprOp::Eq, int, 6, 7),
+            step(ExprOp::Column, int, 2, 0),
+            step(ExprOp::IsNull, int, 9, 0),
+            step(ExprOp::And, int, 8, 10),
+            step(ExprOp::And, int, 2, 5),
+            step(ExprOp::And, int, 12, 11),
         ];
         let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
-        let predicate = Predicate::new(nodes);
+        let expr = crate::expression::Expr { nodes, values: None };
         // A string column, an integer one, one also tested for nulls, and one
         // it doesn't read.
-        let only: StdVec<bool> = (0..4).map(|c| predicate.compares_only_strings(c)).collect();
-        assert_eq!(only, [true, false, false, false]);
+        let kinds: StdVec<_> = (0..4).map(|column| compared_with(&expr, column)).collect();
+        assert!(kinds == [Some(string), Some(int), None, None]);
     }
 }

@@ -38,6 +38,16 @@ impl Comparison {
             Comparison::GreaterEqual => order.is_ge(),
         }
     }
+    /// The comparison with its sides swapped.
+    pub fn flipped(self) -> Comparison {
+        match self {
+            Comparison::Less => Comparison::Greater,
+            Comparison::LessEqual => Comparison::GreaterEqual,
+            Comparison::Greater => Comparison::Less,
+            Comparison::GreaterEqual => Comparison::LessEqual,
+            Comparison::Equal | Comparison::NotEqual => self,
+        }
+    }
 }
 
 /// A value to compare a column with, of the column's type.

@@ -697,15 +697,16 @@ mod tests {
         assert_eq!(kept("FROM t |> WHERE a + 1 > 2 |> SELECT a"), [2.0]);
         assert_eq!(kept("FROM t |> WHERE a |> SELECT a"), [1.0, 2.0]);
         assert_eq!(error("FROM t |> WHERE f > 1.5"), (ErrorCode::Unsupported, 20));
-        assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 20));
+        assert_eq!(error("FROM t |> WHERE f > 9007199254740993"), (ErrorCode::Unsupported, 16));
         assert_eq!(
             error("FROM t |> WHERE a > 9223372036854775808"),
             (ErrorCode::NumberTooLarge, 20)
         );
-        let wide = (0..40).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
+        // Past the most nodes an expression has.
+        let wide = (0..100).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
         let wide = format!("FROM t |> WHERE {wide}");
-        assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
-        assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 22));
+        assert_eq!(error(&wide).0, ErrorCode::ExpressionTooLarge);
+        assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 16));
         // As `a = 'a'` is.
         assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::ExpectedOneKind, 27));
         assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::ExpectedOneKind, 16));

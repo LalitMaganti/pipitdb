@@ -157,6 +157,11 @@ impl OutputProperties {
         at!(self.columns, ..self.column_count as usize)
     }
 
+    /// How many columns a batch has.
+    pub fn column_count(&self) -> u32 {
+        self.column_count
+    }
+
     /// The position of `column` in a batch, if it has one.
     pub fn position_of(&self, column: ColumnId) -> Option<u32> {
         #[expect(clippy::cast_possible_truncation, reason = "at most `BATCH_COLUMNS_MAX`")]

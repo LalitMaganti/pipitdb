@@ -8,10 +8,10 @@ use pipit_kernel::expression::{
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::slow_vec::SlowVec;
+use pipit_kernel::string_pool::Id;
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
-use crate::condition::string;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
 use crate::parser::IN_LIST_MAX;
@@ -444,4 +444,26 @@ fn integer(compiler: &Compiler<'_, '_>, node: Node, negative: bool) -> Result<i6
     let magnitude = i128::from(compiler.integer(node)?);
     let value = if negative { -magnitude } else { magnitude };
     i64::try_from(value).map_err(|_| Error::new(ErrorCode::NumberTooLarge, node.span()))
+}
+
+/// `node`, a string literal, added to the plan's literals, a quote for each
+/// `''`, and its id there.
+pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> {
+    let quoted = compiler.bytes(node.span());
+    // Between its quotes, which the lexer checked are there.
+    let inside = at!(quoted, 1..quoted.len() - 1);
+    let allocator = compiler.allocator();
+    if !inside.windows(2).any(|pair| pair == b"''") {
+        return Ok(compiler.plan.add_literal(allocator, inside)?);
+    }
+    let mut unquoted = SlowVec::fixed(allocator, inside.len())?;
+    let mut quote = false;
+    for &byte in inside {
+        // The second quote of each `''` is the one kept.
+        quote = byte == b'\'' && !quote;
+        if !quote {
+            unquoted.push(byte)?;
+        }
+    }
+    Ok(compiler.plan.add_literal(allocator, &unquoted)?)
 }
