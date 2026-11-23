@@ -241,8 +241,8 @@ pub struct OperatorFunctions {
     finish: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Executed,
 }
 
-impl<'a> DynSource<'a> {
-    /// A source from parts that already agree on its step's and state's types,
+impl<'a, F> Erased<'a, F> {
+    /// A step from parts that already agree on its step's and state's types,
     /// named `name` for tests to print plans.
     ///
     /// # Safety
@@ -254,9 +254,9 @@ impl<'a> DynSource<'a> {
         state_layout: Layout,
         new_state: NewState,
         drop_state: unsafe fn(NonNull<u8>),
-        next: SourceNext,
+        run: F,
         name: &'static str,
-    ) -> DynSource<'a> {
+    ) -> Erased<'a, F> {
         #[cfg(not(test))]
         let _ = name;
         Erased {
@@ -264,13 +264,15 @@ impl<'a> DynSource<'a> {
             state_layout,
             new_state,
             drop_state,
-            run: next,
+            run,
             lifetime: PhantomData,
             #[cfg(test)]
             name,
         }
     }
+}
 
+impl<'a> DynSource<'a> {
     pub fn new<T: Source + 'a>(env: &Env, source: T) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
@@ -349,34 +351,6 @@ impl Drop for SourceRun<'_, '_> {
 }
 
 impl<'a> DynTransform<'a> {
-    /// A transform from parts that already agree on its step's and state's
-    /// types, named `name` for tests to print plans.
-    ///
-    /// # Safety
-    ///
-    /// As for `DynSource::from_parts`.
-    pub(crate) unsafe fn from_parts(
-        step: ErasedBox,
-        state_layout: Layout,
-        new_state: NewState,
-        drop_state: unsafe fn(NonNull<u8>),
-        process: TransformProcess,
-        name: &'static str,
-    ) -> DynTransform<'a> {
-        #[cfg(not(test))]
-        let _ = name;
-        Erased {
-            step,
-            state_layout,
-            new_state,
-            drop_state,
-            run: process,
-            lifetime: PhantomData,
-            #[cfg(test)]
-            name,
-        }
-    }
-
     pub fn new<T: Transform + 'a>(env: &Env, transform: T) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
