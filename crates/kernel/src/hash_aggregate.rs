@@ -376,6 +376,7 @@ impl Breaker for HashAggregate {
 
 #[cfg(test)]
 mod tests {
+    use crate::bitmap::BitSlice;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -392,11 +393,11 @@ mod tests {
     fn column(values: &[Option<i64>]) -> ColumnView {
         let global = Global::current();
         let mut words = Buffer::allocate(global, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
+        let mut bits = Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
         bits.as_mut_slice::<u8>().fill(0);
         for (i, value) in values.iter().enumerate() {
             words.as_mut_slice::<i64>()[i] = value.unwrap_or(0);
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
+            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, value.is_some());
         }
         let validity = values.iter().any(Option::is_none).then_some(bits);
         ColumnView::new(&mut Context::new(global, None), DataType::Int64, words, validity).unwrap()
@@ -438,7 +439,7 @@ mod tests {
     fn strings(values: &[Option<String>]) -> ColumnView {
         let global = Global::current();
         let mut views = Buffer::allocate(global, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
+        let mut bits = Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
         let mut bytes = Vec::new();
         for (i, value) in values.iter().enumerate() {
             let value = value.as_deref().unwrap_or_default();
@@ -447,7 +448,7 @@ mod tests {
             bytes.extend_from_slice(value.as_bytes());
         }
         for (i, value) in values.iter().enumerate() {
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(value.is_some()) << (i % 8);
+            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, value.is_some());
         }
         let mut stored = Buffer::allocate(global, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);

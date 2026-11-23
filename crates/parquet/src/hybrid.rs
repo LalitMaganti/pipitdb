@@ -157,6 +157,7 @@ impl Hybrid {
 
 #[cfg(test)]
 mod tests {
+    use pipit_kernel::bitmap::BitSlice;
     extern crate std;
 
     use super::*;
@@ -190,7 +191,7 @@ mod tests {
         for (i, &value) in values.iter().enumerate() {
             for b in 0..width as usize {
                 let bit = i * width as usize + b;
-                bits[bit / 8] |= u8::from(value >> b & 1 == 1) << (bit % 8);
+                BitSlice::of_mut(&mut bits).set_if(bit, value >> b & 1 == 1);
             }
         }
         bytes.extend(bits);

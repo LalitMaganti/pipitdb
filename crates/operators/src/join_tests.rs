@@ -3,6 +3,7 @@
 
 extern crate std;
 
+use pipit_kernel::bitmap::BitSlice;
 use std::format;
 use std::string::{String, ToString};
 use std::vec;
@@ -32,11 +33,12 @@ fn int64s(values: &[Option<i64>]) -> ColumnView {
     }
     // A bit a row, set where it isn't null.
     let validity = values.iter().any(Option::is_none).then(|| {
-        let mut bits = Buffer::allocate(Global::current(), values.len().div_ceil(8)).unwrap();
+        let mut bits =
+            Buffer::allocate(Global::current(), BitSlice::<u8>::words_for(values.len())).unwrap();
         let bytes = bits.as_mut_slice::<u8>();
         bytes.fill(0);
         for (row, value) in values.iter().enumerate() {
-            bytes[row / 8] |= u8::from(value.is_some()) << (row % 8);
+            BitSlice::of_mut(&mut *bytes).set_if(row, value.is_some());
         }
         bits
     });

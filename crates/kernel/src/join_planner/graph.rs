@@ -2,6 +2,7 @@
 //! edges.
 
 use crate::allocator::AllocError;
+use crate::bitmap::{BitSlice, Word};
 use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
@@ -46,12 +47,13 @@ impl RelationSet {
         if word >= self.words() {
             self.rest.extend_zeroed(word + 1 - self.words())?;
         }
-        *self.word_mut(word) |= 1 << (relation % 64);
+        let bits = self.word_mut(word);
+        *bits = bits.or(relation as usize % 64, true);
         Ok(())
     }
 
     pub fn contains(&self, relation: u32) -> bool {
-        self.word(relation as usize / 64) & (1 << (relation % 64)) != 0
+        self.word(relation as usize / 64).bit(relation as usize % 64)
     }
 
     /// Adds every relation of `other`.
@@ -210,7 +212,7 @@ impl Sides {
             return if right == 0 { &edge.left } else { &edge.right }.meets(set);
         }
         let relation = *at!(self.first, right) as usize;
-        let has = at!(set, relation / 64) >> (relation % 64) & 1 != 0;
+        let has = BitSlice::of(set).get(relation);
         (has, has)
     }
 }

@@ -2,6 +2,7 @@
 //! one; `ComputeOp`, the op that adds columns computed by them; and
 //! `Compute`, the transform that runs it.
 
+use crate::bitmap::BitSlice;
 use core::ops::BitOr;
 
 use crate::allocator::AllocError;
@@ -340,7 +341,7 @@ pub fn validity_of(
         return Ok(None);
     }
     let rows = first.row_count() as usize;
-    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
     for (i, bytes) in buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate() {
         let (at, count) = (i * 64, (rows - i * 64).min(64));
         let word = columns.iter().fold(!0, |w, column| w & word(column.validity(), at, count));
@@ -577,9 +578,9 @@ fn logic(
         (!column.is_null(row)).then(|| *at!(column.int64s(), row as usize) != 0)
     };
     let mut values = context.values_buffer(rows as usize * 8)?;
-    let mut validity = context.small_buffer((rows as usize).div_ceil(8))?;
-    let known = validity.as_mut_slice::<u8>();
-    known.fill(0);
+    let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows as usize))?;
+    validity.as_mut_slice::<u8>().fill(0);
+    let known = BitSlice::of_mut(validity.as_mut_slice::<u8>());
     let mut unknown = false;
     for (row, o) in (0..rows).zip(values.as_mut_slice::<i64>()) {
         let (x, y) = (truth(a, row), b.map(|b| truth(b, row)));
@@ -591,7 +592,7 @@ fn logic(
         };
         *o = i64::from(value == Some(true));
         unknown |= value.is_none();
-        *at_mut!(known, row as usize / 8) |= u8::from(value.is_some()) << (row % 8);
+        known.set_if(row as usize, value.is_some());
     }
     ColumnView::new(context, DataType::Int64, values, unknown.then_some(validity))
 }
@@ -627,7 +628,7 @@ fn pick<'r>(
     }
     // Each row's presence, a bit each.
     let mut present_out = [0_u64; BATCH_ROWS_MAX as usize / 64];
-    let present_out = at_mut!(present_out, ..rows.div_ceil(64));
+    let present_out = at_mut!(present_out, ..BitSlice::<u64>::words_for(rows));
     for (i, bits) in present_out.iter_mut().enumerate() {
         *bits = word(otherwise.validity(), i * 64, (rows - i * 64).min(64));
     }
@@ -692,7 +693,7 @@ fn blend_bits(x: &[i64], at: usize, take: u64, o: &mut [i64]) {
 
 /// A validity of `rows` rows from `words`, a bit each.
 fn pack_words(context: &mut Context, rows: usize, words: &[u64]) -> Result<Buffer, AllocError> {
-    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
     for (bytes, word) in buffer.as_mut_slice::<u8>().chunks_mut(8).zip(words) {
         let word = word.to_le_bytes();
         bytes.copy_from_slice(at!(word, ..bytes.len()));
@@ -787,12 +788,12 @@ fn validity(
     if a.is_none() && b.is_none() && divisor.is_none() {
         return Ok(None);
     }
-    let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+    let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
     let aligned = |validity: Option<Validity>| validity.is_none_or(|v| v.bits().1 == 0);
     if divisor.is_none() && aligned(a) && aligned(b) {
         // Nearly always: only a scan's later batches start mid-byte. The
         // bits past the last row are never read.
-        let len = rows.div_ceil(8);
+        let len = BitSlice::<u8>::words_for(rows);
         let out = buffer.as_mut_slice::<u8>();
         match (a.map(|a| at!(a.bits().0, ..len)), b.map(|b| at!(b.bits().0, ..len))) {
             (Some(x), Some(y)) => {
@@ -833,7 +834,7 @@ fn word(validity: Option<Validity>, at: usize, count: usize) -> u64 {
     }
     (0..count).fold(0, |word, k| {
         let bit = shift as usize + at + k;
-        word | u64::from(at!(bits, bit / 8) >> (bit % 8) & 1) << k
+        word | u64::from(BitSlice::of(bits).get(bit)) << k
     })
 }
 
@@ -1644,11 +1645,12 @@ mod tests {
 
     fn column(cells: &[Option<i64>]) -> ColumnView {
         let mut values = Buffer::allocate(Global::current(), cells.len() * 8).unwrap();
-        let mut validity = Buffer::allocate(Global::current(), cells.len().div_ceil(8)).unwrap();
+        let mut validity =
+            Buffer::allocate(Global::current(), BitSlice::<u8>::words_for(cells.len())).unwrap();
         validity.as_mut_slice::<u8>().fill(0);
         for (row, cell) in cells.iter().enumerate() {
             values.as_mut_slice::<i64>()[row] = cell.unwrap_or(i64::MAX);
-            validity.as_mut_slice::<u8>()[row / 8] |= u8::from(cell.is_some()) << (row % 8);
+            BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row, cell.is_some());
         }
         let validity = cells.contains(&None).then_some(validity);
         ColumnView::new(

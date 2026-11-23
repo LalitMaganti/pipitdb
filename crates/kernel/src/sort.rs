@@ -62,6 +62,7 @@ impl Breaker for Sort {
 
 #[cfg(test)]
 mod tests {
+    use crate::bitmap::BitSlice;
     use alloc::vec::Vec;
 
     use super::*;
@@ -83,13 +84,13 @@ mod tests {
         let global = Global::current();
         let mut context = Context::new(global, None);
         let mut keys = Buffer::allocate(global, n * 8).unwrap();
-        let mut bits = Buffer::allocate(global, n.div_ceil(8)).unwrap();
+        let mut bits = Buffer::allocate(global, BitSlice::<u8>::words_for(n)).unwrap();
         let mut values = Buffer::allocate(global, n * 8).unwrap();
         let mut views = Buffer::allocate(global, n * 8).unwrap();
         let mut bytes = Vec::new();
         for (i, &(key, value, name)) in rows.iter().enumerate() {
             keys.as_mut_slice::<i64>()[i] = key.unwrap_or(0);
-            bits.as_mut_slice::<u8>()[i / 8] |= u8::from(key.is_some()) << (i % 8);
+            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, key.is_some());
             values.as_mut_slice::<i64>()[i] = value;
             let start = u32::try_from(bytes.len()).unwrap();
             views.as_mut_slice::<u32>()[2 * i..2 * i + 2]

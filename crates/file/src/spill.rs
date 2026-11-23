@@ -130,6 +130,7 @@ fn open_unnamed(dir: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    use pipit_kernel::bitmap::BitSlice;
 
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
@@ -143,7 +144,8 @@ mod tests {
         let global = Global::current();
         let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        let mut validity = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
+        let mut validity =
+            Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1111_1101);
         ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, Some(validity))
             .unwrap()
