@@ -472,17 +472,18 @@ struct Join<'c> {
 
 /// What a run of a `Join` keeps.
 struct Held {
-    /// Whether the build side is drained.
-    drained: bool,
+    /// The build side, once drained.
+    built: Option<Built>,
+    /// What probing keeps.
+    probing: Probing,
+}
+
+/// What draining the build side makes.
+struct Built {
     /// The build columns of every build row, in order.
     rows: RowStore,
     /// How many build rows there are.
     count: u32,
-    /// Whether the input batch has had its first round.
-    started: bool,
-    /// Without keys, the build row of the next round; with keys, how many
-    /// rounds there have been.
-    next: u32,
     /// With keys, each build row's group of keys, which holds its last build
     /// row plus one.
     table: Option<GroupTable>,
@@ -497,6 +498,15 @@ struct Held {
     /// row's has been its number above it, as a table's ids are: then none
     /// is hashed, as `direct` finds them all.
     sequence: Sequence,
+}
+
+/// What probing keeps, from one input batch to the next.
+struct Probing {
+    /// Whether the input batch has had its first round.
+    started: bool,
+    /// Without keys, the build row of the next round; with keys, how many
+    /// rounds there have been.
+    next: u32,
     /// With keys, each input row's build row of the next round, or `NONE`.
     next_of: Array<u32>,
     /// A bit for each row of the batch being joined, set once a build row
@@ -519,6 +529,14 @@ struct Held {
     /// When it keeps the build rows, a null column of each probe column's
     /// type, a batch long.
     probe_nulls: SmallVec<ColumnView>,
+}
+
+impl Held {
+    /// The build side, which must be drained, and what probing keeps.
+    fn parts(&mut self) -> (&mut Built, &mut Probing) {
+        let Some(built) = &mut self.built else { failed!() };
+        (built, &mut self.probing)
+    }
 }
 
 /// Writes to `groups` the group in `table` of the keys at `positions` of
@@ -599,20 +617,34 @@ impl Join<'_> {
 
     /// Holds every row of the build side, and with keys, finds each one's
     /// group.
-    fn drain(&self, context: &mut Context, held: &mut Held) -> Result<(), Error> {
-        held.drained = true;
+    fn drain(&self, context: &mut Context, next_of: &mut [u32]) -> Result<Built, Error> {
+        let env = context.env();
+        // A word a group after its keys, for its last build row.
+        let table = match &self.keys {
+            Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
+            None => None,
+        };
+        let mut built = Built {
+            rows: RowStore::new(env)?,
+            count: 0,
+            table,
+            before: SmallVec::new(env, 1 << 31)?,
+            repeats: false,
+            direct: None,
+            sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
+        };
         let mut run = self.build.start(context)?;
         let mut batch = RowBatch::new();
         let build_columns = at!(self.build_columns, ..self.held);
         while run.next(context, &mut batch)? {
             let selection = batch.selection();
-            let first = held.count;
-            held.count = held.count.checked_add(selection.len()).ok_or(Error::OutOfMemory)?;
+            let first = built.count;
+            built.count = built.count.checked_add(selection.len()).ok_or(Error::OutOfMemory)?;
             if selection.is_empty() {
                 continue;
             }
             if let Some(keys) = &self.keys {
-                Self::hash(context, held, keys, &batch, first)?;
+                Self::hash(context, &mut built, next_of, keys, &batch, first)?;
             }
             if build_columns.is_empty() {
                 continue;
@@ -632,25 +664,24 @@ impl Join<'_> {
                 }
             }
             columns.selection_mut().clone_from(selection);
-            held.rows.append(context, &columns)?;
+            built.rows.append(context, &columns)?;
         }
-        if let Some(table) = &mut held.table {
+        if let Some(table) = &mut built.table {
             table.freeze();
         }
         // One integer key, each in one build row, is found by its value.
-        if let Sequence::From(min) = held.sequence {
-            held.direct = Some(Direct::sequence(min, held.count));
-            held.table = None;
-        } else if let (true, false, Some(table)) = (self.one_integer(), held.repeats, &held.table) {
-            held.direct = Direct::of(context.env(), table, held.count)?;
-            if held.direct.is_some() {
-                held.table = None;
+        if let Sequence::From(min) = built.sequence {
+            built.direct = Some(Direct::sequence(min, built.count));
+            built.table = None;
+        } else if let (true, false, Some(table)) = (self.one_integer(), built.repeats, &built.table)
+        {
+            built.direct = Direct::of(context.env(), table, built.count)?;
+            if built.direct.is_some() {
+                built.table = None;
             }
         }
-        if self.keeps_build {
-            held.build_matched = Bitmap::new(context.env(), held.count as usize)?;
-        }
-        held.rows.flush(context)
+        built.rows.flush(context)?;
+        Ok(built)
     }
 
     /// Whether it joins on one integer key.
@@ -663,7 +694,8 @@ impl Join<'_> {
     /// unless its one integer key continues a sequence, which needs none.
     fn hash(
         context: &mut Context,
-        held: &mut Held,
+        built: &mut Built,
+        next_of: &mut [u32],
         keys: &Keys,
         batch: &RowBatch,
         first: u32,
@@ -671,9 +703,9 @@ impl Join<'_> {
         let selection = batch.selection();
         let key = batch.column(*at!(keys.build, 0));
         if let (Some(start), true) =
-            (consecutive(key, selection.len(), held.sequence), selection.is_prefix())
+            (consecutive(key, selection.len(), built.sequence), selection.is_prefix())
         {
-            let follows = match held.sequence {
+            let follows = match built.sequence {
                 Sequence::Empty => Some(start),
                 Sequence::From(min) => {
                     (min.checked_add(i64::from(first)) == Some(start)).then_some(min)
@@ -681,38 +713,38 @@ impl Join<'_> {
                 Sequence::Broken => None,
             };
             if let Some(min) = follows {
-                held.sequence = Sequence::From(min);
+                built.sequence = Sequence::From(min);
                 return Ok(());
             }
         }
-        let Some(table) = &mut held.table else { failed!() };
-        if let Sequence::From(min) = held.sequence {
+        let Some(table) = &mut built.table else { failed!() };
+        if let Sequence::From(min) = built.sequence {
             // The rows before, held as a sequence, are hashed now.
             let mut row = 0;
             while row < first {
                 let count = (first - row).min(BATCH_ROWS_MAX);
                 let mut keys = ColumnView::sequence(context, min + i64::from(row), count)?;
                 keys.make_in(context, Forms::FLAT)?;
-                let groups = at_mut!(held.next_of, ..count as usize);
+                let groups = at_mut!(next_of, ..count as usize);
                 table.find_or_create(context, &[&keys], &[], groups)?;
                 for &group in groups.iter() {
-                    held.before.push(NONE)?;
+                    built.before.push(NONE)?;
                     table.set_payload(group, i64::from(row) + 1);
                     row += 1;
                 }
             }
         }
-        held.sequence = Sequence::Broken;
-        let groups = at_mut!(held.next_of, ..selection.len() as usize);
+        built.sequence = Sequence::Broken;
+        let groups = at_mut!(next_of, ..selection.len() as usize);
         find_groups(context, table, batch, at!(keys.build, ..keys.count), groups)?;
         for (row, &group) in (first..).zip(groups.iter()) {
             if group == NONE {
-                held.before.push(NONE)?;
+                built.before.push(NONE)?;
                 continue;
             }
             let last = last_of(table, group);
-            held.repeats |= last != NONE;
-            held.before.push(last)?;
+            built.repeats |= last != NONE;
+            built.before.push(last)?;
             table.set_payload(group, i64::from(row) + 1);
         }
         Ok(())
@@ -720,21 +752,27 @@ impl Join<'_> {
 
     /// Starts joining `input`: no row matched, and with keys, each row's
     /// first build row of its keys.
-    fn start(&self, context: &mut Context, held: &mut Held, input: &RowBatch) -> Result<(), Error> {
-        held.started = true;
-        held.next = 0;
-        held.matched.fill(0);
+    fn start(
+        &self,
+        context: &mut Context,
+        built: &mut Built,
+        probing: &mut Probing,
+        input: &RowBatch,
+    ) -> Result<(), Error> {
+        probing.started = true;
+        probing.next = 0;
+        probing.matched.fill(0);
         let Some(keys) = &self.keys else { return Ok(()) };
         let selection = input.selection();
         // `next_round` finds them by their keys' values.
-        if held.direct.is_some() {
+        if built.direct.is_some() {
             return Ok(());
         }
-        let Some(table) = &mut held.table else { failed!() };
+        let Some(table) = &mut built.table else { failed!() };
         // Each kept row's group, by its place among them, then its first
         // build row, by its number: from the last, as a row's number is at
         // least its place, so no group is written over before it's read.
-        let next_of = &mut *held.next_of;
+        let next_of = &mut *probing.next_of;
         let groups = at_mut!(next_of, ..selection.len() as usize);
         find_groups(context, table, input, at!(keys.probe, ..keys.count), groups)?;
         for i in (0..selection.len()).rev() {
@@ -752,39 +790,40 @@ impl Join<'_> {
     fn next_round(
         &self,
         context: &mut Context,
-        held: &mut Held,
+        built: &Built,
+        probing: &mut Probing,
         pairs: &mut RowBatch,
     ) -> Result<Option<bool>, Error> {
         if self.keys.is_none() {
-            if held.next == held.count {
+            if probing.next == built.count {
                 return Ok(None);
             }
-            at_mut!(held.paired, ..pairs.row_count() as usize).fill(held.next);
-            held.next += 1;
-            return Ok((!pairs.selection().is_empty()).then_some(held.next < held.count));
+            at_mut!(probing.paired, ..pairs.row_count() as usize).fill(probing.next);
+            probing.next += 1;
+            return Ok((!pairs.selection().is_empty()).then_some(probing.next < built.count));
         }
-        if let (Some(direct), Some(keys)) = (&held.direct, &self.keys) {
+        if let (Some(direct), Some(keys)) = (&built.direct, &self.keys) {
             // One round: each row's build row found by its key's value.
-            if held.next > 0 {
+            if probing.next > 0 {
                 return Ok(None);
             }
-            held.next = 1;
-            let paired = at_mut!(held.paired, ..pairs.row_count() as usize);
-            direct.pair(context, *at!(keys.probe, 0), held.count, paired, pairs)?;
+            probing.next = 1;
+            let paired = at_mut!(probing.paired, ..pairs.row_count() as usize);
+            direct.pair(context, *at!(keys.probe, 0), built.count, paired, pairs)?;
             return Ok((!pairs.selection().is_empty()).then_some(false));
         }
-        let (paired, next_of, before) = (&mut held.paired, &mut held.next_of, &held.before);
-        if !held.repeats {
+        let (paired, next_of, before) = (&mut probing.paired, &mut probing.next_of, &built.before);
+        if !built.repeats {
             // One round, the first: a row without a build row takes the
             // first's, as every row is gathered.
-            if held.next > 0 {
+            if probing.next > 0 {
                 return Ok(None);
             }
-            held.next = 1;
+            probing.next = 1;
             pairs.selection_mut().retain(|row| {
-                let build = *at!(next_of, usize::from(row));
-                *at_mut!(paired, usize::from(row)) = if build == NONE { 0 } else { build };
-                build != NONE
+                let build_row = *at!(next_of, usize::from(row));
+                *at_mut!(paired, usize::from(row)) = if build_row == NONE { 0 } else { build_row };
+                build_row != NONE
             });
             return Ok((!pairs.selection().is_empty()).then_some(false));
         }
@@ -792,12 +831,12 @@ impl Join<'_> {
         // as they're gathered too.
         let mut more = false;
         pairs.selection_mut().retain(|row| {
-            let build = *at!(next_of, usize::from(row));
-            if build == NONE {
+            let build_row = *at!(next_of, usize::from(row));
+            if build_row == NONE {
                 return false;
             }
-            let next = *at!(before, build as usize);
-            *at_mut!(paired, usize::from(row)) = build;
+            let next = *at!(before, build_row as usize);
+            *at_mut!(paired, usize::from(row)) = build_row;
             *at_mut!(next_of, usize::from(row)) = next;
             more |= next != NONE;
             true
@@ -810,20 +849,21 @@ impl Join<'_> {
     fn pair(
         &self,
         context: &mut Context,
-        held: &mut Held,
+        built: &mut Built,
+        probing: &mut Probing,
         pairs: &mut RowBatch,
     ) -> Result<(), Error> {
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
         let outputs = pairs.column_count() + self.outputs as u32;
         if self.held > 0 {
-            let paired = at!(held.paired, ..pairs.row_count() as usize);
-            let mut build = RowBatch::new();
-            held.rows.gather_held(context, &mut build, paired)?;
-            for c in 0..build.column_count() {
-                let Ok(()) = pairs.push_column(build.column(c).clone()) else { failed!() };
+            let paired = at!(probing.paired, ..pairs.row_count() as usize);
+            let mut gathered = RowBatch::new();
+            built.rows.gather_held(context, &mut gathered, paired)?;
+            for c in 0..gathered.column_count() {
+                let Ok(()) = pairs.push_column(gathered.column(c).clone()) else { failed!() };
             }
         }
-        if let (Some(condition), Some(state)) = (&self.condition, &mut held.condition) {
+        if let (Some(condition), Some(state)) = (&self.condition, &mut probing.condition) {
             let first = pairs.column_count() as usize;
             condition.process(context, state, pairs)?;
             let (columns, selection) = pairs.columns_and_selection();
@@ -840,16 +880,31 @@ impl Join<'_> {
 
     /// Outputs the input's rows of this kind once every round is done: a
     /// left join's unmatched rows, and an inner join's none.
-    fn finish_input(&self, held: &mut Held, input: &RowBatch, output: &mut RowBatch) {
-        held.started = false;
+    fn finish_input(&self, probing: &mut Probing, input: &RowBatch, output: &mut RowBatch) {
+        probing.started = false;
         output.copy_from(input);
-        let matched = &held.matched;
+        let matched = &probing.matched;
         let left = self.keeps_probe();
         output.selection_mut().retain(|row| left && !is_matched(matched, row));
-        for null in held.nulls.iter() {
+        for null in probing.nulls.iter() {
             let null = null.slice(0, input.row_count());
             let Ok(()) = output.push_column(null) else { failed!() };
         }
+    }
+}
+
+impl Join<'_> {
+    /// Drains the build side into `held`, if it isn't yet.
+    fn drained(&self, context: &mut Context, held: &mut Held) -> Result<(), Error> {
+        if held.built.is_some() {
+            return Ok(());
+        }
+        let built = self.drain(context, &mut held.probing.next_of)?;
+        if self.keeps_build {
+            held.probing.build_matched = Bitmap::new(context.env(), built.count as usize)?;
+        }
+        held.built = Some(built);
+        Ok(())
     }
 }
 
@@ -858,30 +913,16 @@ impl Operator for Join<'_> {
 
     fn new_state(&self, context: &mut Context) -> Result<Held, Error> {
         let env = context.env();
-        let rows = RowStore::new(env)?;
         let nulls = null_columns(context, at!(self.build_types, ..self.outputs))?;
         let probe_nulls = null_columns(context, &self.probe_types)?;
         let condition = match &self.condition {
             Some(condition) => Some(condition.new_state(context)?),
             None => None,
         };
-        // A word a group after its keys, for its last build row.
-        let table = match &self.keys {
-            Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
-            None => None,
-        };
-        Ok(Held {
-            drained: false,
-            rows,
-            count: 0,
+        let probing = Probing {
             started: false,
             next: 0,
-            table,
-            before: SmallVec::new(env, 1 << 31)?,
-            repeats: false,
-            direct: None,
             // Not arrays, which would be copied into place on each run.
-            sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
             next_of: Array::zeroed(env, BATCH_ROWS_MAX as usize)?,
             matched: [0; BATCH_ROWS_MAX as usize / 64],
             nulls,
@@ -890,7 +931,8 @@ impl Operator for Join<'_> {
             build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,
             probe_nulls,
-        })
+        };
+        Ok(Held { built: None, probing })
     }
 
     fn execute(
@@ -900,29 +942,28 @@ impl Operator for Join<'_> {
         input: &RowBatch,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
-        if !held.drained {
-            self.drain(context, held)?;
-        }
+        self.drained(context, held)?;
+        let (built, probing) = held.parts();
         // No probe row can be joined.
-        if held.count == 0 && !self.keeps_probe() {
+        if built.count == 0 && !self.keeps_probe() {
             return Ok(Progress::Done);
         }
-        if !held.started {
-            self.start(context, held, input)?;
+        if !probing.started {
+            self.start(context, built, probing, input)?;
         }
         loop {
             output.copy_from(input);
-            let Some(more) = self.next_round(context, held, output)? else { break };
-            self.pair(context, held, output)?;
+            let Some(more) = self.next_round(context, built, probing, output)? else { break };
+            self.pair(context, built, probing, output)?;
             let selection = output.selection();
             // Only a left join outputs rows by whether they matched.
             for i in (0..selection.len()).filter(|_| self.keeps_probe()) {
                 let kept = selection.kept().row(i);
-                BitSlice::of_mut(&mut held.matched).set(kept as usize);
+                BitSlice::of_mut(&mut probing.matched).set(kept as usize);
             }
             for i in (0..selection.len()).filter(|_| self.keeps_build) {
-                let build = *at!(held.paired, selection.kept().row(i) as usize);
-                held.build_matched.set(build as usize);
+                let build_row = *at!(probing.paired, selection.kept().row(i) as usize);
+                probing.build_matched.set(build_row as usize);
             }
             if selection.is_empty() {
                 continue;
@@ -930,12 +971,12 @@ impl Operator for Join<'_> {
             // A join that doesn't keep probe rows has nothing to add once no
             // row has a build row left: as when each has one, N:1.
             if !self.keeps_probe() && !more {
-                held.started = false;
+                probing.started = false;
                 return Ok(Progress::NeedInput);
             }
             return Ok(Progress::MoreOutput);
         }
-        self.finish_input(held, input, output);
+        self.finish_input(probing, input, output);
         Ok(Progress::NeedInput)
     }
 
@@ -950,15 +991,14 @@ impl Operator for Join<'_> {
         if !self.keeps_build {
             return Ok(Progress::NeedInput);
         }
-        if !held.drained {
-            self.drain(context, held)?;
-        }
+        self.drained(context, held)?;
+        let (built, probing) = held.parts();
         let mut count = 0;
-        while held.unmatched < held.count && count < BATCH_ROWS_MAX {
-            let row = held.unmatched;
-            held.unmatched += 1;
-            if !held.build_matched.get(row as usize) {
-                *at_mut!(held.paired, count as usize) = row;
+        while probing.unmatched < built.count && count < BATCH_ROWS_MAX {
+            let row = probing.unmatched;
+            probing.unmatched += 1;
+            if !probing.build_matched.get(row as usize) {
+                *at_mut!(probing.paired, count as usize) = row;
                 count += 1;
             }
         }
@@ -966,17 +1006,17 @@ impl Operator for Join<'_> {
             return Ok(Progress::NeedInput);
         }
         output.reset(count);
-        for null in held.probe_nulls.iter() {
+        for null in probing.probe_nulls.iter() {
             let Ok(()) = output.push_column(null.slice(0, count)) else { failed!() };
         }
-        let mut build = RowBatch::new();
-        held.rows.gather_held(context, &mut build, at!(held.paired, ..count as usize))?;
+        let mut gathered = RowBatch::new();
+        built.rows.gather_held(context, &mut gathered, at!(probing.paired, ..count as usize))?;
         for c in 0..self.outputs {
             #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
-            let column = build.column(c as u32).clone();
+            let column = gathered.column(c as u32).clone();
             let Ok(()) = output.push_column(column) else { failed!() };
         }
-        let more = held.unmatched < held.count;
+        let more = probing.unmatched < built.count;
         Ok(if more { Progress::MoreOutput } else { Progress::NeedInput })
     }
 }
