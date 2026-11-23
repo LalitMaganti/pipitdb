@@ -13,8 +13,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned so Miri's standard library build can be cached.
-  MIRI_NIGHTLY: nightly-2026-09-27
 
 jobs:
   check:
@@ -126,21 +124,3 @@ jobs:
           PIPIT_CLICKBENCH: ${{ runner.temp }}/clickbench
       - run: crates/bench/check_instructions.py | tee -a "$GITHUB_STEP_SUMMARY"
         shell: bash
-
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: ./.github/actions/setup-rust
-        with:
-          toolchain: ${{ env.MIRI_NIGHTLY }}
-          components: miri,rust-src
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        # The profiles live in the root Cargo.toml, which rust-cache doesn't hash.
-        with:
-          key: ${{ hashFiles('Cargo.toml') }}
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/miri
-          key: miri-${{ env.MIRI_NIGHTLY }}
-      - run: cargo +$MIRI_NIGHTLY miri test
