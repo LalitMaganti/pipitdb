@@ -13,8 +13,8 @@ use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::erase::{value_mut_of, value_of};
 use crate::expression::{
-    Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type, mark_expr_columns,
-    type_expr,
+    Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, Exprs, columns_of, conjuncts,
+    mark_expr_columns, type_expr,
 };
 use crate::function::DynFunction;
 use crate::inline_vec::InlineVec;
@@ -85,8 +85,8 @@ pub trait Op<'c> {
     /// or adding to a set do, and not where it costs about as much, as
     /// comparing an integer does (ClickBench's integer filters were 11-63%
     /// slower through dictionaries).
-    fn accepts(&self, column: ColumnId) -> Forms {
-        let _ = column;
+    fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
+        let _ = (exprs, column);
         Forms::FLAT
     }
 
@@ -112,10 +112,11 @@ pub trait Op<'c> {
     /// passes on other rows, so nothing below can use its condition.
     fn give_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        let _ = (allocator, column);
+        let _ = (exprs, allocator, column);
         Ok(Given::Stop)
     }
 
@@ -135,10 +136,11 @@ pub trait Op<'c> {
     /// split off.
     fn split_below(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
-        let _ = (allocator, below);
+        let _ = (exprs, allocator, below);
         Ok(Moved::none())
     }
 
@@ -153,11 +155,12 @@ pub trait Op<'c> {
     /// `column`: pushdown. Only called if `takes_condition` says so.
     fn take_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
-        condition: Expr,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
-        let _ = (allocator, column, condition);
+        let _ = (exprs, allocator, column, condition);
         failed!()
     }
 
@@ -227,18 +230,23 @@ pub enum Given {
     /// It passes on its child's rows: a copy of the part of its condition
     /// that reads only the column, if any, and any above may give theirs
     /// too.
-    Passed(Option<Expr>),
+    Passed(Option<Conjuncts>),
 }
 
-type GiveCondition = unsafe fn(NonNull<()>, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
+/// The parts of a condition, all of which must be true: the top-level
+/// conjuncts of an expression, or of several.
+pub type Conjuncts = SlowVec<Expr>;
+
+type GiveCondition =
+    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
 
 type TakeCondition =
-    unsafe fn(NonNull<()>, &dyn Allocator, ColumnId, Expr) -> Result<(), AllocError>;
+    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, ColumnId, Conjuncts) -> Result<(), AllocError>;
 
 type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
 
 type SplitBelow<'c> =
-    unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
+    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
 
 type Materialize<'c> = unsafe fn(
     NonNull<()>,
@@ -257,7 +265,7 @@ pub struct DynOp<'c> {
 struct OpFunctions<'c> {
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
-    accepts: unsafe fn(NonNull<()>, ColumnId) -> Forms,
+    accepts: unsafe fn(NonNull<()>, &Exprs, ColumnId) -> Forms,
     passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
     give_condition: GiveCondition,
@@ -291,20 +299,20 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         // SAFETY: only called with this op.
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
         // SAFETY: as for `reads`.
-        accepts: |op, column| unsafe { value_of::<T>(op).accepts(column) },
+        accepts: |op, exprs, column| unsafe { value_of::<T>(op).accepts(exprs, column) },
         // SAFETY: as for `reads`.
         passes_through: |op, column| unsafe { value_of::<T>(op).passes_through(column) },
         // SAFETY: as for `prune`.
         allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
         // SAFETY: as for `prune`.
-        give_condition: |op, allocator, column| unsafe {
-            value_mut_of::<T>(op).give_condition(allocator, column)
+        give_condition: |op, exprs, allocator, column| unsafe {
+            value_mut_of::<T>(op).give_condition(exprs, allocator, column)
         },
         // SAFETY: as for `reads`.
         takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
         // SAFETY: as for `prune`.
-        take_condition: |op, allocator, column, condition| unsafe {
-            value_mut_of::<T>(op).take_condition(allocator, column, condition)
+        take_condition: |op, exprs, allocator, column, condition| unsafe {
+            value_mut_of::<T>(op).take_condition(exprs, allocator, column, condition)
         },
         // SAFETY: as for `reads`.
         materialize: |op, allocator, columns| unsafe {
@@ -317,8 +325,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         // SAFETY: as for `reads`.
         moves_condition: |op, column| unsafe { value_of::<T>(op).moves_condition(column) },
         // SAFETY: as for `prune`.
-        split_below: |op, allocator, below| unsafe {
-            value_mut_of::<T>(op).split_below(allocator, below)
+        split_below: |op, exprs, allocator, below| unsafe {
+            value_mut_of::<T>(op).split_below(exprs, allocator, below)
         },
         // SAFETY: only called with this op, which outlives what it returns.
         needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
@@ -346,9 +354,9 @@ impl<'c> DynOp<'c> {
         unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
     }
 
-    pub(crate) fn accepts(&self, column: ColumnId) -> Forms {
+    pub(crate) fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
         // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.accepts)(self.op.as_ptr(), column) }
+        unsafe { (self.functions.accepts)(self.op.as_ptr(), exprs, column) }
     }
 
     pub(crate) fn passes_through(&self, column: ColumnId) -> bool {
@@ -364,12 +372,13 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn give_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.give_condition)(self.op.as_ptr(), allocator, column) }
+        unsafe { (self.functions.give_condition)(self.op.as_ptr(), exprs, allocator, column) }
     }
 
     pub(crate) fn takes_condition(&self, column: ColumnId) -> bool {
@@ -379,13 +388,15 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn take_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
-        condition: Expr,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
+        let op = self.op.as_ptr();
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.take_condition)(self.op.as_ptr(), allocator, column, condition) }
+        unsafe { (self.functions.take_condition)(op, exprs, allocator, column, condition) }
     }
 
     pub(crate) fn materialize(
@@ -404,12 +415,13 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn split_below(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
         // mutably.
-        unsafe { (self.functions.split_below)(self.op.as_ptr(), allocator, below) }
+        unsafe { (self.functions.split_below)(self.op.as_ptr(), exprs, allocator, below) }
     }
 
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
@@ -473,6 +485,8 @@ pub struct LogicalPlan<'c> {
     pub root: PlanNodeId,
     /// The columns of the result, in order.
     pub output: SlowVec<NamedColumn>,
+    /// The nodes of its expressions.
+    pub exprs: Exprs,
     /// What its runs read through their context, such as its literals.
     statement: Statement,
 }
@@ -485,6 +499,7 @@ impl<'c> LogicalPlan<'c> {
             nodes: SlowVec::new(allocator, PLAN_NODES_MAX)?,
             root: 0,
             output: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+            exprs: Exprs::new(allocator)?,
             statement: Statement::default(),
         })
     }
@@ -627,27 +642,43 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     fn take_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
-        condition: Expr,
+        condition: Conjuncts,
     ) -> Result<(), AllocError> {
         let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
             failed!();
         };
-        // Only what a predicate tests as leaves says which values it keeps.
         let data_type = self.scannable.column_type(scanned.column);
         let column = |_| (scanned.column, data_type);
-        let mut computed = SlowVec::new(allocator, EXPR_NODES_MAX)?;
-        let predicate = Predicate::from_expr(allocator, &condition, &column, 0, &mut computed)?;
-        if !computed.is_empty() {
-            return Ok(());
+        for conjunct in condition.iter() {
+            // Only what a predicate tests as leaves says which values it
+            // keeps, and an `IN` list doesn't say.
+            if exprs.nodes(*conjunct).iter().any(|node| node.op == ExprOp::In) {
+                continue;
+            }
+            let mut computed = SlowVec::new(allocator, EXPR_NODES_MAX)?;
+            let predicate = Predicate::from_expr(
+                allocator,
+                exprs,
+                core::slice::from_ref(conjunct),
+                None,
+                &column,
+                0,
+                &mut computed,
+            )?;
+            if !computed.is_empty() {
+                continue;
+            }
+            let condition = Condition::new(scanned.column, &predicate);
+            let conditions = match &mut self.conditions {
+                Some(conditions) => conditions,
+                None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
+            };
+            conditions.push(condition).map_err(|_| AllocError)?;
         }
-        let condition = Condition::new(scanned.column, &predicate);
-        let conditions = match &mut self.conditions {
-            Some(conditions) => conditions,
-            None => self.conditions.insert(SlowVec::new(allocator, CONDITIONS_MAX)?),
-        };
-        conditions.push(condition).map_err(|_| AllocError)
+        Ok(())
     }
 
     fn materialize(
@@ -750,44 +781,82 @@ impl<'c> Op<'c> for MaterializeOp<'c> {
     }
 }
 
-/// Keeps the rows of its one child that `condition` is true for, as `WHERE`
-/// does: neither false nor null. Its columns are `ColumnId`s.
+/// Keeps the rows of its one child that each of `conjuncts` is true for, as
+/// `WHERE` does: neither false nor null. Their columns are `ColumnId`s.
 pub struct FilterOp {
-    pub condition: Expr,
+    pub conjuncts: Conjuncts,
+}
+
+impl FilterOp {
+    /// The filter of `condition`, of `exprs`: its top-level conjuncts.
+    pub fn new(
+        allocator: &dyn Allocator,
+        exprs: &Exprs,
+        condition: Expr,
+    ) -> Result<FilterOp, AllocError> {
+        let mut count = 0;
+        conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
+        let mut parts = SlowVec::fixed(allocator, count)?;
+        conjuncts(exprs.nodes(condition), condition.root, &mut |root| {
+            parts.extend_within(core::iter::once(Expr { root, ..condition }));
+        });
+        Ok(FilterOp { conjuncts: parts })
+    }
+}
+
+/// The conjuncts of `conjuncts` that `keep` is true for, or `None` if none.
+/// Out of line: each caller's `keep` differs, and inlining one copy each
+/// costs more than calling it.
+#[inline(never)]
+fn kept(
+    allocator: &dyn Allocator,
+    conjuncts: &[Expr],
+    keep: &dyn Fn(Expr) -> bool,
+) -> Result<Option<Conjuncts>, AllocError> {
+    let count = conjuncts.iter().filter(|&&conjunct| keep(conjunct)).count();
+    if count == 0 {
+        return Ok(None);
+    }
+    let kept = conjuncts.iter().copied().filter(|&conjunct| keep(conjunct));
+    let mut parts = SlowVec::fixed(allocator, count)?;
+    parts.extend_within(kept);
+    Ok(Some(parts))
 }
 
 impl<'c> Op<'c> for FilterOp {
-    /// Its condition's columns.
+    /// Its conditions' columns.
     fn reads(&self, reads: &mut Needed) {
-        mark_expr_columns(&self.condition, reads);
+        for &conjunct in self.conjuncts.iter() {
+            mark_expr_columns(conjunct, reads);
+        }
     }
 
     /// Constants, which it tests once; dictionaries of columns it only
     /// compares with strings, whose entries it tests once each; and
     /// sequences of columns it only compares with integers, whose rows it
     /// keeps by their numbers: see `Op::accepts`.
-    fn accepts(&self, column: ColumnId) -> Forms {
-        match compared_with(&self.condition, column) {
+    fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
+        match compared_with(exprs, &self.conjuncts, column) {
             Some(DataType::String) => Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY,
             Some(DataType::Int64) => Forms::FLAT | Forms::CONSTANT | Forms::SEQUENCE,
             _ => Forms::FLAT | Forms::CONSTANT,
         }
     }
 
-    /// Splits off the conjuncts of its condition that `below` can apply to
-    /// an input instead: those whose columns are all in one of its inputs.
+    /// Splits off the conjuncts that `below` can apply to an input instead:
+    /// those whose columns are all in one of its inputs.
     fn split_below(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
-        let condition = &self.condition;
-        // Where conjunct `node` goes: 0 to stay, or 1 more than the input
-        // all its columns are in.
-        let part = |node: u32| {
+        // Where `conjunct` goes: 0 to stay, or 1 more than the input all its
+        // columns are in.
+        let part = |conjunct: Expr| {
             // `None` before any column, then the input all are in, if one.
             let mut place = None;
-            condition.columns_of(node, &mut |column| {
+            columns_of(exprs.nodes(conjunct), conjunct.root, &mut |column| {
                 let input = below.moves_condition(column).filter(|&input| input < 2);
                 place = Some(match place {
                     Some(placed) if placed != input => None,
@@ -799,39 +868,46 @@ impl<'c> Op<'c> for FilterOp {
                 _ => 0,
             }
         };
-        let moves = |to| condition.conjuncts_where(allocator, &|node| part(node) == to);
+        // Each conjunct's place, found once.
+        let mut places = SlowVec::fixed(allocator, self.conjuncts.len())?;
+        places.extend_within(self.conjuncts.iter().map(|&conjunct| part(conjunct)));
+        let place = |conjunct: Expr| {
+            let at = self.conjuncts.iter().position(|&c| c == conjunct).unwrap_or(0);
+            *at!(places, at)
+        };
+        let moves = |to| kept(allocator, &self.conjuncts, &|conjunct| place(conjunct) == to);
         let (first, second) = (moves(1)?, moves(2)?);
         if first.is_none() && second.is_none() {
             return Ok(Moved::none());
         }
-        let kept = moves(0)?;
-        let filter = |part: Option<Expr>| {
-            part.map(|condition| DynOp::new(allocator, FilterOp { condition })).transpose()
+        let stay = moves(0)?;
+        let filter = |part: Option<Conjuncts>| {
+            part.map(|conjuncts| DynOp::new(allocator, FilterOp { conjuncts })).transpose()
         };
         let filters = [filter(first)?, filter(second)?];
-        let emptied = kept.is_none();
-        if let Some(kept) = kept {
-            self.condition = kept;
+        let emptied = stay.is_none();
+        if let Some(stay) = stay {
+            self.conjuncts = stay;
         }
         Ok(Moved { filters, emptied })
     }
 
-    /// A copy of the conjuncts of its condition that read only `column`.
+    /// Its conjuncts that read only `column`.
     fn give_condition(
         &mut self,
+        exprs: &Exprs,
         allocator: &dyn Allocator,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        let condition = &self.condition;
-        let reads_only = |node: u32| {
+        let reads_only = |conjunct: Expr| {
             let (mut read, mut other) = (false, false);
-            condition.columns_of(node, &mut |read_column| {
+            columns_of(exprs.nodes(conjunct), conjunct.root, &mut |read_column| {
                 read |= read_column == column;
                 other |= read_column != column;
             });
             read && !other
         };
-        Ok(Given::Passed(condition.conjuncts_where(allocator, &reads_only)?))
+        Ok(Given::Passed(kept(allocator, &self.conjuncts, &reads_only)?))
     }
 
     /// Its input's, less some rows.
@@ -841,7 +917,7 @@ impl<'c> Op<'c> for FilterOp {
         Ok(out)
     }
 
-    /// A filter of a predicate, which tests what it can of the condition
+    /// A filter of a predicate, which tests what it can of the conditions
     /// itself, first computing the rest.
     fn lower(
         &self,
@@ -850,16 +926,25 @@ impl<'c> Op<'c> for FilterOp {
     ) -> Result<(), LowerError> {
         check!(node.children.len() == 1);
         lowering.lower_input(node, 0)?;
-        let allocator = lowering.allocator();
+        let (allocator, exprs, values) =
+            (lowering.allocator(), lowering.exprs(), lowering.expr_values());
         let rows = lowering.query_rows();
         let column = |column| {
             let Some(position) = rows.position_of(column) else { failed!() };
             (position, rows.type_of(column))
         };
         let mut computed = SlowVec::new(allocator, EXPR_NODES_MAX)?;
-        let condition = &self.condition;
         let at = rows.column_count();
-        let predicate = Predicate::from_expr(allocator, condition, &column, at, &mut computed)?;
+        let conjuncts = &self.conjuncts;
+        let predicate = Predicate::from_expr(
+            allocator,
+            exprs,
+            conjuncts,
+            values.clone(),
+            &column,
+            at,
+            &mut computed,
+        )?;
         if at as usize + computed.len() > BATCH_COLUMNS_MAX as usize {
             return Err(LowerError::TooManyColumns);
         }
@@ -867,20 +952,14 @@ impl<'c> Op<'c> for FilterOp {
         if !computed.is_empty() {
             let mut programs = SlowVec::fixed(allocator, computed.len())?;
             for &part in computed.iter() {
-                let mut part = condition.subtree(allocator, part)?;
-                // Tested as an integer: a double is true where it isn't 0.
-                if check_expr_type(&part, &|column| rows.type_of(column)) == Ok(DataType::Float64) {
-                    let root = part.root();
-                    part.nodes.push(ExprStep { op: ExprOp::Constant, ..zero() })?;
-                    part.nodes.push(ExprStep { op: ExprOp::Ne, a: root, b: root + 1, ..zero() })?;
-                }
-                let program = match type_expr(allocator, rows, &part) {
+                let nodes = exprs.nodes(part);
+                let program = match type_expr(allocator, rows, nodes, values.clone(), true) {
                     Ok(program) => program,
                     Err(ExprError::OutOfMemory) => return Err(LowerError::OutOfMemory),
                     // Named by the first column it reads.
                     Err(_) => {
                         let mut first = None;
-                        part.columns_of(part.root(), &mut |column| _ = first.get_or_insert(column));
+                        columns_of(nodes, part.root, &mut |column| _ = first.get_or_insert(column));
                         return Err(LowerError::WrongType(first.unwrap_or(0)));
                     }
                 };
@@ -890,18 +969,5 @@ impl<'c> Op<'c> for FilterOp {
         }
         let filter = Filter { compute, predicate };
         lowering.add_operator(Step::Transform(DynTransform::new(allocator, filter)?))
-    }
-}
-
-/// An `Int64` node of 0, to fill in.
-fn zero() -> ExprStep {
-    ExprStep {
-        op: ExprOp::Null,
-        data_type: DataType::Int64,
-        a: 0,
-        b: 0,
-        c: 0,
-        int_value: 0,
-        double_value: 0.0,
     }
 }

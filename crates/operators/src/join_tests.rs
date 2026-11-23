@@ -11,7 +11,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::{Expr, ExprOp, ExprStep};
+use pipit_kernel::expression::{ExprOp, ExprStep};
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
@@ -39,9 +39,10 @@ fn greater(nodes: &mut Vec<ExprStep>, column: u32, value: i64) -> u32 {
     at
 }
 
-/// The expression of `nodes`.
-fn expr(nodes: Vec<ExprStep>) -> Expr {
-    Expr { nodes: SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap(), values: None }
+/// A filter of the expression of `nodes`, added to `plan`'s.
+fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &[ExprStep]) -> DynOp<'c> {
+    let condition = plan.exprs.add(nodes).unwrap();
+    DynOp::new(&Heap, FilterOp::new(&Heap, &plan.exprs, condition).unwrap()).unwrap()
 }
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
@@ -124,7 +125,7 @@ fn join(
     if let Some(value) = above {
         let mut nodes = Vec::new();
         greater(&mut nodes, probe_columns[1].id, value);
-        let filter = DynOp::new(&Heap, FilterOp { condition: expr(nodes) }).unwrap();
+        let filter = filter(&mut plan, &nodes);
         let children = [probe];
         probe = plan.add_node(filter, &children).unwrap();
     }
@@ -199,9 +200,9 @@ fn filtered_above(
     let a = greater(&mut nodes, dur.id, durs);
     let b = greater(&mut nodes, tid.id, tids);
     nodes.push(node(ExprOp::And, a, b, 0));
-    let condition = expr(nodes);
+    let filter = filter(&mut plan, &nodes);
     let children = [join];
-    plan.add_node(DynOp::new(&Heap, FilterOp { condition }).unwrap(), &children).unwrap();
+    plan.add_node(filter, &children).unwrap();
     plan.output.push(dur).unwrap();
     plan.output.push(tid).unwrap();
     optimize(&Heap, &mut plan).unwrap();

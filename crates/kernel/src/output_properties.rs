@@ -6,6 +6,7 @@
 use crate::allocator::{AllocError, Allocator};
 use crate::column::DataType;
 use crate::context::CUTOFFS_MAX;
+use crate::expression::Exprs;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
@@ -345,6 +346,11 @@ pub struct DeriveContext<'p, 'c> {
 }
 
 impl DeriveContext<'_, '_> {
+    /// The plan's expressions.
+    pub fn exprs(&self) -> &Exprs {
+        &self.plan.exprs
+    }
+
     /// The id of the node being derived.
     pub fn node(&self) -> PlanNodeId {
         self.self_

@@ -11,7 +11,7 @@ use crate::column::DataType;
 use crate::column::{ColumnView, Form};
 use crate::context::Context;
 use crate::error::Error;
-use crate::expression::{Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep};
+use crate::expression::{Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep, Exprs};
 use crate::filter::{self, Comparison, Entries, Value};
 use crate::flat_hash_map::FlatHashMap;
 use crate::murmur_hash;
@@ -445,40 +445,52 @@ fn negated(comparison: Comparison) -> Comparison {
     }
 }
 
-/// What every test of `column` in a filter of `expr` compares it with, if
-/// one kind: strings, or integers, which tests for null count as. Only
+/// What every test of `column` in a filter of `conjuncts` compares it with,
+/// if one kind: strings, or integers, which tests for null count as. Only
 /// those take a dictionary, or a sequence: see `FilterOp::accepts`.
-pub fn compared_with(expr: &Expr, column: ColumnId) -> Option<DataType> {
-    let reads = |i: u32| {
-        let node = at!(expr.nodes, i as usize);
-        node.op == ExprOp::Column && node.a == column
+pub fn compared_with(exprs: &Exprs, conjuncts: &[Expr], column: ColumnId) -> Option<DataType> {
+    // `None` before any test, then the kind, if one.
+    let mut found = None;
+    let mut test = |tested| {
+        found = Some(match found {
+            Some(before) if before != tested => None,
+            _ => tested,
+        });
     };
-    let constant = |i: u32| {
-        let node = at!(expr.nodes, i as usize);
-        (node.op == ExprOp::Constant).then_some(node.data_type)
-    };
-    // The kind of test node `node` is of the column at its operand `read`.
-    let kind = |node: &ExprStep, read: u32| match node.op {
-        ExprOp::And | ExprOp::Or | ExprOp::Not | ExprOp::IsNull | ExprOp::IsNotNull => {
-            Some(DataType::Int64)
+    for &conjunct in conjuncts {
+        let nodes = exprs.nodes(conjunct);
+        let reads = |i: u32| {
+            let node = at!(nodes, i as usize);
+            node.op == ExprOp::Column && node.a == column
+        };
+        let constant = |i: u32| {
+            let node = at!(nodes, i as usize);
+            (node.op == ExprOp::Constant).then_some(node.data_type)
+        };
+        // A condition that's the column itself tests it as an integer.
+        if reads(conjunct.root) {
+            test(Some(DataType::Int64));
         }
-        ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
-            constant(if read == node.a { node.b } else { node.a })
-        }
-        ExprOp::Like => Some(DataType::String),
-        ExprOp::In if node.data_type == DataType::String => Some(DataType::String),
-        _ => None,
-    };
-    // A condition that's the column itself tests it as an integer.
-    let mut found = reads(expr.root()).then_some(Some(DataType::Int64));
-    for node in expr.nodes.iter() {
-        for (first, count) in node.operands() {
-            for read in (first..first + count).filter(|&read| reads(read)) {
-                let tested = kind(node, read);
-                found = Some(match found {
-                    Some(before) if before != tested => None,
-                    _ => tested,
-                });
+        for node in nodes {
+            for (first, count) in node.operands() {
+                for read in (first..first + count).filter(|&read| reads(read)) {
+                    test(match node.op {
+                        ExprOp::And
+                        | ExprOp::Or
+                        | ExprOp::Not
+                        | ExprOp::IsNull
+                        | ExprOp::IsNotNull => Some(DataType::Int64),
+                        ExprOp::Eq
+                        | ExprOp::Ne
+                        | ExprOp::Lt
+                        | ExprOp::Le
+                        | ExprOp::Gt
+                        | ExprOp::Ge => constant(if read == node.a { node.b } else { node.a }),
+                        ExprOp::Like => Some(DataType::String),
+                        ExprOp::In if node.data_type == DataType::String => Some(DataType::String),
+                        _ => None,
+                    });
+                }
             }
         }
     }
@@ -486,39 +498,54 @@ pub fn compared_with(expr: &Expr, column: ColumnId) -> Option<DataType> {
 }
 
 impl Predicate {
-    /// The predicate a filter of `expr` tests, reading each column `c` at
-    /// `column(c)`, its position and type. A node it can't test as a leaf,
-    /// such as `a < b`, it reads as a column from position `computed_at` on,
-    /// and adds to `computed`: the filter computes those first, as 0, 1 or
-    /// null, and keeps the rows where they aren't 0, as SQL does.
+    /// The predicate a filter of `conjuncts`, all true, tests, reading each
+    /// column `c` at `column(c)`, its position and type, and its `IN` lists
+    /// from `values`. A node it can't test as a leaf, such as `a < b`, it
+    /// reads as a column from position `computed_at` on, and adds to
+    /// `computed`: the filter computes those first, as 0, 1 or null, and
+    /// keeps the rows where they aren't 0, as SQL does.
     pub fn from_expr(
         allocator: &dyn Allocator,
-        expr: &Expr,
+        exprs: &Exprs,
+        conjuncts: &[Expr],
+        values: Option<Buffer>,
         column: &dyn Fn(ColumnId) -> (u32, DataType),
         computed_at: u32,
-        computed: &mut SlowVec<u32>,
+        computed: &mut SlowVec<Expr>,
     ) -> Result<Predicate, AllocError> {
-        // At most one for each of its nodes: `IS NOT NULL` takes two for its two.
-        let mut nodes = SlowVec::fixed(allocator, expr.nodes.len())?;
-        let mut from = FromExpr { expr, column, computed_at, computed, nodes: &mut nodes };
-        from.add(expr.root())?;
-        Ok(Predicate::checked(nodes, expr.values.clone()))
+        let mut nodes = SlowVec::new(allocator, PREDICATE_NODES_MAX)?;
+        let mut root = None;
+        for &conjunct in conjuncts {
+            let start = conjunct.start;
+            let expr = exprs.nodes(conjunct);
+            let mut from =
+                FromExpr { expr, start, column, computed_at, computed, nodes: &mut nodes };
+            let added = from.add(conjunct.root)?;
+            root = Some(match root {
+                Some(root) => push(&mut nodes, Node::And(root, added))?,
+                None => added,
+            });
+        }
+        check!(root.is_some());
+        Ok(Predicate::checked(nodes, values))
     }
 }
 
-/// Turns an `Expr` into a predicate's nodes, as `Predicate::from_expr`.
+/// Turns an expression's nodes, from `start` of its plan's, into a
+/// predicate's, as `Predicate::from_expr`.
 struct FromExpr<'e> {
-    expr: &'e Expr,
+    expr: &'e [ExprStep],
+    start: u32,
     column: &'e dyn Fn(ColumnId) -> (u32, DataType),
     computed_at: u32,
-    computed: &'e mut SlowVec<u32>,
+    computed: &'e mut SlowVec<Expr>,
     nodes: &'e mut SlowVec<Node>,
 }
 
 impl FromExpr<'_> {
     /// Adds node `node`'s predicate nodes, and returns its own.
     fn add(&mut self, node: u32) -> Result<u32, AllocError> {
-        let step = *at!(self.expr.nodes, node as usize);
+        let step = *at!(self.expr, node as usize);
         let added = match step.op {
             ExprOp::And | ExprOp::Or => {
                 let (a, b) = (self.add(step.a)?, self.add(step.b)?);
@@ -535,7 +562,7 @@ impl FromExpr<'_> {
                 } else {
                     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
                     let at = self.computed_at + self.computed.len() as u32;
-                    self.computed.push(node)?;
+                    self.computed.push(Expr { start: self.start, root: node })?;
                     let (comparison, value) = (Comparison::NotEqual, Value::Int64(0));
                     Node::Leaf(Leaf::Compare { column: at, comparison, value })
                 }
@@ -548,7 +575,7 @@ impl FromExpr<'_> {
     /// a column compared with a constant, or `LIKE`, `IS NULL`, `IS NOT
     /// NULL`'s null test or `IN` of a column.
     fn leaf(&self, step: &ExprStep) -> Option<Leaf> {
-        let node = |i: u32| *at!(self.expr.nodes, i as usize);
+        let node = |i: u32| *at!(self.expr, i as usize);
         let column = |i: u32| {
             let read = node(i);
             (read.op == ExprOp::Column).then(|| (self.column)(read.a))
@@ -780,8 +807,9 @@ mod tests {
         }
     }
 
-    /// `expr` as a kernel expression, as a plan holds a condition.
-    fn kernel(expr: &Expr) -> crate::expression::Expr {
+    /// `expr` as a kernel expression, added to `exprs`, as a plan holds a
+    /// condition.
+    fn kernel(exprs: &mut Exprs, expr: &Expr) -> crate::expression::Expr {
         fn add(expr: &Expr, nodes: &mut StdVec<ExprStep>) -> u32 {
             let node = |op, a, b, int_value| ExprStep {
                 op,
@@ -812,15 +840,16 @@ mod tests {
         }
         let mut nodes = StdVec::new();
         add(expr, &mut nodes);
-        let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
-        crate::expression::Expr { nodes, values: None }
+        exprs.add(&nodes).unwrap()
     }
 
-    /// The predicate testing `expr`, of columns at their ids' positions.
-    fn from_kernel(expr: &crate::expression::Expr) -> Predicate {
+    /// The predicate testing `conjuncts`, of `exprs`, of columns at their
+    /// ids' positions.
+    fn from_kernel(exprs: &Exprs, conjuncts: &[crate::expression::Expr]) -> Predicate {
         let mut computed = SlowVec::new(&Heap, 1).unwrap();
         let column = |column| (column, DataType::Int64);
-        let predicate = Predicate::from_expr(&Heap, expr, &column, 2, &mut computed).unwrap();
+        let predicate =
+            Predicate::from_expr(&Heap, exprs, conjuncts, None, &column, 2, &mut computed).unwrap();
         assert!(computed.is_empty());
         predicate
     }
@@ -834,13 +863,17 @@ mod tests {
         // `(a > 2 AND b IS NULL) AND (a > 4 OR a IS NULL) AND (a > 2 OR b > 2)`.
         const ALL: Expr =
             Expr::And(&Expr::And(&Expr::And(&A2, &Expr::IsNull(1)), &A4_OR_NULL), &EITHER);
-        assert_eq!(kept_by(&from_kernel(&kernel(&ALL))), kept(&ALL));
-        let given = |expr: &Expr, column| {
-            let mut filter = FilterOp { condition: kernel(expr) };
-            let Given::Passed(condition) = filter.give_condition(&Heap, column).unwrap() else {
+        let mut exprs = Exprs::new(&Heap).unwrap();
+        let all = kernel(&mut exprs, &ALL);
+        assert_eq!(kept_by(&from_kernel(&exprs, &[all])), kept(&ALL));
+        let mut given = |expr: &Expr, column| {
+            let condition = kernel(&mut exprs, expr);
+            let mut filter = FilterOp::new(&Heap, &exprs, condition).unwrap();
+            let given = filter.give_condition(&exprs, &Heap, column).unwrap();
+            let Given::Passed(condition) = given else {
                 panic!("a filter passes on its child's rows")
             };
-            condition.map(|condition| kept_by(&from_kernel(&condition)))
+            condition.map(|condition| kept_by(&from_kernel(&exprs, &condition)))
         };
         assert_eq!(given(&ALL, 0), Some(kept(&Expr::And(&A2, &A4_OR_NULL))));
         // None reads only a column it doesn't read.
@@ -1101,11 +1134,12 @@ mod tests {
             step(ExprOp::And, int, 2, 5),
             step(ExprOp::And, int, 12, 11),
         ];
-        let nodes = SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap();
-        let expr = crate::expression::Expr { nodes, values: None };
+        let mut exprs = Exprs::new(&Heap).unwrap();
+        let expr = exprs.add(&nodes).unwrap();
         // A string column, an integer one, one also tested for nulls, and one
         // it doesn't read.
-        let kinds: StdVec<_> = (0..4).map(|column| compared_with(&expr, column)).collect();
+        let kinds: StdVec<_> =
+            (0..4).map(|column| compared_with(&exprs, &[expr], column)).collect();
         assert!(kinds == [Some(string), Some(int), None, None]);
     }
 }

@@ -13,7 +13,7 @@ use pipit_kernel::slow_vec::SlowVec;
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
-use crate::parser::{IN_LIST_MAX, parse_query};
+use crate::parser::parse_query;
 use crate::registry::Registry;
 
 /// What a query reads rows from, compiled: its plan node, and its columns, by
@@ -33,8 +33,6 @@ pub struct Compiler<'q, 'c> {
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SlowVec<NamedColumn>,
-    /// The values of the `IN` lists of the expression being compiled.
-    pub in_values: SlowVec<i64>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -158,7 +156,6 @@ pub fn compile<'c>(
         registry,
         plan: LogicalPlan::new(allocator)?,
         scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
-        in_values: SlowVec::new(allocator, IN_LIST_MAX)?,
         allocator,
     };
     let query = ast.node(ast.root());

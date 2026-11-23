@@ -1,10 +1,9 @@
 //! Expressions over the columns in scope, compiled to the kernel's `Expr`,
 //! as Perfetto's `CompileExpr`.
 
-use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
-    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type,
+    EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, check_expr_type,
 };
 use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
 use pipit_kernel::slow_vec::SlowVec;
@@ -14,7 +13,6 @@ use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
-use crate::parser::IN_LIST_MAX;
 use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
@@ -24,18 +22,9 @@ pub fn compile_expr(
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
     let mut nodes = SlowVec::new(compiler.allocator(), EXPR_NODES_MAX)?;
-    compiler.in_values.retain(|_| false);
     compile(compiler, node, 0, &mut nodes)?;
-    let mut values = None;
-    if !compiler.in_values.is_empty() {
-        let size_bytes = size_of_val::<[i64]>(&compiler.in_values);
-        let mut buffer = Buffer::allocate(compiler.allocator(), size_bytes)?;
-        buffer.as_mut_slice::<i64>().copy_from_slice(&compiler.in_values);
-        values = Some(buffer);
-    }
-    let expr = Expr { nodes, values };
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
-    let data_type = check_expr_type(&expr, &type_of).map_err(|error| {
+    let data_type = check_expr_type(&nodes, &type_of).map_err(|error| {
         let span = compiler.span(node);
         let code = match error {
             ExprError::Numbers => ErrorCode::ExpectedNumber,
@@ -53,6 +42,7 @@ pub fn compile_expr(
         };
         Error::new(code, span)
     })?;
+    let expr = compiler.plan.exprs.add(&nodes)?;
     Ok((expr, data_type))
 }
 
@@ -82,8 +72,8 @@ fn push_node(
 }
 
 /// `a IN (1, 2)` or `a IN ('x', 'y')`: a list of integers, or of strings,
-/// whose values, or the strings' ids, go in the compiler's `in_values`. The
-/// node's type says which.
+/// whose values, or the strings' ids, go in the plan's expressions' values.
+/// The node's type says which.
 fn in_list(
     compiler: &mut Compiler<'_, '_>,
     node: Node,
@@ -95,11 +85,11 @@ fn in_list(
     let operand = nodes.len() as u32 - 1;
     let list = compiler.node(node.first_child() + 1);
     let len = list.child_count();
-    if compiler.in_values.len() + len as usize > IN_LIST_MAX {
+    if compiler.plan.exprs.values().len() + len as usize > PLAN_EXPR_VALUES_MAX {
         return Err(Error::new(ErrorCode::ConditionTooLarge, compiler.span(list)));
     }
-    #[expect(clippy::cast_possible_truncation, reason = "at most `IN_LIST_MAX`")]
-    let start = compiler.in_values.len() as u32;
+    #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
+    let start = compiler.plan.exprs.values().len() as u32;
     let mut kind = None;
     for i in 0..len {
         // A literal, compiled as any is, then taken back off as a value.
@@ -115,7 +105,7 @@ fn in_list(
             return Err(Error::new(ErrorCode::ExpectedOneKind, compiler.span(item)));
         }
         kind = Some(item_kind);
-        compiler.in_values.push(listed)?;
+        compiler.plan.exprs.add_value(listed)?;
     }
     let mut test = expr_node(ExprOp::In, operand, start, 0);
     (test.c, test.data_type) = (len, kind.unwrap_or(DataType::Int64));
