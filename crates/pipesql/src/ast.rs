@@ -21,8 +21,11 @@ use pipit_kernel::env::Env;
 pub enum Tag {
     /// A column or function name. A leaf.
     Name,
+    /// An integer literal. A leaf.
     Integer,
+    /// A float literal. A leaf.
     Float,
+    /// A string literal. A leaf.
     String,
     /// `*`, as in `count(*)`. A leaf.
     Star,
@@ -55,23 +58,41 @@ pub enum Tag {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Operator {
+    /// `-a`.
     Negate,
+    /// `NOT a`.
     Not,
+    /// `a OR b`.
     Or,
+    /// `a AND b`.
     And,
+    /// `a = b`.
     Equal,
+    /// `a != b` or `a <> b`.
     NotEqual,
+    /// `a < b`.
     Less,
+    /// `a <= b`.
     LessEqual,
+    /// `a > b`.
     Greater,
+    /// `a >= b`.
     GreaterEqual,
+    /// `a + b`.
     Add,
+    /// `a - b`.
     Subtract,
+    /// `a * b`.
     Multiply,
+    /// `a / b`.
     Divide,
+    /// `a % b`.
     Modulo,
+    /// `a LIKE b`.
     Like,
+    /// `a IS NULL`.
     IsNull,
+    /// `a IS NOT NULL`.
     IsNotNull,
     /// `a IN (1, 2)`: its second child is a `List` of literals.
     In,

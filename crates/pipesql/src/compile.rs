@@ -45,18 +45,26 @@ const ALIAS_COLUMNS_MAX: usize = ALIASES_MAX * PLAN_COLUMNS_MAX;
 
 /// A plan being compiled from a query, which each stage's rule adds to.
 pub struct Compiler<'q, 'c> {
+    /// The query's text, which the tree's spans are into.
     source: &'q [u8],
+    /// The query, parsed.
     ast: &'q Ast,
+    /// The tables `FROM` can name.
     catalog: &'c dyn Catalog,
+    /// The stages' rules and the functions calls can name.
     registry: &'q Registry,
+    /// What the plan's memory comes from.
     env: &'q Env,
+    /// The plan so far.
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SmallVec<NamedColumn>,
     /// The aliases `t.x` can name columns by, the first `alias_count`, and
     /// their columns.
     aliases: [TableAlias; ALIASES_MAX],
+    /// How many of `aliases` there are.
     alias_count: usize,
+    /// The columns of `aliases`, each alias's after the one before's.
     alias_columns: SmallVec<NamedColumn>,
 }
 
