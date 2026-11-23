@@ -19,7 +19,6 @@ use crate::compile::{Compiler, Relation};
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::expression::{add_expr, compile_expr, is_null};
 use crate::keywords::same_word;
-use crate::parser::LIST_MAX;
 use crate::registry::{Item, Point, Rule, Shared};
 
 pub const FROM: Rule = Rule {
@@ -308,7 +307,7 @@ fn using_columns(
     let mut nodes = ExprBuilder::new(env)?;
     let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     // Each build column joined on, one for each name in the list.
-    let mut joined = [0; LIST_MAX];
+    let mut joined = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..using.child_count() {
         let name = listed_once(compiler, using, i, 0)?;
         let (left, right) = (compiler.find_column(name)?, compiler.find_in(&build.columns, name)?);
@@ -319,7 +318,7 @@ fn using_columns(
             nodes.node(ExprOp::And, before, equal)?;
         }
         scope.push(left)?;
-        *at_mut!(joined, i as usize) = right.id;
+        joined.push(right.id)?;
     }
     // The rest of the rows so far's, even another name for a column joined
     // on, or a second copy of one.
@@ -331,7 +330,7 @@ fn using_columns(
         }
     }
     for column in build.columns.iter() {
-        if !at!(joined, ..using.child_count() as usize).contains(&column.id) {
+        if !joined.contains(&column.id) {
             scope.push(*column)?;
         }
     }
