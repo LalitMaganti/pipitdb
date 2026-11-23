@@ -24,7 +24,7 @@ use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::RowBatch;
 use crate::statement::Statement;
-use crate::step::{DynSource, ErasedBatch, Progress, Step};
+use crate::step::{DynSource, ErasedBatch, Progress, SourceNext, Step, StepFunctions};
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -58,18 +58,8 @@ impl<'a> Pipeline<'a> {
     /// pool and statement.
     pub fn into_source(self, env: &Env) -> Result<DynSource<'a>, AllocError> {
         let pipeline = Box::new(env, self)?.erase();
-        let state = Layout::new::<Run<'static>>();
-        // SAFETY: each function takes this pipeline and a run of it.
-        Ok(unsafe {
-            DynSource::from_parts(
-                pipeline,
-                state,
-                new_run,
-                drop_state::<Run>,
-                next_of_run,
-                "Pipeline",
-            )
-        })
+        // SAFETY: each function takes a pipeline and a run of it.
+        Ok(unsafe { DynSource::from_parts(pipeline, &PIPELINE_SOURCE, "Pipeline") })
     }
 
     /// A `Segment` per segment, a `Slot` per step, then the source's state,
@@ -83,7 +73,7 @@ impl<'a> Pipeline<'a> {
         let slots = Layout::array::<Slot>(self.steps.len()).map_err(|_| AllocError)?;
         let (layout, slots) = segments.extend(slots).map_err(|_| AllocError)?;
         let (mut layout, offset) =
-            layout.extend(self.source.state_layout).map_err(|_| AllocError)?;
+            layout.extend(self.source.functions.state_layout).map_err(|_| AllocError)?;
         state(None, offset);
         for (i, step) in self.steps.iter().enumerate() {
             let offset;
@@ -187,6 +177,14 @@ struct Run<'p> {
     /// Frees `memory`.
     _memory: Array<u8>,
 }
+
+/// A pipeline's functions as a source, whose state is a run of it.
+const PIPELINE_SOURCE: StepFunctions<SourceNext> = StepFunctions {
+    state_layout: Layout::new::<Run<'static>>(),
+    new_state: new_run,
+    drop_state: drop_state::<Run<'static>>,
+    run: next_of_run,
+};
 
 /// Makes a run of `pipeline`, a `Pipeline`, at `state`, as a source's state.
 ///
@@ -478,7 +476,7 @@ impl Drop for Run<'_> {
         }
         // SAFETY: each was made by `Run::new`, and is dropped once.
         unsafe {
-            (pipeline.source.drop_state)(self.state(None));
+            (pipeline.source.functions.drop_state)(self.state(None));
             for (i, step) in pipeline.steps.iter().enumerate().take(self.made - 1) {
                 step.drop_state(self.state(Some(i)));
                 self.slot(i).drop_in_place();
