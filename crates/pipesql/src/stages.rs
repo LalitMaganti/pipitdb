@@ -91,14 +91,24 @@ pub const ORDER_BY: Rule = Rule {
 pub const JOIN: Rule = Rule {
     keyword: "join",
     point: Point::Stage,
-    items: &[Item::One(Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    items: &[
+        Item::One(Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
     compile: compile_join,
 };
 
 pub const INNER_JOIN: Rule = Rule {
     keyword: "inner",
     point: Point::Stage,
-    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["on"], Shared::Expr)],
+    items: &[
+        Item::After(&["join"], Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
+        Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
+    ],
     compile: compile_join,
 };
 
@@ -108,7 +118,9 @@ pub const LEFT_JOIN: Rule = Rule {
     items: &[
         Item::Optional("outer"),
         Item::After(&["join"], Shared::Name),
+        Item::Clause(&["as"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
+        Item::Parenthesized(&["using"], Shared::Name),
     ],
     compile: compile_join,
 };
@@ -116,7 +128,7 @@ pub const LEFT_JOIN: Rule = Rule {
 pub const CROSS_JOIN: Rule = Rule {
     keyword: "cross",
     point: Point::Stage,
-    items: &[Item::After(&["join"], Shared::Name)],
+    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["as"], Shared::Name)],
     compile: compile_join,
 };
 
@@ -564,6 +576,11 @@ mod tests {
             "(Query (FROM t) (WHERE (Or (IsNull a) (Not (IsNotNull b)))))"
         );
         assert_eq!(parse("FROM t |> LIMIT 10 offset 5"), "(Query (FROM t) (LIMIT 10 (List 5)))");
+        // A qualified name is one name, spaces and all.
+        assert_eq!(
+            parse("FROM t |> WHERE t.a > u . b"),
+            "(Query (FROM t) (WHERE (Greater t.a u . b)))"
+        );
         assert_eq!(parse("FROM t |> LIMIT 1"), "(Query (FROM t) (LIMIT 1 (List )))");
         assert_eq!(
             parse("FROM t |> ORDER BY a, b + 1 DESC |> LIMIT 10"),
