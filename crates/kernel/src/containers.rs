@@ -281,6 +281,68 @@ impl Drop for ErasedBox {
     }
 }
 
+/// A value of a type only its maker knows, used as the trait object `U`,
+/// such as `dyn Op`, so the compiler makes its table of functions.
+pub struct DynBox<U: ?Sized> {
+    /// The value, as `U`.
+    value: NonNull<U>,
+    /// What the value's memory came from.
+    env: NonNull<Env>,
+}
+
+impl<U: ?Sized> DynBox<U> {
+    /// `value`, used as `U` by `coerce`, such as `|op| op`, which coerces
+    /// it. `coerce` must give the value itself, all of it: it's checked.
+    pub fn new<T>(
+        env: &Env,
+        value: T,
+        coerce: fn(&mut T) -> &mut U,
+    ) -> Result<DynBox<U>, AllocError> {
+        let mut boxed = ManuallyDrop::new(Box::new(env, value)?);
+        // From a unique borrow, so it can change and drop the value.
+        let value = NonNull::from(coerce(&mut boxed));
+        // SAFETY: `coerce` gave a reference, which is valid.
+        let (bytes, align) = unsafe { (size_of_val(value.as_ref()), align_of_val(value.as_ref())) };
+        // As `U`, it's dropped and freed: as the `T`, it must be all of it.
+        check!(
+            core::ptr::addr_eq(value.as_ptr(), boxed.value.as_ptr())
+                && bytes == size_of::<T>()
+                && align == align_of::<T>()
+        );
+        Ok(DynBox { value, env: boxed.env })
+    }
+}
+
+impl<U: ?Sized> Deref for DynBox<U> {
+    type Target = U;
+
+    fn deref(&self) -> &U {
+        // SAFETY: the value was written by `new`, and lives as long as `self`.
+        unsafe { self.value.as_ref() }
+    }
+}
+
+impl<U: ?Sized> DerefMut for DynBox<U> {
+    fn deref_mut(&mut self) -> &mut U {
+        // SAFETY: as in `deref`, and this is the only reference.
+        unsafe { self.value.as_mut() }
+    }
+}
+
+impl<U: ?Sized> Drop for DynBox<U> {
+    fn drop(&mut self) {
+        // SAFETY: the value is a `Box`'s, of its type's size, which `new`
+        // checked, from an `Env` that outlives it, and isn't used again.
+        unsafe {
+            let bytes = size_of_val(self.value.as_ref());
+            self.value.drop_in_place();
+            if bytes != 0 {
+                free_bytes(self.env.as_ref(), self.value.cast(), bytes);
+            }
+        }
+    }
+}
+
 // `SmallVec`: a growable list of values whose count is bounded by the
 // query, not by its data, in memory from the `Env` it was made with.
 
@@ -1062,6 +1124,26 @@ mod tests {
             assert_eq!(unsafe { erased.as_ptr().cast::<Rc<()>>().as_ref() }, &live);
             assert_eq!(Rc::strong_count(&live), 2);
             drop(erased);
+            assert_eq!(Rc::strong_count(&live), 1);
+        }
+
+        trait Count {
+            fn count(&self) -> usize;
+        }
+
+        impl Count for Rc<()> {
+            fn count(&self) -> usize {
+                Rc::strong_count(self)
+            }
+        }
+
+        #[test]
+        fn drops_its_value_once_as_a_trait_object() {
+            let env = Env::current();
+            let live = Rc::new(());
+            let boxed = DynBox::<dyn Count>::new(env, live.clone(), |live| live).unwrap();
+            assert_eq!(boxed.count(), 2);
+            drop(boxed);
             assert_eq!(Rc::strong_count(&live), 1);
         }
     }

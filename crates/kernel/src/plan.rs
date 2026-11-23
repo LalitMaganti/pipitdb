@@ -4,17 +4,11 @@
 //! its inputs and what it outputs, then `lower` turns it into a pipeline,
 //! asking each to lower itself, so extensions can add operations.
 
-#![allow(unsafe_code)]
-
-use core::marker::PhantomData;
-use core::ptr::NonNull;
-
 use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
-use crate::containers::{Box, ErasedBox, InlineVec, SmallVec};
+use crate::containers::{DynBox, InlineVec, SmallVec};
 use crate::env::Env;
-use crate::erase::{value_mut_of, value_of};
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::{
     Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, Exprs, columns_of, conjuncts,
@@ -263,140 +257,36 @@ pub enum Given {
 /// conjuncts of an expression, or of several.
 pub type Conjuncts = SmallVec<Expr>;
 
-type GiveCondition = unsafe fn(NonNull<()>, &Exprs, &Env, ColumnId) -> Result<Given, AllocError>;
-
-type TakeCondition =
-    unsafe fn(NonNull<()>, &Exprs, &Env, ColumnId, Conjuncts) -> Result<(), AllocError>;
-
-type Answer<'c> = unsafe fn(NonNull<()>, &Env, &DynOp<'c>) -> Result<bool, AllocError>;
-
-type SplitBelow<'c> =
-    unsafe fn(NonNull<()>, &Exprs, &Env, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
-
-type Materialize<'c> =
-    unsafe fn(NonNull<()>, &Env, SmallVec<(ColumnId, Forms)>) -> Result<DynOp<'c>, AllocError>;
-
 /// An `Op` of any type that lives for `'c`, owned in memory from an
-/// `Env`, and the functions that know its type.
+/// `Env`.
 pub struct DynOp<'c> {
-    op: ErasedBox,
-    functions: &'c OpFunctions<'c>,
-}
-
-/// An op type's functions: one table for each type, which its ops share.
-struct OpFunctions<'c> {
-    prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
-    reads: unsafe fn(NonNull<()>, &mut Needed),
-    accepts: unsafe fn(NonNull<()>, &Exprs, ColumnId) -> Forms,
-    passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
-    allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
-    give_condition: GiveCondition,
-    takes_condition: unsafe fn(NonNull<()>, ColumnId) -> bool,
-    take_condition: TakeCondition,
-    materialize: Materialize<'c>,
-    summary: unsafe fn(NonNull<()>, Option<ColumnId>) -> Option<Summary>,
-    answer: Answer<'c>,
-    moves_condition: unsafe fn(NonNull<()>, ColumnId) -> Option<u32>,
-    split_below: SplitBelow<'c>,
-    estimate: unsafe fn(NonNull<()>, &Exprs, &[Estimate]) -> Option<Estimate>,
-    choose: unsafe fn(NonNull<()>, &Exprs, &[Estimate]),
-    as_join: unsafe fn(NonNull<()>) -> Option<NonNull<JoinOp>>,
-    // Takes the `DynOp`, not its op's pointer, as the needs borrow from it.
-    needs: for<'n> unsafe fn(&'n DynOp<'c>, u32) -> InputNeeds<'n>,
-    derive: for<'p> unsafe fn(
-        NonNull<()>,
-        &mut DeriveContext<'p, 'c>,
-    ) -> Result<OutputProperties, LowerError>,
-    lower: for<'l> unsafe fn(
-        NonNull<()>,
-        &PlanNode<'c>,
-        &mut Lowering<'l, 'c>,
-    ) -> Result<(), LowerError>,
-}
-
-/// Holds `T`'s table.
-struct Functions<'c, T>(PhantomData<(&'c (), T)>);
-
-impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
-    const TABLE: OpFunctions<'c> = OpFunctions {
-        // SAFETY: only called with this op, which the caller has mutably.
-        prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
-        // SAFETY: only called with this op.
-        reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
-        // SAFETY: as for `reads`.
-        accepts: |op, exprs, column| unsafe { value_of::<T>(op).accepts(exprs, column) },
-        // SAFETY: as for `reads`.
-        passes_through: |op, column| unsafe { value_of::<T>(op).passes_through(column) },
-        // SAFETY: as for `prune`.
-        allow: |op, column, allowed| unsafe { value_mut_of::<T>(op).allow(column, allowed) },
-        // SAFETY: as for `prune`.
-        give_condition: |op, exprs, env, column| unsafe {
-            value_mut_of::<T>(op).give_condition(exprs, env, column)
-        },
-        // SAFETY: as for `reads`.
-        takes_condition: |op, column| unsafe { value_of::<T>(op).takes_condition(column) },
-        // SAFETY: as for `prune`.
-        take_condition: |op, exprs, env, column, condition| unsafe {
-            value_mut_of::<T>(op).take_condition(exprs, env, column, condition)
-        },
-        // SAFETY: as for `reads`.
-        materialize: |op, env, columns| unsafe { value_of::<T>(op).materialize(env, columns) },
-        // SAFETY: as for `reads`.
-        summary: |op, column| unsafe { value_of::<T>(op).summary(column) },
-        // SAFETY: as for `prune`.
-        answer: |op, env, child| unsafe { value_mut_of::<T>(op).answer(env, child) },
-        // SAFETY: as for `reads`.
-        moves_condition: |op, column| unsafe { value_of::<T>(op).moves_condition(column) },
-        // SAFETY: as for `prune`.
-        split_below: |op, exprs, env, below| unsafe {
-            value_mut_of::<T>(op).split_below(exprs, env, below)
-        },
-        // SAFETY: as for `reads`.
-        estimate: |op, exprs, inputs| unsafe { value_of::<T>(op).estimate(exprs, inputs) },
-        // SAFETY: as for `prune`.
-        choose: |op, exprs, inputs| unsafe { value_mut_of::<T>(op).choose(exprs, inputs) },
-        // SAFETY: as for `reads`.
-        as_join: |op| unsafe { value_of::<T>(op).as_join().map(NonNull::from) },
-        // SAFETY: only called with this op, which outlives what it returns.
-        needs: |op, input| unsafe { value_of::<T>(op.op.as_ptr()).needs(input) },
-        // SAFETY: as for `reads`.
-        derive: |op, derive| unsafe { value_of::<T>(op).derive(derive) },
-        // SAFETY: as for `reads`.
-        lower: |op, node, lowering| unsafe { value_of::<T>(op).lower(node, lowering) },
-    };
+    op: DynBox<dyn Op<'c> + 'c>,
 }
 
 impl<'c> DynOp<'c> {
     pub fn new<T: Op<'c> + 'c>(env: &Env, op: T) -> Result<DynOp<'c>, AllocError> {
-        let op = Box::new(env, op)?.erase();
-        Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
+        let op = DynBox::<dyn Op<'c> + 'c>::new(env, op, |op| op)?;
+        Ok(DynOp { op })
     }
 
     pub(crate) fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.prune)(self.op.as_ptr(), needed) }
+        self.op.prune(needed)
     }
 
     pub(crate) fn reads(&self, reads: &mut Needed) {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
+        self.op.reads(reads)
     }
 
     pub(crate) fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.accepts)(self.op.as_ptr(), exprs, column) }
+        self.op.accepts(exprs, column)
     }
 
     pub(crate) fn passes_through(&self, column: ColumnId) -> bool {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.passes_through)(self.op.as_ptr(), column) }
+        self.op.passes_through(column)
     }
 
     pub(crate) fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.allow)(self.op.as_ptr(), column, allowed) }
+        self.op.allow(column, allowed)
     }
 
     pub(crate) fn give_condition(
@@ -405,14 +295,11 @@ impl<'c> DynOp<'c> {
         env: &Env,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.give_condition)(self.op.as_ptr(), exprs, env, column) }
+        self.op.give_condition(exprs, env, column)
     }
 
     pub(crate) fn takes_condition(&self, column: ColumnId) -> bool {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.takes_condition)(self.op.as_ptr(), column) }
+        self.op.takes_condition(column)
     }
 
     pub(crate) fn take_condition(
@@ -422,10 +309,7 @@ impl<'c> DynOp<'c> {
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
-        let op = self.op.as_ptr();
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.take_condition)(op, exprs, env, column, condition) }
+        self.op.take_condition(exprs, env, column, condition)
     }
 
     pub(crate) fn materialize(
@@ -433,13 +317,11 @@ impl<'c> DynOp<'c> {
         env: &Env,
         columns: SmallVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.materialize)(self.op.as_ptr(), env, columns) }
+        self.op.materialize(env, columns)
     }
 
     pub(crate) fn moves_condition(&self, column: ColumnId) -> Option<u32> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.moves_condition)(self.op.as_ptr(), column) }
+        self.op.moves_condition(column)
     }
 
     pub(crate) fn split_below(
@@ -448,20 +330,16 @@ impl<'c> DynOp<'c> {
         env: &Env,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.split_below)(self.op.as_ptr(), exprs, env, below) }
+        self.op.split_below(exprs, env, below)
     }
 
     pub fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.summary)(self.op.as_ptr(), column) }
+        self.op.summary(column)
     }
 
     /// The op's estimate, or the default estimate if it gives none.
     pub(crate) fn estimate(&self, exprs: &Exprs, inputs: &[Estimate]) -> Estimate {
-        // SAFETY: the function matches the op's type.
-        let estimate = unsafe { (self.functions.estimate)(self.op.as_ptr(), exprs, inputs) };
+        let estimate = self.op.estimate(exprs, inputs);
         if let Some(estimate) = estimate {
             return estimate;
         }
@@ -476,33 +354,26 @@ impl<'c> DynOp<'c> {
     }
 
     pub(crate) fn choose(&mut self, exprs: &Exprs, inputs: &[Estimate]) {
-        // SAFETY: the function matches the op's type, which `self` holds
-        // mutably.
-        unsafe { (self.functions.choose)(self.op.as_ptr(), exprs, inputs) }
+        self.op.choose(exprs, inputs)
     }
 
     pub(crate) fn as_join(&self) -> Option<&JoinOp> {
-        // SAFETY: the function matches the op's type, and the join it
-        // returns is the op, which lives as long as `self`.
-        unsafe { (self.functions.as_join)(self.op.as_ptr()).map(|join| join.as_ref()) }
+        self.op.as_join()
     }
 
     pub(crate) fn answer(&mut self, env: &Env, child: &DynOp<'c>) -> Result<bool, AllocError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.answer)(self.op.as_ptr(), env, child) }
+        self.op.answer(env, child)
     }
 
     pub(crate) fn needs(&self, input: u32) -> InputNeeds<'_> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.needs)(self, input) }
+        self.op.needs(input)
     }
 
     pub(crate) fn derive(
         &self,
         derive: &mut DeriveContext<'_, 'c>,
     ) -> Result<OutputProperties, LowerError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.derive)(self.op.as_ptr(), derive) }
+        self.op.derive(derive)
     }
 
     pub(crate) fn lower(
@@ -510,8 +381,7 @@ impl<'c> DynOp<'c> {
         node: &PlanNode<'c>,
         lowering: &mut Lowering<'_, 'c>,
     ) -> Result<(), LowerError> {
-        // SAFETY: the function matches the op's type.
-        unsafe { (self.functions.lower)(self.op.as_ptr(), node, lowering) }
+        self.op.lower(node, lowering)
     }
 }
 
