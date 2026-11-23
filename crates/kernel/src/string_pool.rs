@@ -4,7 +4,7 @@
 use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::buffer::{Buffer, HEADER_BYTES};
-use crate::env::Env;
+use crate::env::{Env, Kind};
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
 use crate::murmur_hash;
 use crate::row_batch::BATCH_ROWS_MAX;
@@ -20,8 +20,8 @@ const LARGE_STRING_FLAG_MASK: u32 = 1 << 31;
 const BLOCK_OFFSET_MASK: u32 = (1 << BLOCK_OFFSET_BITS) - 1;
 const BLOCK_INDEX_MASK: u32 = !LARGE_STRING_FLAG_MASK & !BLOCK_OFFSET_MASK;
 
-/// A block's allocation, its buffer's header and its strings: 2 MB, aligned
-/// to it, so one huge page can hold it.
+/// A block's allocation, its buffer's header and its strings: 2 MB, so on
+/// Linux it's aligned to a huge page, which holds it.
 const BLOCK_BYTES: usize = BLOCK_OFFSET_MASK as usize + 1;
 
 /// How many bytes of strings a block holds.
@@ -330,7 +330,7 @@ impl Store {
     fn add_block(&mut self, env: &Env) -> Result<(), AllocError> {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
-        let block = unsafe { Buffer::allocate_uninit_aligned(env, BLOCK_CAPACITY, BLOCK_BYTES) };
+        let block = unsafe { Buffer::allocate_uninit(env, Kind::Base, BLOCK_CAPACITY) };
         self.blocks.push(block?)?;
         self.block_end = 0;
         Ok(())

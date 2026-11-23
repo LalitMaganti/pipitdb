@@ -11,7 +11,7 @@ use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
 use pipit_kernel::buffer::Buffer;
-use pipit_kernel::env::Env;
+use pipit_kernel::env::{Env, Kind};
 use pipit_kernel::small_vec::SmallVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
@@ -53,7 +53,7 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
         // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(env, BLOCK_BYTES) }
+        let first = unsafe { Buffer::allocate_uninit(env, Kind::Base, BLOCK_BYTES) }
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
         Ok(Parser { env, source, lexer, current, nodes: Nodes::new(first), failed: None })
     }
