@@ -266,14 +266,7 @@ mod tests {
     /// The nodes of `column <comparison> value`.
     fn compared(column: ColumnId, comparison: Comparison, value: i64) -> ExprBuilder {
         let env = Env::current();
-        let op = match comparison {
-            Comparison::Equal => ExprOp::Eq,
-            Comparison::NotEqual => ExprOp::Ne,
-            Comparison::Less => ExprOp::Lt,
-            Comparison::LessEqual => ExprOp::Le,
-            Comparison::Greater => ExprOp::Gt,
-            Comparison::GreaterEqual => ExprOp::Ge,
-        };
+        let op = ExprOp::from(comparison);
         let mut nodes = ExprBuilder::new(env).unwrap();
         let (column, value) = (nodes.column(column).unwrap(), nodes.int(value).unwrap());
         nodes.node(op, column, value).unwrap();
