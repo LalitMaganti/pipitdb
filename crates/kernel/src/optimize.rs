@@ -32,7 +32,11 @@ pub struct Needed<'e> {
 
 impl<'e> Needed<'e> {
     /// None of `count` columns, of a plan whose expressions are `exprs`.
-    fn none(allocator: &Global, count: usize, exprs: &'e Exprs) -> Result<Needed<'e>, AllocError> {
+    pub(crate) fn none(
+        allocator: &Global,
+        count: usize,
+        exprs: &'e Exprs,
+    ) -> Result<Needed<'e>, AllocError> {
         let columns = SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))?;
         Ok(Needed { columns, exprs })
     }

@@ -52,8 +52,11 @@ pub struct JoinOp {
     /// Which pairs of rows are joined, an `Int64` true where it isn't 0 or
     /// null: every pair if none, a cross join.
     condition: Option<Expr>,
-    /// Each child's columns it outputs.
+    /// Each child's columns, at most a batch's, and a bit for each it
+    /// outputs, which pruning clears: which child a column comes from is
+    /// known by them all.
     columns: [SlowVec<ColumnId>; 2],
+    outputs: [u64; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
     build: u32,
@@ -62,7 +65,14 @@ pub struct JoinOp {
 impl JoinOp {
     /// A join of `kind` on `condition`, outputting `columns` of each child.
     pub fn new(kind: JoinKind, condition: Option<Expr>, columns: [SlowVec<ColumnId>; 2]) -> JoinOp {
-        JoinOp { kind, condition, columns, build: 1 }
+        let all = |columns: &SlowVec<ColumnId>| {
+            check!(columns.len() <= COLUMNS);
+            #[expect(clippy::cast_possible_truncation, reason = "at most `COLUMNS`")]
+            let len = columns.len() as u32;
+            u64::MAX.checked_shr(64 - len).unwrap_or(0)
+        };
+        let outputs = [all(at!(columns, 0)), all(at!(columns, 1))];
+        JoinOp { kind, condition, columns, outputs, build: 1 }
     }
 
     fn probe(&self) -> u32 {
@@ -87,13 +97,22 @@ impl JoinOp {
         self.kind == JoinKind::Left && self.build == 0
     }
 
-    fn build_columns(&self) -> &[ColumnId] {
-        at!(self.columns, self.build as usize)
+    /// The build side's columns it outputs, and how many.
+    fn build_columns(&self) -> ([ColumnId; COLUMNS], usize) {
+        let (columns, outputs) = (self.build as usize, *at!(self.outputs, self.build as usize));
+        let mut out = [0; COLUMNS];
+        let mut count = 0;
+        for (i, &column) in at!(self.columns, columns).iter().enumerate() {
+            if outputs >> i & 1 != 0 {
+                *at_mut!(out, count) = column;
+                count += 1;
+            }
+        }
+        (out, count)
     }
 
     fn is_build_column(&self, column: ColumnId) -> bool {
-        #[expect(clippy::manual_contains, reason = "`contains` unrolls for long slices")]
-        self.build_columns().iter().any(|&c| c == column)
+        at!(self.columns, self.build as usize).iter().any(|&c| c == column)
     }
 
     /// The best key either side has among the equalities at the top of its
@@ -138,7 +157,8 @@ impl JoinOp {
                 count += 1;
             }
         };
-        for &column in self.build_columns() {
+        let (outputs, output_count) = self.build_columns();
+        for &column in at!(outputs, ..output_count) {
             add(column);
         }
         if let Some(condition) = self.condition.filter(|_| tested) {
@@ -166,8 +186,12 @@ impl JoinOp {
 impl<'c> Op<'c> for JoinOp {
     /// Keeps the columns needed above.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        for columns in &mut self.columns {
-            columns.retain(|&column| needed.is_needed(column));
+        for (columns, outputs) in self.columns.iter().zip(&mut self.outputs) {
+            for (i, &column) in columns.iter().enumerate() {
+                if !needed.is_needed(column) {
+                    *outputs &= !(1 << i);
+                }
+            }
         }
         self.reads(needed);
         Pruned::Keep
@@ -178,9 +202,11 @@ impl<'c> Op<'c> for JoinOp {
         if let Some(condition) = self.condition {
             mark_expr_columns(condition, reads);
         }
-        for columns in &self.columns {
-            for &column in columns.iter() {
-                reads.need(column);
+        for (columns, outputs) in self.columns.iter().zip(&self.outputs) {
+            for (i, &column) in columns.iter().enumerate() {
+                if outputs >> i & 1 != 0 {
+                    reads.need(column);
+                }
             }
         }
     }
@@ -270,7 +296,8 @@ impl<'c> Op<'c> for JoinOp {
         if self.keeps_build() {
             out.make_nullable();
         }
-        let mut out = self.pairs(&out, c.input(build), self.build_columns())?;
+        let (outputs, count) = self.build_columns();
+        let mut out = self.pairs(&out, c.input(build), at!(outputs, ..count))?;
         out.arrangements = Arrangements::NONE;
         out.drop_rows();
         out.scan = None;
@@ -321,10 +348,11 @@ impl<'c> Op<'c> for JoinOp {
             *at = position(column);
         }
         let mut build_types = [DataType::Int64; BATCH_COLUMNS_MAX as usize];
-        for (data_type, &column) in build_types.iter_mut().zip(self.build_columns()) {
+        let (outputs, count) = self.build_columns();
+        for (data_type, &column) in build_types.iter_mut().zip(at!(outputs, ..count)) {
             *data_type = rows.type_of(column);
         }
-        let (held, outputs) = (held.len(), self.build_columns().len());
+        let (held, outputs) = (held.len(), count);
         let mut probe_types = SlowVec::fixed(allocator, probe.column_count() as usize)?;
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
@@ -1103,6 +1131,27 @@ mod tests {
         let mut join = JoinOp::new(kind, condition, [one(0), one(1)]);
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build
+    }
+
+    #[test]
+    fn builds_by_keys_nothing_above_reads() {
+        // Joined on 0 = 1, of which only 2 and 3 are read above: pruned,
+        // the join still knows its first side's key is an id.
+        let mut exprs = Exprs::new(Global::current()).unwrap();
+        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
+        let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
+        nodes.node(ExprOp::Eq, a, b).unwrap();
+        let condition = Some(exprs.add(nodes.nodes()).unwrap());
+        let two = |a, b| SlowVec::fixed_from(Global::current(), [a, b].into_iter()).unwrap();
+        let mut join = JoinOp::new(JoinKind::Inner, condition, [two(0, 2), two(1, 3)]);
+        let mut needed = Needed::none(Global::current(), 4, &exprs).unwrap();
+        needed.need(2);
+        needed.need(3);
+        join.prune(&mut needed);
+        let mut first = Estimate::of(RowEstimate::exactly(1_000_000));
+        first.add_key(0, Key::Id);
+        join.choose(&exprs, &[first, Estimate::of(RowEstimate::exactly(10))]);
+        assert_eq!(join.build, 0);
     }
 
     #[test]
