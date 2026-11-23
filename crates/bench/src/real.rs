@@ -49,6 +49,21 @@ pub fn clickbench_query(name: &str) -> Option<&'static str> {
     pipesql.filter(|pipesql| !pipesql.is_empty())
 }
 
+/// The PipeSQL of query `number` of TPC suite `suite`, `tpch` or `tpcds`, in
+/// `tpc/SUITE.tsv`, if pipitdb can run it yet.
+pub fn tpc_query(suite: &str, number: &str) -> Option<&'static str> {
+    let queries = match suite {
+        "tpch" => include_str!("../tpc/tpch.tsv"),
+        "tpcds" => include_str!("../tpc/tpcds.tsv"),
+        _ => return None,
+    };
+    let pipesql = queries.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        if fields.next() == Some(number) { fields.next() } else { None }
+    });
+    pipesql.filter(|pipesql| !pipesql.is_empty())
+}
+
 struct Slices(&'static DynScannable<'static>);
 
 impl Catalog for Slices {

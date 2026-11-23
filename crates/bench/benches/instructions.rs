@@ -125,13 +125,104 @@ fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
 }
 
 library_benchmark_group!(name = clickbench_group, benchmarks = [clickbench]);
-// gungraun clears benchmarks' environment: `PIPIT_CLICKBENCH` says where the
-// ClickBench file is, and that it must be there.
+/// Tables by name, each the Parquet files named after it.
+struct Tables(Vec<(String, DynScannable<'static>)>);
+
+impl Catalog for Tables {
+    fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+        self.0.iter().find(|(table, _)| table == name).map(|(_, table)| table)
+    }
+}
+
+/// The tables of TPC suite `suite`, `tpch` or `tpcds`, and the PipeSQL of its
+/// query `number`. The tables are `tpc/generate.py`'s Parquet files at scale
+/// 0.01, in `$PIPIT_TPC/SUITE`, by default `target/tpc`. `None` without them,
+/// unless `$PIPIT_TPC` says where they should be, as in CI.
+#[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
+fn tpc(suite: &str, number: &str) -> Option<(&'static dyn Catalog, &'static str)> {
+    let set = std::env::var("PIPIT_TPC").ok();
+    let dir = set
+        .clone()
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/tpc").to_string());
+    let dir = std::path::Path::new(&dir).join(suite);
+    if set.is_none() && !dir.exists() {
+        return None;
+    }
+    let env = pipitdb_bench::env();
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("tpc/generate.py wrote the suite")
+        .map(|entry| entry.expect("a file").path())
+        .collect();
+    paths.sort();
+    let mut tables = Vec::new();
+    for path in paths {
+        let name = path.file_stem().expect("a file").to_string_lossy().into_owned();
+        let file: &'static FileSource =
+            Box::leak(Box::new(FileSource::open(&path).expect("readable")));
+        let sources: &'static [&dyn ByteSource] = Box::leak(Box::new([file as &dyn ByteSource]));
+        let table = ParquetTable::open(env, &Codecs, sources).expect("a Parquet file");
+        tables.push((name, DynScannable::new(env, table).expect("allocates")));
+    }
+    let query = pipitdb_bench::real::tpc_query(suite, number).expect("a query pipitdb runs");
+    Some((Box::leak(Box::new(Tables(tables))), query))
+}
+
+/// Compiles, plans and runs `query` over `catalog`, as a user would.
+#[expect(clippy::expect_used, reason = "a benchmark of a query that fails is broken")]
+fn run_query(catalog: &'static dyn Catalog, query: &str) -> u64 {
+    let plan = pipitdb_bench::plan(black_box(catalog), black_box(query)).expect("compiles");
+    pipitdb_bench::run_plan(&plan)
+}
+
+// TPC-H's and TPC-DS's queries that pipitdb runs, at scale 0.01: realistic
+// small queries, end to end. 0 without the data, which CI generates. (gungraun
+// allows no doc comment here.)
+#[library_benchmark]
+#[bench::q1(tpc("tpch", "1"))]
+#[bench::q3(tpc("tpch", "3"))]
+#[bench::q5(tpc("tpch", "5"))]
+#[bench::q7(tpc("tpch", "7"))]
+#[bench::q8(tpc("tpch", "8"))]
+#[bench::q9(tpc("tpch", "9"))]
+#[bench::q10(tpc("tpch", "10"))]
+#[bench::q12(tpc("tpch", "12"))]
+#[bench::q13(tpc("tpch", "13"))]
+#[bench::q14(tpc("tpch", "14"))]
+#[bench::q19(tpc("tpch", "19"))]
+fn tpch(query: Option<(&'static dyn Catalog, &'static str)>) -> u64 {
+    query.map_or(0, |(catalog, query)| black_box(run_query(catalog, query)))
+}
+
+#[library_benchmark]
+#[bench::q3(tpc("tpcds", "3"))]
+#[bench::q7(tpc("tpcds", "7"))]
+#[bench::q25(tpc("tpcds", "25"))]
+#[bench::q26(tpc("tpcds", "26"))]
+#[bench::q29(tpc("tpcds", "29"))]
+#[bench::q42(tpc("tpcds", "42"))]
+#[bench::q43(tpc("tpcds", "43"))]
+#[bench::q50(tpc("tpcds", "50"))]
+#[bench::q52(tpc("tpcds", "52"))]
+#[bench::q55(tpc("tpcds", "55"))]
+#[bench::q72(tpc("tpcds", "72"))]
+#[bench::q91(tpc("tpcds", "91"))]
+#[bench::q96(tpc("tpcds", "96"))]
+fn tpcds(query: Option<(&'static dyn Catalog, &'static str)>) -> u64 {
+    query.map_or(0, |(catalog, query)| black_box(run_query(catalog, query)))
+}
+
+library_benchmark_group!(name = tpc_group, benchmarks = [tpch, tpcds]);
+// gungraun clears benchmarks' environment: `PIPIT_CLICKBENCH` and `PIPIT_TPC`
+// say where the ClickBench file and the TPC data are, and that they must be
+// there.
 main!(
-    config = LibraryBenchmarkConfig::default().pass_through_env("PIPIT_CLICKBENCH");
+    config = LibraryBenchmarkConfig::default()
+        .pass_through_env("PIPIT_CLICKBENCH")
+        .pass_through_env("PIPIT_TPC");
     library_benchmark_groups = parser_group,
     small_group,
     perfetto_filter_group,
     join_group,
-    clickbench_group
+    clickbench_group,
+    tpc_group
 );
