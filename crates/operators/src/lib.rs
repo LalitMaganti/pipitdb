@@ -1,6 +1,7 @@
 //! The tables, sources and operators pipitdb comes with. They use the same
 //! API as any extension.
 
+#![forbid(unsafe_code)]
 #![no_std]
 
 #[macro_use]
