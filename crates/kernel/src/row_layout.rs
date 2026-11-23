@@ -85,11 +85,9 @@ impl RowLayout {
         for i in 0..count {
             let to = at_mut!(rows, i as usize * stride + offset..);
             if slot.nullable {
-                let value = get(i);
-                #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
-                let byte = u8::from(value.is_some()).wrapping_neg() ^ invert as u8;
-                *at_mut!(to, 0) = byte;
-                let bits = value.map_or(0, |value| value.encode() ^ invert).to_be_bytes();
+                let (flag, bits) = encode_nullable(slot, get(i));
+                *at_mut!(to, 0) = flag;
+                let bits = bits.to_be_bytes();
                 at_mut!(to, 1..=T::SIZE).copy_from_slice(at!(bits, 8 - T::SIZE..));
             } else {
                 let Some(value) = get(i) else { failed!() };
@@ -98,6 +96,15 @@ impl RowLayout {
             }
         }
     }
+}
+
+/// The flag and value bits `write` lays out in `slot`, a nullable slot, for
+/// `value`: as a pair, they order as the bytes do.
+pub(crate) fn encode_nullable<T: Encode>(slot: Slot, value: Option<T>) -> (u8, u64) {
+    let invert = if slot.descending { u64::MAX } else { 0 };
+    #[expect(clippy::cast_possible_truncation, reason = "a byte of all ones or none")]
+    let flag = u8::from(value.is_some()).wrapping_neg() ^ invert as u8;
+    (flag, value.map_or(0, |value| value.encode() ^ invert))
 }
 
 /// The word `write` laid out in `slot` of `row`, an integer or, if `float`,
@@ -250,6 +257,8 @@ mod tests {
             RowLayout::write(layout.slot(0), 5, get, &mut rows);
             for (i, row) in (0..).zip(rows.chunks(stride)) {
                 assert_eq!(decode(layout.slot(0), row, float), bits(i), "{i}");
+                let (flag, value) = encode_nullable(layout.slot(0), get(i));
+                assert_eq!((row[0], &row[1..]), (flag, &value.to_be_bytes()[..]), "{i}");
             }
         }
     }

@@ -5,12 +5,13 @@
 use core::cmp::Ordering;
 
 use crate::allocator::{AllocError, Allocator};
+use crate::column::DataType;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
-use crate::row_layout::{RowLayout, decode};
+use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
 use crate::slow_vec::SlowVec;
-use crate::sorted_rows::{SortKey, SortedRows, lay_out_keys};
+use crate::sorted_rows::{KeyColumn, SortKey, SortedRows, lay_out_keys_from};
 use crate::step::{Breaker, DynOperator};
 
 /// The breaker that outputs the first `count` rows sorted by `keys`. If it
@@ -121,29 +122,55 @@ impl TopK {
         kept: &mut Kept,
         input: &RowBatch<'b>,
     ) -> Result<RowBatch<'b>, Error> {
-        let (Some(cutoff), keys) = (&kept.cutoff, &mut kept.keys) else { failed!() };
-        let (layout, strings) = (kept.rows.layout(), kept.rows.string_columns());
+        let (Some(cutoff), keys, held) = (&kept.cutoff, &mut kept.keys, &kept.rows) else {
+            failed!()
+        };
+        let (layout, columns) = (held.layout(), held.key_columns());
+        check!(!columns.is_empty());
         let stride = layout.stride() as usize;
-        let count = input.selection().len() as usize;
-        while keys.pop().is_some() {}
-        keys.extend_zeroed(count * stride)?;
-        lay_out_keys(layout, input, &self.keys, keys);
-        let mut passing = 0;
-        let mut i = 0;
+        // Strings' slots are left as they were: `sort` lays them out.
+        let len = input.selection().len() as usize * stride;
+        keys.extend_zeroed(len.saturating_sub(keys.len()))?;
+        // Most rows come after the cutoff on the first key alone: they're
+        // dropped before any key is laid out.
+        let (slot, column) = (layout.slot(0), input.column(at!(self.keys, 0).column));
+        let (values, string) = (column.values(), column.data_type() == DataType::String);
+        let float = column.data_type() == DataType::Float64;
+        let words = if string { &[][..] } else { values.words() };
+        let their_string =
+            at!(cutoff.strings, 0).map(|(start, len)| at!(cutoff.bytes, start..start + len));
+        let at = usize::from(slot.offset);
+        let mut bits = [0; 8];
+        if !string {
+            let cutoff_bits = at!(cutoff.keys, at + 1..=at + Word::SIZE);
+            at_mut!(bits, 8 - Word::SIZE..).copy_from_slice(cutoff_bits);
+        }
+        let theirs = (*at!(cutoff.keys, at), u64::from_be_bytes(bits));
+        let only = columns.len() == 1;
+        let (mut i, mut passing) = (0, 0);
         let mut passed = RowBatch::new();
         passed.copy_from(input);
         passed.selection_mut().retain(|row| {
-            let laid_out = at!(keys, i * stride..(i + 1) * stride);
+            let from = i;
             i += 1;
-            let ordering = compare(layout, strings, cutoff, input, u32::from(row), laid_out);
-            if ordering != Ordering::Less {
+            let row = u32::from(row);
+            let present = !values.is_null(row);
+            let ordering = if string {
+                let mine = present.then(|| values.strings().get(row as usize));
+                // Nulls first, as `None` orders.
+                let ordering = mine.cmp(&their_string);
+                if slot.descending { ordering.reverse() } else { ordering }
+            } else {
+                let mine = present.then(|| Word { bits: *at!(words, row as usize), float });
+                encode_nullable(slot, mine).cmp(&theirs)
+            };
+            if ordering.is_gt() || only && ordering.is_eq() {
                 return false;
             }
-            if passing != i - 1 {
-                keys.copy_within((i - 1) * stride..i * stride, passing * stride);
-            }
-            passing += 1;
-            true
+            let laid_out = at_mut!(keys, passing * stride..(passing + 1) * stride);
+            let before = lay_out_passing(held, &self.keys, cutoff, input, from, ordering, laid_out);
+            passing += usize::from(before);
+            before
         });
         Ok(passed)
     }
@@ -170,8 +197,8 @@ impl TopK {
         }
         let mut strings = SlowVec::fixed(allocator, self.keys.len())?;
         let mut bytes = SlowVec::new(allocator, 1 << 31)?;
-        for column in first.string_columns() {
-            let string = column.and_then(|column| first.string(column, last));
+        for column in first.key_columns() {
+            let string = column.string().and_then(|column| first.string(column, last));
             strings.push(string.map(|string| (bytes.len(), string.len())))?;
             bytes.extend_from_slice(string.unwrap_or_default())?;
         }
@@ -180,23 +207,40 @@ impl TopK {
     }
 }
 
+/// Lays out at `laid_out` the keys of the `from`th row `input` keeps, which
+/// compares with the cutoff on its first key as `first`, and returns whether
+/// it comes before the cutoff. Few rows do, so it's kept out of the loop.
+#[cold]
+#[inline(never)]
+fn lay_out_passing(
+    held: &SortedRows,
+    keys: &[SortKey],
+    cutoff: &Cutoff,
+    input: &RowBatch,
+    from: u32,
+    first: Ordering,
+    laid_out: &mut [u8],
+) -> bool {
+    let (layout, columns) = (held.layout(), held.key_columns());
+    lay_out_keys_from(layout, input, keys, from, laid_out);
+    let row = input.selection().kept().row(from);
+    first.is_lt() || compare(layout, columns, cutoff, input, row, laid_out).is_lt()
+}
+
 /// How the row `row` of `input`, its keys laid out at `laid_out` by
 /// `layout`, compares with the cutoff. String keys, whose ranks aren't known
 /// until rows are sorted, are compared by their bytes, as ranks order them.
 fn compare(
     layout: &RowLayout,
-    strings: &[Option<u32>],
+    columns: &[KeyColumn],
     cutoff: &Cutoff,
     input: &RowBatch,
     row: u32,
     laid_out: &[u8],
 ) -> Ordering {
-    if strings.iter().all(Option::is_none) {
-        return laid_out.cmp(&cutoff.keys);
-    }
-    for (k, string) in strings.iter().enumerate() {
+    for (k, key) in columns.iter().enumerate() {
         let slot = layout.slot(k);
-        let ordering = if let Some(column) = *string {
+        let ordering = if let Some(column) = key.string() {
             let values = input.column(column).values();
             let mine = (!values.is_null(row)).then(|| values.strings().get(row as usize));
             let theirs =
@@ -206,7 +250,7 @@ fn compare(
             if slot.descending { ordering.reverse() } else { ordering }
         } else {
             let start = usize::from(slot.offset);
-            let end = strings
+            let end = columns
                 .get(k + 1)
                 .map_or(layout.stride() as usize, |_| usize::from(layout.slot(k + 1).offset));
             at!(laid_out, start..end).cmp(at!(cutoff.keys, start..end))
