@@ -1,8 +1,8 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
 use crate::allocator::AllocError;
+use crate::containers::SmallVec;
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 pub struct Names {
     bytes: SmallVec<u8>,

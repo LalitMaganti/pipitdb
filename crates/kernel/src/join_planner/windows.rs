@@ -6,11 +6,9 @@ use super::estimate::Estimator;
 use super::exact::{self, Link};
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree, Node};
-use crate::array::Array;
-use crate::bitmap::BitSlice;
+use crate::containers::{Array, BitSlice, SmallVec};
 use crate::env::Env;
 use crate::error::Error;
-use crate::small_vec::SmallVec;
 
 /// How many subtrees a window joins.
 const WINDOW: usize = 8;

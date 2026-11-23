@@ -9,9 +9,8 @@
 //! each key is its row's number above the first, as a table's ids are.
 
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::bitmap::{BitSlice, Bitmap};
 use crate::column::{ColumnView, DataType, Form, Forms};
+use crate::containers::{Array, BitSlice, Bitmap, SmallVec};
 use crate::context::Context;
 use crate::error::Error;
 use crate::estimate::Estimate;
@@ -31,7 +30,6 @@ use crate::env::Env;
 use crate::row_store::RowStore;
 use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
-use crate::small_vec::SmallVec;
 use crate::step::{DynOperator, DynSource, Operator, Progress, Step, Transform};
 
 mod direct;

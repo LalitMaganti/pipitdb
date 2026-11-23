@@ -5,13 +5,13 @@
 
 use crate::allocator::AllocError;
 use crate::column::DataType;
+use crate::containers::SmallVec;
 use crate::context::CUTOFFS_MAX;
 use crate::env::Env;
 use crate::expression::Exprs;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
-use crate::small_vec::SmallVec;
 
 /// A layout known to hold for rows: grouped by the columns of its first
 /// `grouped` keys, none meaning one group, and each group sorted by the

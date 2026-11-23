@@ -5,8 +5,8 @@
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::boxed::{Box, ErasedBox};
 use crate::column::ColumnView;
+use crate::containers::{Box, ErasedBox};
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::value_of;

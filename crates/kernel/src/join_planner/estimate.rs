@@ -3,7 +3,7 @@
 //! source.
 
 use super::graph::{JoinEdge, JoinKind, QueryGraph};
-use crate::array::Array;
+use crate::containers::Array;
 use crate::env::Env;
 use crate::error::Error;
 

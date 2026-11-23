@@ -2,9 +2,8 @@
 //! whole blocks at a time, and sorting strings by their bytes.
 
 use crate::allocator::AllocError;
-use crate::array::Array;
+use crate::containers::{Array, SmallVec};
 use crate::env::Env;
-use crate::small_vec::SmallVec;
 
 /// How many bits one partition splits on.
 const DIGIT_BITS: u32 = 8;

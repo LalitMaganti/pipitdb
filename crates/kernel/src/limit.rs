@@ -122,10 +122,10 @@ mod tests {
 
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
+    use crate::containers::SmallVec;
     use crate::env::Env;
     use crate::pipeline::Pipeline;
     use crate::selection::Kept;
-    use crate::small_vec::SmallVec;
     use crate::step::{DynSource, Source};
 
     /// `batches` batches of two rows, counting up from 0, counting in

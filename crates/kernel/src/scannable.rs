@@ -10,17 +10,16 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::{Bounds, ColumnView, DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
+use crate::containers::{Box, ErasedBox, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
-use crate::small_vec::SmallVec;
 use crate::step::{DynSource, DynTransform, ErasedBatch, NewState};
 
 /// Named, typed columns, read into batches. Where a read is lives in

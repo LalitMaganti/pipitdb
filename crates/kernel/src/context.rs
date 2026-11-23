@@ -3,10 +3,10 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
+use crate::containers::SmallVec;
 use crate::env::{Env, MemoryKind};
 use crate::function::DynFunction;
 use crate::selection::Selection;
-use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::string_pool::StringPool;
 

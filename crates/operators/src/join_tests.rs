@@ -3,7 +3,7 @@
 
 extern crate std;
 
-use pipit_kernel::bitmap::BitSlice;
+use pipit_kernel::containers::{BitSlice, SmallVec};
 use std::format;
 use std::string::{String, ToString};
 use std::vec;
@@ -24,7 +24,6 @@ use pipit_kernel::plan::{
 };
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
-use pipit_kernel::small_vec::SmallVec;
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
     let mut buffer = Buffer::allocate(Env::current(), values.len() * 8).unwrap();

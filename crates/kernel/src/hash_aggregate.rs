@@ -10,6 +10,7 @@ use crate::aggregate_function::{
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms};
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
@@ -18,7 +19,6 @@ use crate::group_table::{GroupTable, KEYS_MAX};
 use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
-use crate::small_vec::SmallVec;
 use crate::step::{Breaker, DynOperator};
 use crate::string_pool::CACHED_SLOTS;
 
@@ -374,7 +374,7 @@ impl Breaker for HashAggregate {
 
 #[cfg(test)]
 mod tests {
-    use crate::bitmap::BitSlice;
+    use crate::containers::BitSlice;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;

@@ -6,11 +6,10 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
-use crate::bitmap::BitSlice;
+use crate::containers::{Array, BitSlice};
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
-use crate::array::Array;
 use crate::column::{ColumnView, DataType, Form, Forms, Values};
 use crate::eight;
 use crate::env::Env;

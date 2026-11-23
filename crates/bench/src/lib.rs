@@ -2,9 +2,10 @@
 
 pub mod join_planner;
 
-use pipit_kernel::bitmap::BitSlice;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
+use pipit_kernel::containers::BitSlice;
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::env::{Env, ThreadEnv};
 use pipit_kernel::error::Error;
@@ -23,7 +24,6 @@ use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Selection;
-use pipit_kernel::small_vec::SmallVec;
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
@@ -395,7 +395,7 @@ pub fn small_plan(rows: u32, query: &str) -> PhysicalPlan<'static> {
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
     let mut owned =
-        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), steps).expect("allocates");
+        pipit_kernel::containers::SmallVec::fixed(crate::env(), steps).expect("allocates");
     for _ in 0..steps {
         let step = if operators {
             Step::Operator(DynOperator::new(crate::env(), PassOperator).expect("allocates"))
@@ -414,7 +414,7 @@ pub fn nested_pipeline(batches: u32) -> Pipeline<'static> {
     let inner = pass_pipeline(batches, 0, false).into_source(crate::env()).expect("allocates");
     Pipeline::new(
         inner,
-        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), 0).expect("allocates"),
+        pipit_kernel::containers::SmallVec::fixed(crate::env(), 0).expect("allocates"),
     )
 }
 
@@ -444,7 +444,7 @@ pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static>
     let source = table.scan(crate::env(), columns, &[], None).expect("allocates");
     Pipeline::new(
         source,
-        pipit_kernel::small_vec::SmallVec::fixed(crate::env(), 0).expect("allocates"),
+        pipit_kernel::containers::SmallVec::fixed(crate::env(), 0).expect("allocates"),
     )
 }
 
@@ -615,7 +615,7 @@ pub fn predicate(shape: &str) -> Predicate {
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
     Predicate::new(
-        pipit_kernel::small_vec::SmallVec::fixed_from(crate::env(), nodes.iter().copied())
+        pipit_kernel::containers::SmallVec::fixed_from(crate::env(), nodes.iter().copied())
             .expect("allocates"),
     )
 }

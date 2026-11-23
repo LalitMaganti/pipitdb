@@ -2,12 +2,11 @@
 //! each group, and how it updates and outputs it, a batch at a time, as
 //! Perfetto's do, for the operators that aggregate.
 
-use crate::bitmap::BitSlice;
+use crate::containers::{BitSlice, Blocks, address};
 use core::cmp::Ordering;
 
 use crate::aggregate::Function;
 use crate::allocator::AllocError;
-use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, Validity};
 use crate::context::Context;

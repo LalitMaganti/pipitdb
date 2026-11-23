@@ -4,6 +4,7 @@
 
 use crate::allocator::AllocError;
 use crate::column::Forms;
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::estimate::Estimate;
 use crate::expression::Exprs;
@@ -11,7 +12,6 @@ use crate::join_planner::plan_regions;
 use crate::plan::{
     Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
-use crate::small_vec::SmallVec;
 
 /// Runs every pass over `plan`, with scratch memory from `env`.
 pub fn optimize(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {

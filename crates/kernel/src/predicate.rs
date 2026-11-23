@@ -9,6 +9,7 @@ use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::DataType;
 use crate::column::{ColumnView, Form};
+use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
@@ -19,7 +20,6 @@ use crate::murmur_hash;
 use crate::plan::ColumnId;
 use crate::row_batch::RowBatch;
 use crate::selection::Selection;
-use crate::small_vec::SmallVec;
 use crate::step::Transform;
 use crate::string_pool::{Id, StringPool};
 

@@ -13,8 +13,8 @@ use core::mem;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::array::Array;
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::containers::Array;
 use crate::env::Env;
 use crate::murmur_hash;
 

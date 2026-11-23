@@ -4,6 +4,7 @@
 
 use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
+use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
@@ -14,7 +15,6 @@ use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::scannable::Key;
-use crate::small_vec::SmallVec;
 use crate::step::DynSource;
 use crate::step::Step;
 use crate::values::Values;

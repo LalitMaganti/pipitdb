@@ -10,8 +10,8 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
+use pipit_kernel::containers::SmallVec;
 use pipit_kernel::env::Env;
-use pipit_kernel::small_vec::SmallVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
 /// argument counts as a level.

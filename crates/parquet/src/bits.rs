@@ -1,6 +1,6 @@
 //! Moving values to the rows a validity bitmap says aren't null.
 
-use pipit_kernel::bitmap::BitSlice;
+use pipit_kernel::containers::BitSlice;
 
 /// Moves the first `valid` of `values` to the rows `validity` says aren't
 /// null, in order, and sets the rest to `null`. From the end, so none is

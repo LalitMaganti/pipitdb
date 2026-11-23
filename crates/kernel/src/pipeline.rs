@@ -14,15 +14,13 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::array::Array;
-use crate::boxed::Box;
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
+use crate::containers::{Array, Box, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::RowBatch;
-use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::step::{DynSource, ErasedBatch, Progress, Step};
 
@@ -786,13 +784,13 @@ mod tests {
     }
 
     impl Transform for Boxed {
-        type State = crate::boxed::Box<i64>;
+        type State = crate::containers::Box<i64>;
 
         fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
             if self.fail {
                 return Err(Error::OutOfMemory);
             }
-            Ok(crate::boxed::Box::new(context.env(), 7)?)
+            Ok(crate::containers::Box::new(context.env(), 7)?)
         }
 
         fn process(
@@ -916,7 +914,7 @@ mod tests {
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
         let env = Env::current();
-        let mut owned = crate::small_vec::SmallVec::new(env, 8).unwrap();
+        let mut owned = crate::containers::SmallVec::new(env, 8).unwrap();
         for step in steps {
             assert!(owned.push(step).is_ok());
         }

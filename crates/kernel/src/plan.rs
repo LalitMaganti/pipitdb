@@ -8,9 +8,9 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
+use crate::containers::{Box, ErasedBox, InlineVec, SmallVec};
 use crate::env::Env;
 use crate::erase::{value_mut_of, value_of};
 use crate::estimate::{Estimate, RowEstimate};
@@ -19,7 +19,6 @@ use crate::expression::{
     mark_expr_columns, type_expr,
 };
 use crate::function::DynFunction;
-use crate::inline_vec::InlineVec;
 use crate::join::JoinOp;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
@@ -28,7 +27,6 @@ use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, 
 use crate::predicate::{Filter, Predicate, compared_with};
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
-use crate::small_vec::SmallVec;
 use crate::statement::Statement;
 use crate::step::{DynTransform, Step};
 use crate::string_pool::Id;

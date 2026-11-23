@@ -2,7 +2,7 @@
 //! one; `ComputeOp`, the op that adds columns computed by them; and
 //! `Compute`, the transform that runs it.
 
-use crate::bitmap::BitSlice;
+use crate::containers::{BitSlice, SmallVec};
 use core::ops::BitOr;
 
 use crate::allocator::AllocError;
@@ -21,7 +21,6 @@ use crate::plan::{ColumnId, Op, PlanNode};
 use crate::predicate::{Leaf, Predicate, Set};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
-use crate::small_vec::SmallVec;
 use crate::step::{DynTransform, Step, Transform};
 use crate::string_pool::Id;
 

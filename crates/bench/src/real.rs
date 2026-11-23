@@ -2,7 +2,7 @@
 //! `test/data` of a Perfetto checkout at `$PIPIT_PERFETTO` (`~/perfetto` by
 //! default). Not in CI, which has no checkout.
 
-use pipit_kernel::bitmap::BitSlice;
+use pipit_kernel::containers::BitSlice;
 use std::collections::HashMap;
 use std::path::PathBuf;
 

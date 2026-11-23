@@ -131,7 +131,7 @@ fn open_unnamed(dir: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::bitmap::BitSlice;
+    use pipit_kernel::containers::BitSlice;
 
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
