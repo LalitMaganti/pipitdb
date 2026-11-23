@@ -28,6 +28,7 @@
   "perfetto_filter.eq_uint32": 3816144,
   "perfetto_filter.lt_int64": 3817680,
   "query.typical": 729636,
+  "small.empty": 23654,
   "small.point": 47612,
   "tpcds.q25": 54516600,
   "tpcds.q26": 19394764,
