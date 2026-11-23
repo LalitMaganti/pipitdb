@@ -2,6 +2,7 @@
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
 use crate::allocator::AllocError;
+use crate::bitmap::BitSlice;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
 use crate::context::Context;
@@ -580,7 +581,8 @@ struct Packing {
 impl Packing {
     fn new(context: &mut Context, data_type: DataType) -> Result<Packing, AllocError> {
         let values = context.values_buffer(BATCH_ROWS_MAX as usize * 8)?;
-        let mut validity = context.small_buffer(BATCH_ROWS_MAX.div_ceil(8) as usize)?;
+        let mut validity =
+            context.small_buffer(BitSlice::<u8>::words_for(BATCH_ROWS_MAX as usize))?;
         validity.as_mut_slice::<u8>().fill(0);
         let bytes = if data_type.has_bytes() {
             Some(SlowVec::new(context.allocator(), 1 << 31)?)
@@ -597,7 +599,7 @@ impl Packing {
             let row = kept.row(i);
             let at = self.rows as usize;
             let valid = !values.is_null(row);
-            *at_mut!(self.validity.as_mut_slice::<u8>(), at / 8) |= u8::from(valid) << (at % 8);
+            BitSlice::of_mut(self.validity.as_mut_slice::<u8>()).set_if(at, valid);
             self.nulls |= !valid;
             match &mut self.bytes {
                 None => {
@@ -662,14 +664,14 @@ fn gather(
     let mut values = context.values_buffer(rows * 8)?;
     let mut validity = None;
     if nullable {
-        let mut buffer = context.small_buffer(rows.div_ceil(8))?;
+        let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         let bits = buffer.as_mut_slice::<u8>();
         bits.fill(0);
         let mut nulls = false;
         for (r, &place) in places.iter().enumerate() {
             let (source, row) = found(place);
             let valid = source.is_valid(row);
-            *at_mut!(bits, r / 8) |= u8::from(valid) << (r % 8);
+            BitSlice::of_mut(&mut *bits).set_if(r, valid);
             nulls |= !valid;
         }
         validity = nulls.then_some(buffer);
@@ -716,15 +718,14 @@ mod tests {
     fn batch(context: &mut Context, base: i64, keep: impl FnMut(u16) -> bool) -> RowBatch<'static> {
         let rows = BATCH_ROWS_MAX;
         let mut ints = context.values_buffer(rows as usize * 8).unwrap();
-        let mut validity = context.small_buffer(rows.div_ceil(8) as usize).unwrap();
+        let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows as usize)).unwrap();
         validity.as_mut_slice::<u8>().fill(0);
         let mut text = String::new();
         let mut views = context.values_buffer(rows as usize * 8).unwrap();
         for row in 0..rows {
             let value = value(base, row);
             ints.as_mut_slice::<i64>()[row as usize] = value.unwrap_or(0);
-            validity.as_mut_slice::<u8>()[row as usize / 8] |=
-                u8::from(value.is_some()) << (row % 8);
+            BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row as usize, value.is_some());
             let string = format!("v{}", value.unwrap_or(0));
             let start = u32::try_from(text.len()).unwrap();
             views.as_mut_slice::<u32>()[2 * row as usize..2 * row as usize + 2]

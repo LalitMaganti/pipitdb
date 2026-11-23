@@ -5,6 +5,7 @@
 use super::estimate::Estimator;
 use super::graph::{QueryGraph, Sides};
 use super::tree::{JoinNode, JoinTree};
+use crate::bitmap::BitSlice;
 use crate::error::Error;
 use crate::global::Global;
 use crate::slow_vec::SlowVec;
@@ -75,7 +76,7 @@ pub(super) fn plan<'g>(
     work: &mut usize,
 ) -> Result<Option<JoinTree>, Error> {
     let count = graph.relations.len();
-    let words = count.div_ceil(64);
+    let words = BitSlice::<u64>::words_for(count);
     let mut greedy = Greedy {
         graph,
         estimator,
@@ -92,7 +93,7 @@ pub(super) fn plan<'g>(
         greedy.nodes.push(Node { left: NONE, right: NONE, rows, place: node })?;
     }
     for relation in 0..count {
-        *at_mut!(greedy.sets, relation * words + relation / 64) |= 1 << (relation % 64);
+        BitSlice::of_mut(at_mut!(greedy.sets, relation * words..)).set(relation);
     }
     // Each hyperedge is linked in front of those before it, unless it has
     // the same sides as the last one linked.

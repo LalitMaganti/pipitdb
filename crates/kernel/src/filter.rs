@@ -6,6 +6,7 @@
 //! selection, `dropped`, a filter also writes the rows it drops there, in the
 //! same pass, so an `OR` can test its next condition on only those.
 
+use crate::bitmap::BitSlice;
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
@@ -387,7 +388,8 @@ impl Entries {
             && self.dictionary.as_ref().is_some_and(|dictionary| dictionary.shares_values(column));
         if !found {
             let values = column.values();
-            let mut bits = Array::zeroed(allocator, (values.len() as usize).div_ceil(64))?;
+            let mut bits =
+                Array::zeroed(allocator, BitSlice::<u64>::words_for(values.len() as usize))?;
             set(values, &mut bits);
             self.matched = bits.iter().map(|word| word.count_ones()).sum();
             if self.matched == 1 {
@@ -420,7 +422,7 @@ pub fn compare_string_bits(
 fn set(bits: &mut [u64], values: Values<'_>, test: impl Fn(u32) -> bool) {
     for e in 0..values.len() {
         let passes = !values.is_null(e) && test(e);
-        *at_mut!(bits, e as usize / 64) |= u64::from(passes) << (e % 64);
+        BitSlice::of_mut(&mut *bits).set_if(e as usize, passes);
     }
 }
 
@@ -461,7 +463,7 @@ pub fn keep_entries(
             return e == entries.only;
         }
         // An index past the entries fails the check, as when read anywhere.
-        (*at!(bits, e as usize / 64) >> (e % 64)) & 1 == 1
+        BitSlice::of(bits).get(e as usize)
     });
 }
 
@@ -718,7 +720,7 @@ mod tests {
             let mut validity = Buffer::allocate(global, 2).unwrap();
             for row in 0..10_u16 {
                 if !nulls.contains(&row) {
-                    validity.as_mut_slice::<u8>()[row as usize / 8] |= 1 << (row % 8);
+                    BitSlice::of_mut(validity.as_mut_slice::<u8>()).set(row as usize);
                 }
             }
             validity
@@ -839,10 +841,11 @@ mod tests {
             let mut values = Buffer::allocate(global, cells.len() * 8).unwrap();
             values.as_mut_slice::<i64>().copy_from_slice(&cells);
             let validity = nulls.then(|| {
-                let mut validity = Buffer::allocate(global, cells.len().div_ceil(8)).unwrap();
+                let mut validity =
+                    Buffer::allocate(global, BitSlice::<u8>::words_for(cells.len())).unwrap();
                 validity.as_mut_slice::<u8>().fill(0);
                 for row in (0..cells.len()).filter(|row| !row.is_multiple_of(3)) {
-                    validity.as_mut_slice::<u8>()[row / 8] |= 1 << (row % 8);
+                    BitSlice::of_mut(validity.as_mut_slice::<u8>()).set(row);
                 }
                 validity
             });

@@ -6,6 +6,7 @@ use super::estimate::Estimator;
 use super::exact::{self, Link};
 use super::graph::{LIST_MAX, QueryGraph};
 use super::tree::{JoinNode, JoinTree, Node};
+use crate::bitmap::BitSlice;
 use crate::error::Error;
 use crate::global::Global;
 use crate::slow_vec::SlowVec;
@@ -43,13 +44,13 @@ pub(super) fn improve<'g>(
     work: &mut usize,
 ) -> Result<(), Error> {
     let count = graph.relations.len();
-    let words = count.div_ceil(64);
+    let words = BitSlice::<u64>::words_for(count);
     let mut sets = SlowVec::zeroed(global, (tree.nodes.len() + 2) * words)?;
     for (node, found) in tree.nodes.iter().enumerate() {
         match found.kind {
             JoinNode::Relation(relation) => {
                 let relation = relation as usize;
-                *at_mut!(sets, node * words + relation / 64) |= 1 << (relation % 64);
+                BitSlice::of_mut(at_mut!(sets, node * words..)).set(relation);
             }
             JoinNode::Join { left, right } => {
                 #[expect(clippy::cast_possible_truncation, reason = "at most `2 * LIST_MAX`")]

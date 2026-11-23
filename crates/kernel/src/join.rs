@@ -9,6 +9,7 @@
 //! each key is its row's number above the first, as a table's ids are.
 
 use crate::allocator::AllocError;
+use crate::bitmap::{BitSlice, Bitmap};
 use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
@@ -505,7 +506,7 @@ struct Held {
     /// When it keeps the build rows: a bit for each, set once a probe row
     /// matched it; the next it hasn't looked at for output at the end; and
     /// a null column of each probe column's type, a batch long.
-    build_matched: SlowVec<u64>,
+    build_matched: Bitmap,
     unmatched: u32,
     probe_nulls: SlowVec<ColumnView>,
 }
@@ -695,7 +696,7 @@ fn last_of(table: &GroupTable, group: u32) -> u32 {
 }
 
 fn is_matched(matched: &[u64], row: u16) -> bool {
-    at!(matched, usize::from(row / 64)) >> (row % 64) & 1 != 0
+    BitSlice::of(matched).get(usize::from(row))
 }
 
 /// The kept rows of `selection`, by index, or empty if they're a prefix,
@@ -765,8 +766,7 @@ impl Join<'_> {
             }
         }
         if self.keeps_build {
-            let words = held.count.div_ceil(64) as usize;
-            held.build_matched = SlowVec::zeroed(context.allocator(), words)?;
+            held.build_matched = Bitmap::new(context.allocator(), held.count as usize)?;
         }
         held.rows.flush(context)
     }
@@ -1005,7 +1005,7 @@ impl Operator for Join<'_> {
             nulls,
             paired: SlowVec::zeroed(allocator, BATCH_ROWS_MAX as usize)?,
             condition,
-            build_matched: SlowVec::zeroed(allocator, 0)?,
+            build_matched: Bitmap::new(allocator, 0)?,
             unmatched: 0,
             probe_nulls,
         })
@@ -1036,11 +1036,11 @@ impl Operator for Join<'_> {
             // Only a left join outputs rows by whether they matched.
             for i in (0..selection.len()).filter(|_| self.keeps_probe()) {
                 let kept = selection.kept().row(i);
-                *at_mut!(held.matched, kept as usize / 64) |= 1 << (kept % 64);
+                BitSlice::of_mut(&mut held.matched).set(kept as usize);
             }
             for i in (0..selection.len()).filter(|_| self.keeps_build) {
                 let build = *at!(held.paired, selection.kept().row(i) as usize);
-                *at_mut!(held.build_matched, build as usize / 64) |= 1 << (build % 64);
+                held.build_matched.set(build as usize);
             }
             if selection.is_empty() {
                 continue;
@@ -1075,7 +1075,7 @@ impl Operator for Join<'_> {
         while held.unmatched < held.count && count < BATCH_ROWS_MAX {
             let row = held.unmatched;
             held.unmatched += 1;
-            if *at!(held.build_matched, row as usize / 64) >> (row % 64) & 1 == 0 {
+            if !held.build_matched.get(row as usize) {
                 *at_mut!(held.paired, count as usize) = row;
                 count += 1;
             }

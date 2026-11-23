@@ -6,6 +6,7 @@
 //! Calls block. A store that's remote does its uploads and fetches on its
 //! own threads, behind them.
 
+use crate::bitmap::BitSlice;
 use crate::column::{ColumnView, DataType, Strings, Validity};
 use crate::context::Context;
 use crate::error::Error;
@@ -91,7 +92,7 @@ pub fn write_column(
 /// if the view starts mid-byte, so they need no memory.
 fn write_validity(store: &dyn SpillStore, log: LogId, validity: Validity) -> Result<Block, Error> {
     let (bits, shift) = validity.bits();
-    let len = validity.row_count().div_ceil(8) as usize;
+    let len = BitSlice::<u8>::words_for(validity.row_count() as usize);
     let mut chunk = [0_u8; CHUNK_BYTES];
     let mut block = None;
     for first in (0..len).step_by(CHUNK_BYTES) {
@@ -182,9 +183,9 @@ pub fn read_column(
     let validity = match spilled.validity {
         None => None,
         Some(block) => {
-            let len = spilled.row_count.div_ceil(8);
-            check!(block.len == u64::from(len));
-            let mut bits = context.small_buffer(len as usize)?;
+            let len = BitSlice::<u8>::words_for(spilled.row_count as usize);
+            check!(block.len == len as u64);
+            let mut bits = context.small_buffer(len)?;
             store.read(log, block, bits.as_mut_slice::<u8>())?;
             Some(bits)
         }
@@ -289,10 +290,11 @@ mod tests {
         let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
+            let mut bits =
+                Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
             bits.as_mut_slice::<u8>().fill(0xff);
             for &row in nulls {
-                bits.as_mut_slice::<u8>()[row as usize / 8] &= !(1 << (row % 8));
+                BitSlice::of_mut(bits.as_mut_slice::<u8>()).clear(row as usize);
             }
             bits
         });
@@ -340,7 +342,8 @@ mod tests {
                 .copy_from_slice(&[u32::try_from(at).unwrap(), len]);
             at += word.len();
         }
-        let mut validity = Buffer::allocate(global, words.len().div_ceil(8)).unwrap();
+        let mut validity =
+            Buffer::allocate(global, BitSlice::<u8>::words_for(words.len())).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1110_1111);
         let whole =
             ColumnView::strings(&mut Context::new(global, None), views, bytes, Some(validity))

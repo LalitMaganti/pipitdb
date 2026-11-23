@@ -1,5 +1,6 @@
 //! `ColumnView`: a range of rows over a column's buffers.
 
+use crate::bitmap::BitSlice;
 use core::cell::Cell;
 use core::ptr::NonNull;
 
@@ -198,7 +199,7 @@ impl GatherSource {
         self.validity.is_none_or(|bits| {
             // SAFETY: made from the view's validity, which it keeps alive.
             let bits = unsafe { bits.as_ref() };
-            *at!(bits, row / 8) >> (row % 8) & 1 != 0
+            BitSlice::of(bits).get(row)
         })
     }
 
@@ -289,7 +290,7 @@ impl ColumnView {
         len: u32,
     ) -> Result<ColumnView, AllocError> {
         if let Some(validity) = &validity {
-            check!(validity.size_bytes() >= len.div_ceil(8) as usize);
+            check!(validity.size_bytes() >= BitSlice::<u8>::words_for(len as usize));
         }
         let (indices, bounds) = (None, Cell::new(UNKNOWN));
         let kind = Kind::Flat;
@@ -545,15 +546,15 @@ impl ColumnView {
         let validity = match values.validity() {
             None => None,
             Some(valid) => {
-                let mut bits = context.small_buffer(rows.div_ceil(8))?;
+                let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
                 let out = bits.as_mut_slice::<u8>();
                 out.fill(0);
                 for row in 0..self.row_count {
                     let i = index(row);
                     check!(i < values.len);
                     // SAFETY: `i` is one of the values, checked just above.
-                    let bit = u8::from(unsafe { valid.is_valid_unchecked(i) });
-                    *at_mut!(out, row as usize / 8) |= bit << (row % 8);
+                    let valid = unsafe { valid.is_valid_unchecked(i) };
+                    BitSlice::of_mut(&mut *out).set_if(row as usize, valid);
                 }
                 Some(bits)
             }
@@ -697,7 +698,7 @@ impl<'a> Values<'a> {
         check!(value < self.len);
         let Some(validity) = &self.header.validity else { return false };
         let bit = (self.start + value) as usize;
-        at!(validity.as_slice::<u8>(), bit / 8) & (1 << (bit % 8)) == 0
+        !BitSlice::of(validity.as_slice::<u8>()).get(bit)
     }
 
     fn slice_of<T: Primitive>(self) -> &'a [T] {
@@ -772,7 +773,7 @@ impl<'a> Validity<'a> {
         let bit = (self.start + row) as usize;
         // SAFETY: `ColumnView::new` checked the bitmap covers every row, and
         // `slice` keeps rows within it.
-        (unsafe { *self.bits.get_unchecked(bit / 8) } >> (bit % 8)) & 1 != 0
+        unsafe { BitSlice::of(self.bits).get_unchecked(bit) }
     }
 }
 
@@ -904,10 +905,11 @@ mod tests {
         let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
+            let mut bits =
+                Buffer::allocate(global, BitSlice::<u8>::words_for(values.len())).unwrap();
             bits.as_mut_slice::<u8>().fill(0xff);
             for &row in nulls {
-                bits.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
+                BitSlice::of_mut(bits.as_mut_slice::<u8>()).clear(row);
             }
             bits
         });

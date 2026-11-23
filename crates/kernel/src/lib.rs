@@ -11,6 +11,7 @@ pub mod aggregate;
 mod aggregate_function;
 pub mod allocator;
 mod array;
+pub mod bitmap;
 mod blocks;
 pub mod boxed;
 pub mod buffer;

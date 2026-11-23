@@ -2,6 +2,7 @@
 
 pub mod join_planner;
 
+use pipit_kernel::bitmap::BitSlice;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
@@ -180,7 +181,8 @@ pub fn compute_pipeline(
     let rows = BATCH_ROWS_MAX as usize;
     let column = |value: fn(usize) -> i64, scale: f64, null: usize| {
         let mut values = Buffer::allocate(crate::global(), rows * 8).expect("allocates");
-        let mut validity = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
+        let mut validity =
+            Buffer::allocate(crate::global(), BitSlice::<u8>::words_for(rows)).expect("allocates");
         validity.as_mut_slice::<u8>().fill(0);
         for row in 0..rows {
             #[expect(clippy::cast_precision_loss, reason = "small integers")]
@@ -189,7 +191,7 @@ pub fn compute_pipeline(
                 DataType::Float64 => float.to_bits().cast_signed(),
                 _ => value(row),
             };
-            validity.as_mut_slice::<u8>()[row / 8] |= u8::from(row % 10 != null) << (row % 8);
+            BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row, row % 10 != null);
         }
         let validity = nulls.then_some(validity);
         ColumnView::new(&mut Context::new(global(), None), data_type, values, validity)
@@ -462,10 +464,11 @@ pub fn filter_column(nulls: bool) -> ColumnView {
         *value = (i * 7919) % 1000;
     }
     let validity = nulls.then(|| {
-        let mut validity = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
+        let mut validity =
+            Buffer::allocate(crate::global(), BitSlice::<u8>::words_for(rows)).expect("allocates");
         validity.as_mut_slice::<u8>().fill(0xff);
         for row in (0..rows).step_by(16) {
-            validity.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
+            BitSlice::of_mut(validity.as_mut_slice::<u8>()).clear(row);
         }
         validity
     });
@@ -687,10 +690,11 @@ pub fn perfetto_slices() -> &'static dyn Catalog {
                 *slot = value(first + i);
             }
             let validity = valid.map(|valid| {
-                let mut bits = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
+                let mut bits = Buffer::allocate(crate::global(), BitSlice::<u8>::words_for(rows))
+                    .expect("allocates");
                 bits.as_mut_slice::<u8>().fill(0);
                 for i in 0..rows {
-                    bits.as_mut_slice::<u8>()[i / 8] |= u8::from(valid(first + i)) << (i % 8);
+                    BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, valid(first + i));
                 }
                 bits
             });

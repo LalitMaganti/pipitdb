@@ -1,6 +1,7 @@
 //! `ChunkReader`: a column chunk's values, a page at a time, decoded into
 //! columns a batch at a time.
 
+use pipit_kernel::bitmap::BitSlice;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
@@ -289,9 +290,9 @@ impl<'s> ChunkReader<'s> {
         let (mut row, mut before) = (0, 0);
         let mut value_of = |kept: usize| {
             if let Some(bits) = bits {
-                before += (row..kept).filter(|&r| bits::get(bits, r)).count();
+                before += (row..kept).filter(|&r| BitSlice::of(bits).get(r)).count();
                 row = kept;
-                bits::get(bits, kept).then_some(before)
+                BitSlice::of(bits).get(kept).then_some(before)
             } else {
                 Some(kept)
             }
@@ -481,10 +482,10 @@ impl<'s> ChunkReader<'s> {
         let page = at!(body.as_slice::<u8>(), ..len);
         let count32 = u32::try_from(count).map_err(|_| Error::Unsupported)?;
         // The values, then a null.
-        let mut nulls = context.bytes_buffer((count + 1).div_ceil(8))?;
+        let mut nulls = context.bytes_buffer(BitSlice::<u8>::words_for(count + 1))?;
         let bits = nulls.as_mut_slice::<u8>();
         bits.fill(0xff);
-        *at_mut!(bits, count / 8) &= !(1 << (count % 8));
+        BitSlice::of_mut(&mut *bits).clear(count);
         let (values, nullable, words, mut bounds) = match self.data_type {
             DataType::String => {
                 // Views into the page, then an empty string, for nulls.
@@ -759,23 +760,23 @@ impl Position {
             }
             row += run.len();
         };
-        let mut validity = context.small_buffer(rows.div_ceil(8))?;
+        let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         let bits = validity.as_mut_slice::<u8>();
         bits.fill(0);
-        bits::set(bits, 0, row);
+        BitSlice::of_mut(&mut *bits).set_run(0, row);
         let mut valid = row;
         loop {
             match run {
                 Run::Repeat(level, n) => {
                     if level == 1 {
-                        bits::set(bits, row, n);
+                        BitSlice::of_mut(&mut *bits).set_run(row, n);
                         valid += n;
                     }
                     row += n;
                 }
                 Run::Packed(n) => {
                     for &level in at!(decoded, ..n) {
-                        *at_mut!(bits, row / 8) |= u8::from(level == 1) << (row % 8);
+                        BitSlice::of_mut(&mut *bits).set_if(row, level == 1);
                         (row, valid) = (row + 1, valid + usize::from(level == 1));
                     }
                 }

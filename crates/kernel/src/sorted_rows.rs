@@ -5,6 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::array::Array;
+use crate::bitmap::BitSlice;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
@@ -285,13 +286,13 @@ impl SortedRows {
                 }
                 return Ok(ColumnView::new(context, data_type, values, None)?);
             }
-            let mut validity = context.small_buffer(rows.len().div_ceil(8))?;
+            let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows.len()))?;
             let (out, bits) = (values.as_mut_slice::<i64>(), validity.as_mut_slice::<u8>());
             bits.fill(0);
             let mut nulls = false;
             let mut put = |r: usize, value: Option<i64>| {
                 *at_mut!(out, r) = value.unwrap_or(0);
-                *at_mut!(bits, r / 8) |= u8::from(value.is_some()) << (r % 8);
+                BitSlice::of_mut(&mut *bits).set_if(r, value.is_some());
                 nulls |= value.is_none();
             };
             if let Some((words, in_words)) = &in_words {

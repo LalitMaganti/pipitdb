@@ -5,6 +5,7 @@
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::AllocError;
 use crate::array::Array;
+use crate::bitmap::BitSlice;
 use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form};
@@ -468,7 +469,7 @@ impl GroupTable {
         if !nulls {
             return Ok(ColumnView::new(context, DataType::Int64, values, None)?);
         }
-        let mut validity = context.small_buffer(rows.div_ceil(8))?;
+        let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         let starts = range.clone().step_by(8);
         for (bits, start) in validity.as_mut_slice::<u8>().iter_mut().zip(starts) {
             let groups = (start..range.end.min(start + 8)).enumerate();
@@ -553,7 +554,7 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);
     let mut validity = None;
     if (0..rows).any(|row| id(row).is_null()) {
-        let mut bits = context.small_buffer(rows.div_ceil(8))?;
+        let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
         for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
             let row = start * 8;
             let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
