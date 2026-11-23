@@ -294,11 +294,12 @@ mod tests {
 
     #[cfg(not(feature = "string-functions"))]
     static REGISTRY: Registry =
-        Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[CHOICES, HALF]);
+        Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[CHOICES, HALF, TOTAL]);
     #[cfg(feature = "string-functions")]
     static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION, JOINS]).with_functions(&[
         CHOICES,
         HALF,
+        TOTAL,
         crate::string_functions::STRING_FUNCTIONS,
     ]);
 
@@ -325,6 +326,38 @@ mod tests {
             let mut values = context.values_buffer(x.len() * 8)?;
             for (o, &x) in values.as_mut_slice::<f64>().iter_mut().zip(x) {
                 *o = x / 2.0;
+            }
+            Ok(ColumnView::new(context, DataType::Float64, values, validity)?)
+        }
+    }
+
+    /// `total(x1, ..., x20)`: more arguments than a call holds in place.
+    const TOTAL: &[FunctionRule] = &[FunctionRule {
+        name: "total",
+        compile: |compiler, node, depth, nodes| {
+            let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Total)?);
+            let signature = (&[DataType::Float64; 20][..], DataType::Float64);
+            call_bound(compiler, (node, depth), nodes, signature, bind)
+        },
+    }];
+
+    struct Total;
+
+    impl Function for Total {
+        fn run(
+            &self,
+            context: &mut Context,
+            arguments: &[&ColumnView],
+        ) -> Result<ColumnView, pipit_kernel::error::Error> {
+            let validity = validity_of(context, arguments)?;
+            let rows = arguments[0].float64s().len();
+            let mut values = context.values_buffer(rows * 8)?;
+            let out = values.as_mut_slice::<f64>();
+            out.fill(0.0);
+            for argument in arguments {
+                for (o, &x) in out.iter_mut().zip(argument.float64s()) {
+                    *o += x;
+                }
             }
             Ok(ColumnView::new(context, DataType::Float64, values, validity)?)
         }
@@ -817,6 +850,8 @@ mod tests {
     fn calls_functions_from_the_registry() {
         assert_eq!(kept("FROM t |> SELECT half(f) AS x"), [0.25, 1.25]);
         assert_eq!(kept("FROM t |> SELECT half(a) AS x"), [0.5, 1.0]);
+        let total = format!("FROM t |> SELECT total({}) AS x", ["f"; 20].join(", "));
+        assert_eq!(kept(&total), [10.0, 50.0]);
         let null = "FROM t |> EXTEND half(NULL) AS x |> WHERE x IS NULL |> SELECT a";
         assert_eq!(kept(null), [1.0, 2.0]);
     }

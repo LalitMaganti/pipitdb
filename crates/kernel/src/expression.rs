@@ -13,7 +13,6 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::Estimate;
 use crate::filter::{Comparison, Entries};
-use crate::function::ARGUMENTS_MAX;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Column, DeriveContext, OutputProperties};
@@ -379,6 +378,9 @@ pub fn validity_of(
     Ok(Some(buffer))
 }
 
+/// How many arguments a call holds in place: more than most functions take.
+const ARGUMENTS_INLINE: usize = 8;
+
 /// Calls `step`'s function with its arguments' registers.
 #[inline(never)]
 fn call(
@@ -388,13 +390,13 @@ fn call(
     registers: &[Option<ColumnView>],
     rows: u32,
 ) -> Result<ColumnView, Error> {
-    let count = step.b as usize;
-    check!(0 < count && count <= ARGUMENTS_MAX);
-    let first = step.a as usize;
-    let arguments: [&ColumnView; ARGUMENTS_MAX] = core::array::from_fn(|k| {
-        register(registers, at!(program.steps, first + k.min(count - 1)).a)
-    });
-    let result = context.function(step.c).run(context, at!(arguments, ..count))?;
+    let (first, count) = (step.a as usize, step.b as usize);
+    check!(count > 0);
+    let mut arguments = SpillVec::<_, ARGUMENTS_INLINE>::new(context.env(), EXPR_NODES_MAX);
+    for argument in at!(program.steps, first..first + count) {
+        arguments.push(register(registers, argument.a))?;
+    }
+    let result = context.function(step.c).run(context, &arguments)?;
     check!(result.data_type() == step.data_type && result.row_count() == rows);
     Ok(result)
 }

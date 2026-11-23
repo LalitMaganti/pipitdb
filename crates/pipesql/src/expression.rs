@@ -6,7 +6,7 @@ use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{
     Expr, ExprBuilder, ExprError, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, check_expr_type,
 };
-use pipit_kernel::function::{ARGUMENTS_MAX, DynFunction};
+use pipit_kernel::function::DynFunction;
 use pipit_kernel::string_pool::Id;
 
 use crate::ast::{Node, Operator, Tag};
@@ -259,9 +259,8 @@ pub fn call_bound(
     (arguments, result): (&[DataType], DataType),
     bind: Bind,
 ) -> Result<(), Error> {
-    check!(!arguments.is_empty() && arguments.len() <= ARGUMENTS_MAX);
-    #[expect(clippy::cast_possible_truncation, reason = "at most `ARGUMENTS_MAX`")]
-    let count = arguments.len() as u32;
+    check!(!arguments.is_empty());
+    let Ok(count) = u32::try_from(arguments.len()) else { failed!() };
     let values = compile_arguments(compiler, (node, depth), nodes, count, count)?;
     let function = bind(compiler, node)?;
     let env = compiler.env();
