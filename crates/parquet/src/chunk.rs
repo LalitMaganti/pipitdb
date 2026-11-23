@@ -506,7 +506,8 @@ impl<'s> ChunkReader<'s> {
     /// `len` bytes of the chunk from `at`.
     fn read_bytes(&self, context: &Context, at: u64, len: u64) -> Result<Buffer, Error> {
         let len = usize::try_from(len).map_err(|_| Error::Corrupt)?;
-        let mut bytes = Buffer::allocate(context.allocator(), len)?;
+        // SAFETY: reading fills every byte, or fails.
+        let mut bytes = unsafe { Buffer::allocate_uninit(context.allocator(), len)? };
         self.source.read(at, bytes.as_mut_slice::<u8>())?;
         Ok(bytes)
     }
