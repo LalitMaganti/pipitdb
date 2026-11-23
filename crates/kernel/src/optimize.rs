@@ -102,37 +102,54 @@ pub fn prune_columns(allocator: &Global, plan: &mut LogicalPlan<'_>) -> Result<(
 }
 
 /// Removes the nodes pruning or answering left unread, so nothing after it
-/// can reach them. Inputs come before what reads them, which removing nodes
-/// keeps true.
+/// can reach them, and orders the rest so inputs come before what reads
+/// them: a pass may rebuild part of a plan in another order.
 fn remove_unreachable_nodes(plan: &mut LogicalPlan<'_>) {
-    let mut reachable = [false; PLAN_NODES_MAX];
-    *at_mut!(reachable, plan.root as usize) = true;
-    for id in (0..plan.nodes.len()).rev() {
-        if *at!(reachable, id) {
-            for &child in at!(plan.nodes, id).children.iter() {
-                check!((child as usize) < id);
-                *at_mut!(reachable, child as usize) = true;
-            }
-        }
-    }
-    let mut new_ids = [0; PLAN_NODES_MAX];
-    let mut kept: PlanNodeId = 0;
-    for (id, node) in plan.nodes.iter_mut().enumerate() {
-        if !*at!(reachable, id) {
+    // Each node's new id: the order a walk from the root finishes them, then
+    // the unreachable ones'.
+    let mut new_ids = [PlanNodeId::MAX; PLAN_NODES_MAX];
+    let mut pending = [(0, false); 2 * PLAN_NODES_MAX];
+    let (mut count, mut kept) = (1, 0);
+    *at_mut!(pending, 0) = (plan.root, false);
+    while count > 0 {
+        count -= 1;
+        let (id, children_done) = *at!(pending, count);
+        if *at!(new_ids, id as usize) != PlanNodeId::MAX {
             continue;
         }
+        if children_done {
+            *at_mut!(new_ids, id as usize) = kept;
+            kept += 1;
+            continue;
+        }
+        *at_mut!(pending, count) = (id, true);
+        count += 1;
+        for &child in at!(plan.nodes, id as usize).children.iter() {
+            *at_mut!(pending, count) = (child, false);
+            count += 1;
+        }
+    }
+    let unreachable = at_mut!(new_ids, ..plan.nodes.len()).iter_mut();
+    for (id, next) in unreachable.filter(|id| **id == PlanNodeId::MAX).zip(kept..) {
+        *id = next;
+    }
+    for node in plan.nodes.iter_mut() {
         for child in node.children.iter_mut() {
             *child = *at!(new_ids, *child as usize);
         }
-        *at_mut!(new_ids, id) = kept;
-        kept += 1;
     }
-    let mut id = 0;
-    plan.nodes.retain(|_| {
-        id += 1;
-        *at!(reachable, id - 1)
-    });
     plan.root = *at!(new_ids, plan.root as usize);
+    // Moves each node to its new id along the cycles of the order.
+    for i in 0..plan.nodes.len() {
+        while *at!(new_ids, i) as usize != i {
+            let to = *at!(new_ids, i) as usize;
+            plan.nodes.swap(i, to);
+            new_ids.swap(i, to);
+        }
+    }
+    while plan.nodes.len() > kept as usize {
+        plan.nodes.pop();
+    }
 }
 
 /// Has each op that can make its rows from what its one child knows of its
@@ -609,6 +626,24 @@ mod tests {
         fn lower(&self, _: &PlanNode<'c>, _: &mut Lowering<'_, 'c>) -> Result<(), LowerError> {
             failed!()
         }
+    }
+
+    #[test]
+    fn orders_reachable_nodes_inputs_first() {
+        // Node 1 reads node 3, after it, and nothing reads nodes 0 and 2.
+        let mut plan = LogicalPlan::new(Global::current()).unwrap();
+        let reader = || {
+            DynOp::new(Global::current(), Reader { accepts: Forms::FLAT, passes_through: true })
+                .unwrap()
+        };
+        for children in [&[][..], &[0], &[], &[]] {
+            plan.add_node(reader(), children).unwrap();
+        }
+        at_mut!(plan.nodes, 1).children = Children::from_slice(&[3]).unwrap();
+        plan.root = 1;
+        remove_unreachable_nodes(&mut plan);
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!((plan.root, &at!(plan.nodes, 1).children[..]), (1, &[0][..]));
     }
 
     #[test]
