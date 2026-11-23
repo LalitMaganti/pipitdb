@@ -2,6 +2,8 @@
 //! one; `ComputeOp`, the op that adds columns computed by them; and
 //! `Compute`, the transform that runs it.
 
+use core::ops::BitOr;
+
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
@@ -141,8 +143,9 @@ pub struct Compute {
 
 /// What a run of a `Compute` keeps between batches.
 pub struct ComputeState {
-    /// By program, then step, what's made for the step once per run.
-    prepared: SlowVec<SlowVec<Prepared>>,
+    /// By program, then step, what's made for the step once per run, all
+    /// in one list.
+    prepared: SlowVec<Prepared>,
     /// By step, what each computed for the program last run.
     registers: SlowVec<Option<ColumnView>>,
 }
@@ -164,15 +167,16 @@ impl Transform for Compute {
 
     fn new_state(&self, context: &mut Context) -> Result<ComputeState, Error> {
         let allocator = context.allocator();
-        let mut prepared = SlowVec::fixed(allocator, self.programs.len())?;
-        let mut steps_max = 0;
+        let (mut steps, mut steps_max) = (0, 0);
         for program in self.programs.iter() {
-            let mut steps = SlowVec::fixed(allocator, program.steps.len())?;
-            for step in program.steps.iter() {
-                steps.push(prepare(context, program, step)?)?;
-            }
-            prepared.push(steps)?;
+            steps += program.steps.len();
             steps_max = steps_max.max(program.steps.len());
+        }
+        let mut prepared = SlowVec::fixed(allocator, steps)?;
+        for program in self.programs.iter() {
+            for step in program.steps.iter() {
+                prepared.push(prepare(context, program, step)?)?;
+            }
         }
         let registers = SlowVec::fixed_from(allocator, (0..steps_max).map(|_| None))?;
         Ok(ComputeState { prepared, registers })
@@ -184,8 +188,12 @@ impl Transform for Compute {
         state: &mut ComputeState,
         batch: &mut RowBatch,
     ) -> Result<(), Error> {
-        for (program, prepared) in self.programs.iter().zip(state.prepared.iter_mut()) {
+        let mut start = 0;
+        for program in self.programs.iter() {
+            let end = start + program.steps.len();
+            let prepared = at_mut!(state.prepared, start..end);
             let result = run(context, program, prepared, &mut state.registers, batch)?;
+            start = end;
             let Ok(()) = batch.push_column(result) else { failed!() };
         }
         Ok(())
@@ -402,34 +410,42 @@ fn int_arithmetic(op: ExprOp, x: &[i64], y: &[i64], o: &mut [i64]) -> bool {
     match op {
         // Overflow is found from the signs, which, unlike the CPU's flag,
         // vectorizes.
-        ExprOp::Add => each(x, y, o, |a, b| {
-            let c = a.wrapping_add(b);
-            (c, (a ^ c) & (b ^ c) >= 0)
-        }),
-        ExprOp::Sub => each(x, y, o, |a, b| {
-            let c = a.wrapping_sub(b);
-            (c, (a ^ b) & (a ^ c) >= 0)
-        }),
-        ExprOp::Mul => each(x, y, o, |a, b| fits(a.overflowing_mul(b))),
-        ExprOp::Div => each(x, y, o, |a, b| fits(a.overflowing_div(nonzero(b)))),
-        ExprOp::Mod => each(x, y, o, |a, b| (a.wrapping_rem(nonzero(b)), true)),
+        ExprOp::Add => {
+            each(x, y, o, |a, b| {
+                let c = a.wrapping_add(b);
+                (c, (a ^ c) & (b ^ c))
+            }) >= 0
+        }
+        ExprOp::Sub => {
+            each(x, y, o, |a, b| {
+                let c = a.wrapping_sub(b);
+                (c, (a ^ b) & (a ^ c))
+            }) >= 0
+        }
+        ExprOp::Mul => {
+            each(x, y, o, |a, b| {
+                let (c, overflowed) = a.overflowing_mul(b);
+                (c, -i64::from(overflowed))
+            }) >= 0
+        }
+        ExprOp::Div => !each(x, y, o, |a, b| a.overflowing_div(nonzero(b))),
+        ExprOp::Mod => !each(x, y, o, |a, b| (a.wrapping_rem(nonzero(b)), false)),
         _ => failed!(),
     }
 }
 
 fn double_arithmetic(op: ExprOp, x: &[f64], y: &[f64], o: &mut [f64]) {
     match op {
-        ExprOp::Add => each(x, y, o, |a, b| (a + b, true)),
-        ExprOp::Sub => each(x, y, o, |a, b| (a - b, true)),
-        ExprOp::Mul => each(x, y, o, |a, b| (a * b, true)),
-        ExprOp::Div => each(x, y, o, |a, b| (a / b, true)),
+        ExprOp::Add => each(x, y, o, |a, b| (a + b, false)),
+        ExprOp::Sub => each(x, y, o, |a, b| (a - b, false)),
+        ExprOp::Mul => each(x, y, o, |a, b| (a * b, false)),
+        ExprOp::Div => each(x, y, o, |a, b| (a / b, false)),
         _ => failed!(),
     };
 }
 
-/// Computes the comparison `step`, as `Eq`, `Lt` or `Le`, so that there are
-/// fewer copies of the loops: `a > b` is `b < a`, `a >= b` is `b <= a`, and
-/// `a != b` is the opposite of `a = b`, which holds for doubles too.
+/// Computes the comparison `step`, as `Eq`, `Ne`, `Lt` or `Le`, so that there
+/// are fewer copies of the loops: `a > b` is `b < a`, and `a >= b` is `b <= a`.
 #[inline(never)]
 fn compare(
     context: &mut Context,
@@ -440,7 +456,6 @@ fn compare(
     let (a, b) = if swap { (step.b, step.a) } else { (step.a, step.b) };
     let (a, b) = (register(registers, a), register(registers, b));
     let op = match step.op {
-        ExprOp::Ne => ExprOp::Eq,
         ExprOp::Gt => ExprOp::Lt,
         ExprOp::Ge => ExprOp::Le,
         op => op,
@@ -454,18 +469,14 @@ fn compare(
         DataType::Float64 => compare_numbers(op, a.float64s(), b.float64s(), o),
         DataType::String => compare_strings(op, a, b, o),
     }
-    if step.op == ExprOp::Ne {
-        for o in o.iter_mut() {
-            *o ^= 1;
-        }
-    }
     ColumnView::new(context, DataType::Int64, values, validity)
 }
 
-/// `x op y` at every row, as 0 or 1, for `op` `Eq`, `Lt` or `Le`.
+/// `x op y` at every row, as 0 or 1, for `op` `Eq`, `Ne`, `Lt` or `Le`.
 fn compare_numbers<T: PartialOrd + Copy>(op: ExprOp, x: &[T], y: &[T], o: &mut [i64]) {
     match op {
         ExprOp::Eq => compare_each(x, y, o, |a, b| a == b),
+        ExprOp::Ne => compare_each(x, y, o, |a, b| a != b),
         ExprOp::Lt => compare_each(x, y, o, |a, b| a < b),
         _ => compare_each(x, y, o, |a, b| a <= b),
     }
@@ -494,6 +505,7 @@ fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
         let order = left.get(row).cmp(right.get(row));
         *o = i64::from(match op {
             ExprOp::Eq => order.is_eq(),
+            ExprOp::Ne => order.is_ne(),
             ExprOp::Lt => order.is_lt(),
             _ => order.is_le(),
         });
@@ -720,24 +732,25 @@ fn choose_strings<'r>(
     ColumnView::strings(context, views, bytes, validity)
 }
 
-/// An overflowing operation's result, and whether it fit.
-fn fits((value, overflowed): (i64, bool)) -> (i64, bool) {
-    (value, !overflowed)
-}
-
 /// The loop for each operation and type, kept to the arithmetic itself so
-/// that each copy is small. Returns whether every result fit, checking once
-/// at the end rather than at each row.
+/// that each copy is small. `f` gives each row's value and whether it
+/// overflowed, as a bool or a word's sign: returns them or'd together, so
+/// that's checked once at the end rather than at each row.
 #[inline(never)]
-fn each<T: Copy>(x: &[T], y: &[T], o: &mut [T], f: impl Fn(T, T) -> (T, bool)) -> bool {
+fn each<T: Copy, F: Copy + Default + BitOr<Output = F>>(
+    x: &[T],
+    y: &[T],
+    o: &mut [T],
+    f: impl Fn(T, T) -> (T, F),
+) -> F {
     check!(x.len() == o.len() && y.len() == o.len());
-    let mut all_fit = true;
+    let mut overflows = F::default();
     for ((o, &x), &y) in o.iter_mut().zip(x).zip(y) {
-        let (value, fit) = f(x, y);
+        let (value, overflow) = f(x, y);
         *o = value;
-        all_fit &= fit;
+        overflows = overflows | overflow;
     }
-    all_fit
+    overflows
 }
 
 /// Whether `op` overflows at some row `selection` keeps where `out` isn't
