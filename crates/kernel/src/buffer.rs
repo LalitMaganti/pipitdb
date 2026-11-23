@@ -113,8 +113,8 @@ impl Buffer {
         Ok(Buffer { data })
     }
 
-    /// What the bytes came from.
-    pub fn env(&self) -> &Env {
+    /// What the bytes came from, which frees them.
+    fn env(&self) -> &Env {
         // SAFETY: an `Env` outlives what's allocated from it.
         unsafe { self.header().env.as_ref() }
     }

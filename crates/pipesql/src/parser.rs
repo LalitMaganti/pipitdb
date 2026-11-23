@@ -42,7 +42,7 @@ pub fn parse_expression(env: &Env, source: &[u8]) -> Result<Ast, Error> {
 }
 
 pub(crate) struct Parser<'a> {
-    /// What lists too long for the stack are gathered with.
+    /// What the tree's blocks, and lists too long for the stack, come from.
     env: &'a Env,
     /// The query's text.
     source: &'a [u8],
@@ -136,7 +136,7 @@ impl<'a> Parser<'a> {
     fn push(&mut self, node: Node) {
         self.nodes.push(node);
         if self.nodes.needs_block()
-            && let Err(code) = self.nodes.grow()
+            && let Err(code) = self.nodes.grow(self.env)
         {
             self.failed.get_or_insert(Error::new(code, self.current.span));
         }
