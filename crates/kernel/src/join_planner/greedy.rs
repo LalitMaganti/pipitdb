@@ -5,6 +5,7 @@
 use super::estimate::Estimator;
 use super::graph::{QueryGraph, Sides};
 use super::tree::{JoinNode, JoinTree};
+use crate::array::Array;
 use crate::bitmap::BitSlice;
 use crate::env::Env;
 use crate::error::Error;
@@ -57,7 +58,7 @@ struct Greedy<'g, 'e> {
     /// The forest's nodes.
     nodes: SmallVec<Node>,
     /// Each node's relations, `words` words a node.
-    sets: SmallVec<u64>,
+    sets: Array<u64>,
     /// The graph's edges.
     edges: SmallVec<Edge>,
     /// The first of the hyperedges, linked through `Edge::next`, or `NONE`.
@@ -82,7 +83,7 @@ pub(super) fn plan<'g>(
         estimator,
         words,
         nodes: SmallVec::fixed(env, 2 * count - 1)?,
-        sets: SmallVec::zeroed(env, (2 * count - 1) * words)?,
+        sets: Array::zeroed(env, (2 * count - 1) * words)?,
         edges: SmallVec::fixed(env, graph.edges.len())?,
         hypers: NONE,
     };

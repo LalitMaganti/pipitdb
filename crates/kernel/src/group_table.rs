@@ -55,7 +55,7 @@ pub(crate) struct GroupTable {
     /// The hash table. An empty slot is 0. A used slot holds the top bits
     /// of the group's hash, then the group number plus one in the low
     /// `GROUP_BITS` bits.
-    slots: SmallVec<u64>,
+    slots: Array<u64>,
     /// Each group's null bits, then its keys, then its payload, `stride`
     /// words each. Keeping them together means comparing a group reads one
     /// cache line.
@@ -115,7 +115,7 @@ impl GroupTable {
         let first = usize::from(nullable != 0);
         let stride = first + keys + payload_words;
         Ok(GroupTable {
-            slots: SmallVec::new(env, 1)?,
+            slots: Array::zeroed(env, 0)?,
             records: Blocks::new(env, stride)?,
             stride,
             first,
@@ -433,7 +433,7 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
-        let mut slots = SmallVec::zeroed(env, capacity)?;
+        let mut slots = Array::zeroed(env, capacity)?;
         let mask = capacity - 1;
         // No need to hash the keys again: `slot_of` only uses bits a slot has.
         for &slot in self.slots.iter().filter(|&&slot| slot != 0) {

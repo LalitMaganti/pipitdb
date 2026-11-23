@@ -3,9 +3,9 @@
 //! source.
 
 use super::graph::{JoinEdge, JoinKind, QueryGraph};
+use crate::array::Array;
 use crate::env::Env;
 use crate::error::Error;
-use crate::small_vec::SmallVec;
 
 /// The most rows an estimate reaches.
 #[expect(clippy::cast_precision_loss, reason = "a limit, not a count")]
@@ -34,7 +34,7 @@ pub struct Estimator<'a> {
     divided: u64,
     /// For each later equivalence set, the last join (`stamp`) that divided
     /// by it.
-    stamps: SmallVec<u64>,
+    stamps: Array<u64>,
     /// The join being estimated, numbered from 1.
     stamp: u64,
     /// The join's rows as an inner join, by the edges applied so far.
@@ -47,7 +47,7 @@ pub struct Estimator<'a> {
 
 impl<'a> Estimator<'a> {
     pub fn new(env: &Env, graph: &'a QueryGraph) -> Result<Estimator<'a>, Error> {
-        let stamps = SmallVec::zeroed(env, graph.equivalences.len().saturating_sub(64))?;
+        let stamps = Array::zeroed(env, graph.equivalences.len().saturating_sub(64))?;
         let (divided, stamp, rows, sides, kept) = (0, 0, 0.0, [0.0; 2], None);
         Ok(Estimator { graph, divided, stamps, stamp, rows, sides, kept })
     }

@@ -95,19 +95,6 @@ impl<T> SmallVec<T> {
         }
     }
 
-    /// `len` zeros, in a `SmallVec` that never grows. Zeroed by the
-    /// allocator, which on fresh pages needn't write them.
-    #[inline]
-    pub fn zeroed(env: &Env, len: usize) -> Result<SmallVec<T>, AllocError>
-    where
-        T: Primitive,
-    {
-        const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        let mut raw = RawVec::new(env, size_of::<T>(), len, len, true)?;
-        raw.len = len;
-        Ok(SmallVec { raw, values: PhantomData })
-    }
-
     pub fn capacity(&self) -> usize {
         self.raw.capacity as usize
     }
@@ -117,10 +104,7 @@ impl<T> SmallVec<T> {
     #[inline]
     fn empty(env: &Env, capacity: usize, max: usize) -> Result<SmallVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        Ok(SmallVec {
-            raw: RawVec::new(env, size_of::<T>(), capacity, max, false)?,
-            values: PhantomData,
-        })
+        Ok(SmallVec { raw: RawVec::new(env, size_of::<T>(), capacity, max)?, values: PhantomData })
     }
 
     /// Where value `i` goes.
@@ -246,23 +230,15 @@ fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
 }
 
 impl RawVec {
-    /// Room for `capacity` values of `item` bytes, zeroed if `zeroed`, and
-    /// at most `max`, which is at least `capacity`: both rounded up to a
+    /// Room for `capacity` values of `item` bytes, and at most `max`, which is at least `capacity`: both rounded up to a
     /// power of two, but for a `capacity` of 0.
     #[inline(never)]
-    fn new(
-        env: &Env,
-        item: usize,
-        capacity: usize,
-        max: usize,
-        zeroed: bool,
-    ) -> Result<RawVec, AllocError> {
+    fn new(env: &Env, item: usize, capacity: usize, max: usize) -> Result<RawVec, AllocError> {
         let capacity = if capacity == 0 { 0 } else { capacity.next_power_of_two() };
         let Ok(max) = u32::try_from(max.next_power_of_two()) else { return Err(AllocError) };
         let values = match capacity {
             // Nothing to allocate; aligned for any value, as slices need.
             0 => NonNull::<Aligned>::dangling().cast(),
-            _ if zeroed => env.allocate_zeroed(layout(item, capacity)?)?,
             _ => env.allocate(layout(item, capacity)?)?,
         };
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
@@ -451,14 +427,6 @@ mod tests {
         // Made with room for its max, it never grew.
         assert_eq!(left.get(), 0);
         assert_eq!(values.capacity(), 4);
-    }
-
-    #[test]
-    fn zeroed_holds_zeros() {
-        let env = Env::current();
-        let values = SmallVec::<i64>::zeroed(env, 5).unwrap();
-        assert_eq!(*values, [0; 5]);
-        assert_eq!(values.capacity(), 8);
     }
 
     /// Records the layouts asked for.
