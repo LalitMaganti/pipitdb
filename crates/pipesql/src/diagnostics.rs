@@ -201,7 +201,7 @@ fn unsupported(found: &str, detail: u16) -> (String, String) {
     match detail {
         what if what == Unsupported::SelectExpression as u16 => {
             (
-                "only arithmetic, comparisons and `AND`, `OR` and `NOT` of columns, integers, strings and `NULL` can be computed yet"
+                "only arithmetic, comparisons, `IN` lists and `AND`, `OR` and `NOT` of columns, integers, strings and `NULL` can be computed yet"
                     .into(),
                 "can't compute this yet".into(),
             )

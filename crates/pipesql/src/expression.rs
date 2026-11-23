@@ -1,6 +1,7 @@
 //! Expressions over the columns in scope, compiled to the kernel's `Expr`,
 //! as Perfetto's `CompileExpr`.
 
+use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::DataType;
 use pipit_kernel::expression::{
     EXPR_NODES_MAX, Expr, ExprError, ExprOp, ExprStep, check_expr_type,
@@ -13,6 +14,7 @@ use crate::compile::Compiler;
 use crate::condition::string;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::keywords::same_word;
+use crate::parser::IN_LIST_MAX;
 use crate::stages::aggregate;
 
 /// Compiles the expression `node` against the columns in scope, and the type
@@ -22,8 +24,16 @@ pub fn compile_expr(
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
     let mut nodes = SlowVec::new(compiler.allocator(), EXPR_NODES_MAX)?;
+    compiler.in_values.retain(|_| false);
     compile(compiler, node, 0, &mut nodes)?;
-    let expr = Expr { nodes };
+    let mut values = None;
+    if !compiler.in_values.is_empty() {
+        let size_bytes = size_of_val::<[i64]>(&compiler.in_values);
+        let mut buffer = Buffer::allocate(compiler.allocator(), size_bytes)?;
+        buffer.as_mut_slice::<i64>().copy_from_slice(&compiler.in_values);
+        values = Some(buffer);
+    }
+    let expr = Expr { nodes, values };
     let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
     let data_type = check_expr_type(&expr, &type_of).map_err(|error| {
         let span = compiler.span(node);
@@ -33,6 +43,7 @@ pub fn compile_expr(
             ExprError::Kinds => ErrorCode::ExpectedOneKind,
             ExprError::Types => ErrorCode::ExpectedOneType,
             ExprError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
+            ExprError::DoubleIn => return Error::unsupported(Unsupported::SelectExpression, span),
             ExprError::Strings => ErrorCode::ExpectedString,
             ExprError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
             ExprError::Condition => ErrorCode::NumberCondition,
@@ -68,6 +79,48 @@ fn push_node(
     nodes.push(node)?;
     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
     Ok(nodes.len() as u32 - 1)
+}
+
+/// `a IN (1, 2)` or `a IN ('x', 'y')`: a list of integers, or of strings,
+/// whose values, or the strings' ids, go in the compiler's `in_values`. The
+/// node's type says which.
+fn in_list(
+    compiler: &mut Compiler<'_, '_>,
+    node: Node,
+    depth: usize,
+    nodes: &mut SlowVec<ExprStep>,
+) -> Result<(), Error> {
+    compile(compiler, compiler.node(node.first_child()), depth + 1, nodes)?;
+    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+    let operand = nodes.len() as u32 - 1;
+    let list = compiler.node(node.first_child() + 1);
+    let len = list.child_count();
+    if compiler.in_values.len() + len as usize > IN_LIST_MAX {
+        return Err(Error::new(ErrorCode::ConditionTooLarge, compiler.span(list)));
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "at most `IN_LIST_MAX`")]
+    let start = compiler.in_values.len() as u32;
+    let mut kind = None;
+    for i in 0..len {
+        // A literal, compiled as any is, then taken back off as a value.
+        let item = compiler.node(list.first_child() + i);
+        compile(compiler, item, depth + 1, nodes)?;
+        let Some(constant) = nodes.pop() else { pipit_kernel::failed!() };
+        let (listed, item_kind) = match (constant.op, constant.data_type) {
+            (ExprOp::Constant, DataType::Int64) => (constant.int_value, DataType::Int64),
+            (ExprOp::Constant, DataType::String) => (i64::from(constant.a), DataType::String),
+            _ => return Err(Error::unsupported(Unsupported::Where, compiler.span(item))),
+        };
+        if kind.is_some_and(|kind| kind != item_kind) {
+            return Err(Error::new(ErrorCode::ExpectedOneKind, compiler.span(item)));
+        }
+        kind = Some(item_kind);
+        compiler.in_values.push(listed)?;
+    }
+    let mut test = expr_node(ExprOp::In, operand, start, 0);
+    (test.c, test.data_type) = (len, kind.unwrap_or(DataType::Int64));
+    push_node(nodes, test, node, compiler)?;
+    Ok(())
 }
 
 /// Appends the nodes of the expression `node`, `depth` deep, its result
@@ -113,6 +166,7 @@ fn compile(
         Tag::Unary if node.operator() == Operator::Negate => negate(compiler, node, depth, nodes)?,
         Tag::Unary => unary(compiler, node, depth, nodes)?,
         Tag::Binary if node.operator() == Operator::Like => like(compiler, node, depth, nodes)?,
+        Tag::Binary if node.operator() == Operator::In => in_list(compiler, node, depth, nodes)?,
         Tag::Call => (compiler.registry().call)(compiler, node, depth, nodes)?,
         Tag::Case => case(compiler, node, depth, nodes)?,
         Tag::Binary => {

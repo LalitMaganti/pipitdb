@@ -210,7 +210,7 @@ pub fn compute_pipeline(
         SlowVec::fixed_from(&Heap, [first, second, step(op, result, 0, 1)].into_iter())
     };
     let steps = steps.expect("allocates");
-    let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps }].into_iter());
+    let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps, values: None }].into_iter());
     let compute = Compute { programs: programs.expect("allocates") };
     let mut owned = SlowVec::fixed(&Heap, 1).expect("allocates");
     let step = Step::Transform(DynTransform::new(&Heap, compute).expect("allocates"));

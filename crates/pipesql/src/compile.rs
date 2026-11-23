@@ -13,7 +13,7 @@ use pipit_kernel::slow_vec::SlowVec;
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
-use crate::parser::parse_query;
+use crate::parser::{IN_LIST_MAX, parse_query};
 use crate::registry::Registry;
 
 /// What a query reads rows from, compiled: its plan node, and its columns, by
@@ -33,6 +33,8 @@ pub struct Compiler<'q, 'c> {
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SlowVec<NamedColumn>,
+    /// The values of the `IN` lists of the expression being compiled.
+    pub in_values: SlowVec<i64>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -156,6 +158,7 @@ pub fn compile<'c>(
         registry,
         plan: LogicalPlan::new(allocator)?,
         scope: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
+        in_values: SlowVec::new(allocator, IN_LIST_MAX)?,
         allocator,
     };
     let query = ast.node(ast.root());
@@ -383,6 +386,25 @@ mod tests {
         assert_eq!(kept("FROM n |> SELECT x IS NULL AND x = 1 AS y"), [0.0, null]);
         assert_eq!(kept("FROM n |> SELECT NOT x = 1 AS y"), [0.0, null]);
         assert_eq!(error("FROM t |> SELECT s AND a = 1 AS y"), (ErrorCode::NumberCondition, 17));
+    }
+
+    #[test]
+    fn computes_in_lists() {
+        let null = f64::NEG_INFINITY;
+        assert_eq!(kept("FROM t |> SELECT a IN (2, 3) AS y"), [0.0, 1.0]);
+        assert_eq!(kept("FROM t |> SELECT a + 1 IN (2, -5) AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM t |> SELECT s IN ('it''s', 'x') AS y"), [1.0, 0.0]);
+        assert_eq!(kept("FROM n |> SELECT x IN (1) AS y"), [1.0, null]);
+        // More than a filter scans, so looked up in a set.
+        assert_eq!(
+            kept(
+                "FROM t |> SELECT b IN (30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 20) AS y"
+            ),
+            [0.0, 1.0]
+        );
+        assert_eq!(kept("FROM t |> WHERE a * 10 IN (20) |> SELECT a"), [2.0]);
+        assert_eq!(error("FROM t |> SELECT a IN (1, 'x') AS y"), (ErrorCode::ExpectedOneKind, 26));
+        assert_eq!(error("FROM t |> SELECT s IN (1) AS y"), (ErrorCode::ExpectedOneKind, 17));
     }
 
     #[test]
@@ -684,8 +706,9 @@ mod tests {
         let wide = format!("FROM t |> WHERE {wide}");
         assert_eq!(error(&wide).0, ErrorCode::ConditionTooLarge);
         assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 22));
-        assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::Unsupported, 27));
-        assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::Unsupported, 22));
+        // As `a = 'a'` is.
+        assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::ExpectedOneKind, 27));
+        assert_eq!(error("FROM t |> WHERE a IN ('a')"), (ErrorCode::ExpectedOneKind, 16));
         assert_eq!(error("FROM t |> AGGREGATE median(a)"), (ErrorCode::UnknownFunction, 20));
         assert_eq!(error("FROM t |> ORDER BY a + 1"), (ErrorCode::Unsupported, 19));
         assert_eq!(error("FROM t |> AGGREGATE sum(s)"), (ErrorCode::Unsupported, 20));

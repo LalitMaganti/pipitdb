@@ -108,6 +108,16 @@ impl Predicate {
         Ok(Predicate::checked(nodes, buffer))
     }
 
+    /// A predicate of one leaf, whose `IN` lists are of `values`.
+    pub(crate) fn of_leaf(
+        allocator: &dyn Allocator,
+        leaf: Leaf,
+        values: Option<Buffer>,
+    ) -> Result<Predicate, AllocError> {
+        let nodes = SlowVec::fixed_from(allocator, [Node::Leaf(leaf)].into_iter())?;
+        Ok(Predicate::checked(nodes, values))
+    }
+
     /// For each node, the set of its `IN` list's values if it has more than
     /// `filter::IN_SCAN_MAX` of them, for `select`: none if no list does.
     /// String lists' values are ids in `literals`.
