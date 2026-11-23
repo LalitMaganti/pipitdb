@@ -117,12 +117,13 @@ pub enum Unsupported {
     Decimal = 4,
     /// A `LIMIT` or `OFFSET` that isn't one integer.
     Limit = 5,
-    /// An aggregate that isn't a function of a column, or `COUNT(*)`.
+    /// An item of `AGGREGATE` that isn't a call of an aggregate function,
+    /// or `COUNT(*)`.
     Aggregate = 6,
     /// An aggregate of a column whose type it can't take, such as a string's
     /// sum.
     AggregateType = 7,
-    /// A key to group by that isn't an `Int64` or string column.
+    /// A key to group by that isn't an `Int64` or string.
     GroupKey = 8,
     /// An `ORDER BY` key that isn't a column.
     OrderBy = 9,

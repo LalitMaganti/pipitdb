@@ -595,12 +595,12 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     let env = compiler.env();
     let mut keys = SmallVec::fixed(env, by.child_count() as usize)?;
     let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
+    // Keys and arguments that are expressions are computed first, as an
+    // `EXTEND` before the stage would.
+    let mut computed = SmallVec::fixed(env, (by.child_count() + list.child_count()) as usize)?;
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
-        if key.tag() != Tag::Name {
-            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
-        }
-        let column = compiler.find_column(key)?;
+        let column = input_column(compiler, key, alias, &mut computed)?;
         let data_type = at!(compiler.plan.columns, column.id as usize).data_type;
         if !matches!(data_type, DataType::Int64 | DataType::String) {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
@@ -628,18 +628,20 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         }
         let (function, input) = match argument.tag() {
             Tag::Star if function == Function::Count && !distinct => (Function::CountStar, None),
-            Tag::Name => (function, Some(compiler.find_column(argument)?.id)),
-            _ => return Err(unsupported),
+            Tag::Star => return Err(unsupported),
+            _ => (function, Some(input_column(compiler, argument, alias, &mut computed)?.id)),
         };
         let input_type =
             input.map_or(DataType::Int64, |id| at!(compiler.plan.columns, id as usize).data_type);
         if input.is_some() && !function.reads(input_type) {
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
-        let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
-        let name = match alias {
-            Some(alias) => compiler.plan.names.add(compiler.text(alias.span()))?,
-            None => aggregate_name(compiler, function_name, distinct, argument)?,
+        let name = if let Some(alias) = alias {
+            compiler.plan.names.add(compiler.text(alias.span()))?
+        } else {
+            // Unnamed, the argument is `*` or a column's name.
+            let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
+            aggregate_name(compiler, function_name, distinct, argument)?
         };
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
@@ -650,12 +652,31 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         aggregates.push(Aggregate { function, input, distinct, binding })?;
         scope.push(binding)?;
     }
+    add_compute(compiler, computed)?;
     let aggregate = DynOp::new(env, AggregateOp { keys, aggregates, answer: None })?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
     compiler.clear_aliases();
     Ok(())
+}
+
+/// The column `value` is: one in scope if it names one, else one computed
+/// into `computed`, named `alias`, which an expression needs, as in `SELECT`.
+fn input_column(
+    compiler: &mut Compiler<'_, '_>,
+    value: Node,
+    alias: Option<Node>,
+    computed: &mut SmallVec<ComputeItem>,
+) -> Result<NamedColumn, Error> {
+    if value.tag() == Tag::Name && !is_null(compiler, value) {
+        return compiler.find_column(value);
+    }
+    let name = match alias {
+        Some(alias) => Some(compiler.plan.names.add(compiler.text(alias.span()))?),
+        None => None,
+    };
+    value_of(compiler, value, name, computed)
 }
 
 /// The name of an aggregate without an alias, such as `count(DISTINCT a)`.
