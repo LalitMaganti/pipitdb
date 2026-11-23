@@ -11,7 +11,7 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::flat_hash_map::prefetch;
-use crate::murmur_hash::mix;
+use crate::murmur_hash::{SEED, combine};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
 
@@ -674,15 +674,6 @@ fn probe(slots: &[u64], hash: u64, equal: impl Fn(usize) -> bool) -> Result<u32,
         }
         at = (at + 1) & mask;
     }
-}
-
-/// What Perfetto's `MurmurHashCombiner` starts from.
-const SEED: u64 = 0xe17a_1465;
-
-/// `hash` with `word` combined in, as Perfetto's `MurmurHashCombiner` does.
-#[inline]
-fn combine(hash: u64, word: u64) -> u64 {
-    hash ^ mix(word).wrapping_add(0x9e37_79b9).wrapping_add(hash << 6).wrapping_add(hash >> 2)
 }
 
 /// Writes the rows of `keys`, whose null words are `nulls` unless none are
