@@ -152,8 +152,9 @@ enum Prepared {
     None,
     /// A constant step's value at every row a batch can have.
     Constant(ColumnView),
-    /// An `In` step's list, as a predicate of one leaf on its operand, and
-    /// the sets and entries selecting with it uses.
+    /// An `In` or `Like` step's test, as a predicate of one leaf on its
+    /// operand, as a filter tests it, and the sets and entries selecting
+    /// with it uses.
     Test { predicate: Predicate, sets: SlowVec<Option<Set>>, entries: SlowVec<Entries> },
 }
 
@@ -196,13 +197,13 @@ fn prepare(
     program: &ExprProgram,
     step: &ExprStep,
 ) -> Result<Prepared, AllocError> {
-    if step.op != ExprOp::In {
-        return Ok(constant(context, step)?.map_or(Prepared::None, Prepared::Constant));
-    }
     let (column, start, len) = (0, step.b, step.c);
-    let leaf = match at!(program.steps, step.a as usize).data_type {
-        DataType::String => Leaf::InStrings { column, start, len },
-        _ => Leaf::In { column, start, len },
+    let strings = || at!(program.steps, step.a as usize).data_type == DataType::String;
+    let leaf = match step.op {
+        ExprOp::Like => Leaf::Like { column, pattern: Id::raw(step.b) },
+        ExprOp::In if strings() => Leaf::InStrings { column, start, len },
+        ExprOp::In => Leaf::In { column, start, len },
+        _ => return Ok(constant(context, step)?.map_or(Prepared::None, Prepared::Constant)),
     };
     let allocator = context.allocator();
     let predicate = Predicate::of_leaf(allocator, leaf, program.values.clone())?;
@@ -270,7 +271,7 @@ fn run(
                 let Prepared::Constant(constant) = at!(prepared, i) else { failed!() };
                 constant.slice(0, rows)
             }
-            ExprOp::In => in_list(context, at_mut!(prepared, i), step, registers)?,
+            ExprOp::In | ExprOp::Like => test(context, at_mut!(prepared, i), step, registers)?,
             ExprOp::ToDouble => {
                 let a = register(registers, step.a);
                 let mut values = context.values_buffer(rows as usize * 8)?;
@@ -288,7 +289,6 @@ fn run(
             ExprOp::Eq | ExprOp::Ne | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge => {
                 compare(context, step, registers)?
             }
-            ExprOp::Like => like(context, step, registers)?,
             ExprOp::IsNull | ExprOp::IsNotNull => null_test(context, step, registers)?,
             ExprOp::And | ExprOp::Or | ExprOp::Not => logic(context, step, registers)?,
             ExprOp::When | ExprOp::Argument => {
@@ -496,40 +496,6 @@ fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
     }
 }
 
-/// Whether each row's string matches `step`'s pattern, as 0 or 1, at the rows
-/// where it isn't null: others' views may not be of their bytes. A
-/// `%needle%` pattern is searched for once across the strings' bytes.
-#[inline(never)]
-fn like(
-    context: &mut Context,
-    step: &ExprStep,
-    registers: &[Option<ColumnView>],
-) -> Result<ColumnView, AllocError> {
-    let a = register(registers, step.a);
-    let pattern = context.literals().and_then(|literals| literals.get(Id::raw(step.b)));
-    let Some(pattern) = pattern else { failed!() };
-    let rows = a.row_count() as usize;
-    let validity = validity(context, a, None, None)?;
-    let mut values = context.values_buffer(rows * 8)?;
-    let strings = a.string_values();
-    let contains = crate::like::contained(pattern)
-        .map(|needle| crate::like::Contains::new(strings.bytes(), needle));
-    for (row, o) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
-        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
-        if a.is_null(row as u32) {
-            *o = 0;
-            continue;
-        }
-        let cell = strings.get(row);
-        let matches = match &contains {
-            Some(contains) => contains.within(cell),
-            None => crate::like::like(cell, pattern),
-        };
-        *o = i64::from(matches);
-    }
-    ColumnView::new(context, DataType::Int64, values, validity)
-}
-
 /// Whether each row of `step`'s register is null, or isn't, as 0 or 1.
 #[inline(never)]
 fn null_test(
@@ -544,10 +510,11 @@ fn null_test(
     ColumnView::new(context, DataType::Int64, values, None)
 }
 
-/// Whether `step`'s operand is one of its list at every row, as 0 or 1: null
-/// where the operand is. Tested as a filter tests it, by its predicate.
+/// Whether `step`'s test, `IN` or `LIKE`, is true of its operand at every
+/// row, as 0 or 1: null where the operand is. Tested as a filter tests it,
+/// by its predicate.
 #[inline(never)]
-fn in_list(
+fn test(
     context: &mut Context,
     test: &mut Prepared,
     step: &ExprStep,
