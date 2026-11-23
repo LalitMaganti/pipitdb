@@ -8,7 +8,7 @@ pub struct Names {
 }
 
 /// Where a name is in its `Names`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Name {
     start: u32,
     len: u32,
