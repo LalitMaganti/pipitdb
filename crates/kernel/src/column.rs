@@ -263,6 +263,25 @@ impl ColumnView {
         ColumnView::flat(context, data_type, values, None, validity, len)
     }
 
+    /// `Int64` values, each null if `None`, in buffers of their own: for
+    /// tests and tools, which make columns from values they hold.
+    pub fn from_int64s(
+        context: &mut Context,
+        values: impl ExactSizeIterator<Item = Option<i64>>,
+    ) -> Result<ColumnView, AllocError> {
+        let env = context.env();
+        let mut words = Buffer::allocate(env, values.len() * 8)?;
+        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len()))?;
+        let mut nulls = false;
+        let (out, valid) = (words.as_mut_slice::<i64>(), bits.as_mut_slice::<u8>());
+        for (row, value) in values.enumerate() {
+            *at_mut!(out, row) = value.unwrap_or(0);
+            BitSlice::of_mut(&mut *valid).set_if(row, value.is_some());
+            nulls |= value.is_none();
+        }
+        ColumnView::new(context, DataType::Int64, words, nulls.then_some(bits))
+    }
+
     /// Strings as views: value `i` is the `views[2i + 1]` bytes of `bytes`
     /// from `views[2i]`, so `views` holds two `u32`s a value. The strings
     /// needn't be in order or next to each other, so they can stay where they

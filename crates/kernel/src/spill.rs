@@ -284,18 +284,9 @@ mod tests {
     }
 
     fn column(values: &[i64], nulls: &[u32]) -> ColumnView {
-        let env = Env::current();
-        let mut buffer = Buffer::allocate(env, values.len() * 8).unwrap();
-        buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
-            bits.as_mut_slice::<u8>().fill(0xff);
-            for &row in nulls {
-                BitSlice::of_mut(bits.as_mut_slice::<u8>()).clear(row as usize);
-            }
-            bits
-        });
-        ColumnView::new(&mut Context::new(env, None), DataType::Int64, buffer, validity).unwrap()
+        let null = |row: usize| nulls.iter().any(|&null| null as usize == row);
+        let cells = values.iter().enumerate().map(|(row, &value)| (!null(row)).then_some(value));
+        ColumnView::from_int64s(&mut Context::new(Env::current(), None), cells).unwrap()
     }
 
     fn rows(column: &ColumnView) -> StdVec<Option<i64>> {
