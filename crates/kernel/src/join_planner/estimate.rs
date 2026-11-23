@@ -2,10 +2,7 @@
 //! equivalence sets it joins on. `docs/join-planner.md` gives each rule's
 //! source.
 
-use super::graph::{JoinEdge, JoinKind, QueryGraph};
-use crate::containers::Array;
-use crate::env::Env;
-use crate::error::Error;
+use super::graph::{EquivalenceSet, JoinEdge, JoinKind};
 
 /// The most rows an estimate reaches.
 #[expect(clippy::cast_precision_loss, reason = "a limit, not a count")]
@@ -23,18 +20,18 @@ struct Kept {
     matched: f64,
 }
 
-/// Estimates the rows of joins, with memory it reuses from one join to the
-/// next. A join is estimated by `start`, then `apply` for each edge it
-/// applies, then `finish`.
+/// Estimates the rows of joins, with memory it's given and reuses from one
+/// join to the next. A join is estimated by `start`, then `apply` for each
+/// edge it applies, then `finish`.
 pub struct Estimator<'a> {
-    /// The graph whose joins it estimates.
-    graph: &'a QueryGraph,
+    /// The equivalence sets of the graph whose joins it estimates.
+    equivalences: &'a [EquivalenceSet],
     /// The first 64 equivalence sets the join has divided by, as bits, so
     /// that it divides by each once.
     divided: u64,
     /// For each later equivalence set, the last join (`stamp`) that divided
     /// by it.
-    stamps: Array<u64>,
+    stamps: &'a mut [u64],
     /// The join being estimated, numbered from 1.
     stamp: u64,
     /// The join's rows as an inner join, by the edges applied so far.
@@ -46,10 +43,18 @@ pub struct Estimator<'a> {
 }
 
 impl<'a> Estimator<'a> {
-    pub fn new(env: &Env, graph: &'a QueryGraph) -> Result<Estimator<'a>, Error> {
-        let stamps = Array::zeroed(env, graph.equivalences.len().saturating_sub(64))?;
+    /// How many stamps an estimator of joins on `equivalences` equivalence
+    /// sets needs.
+    pub fn stamps(equivalences: usize) -> usize {
+        equivalences.saturating_sub(64)
+    }
+
+    /// Estimates joins on `equivalences`, with `stamps`, as many as
+    /// `Estimator::stamps` says.
+    pub fn new(equivalences: &'a [EquivalenceSet], stamps: &'a mut [u64]) -> Estimator<'a> {
+        stamps.fill(0);
         let (divided, stamp, rows, sides, kept) = (0, 0, 0.0, [0.0; 2], None);
-        Ok(Estimator { graph, divided, stamps, stamp, rows, sides, kept })
+        Estimator { equivalences, divided, stamps, stamp, rows, sides, kept }
     }
 
     /// Starts estimating a join of sides of `left_rows` and `right_rows`.
@@ -64,7 +69,7 @@ impl<'a> Estimator<'a> {
     /// Applies `edge` to the join. `forward` is whether the edge's `left` is
     /// on the join's left side.
     pub fn apply(&mut self, edge: &JoinEdge, forward: bool) {
-        let domain = at!(self.graph.equivalences, edge.equivalence as usize).domain;
+        let domain = at!(self.equivalences, edge.equivalence as usize).domain;
         #[expect(clippy::cast_precision_loss, reason = "an estimate")]
         let domain = domain.max(1) as f64;
         if edge.kind != JoinKind::Inner {
@@ -104,7 +109,7 @@ impl<'a> Estimator<'a> {
 mod tests {
     use super::*;
     use crate::env::Env;
-    use crate::join_planner::{EquivalenceSet, RelationSet};
+    use crate::join_planner::{QueryGraph, RelationSet};
 
     /// A graph with equivalence sets of domains 10 and 100, and an edge of
     /// each kind on the first.
@@ -129,7 +134,7 @@ mod tests {
     /// The rows of joining 1000 rows to 4, by edges `edges` of `graph()`.
     fn rows(edges: &[usize], forward: bool) -> f64 {
         let graph = graph();
-        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
+        let mut estimator = Estimator::new(&graph.equivalences, &mut []);
         estimator.start(1000.0, 4.0);
         for &edge in edges {
             estimator.apply(at!(graph.edges, edge), forward);
@@ -159,7 +164,7 @@ mod tests {
     #[test]
     fn estimates_saturate() {
         let graph = graph();
-        let mut estimator = Estimator::new(Env::current(), &graph).unwrap();
+        let mut estimator = Estimator::new(&graph.equivalences, &mut []);
         estimator.start(ROWS_MAX, ROWS_MAX);
         assert!(estimator.finish() <= ROWS_MAX);
     }
