@@ -8,7 +8,7 @@ use crate::function::DynFunction;
 use crate::string_pool::{Id, StringPool};
 
 /// The most functions a statement binds.
-pub const FUNCTIONS_MAX: usize = 1 << 8;
+pub const FUNCTIONS_MAX: usize = 1 << 16;
 
 #[derive(Default)]
 pub struct Statement {

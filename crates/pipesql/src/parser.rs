@@ -5,19 +5,22 @@
 
 #![allow(unsafe_code)]
 
-use core::mem::MaybeUninit;
-
 use crate::ast::{Ast, DATA_MAX, Node, Nodes, Operator, Tag};
 use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
+use crate::settings::build_setting;
 use pipit_kernel::containers::SpillVec;
 use pipit_kernel::env::Env;
 
-/// How deeply operators, parentheses and calls can nest. Each waiting
-/// argument counts as a level.
-pub const NESTING_MAX: usize = 64;
+/// How deeply operators, parentheses and calls can nest: by default as
+/// deeply as DuckDB's parser allows. Each waiting argument counts as a
+/// level. Compiling takes up to about 500 bytes of stack a level. Set at
+/// build time with `PIPIT_NESTING_MAX`.
+pub const NESTING_MAX: usize = build_setting(option_env!("PIPIT_NESTING_MAX"), 1000);
+
+const _: () = assert!(NESTING_MAX >= 2, "PIPIT_NESTING_MAX must be at least 2");
 
 /// How many stages a query, or items a list, can have: as many as a node
 /// can count.
@@ -256,38 +259,36 @@ struct Frame {
     min_power: u8,
 }
 
-/// The frames waiting for operands. Bounded, as the parser doesn't recurse.
-/// Frames from `depth` up are unwritten, so making one costs nothing.
-struct Stack {
-    frames: [MaybeUninit<Frame>; NESTING_MAX],
-    depth: usize,
+/// How many frames are held in place: as many as most expressions nest, so
+/// parsing them allocates nothing.
+const FRAMES_INLINE: usize = 64;
+
+/// The frames waiting for operands, the innermost last. The parser doesn't
+/// recurse, so its depth costs memory, not stack.
+struct Stack<'e> {
+    frames: SpillVec<'e, Frame, FRAMES_INLINE>,
 }
 
-impl Stack {
-    fn new() -> Stack {
-        Stack { frames: [const { MaybeUninit::uninit() }; NESTING_MAX], depth: 0 }
+impl<'e> Stack<'e> {
+    fn new(env: &'e Env) -> Stack<'e> {
+        Stack { frames: SpillVec::new(env, NESTING_MAX) }
     }
 
     fn push(&mut self, pending: Pending, min_power: u8, token: Token) -> Result<(), Error> {
-        if self.depth == NESTING_MAX {
+        if self.frames.len() == NESTING_MAX {
             return Err(Error::new(ErrorCode::NestingTooDeep, token.span));
         }
-        at_mut!(self.frames, self.depth).write(Frame { pending, min_power });
-        self.depth += 1;
-        Ok(())
+        Ok(self.frames.push(Frame { pending, min_power })?)
     }
 
     /// The frames, bottom first.
     fn frames(&self) -> &[Frame] {
-        // SAFETY: `push` keeps `depth` within `frames`, the first `depth` were
-        // written, and `MaybeUninit<Frame>` is laid out as `Frame`.
-        unsafe { core::slice::from_raw_parts(self.frames.as_ptr().cast(), self.depth) }
+        &self.frames
     }
 
     /// Keeps the bottom `depth` frames.
     fn truncate(&mut self, depth: usize) {
-        check!(depth <= self.depth);
-        self.depth = depth;
+        self.frames.truncate(depth);
     }
 }
 
@@ -295,7 +296,7 @@ impl Parser<'_> {
     /// Parses an expression, stopping at the first token that can't continue
     /// it. Returns its root, which is not in the tree yet.
     pub(crate) fn expression(&mut self) -> Result<Node, Error> {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(self.env);
         let mut min_power = 0;
         'operand: loop {
             let token = self.advance()?;
@@ -335,7 +336,7 @@ impl Parser<'_> {
                     }
                     Ended::No => {}
                 }
-                stack.truncate(stack.depth - 1);
+                stack.truncate(stack.frames().len() - 1);
                 min_power = frame.min_power;
                 operand = match frame.pending {
                     Pending::Unary(operator) => self.operation(Tag::Unary, operator, &[operand]),
@@ -401,7 +402,7 @@ impl Parser<'_> {
     /// Pops a call and its arguments off `stack`, `last` being its last
     /// argument, and writes them to the tree. Returns the call and the binding
     /// power to go back to.
-    fn call(&mut self, stack: &mut Stack, last: Node) -> (Node, u8) {
+    fn call(&mut self, stack: &mut Stack<'_>, last: Node) -> (Node, u8) {
         let frames = stack.frames();
         let mut call = frames.len() - 1;
         while let Pending::Argument(_) = at!(frames, call).pending {
@@ -424,7 +425,7 @@ impl Parser<'_> {
     /// its operand.
     fn push_pending(
         &mut self,
-        stack: &mut Stack,
+        stack: &mut Stack<'_>,
         pending: Pending,
         min_power: u8,
         token: Token,
@@ -450,7 +451,12 @@ impl Parser<'_> {
     /// Ends `operand` as an argument of the call, or a part of the `CASE`,
     /// that `frame`, the top of `stack`, is part of, at the token after it:
     /// another follows, or the call or `CASE` closes.
-    fn end_part(&mut self, stack: &mut Stack, frame: Frame, operand: Node) -> Result<Ended, Error> {
+    fn end_part(
+        &mut self,
+        stack: &mut Stack<'_>,
+        frame: Frame,
+        operand: Node,
+    ) -> Result<Ended, Error> {
         match frame.pending {
             Pending::Case | Pending::CasePart(..) => {
                 let token = self.advance()?;
@@ -500,7 +506,7 @@ impl Parser<'_> {
     /// writes them to the tree: its subject, each condition and value, and
     /// its `ELSE`'s value, an empty node for one it hasn't. Returns the `CASE`
     /// and the binding power to go back to.
-    fn case(&mut self, stack: &mut Stack, last: Node, before: Keyword) -> (Node, u8) {
+    fn case(&mut self, stack: &mut Stack<'_>, last: Node, before: Keyword) -> (Node, u8) {
         let frames = stack.frames();
         let mut case = frames.len() - 1;
         while let Pending::CasePart(..) = at!(frames, case).pending {
@@ -965,7 +971,10 @@ mod tests {
         assert_eq!(error("(a"), (ErrorCode::ExpectedToken, 2));
         assert_eq!(error("a b"), (ErrorCode::UnexpectedToken, 2));
         assert_eq!(error("a AND"), (ErrorCode::ExpectedExpression, 5));
-        assert_eq!(error(&"(".repeat(NESTING_MAX + 1)), (ErrorCode::NestingTooDeep, 64));
+        assert_eq!(
+            error(&"(".repeat(NESTING_MAX + 1)),
+            (ErrorCode::NestingTooDeep, u32::try_from(NESTING_MAX).unwrap())
+        );
         assert_eq!(error("f(a b"), (ErrorCode::ExpectedToken, 4));
         assert_eq!(error("f(a,"), (ErrorCode::ExpectedExpression, 4));
         let many = format!("f({})", vec!["a"; NESTING_MAX + 1].join(","));

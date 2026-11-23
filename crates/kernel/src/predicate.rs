@@ -9,7 +9,7 @@ use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::DataType;
 use crate::column::{ColumnView, Form};
-use crate::containers::SmallVec;
+use crate::containers::{SmallVec, SpillVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
@@ -25,6 +25,9 @@ use crate::string_pool::{Id, StringPool};
 
 /// The most nodes a predicate can have.
 pub const PREDICATE_NODES_MAX: usize = EXPR_NODES_MAX;
+
+/// How many nodes' depths finding a predicate's depth holds in place.
+const DEPTHS_INLINE: usize = 256;
 
 /// A node of a predicate. Children come before their parents.
 #[derive(Clone, Copy, Debug)]
@@ -75,8 +78,8 @@ pub type Set = FlatHashMap<filter::Listed, ()>;
 
 impl Predicate {
     /// A predicate of `nodes`, the last of which is its root.
-    pub fn new(nodes: SmallVec<Node>) -> Predicate {
-        Predicate::checked(nodes, None)
+    pub fn new(env: &Env, nodes: SmallVec<Node>) -> Result<Predicate, AllocError> {
+        Predicate::checked(env, nodes, None)
     }
 
     /// A predicate of `nodes`, whose `IN` lists are of `values`.
@@ -91,7 +94,7 @@ impl Predicate {
             held.as_mut_slice::<i64>().copy_from_slice(values);
             buffer = Some(held);
         }
-        Ok(Predicate::checked(nodes, buffer))
+        Predicate::checked(env, nodes, buffer)
     }
 
     /// A predicate of one leaf, whose `IN` lists are of `values`.
@@ -101,7 +104,7 @@ impl Predicate {
         values: Option<Buffer>,
     ) -> Result<Predicate, AllocError> {
         let nodes = SmallVec::fixed_from(env, [Node::Leaf(leaf)].into_iter())?;
-        Ok(Predicate::checked(nodes, values))
+        Predicate::checked(env, nodes, values)
     }
 
     /// For each node, the set of its `IN` list's values if it has more than
@@ -163,7 +166,11 @@ impl Predicate {
     }
 
     /// A predicate of `nodes`, checked to be one, and of `values`.
-    fn checked(nodes: SmallVec<Node>, values: Option<Buffer>) -> Predicate {
+    fn checked(
+        env: &Env,
+        nodes: SmallVec<Node>,
+        values: Option<Buffer>,
+    ) -> Result<Predicate, AllocError> {
         check!(!nodes.is_empty() && nodes.len() <= PREDICATE_NODES_MAX);
         let value_count =
             values.as_ref().map_or(0, |values| values.size_bytes() / size_of::<i64>());
@@ -177,25 +184,38 @@ impl Predicate {
             }
             _ => true,
         }));
-        // Each node's depth: how many selections it holds at once, at most.
-        let mut depths = [0_u32; PREDICATE_NODES_MAX];
+        // Each node's depth, wanted true and wanted false: how many
+        // selections `narrow` holds at once for it, at most. An `And` wanted
+        // true, or an `Or` wanted false, narrows in place; the other way, it
+        // holds one while its children run, for the rows left.
+        let len = nodes.len();
+        let mut held =
+            SpillVec::<[u32; 2], DEPTHS_INLINE>::filled(env, PREDICATE_NODES_MAX, len, [0; 2])?;
+        let depths: &mut [[u32; 2]] = &mut held;
         for (i, node) in (0..).zip(nodes.iter()) {
             let depth = |child: u32| *at!(depths, child as usize);
             *at_mut!(depths, i as usize) = match *node {
-                Node::Leaf(_) => 0,
-                // One while its children run, in case it needs the rows left.
+                Node::Leaf(_) => [0, 0],
                 Node::And(a, b) | Node::Or(a, b) => {
                     check!(a < i && b < i);
-                    1 + depth(a).max(depth(b))
+                    let [a, b] = [depth(a), depth(b)];
+                    // Its children are narrowed for what it's wanted for.
+                    let [wanted_true, wanted_false] = [a[0].max(b[0]), a[1].max(b[1])];
+                    if matches!(node, Node::And(..)) {
+                        [wanted_true, wanted_false + 1]
+                    } else {
+                        [wanted_true + 1, wanted_false]
+                    }
                 }
                 Node::Not(a) => {
                     check!(a < i);
-                    depth(a)
+                    let [true_, false_] = depth(a);
+                    [false_, true_]
                 }
             };
         }
-        let depth = *at!(depths, nodes.len() - 1);
-        Predicate { nodes, values, depth }
+        let depth = at!(depths, nodes.len() - 1)[0];
+        Ok(Predicate { nodes, values, depth })
     }
 
     /// Its nodes, the last its root.
@@ -284,8 +304,17 @@ impl Predicate {
         want: bool,
         selection: &mut Selection,
     ) -> Result<(), AllocError> {
-        self.narrow(inputs, scratch, a, want, selection)?;
-        self.narrow(inputs, scratch, b, want, selection)
+        let (mut a, mut b) = (a, b);
+        loop {
+            self.narrow(inputs, scratch, a, want, selection)?;
+            // The rest of a chain, such as a filter's conjuncts, in a loop
+            // rather than recursing.
+            match *at!(self.nodes, b as usize) {
+                Node::And(next, rest) if want => (a, b) = (next, rest),
+                Node::Or(next, rest) if !want => (a, b) = (next, rest),
+                _ => return self.narrow(inputs, scratch, b, want, selection),
+            }
+        }
     }
 }
 
@@ -485,19 +514,21 @@ impl Predicate {
     ) -> Result<Predicate, AllocError> {
         let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX)?;
         let mut root = None;
-        for &conjunct in conjuncts {
+        // From the last, joined from the right, so `narrow` tests them in
+        // order in a loop.
+        for &conjunct in conjuncts.iter().rev() {
             let start = conjunct.start;
             let expr = exprs.nodes(conjunct);
             let mut from =
                 FromExpr { expr, start, column, computed_at, computed, nodes: &mut nodes };
             let added = from.add(conjunct.root)?;
             root = Some(match root {
-                Some(root) => push(&mut nodes, Node::And(root, added))?,
+                Some(root) => push(&mut nodes, Node::And(added, root))?,
                 None => added,
             });
         }
         check!(root.is_some());
-        Ok(Predicate::checked(nodes, values))
+        Predicate::checked(env, nodes, values)
     }
 }
 
@@ -743,7 +774,7 @@ mod tests {
         let env = Env::current();
         let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
-        Predicate::new(nodes)
+        Predicate::new(env, nodes).unwrap()
     }
 
     fn kept(expr: &Expr) -> StdVec<usize> {
@@ -860,14 +891,15 @@ mod tests {
             &Expr::Not(&NULL_OR_B),
             &Expr::Not(&Expr::Not(&Expr::And(&EITHER, &Expr::Not(&BOTH)))),
         ];
-        // One scratch selection per `AND` or `OR` nested in another.
+        // A scratch selection for each `OR` wanted true, or `AND` wanted
+        // false, nested in another: an `AND` wanted true narrows in place.
         let depth = |expr: &Expr| {
             let env = Env::current();
             let mut nodes = SmallVec::new(env, PREDICATE_NODES_MAX).unwrap();
             build(expr, &mut nodes);
-            Predicate::new(nodes).depth()
+            Predicate::new(env, nodes).unwrap().depth()
         };
-        assert_eq!([&A2, &BOTH, exprs[8]].map(depth), [0, 1, 2]);
+        assert_eq!([&A2, &BOTH, &EITHER, exprs[4], exprs[8]].map(depth), [0, 0, 1, 1, 1]);
         for expr in exprs {
             let expected: StdVec<usize> =
                 (0..6).filter(|&row| reference(expr, row) == Some(true)).collect();
@@ -951,7 +983,7 @@ mod tests {
         let leaf = Leaf::CompareString { column: 0, comparison, string };
         let nodes = [Node::Leaf(leaf), Node::Not(0)];
         let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
-        (Predicate::new(nodes.unwrap()), literals)
+        (Predicate::new(env, nodes.unwrap()).unwrap(), literals)
     }
 
     /// The rows `predicate`, with `literals`, keeps of a batch of `column`,
@@ -1013,7 +1045,7 @@ mod tests {
             let pattern = id(&mut literals, b"_");
             let nodes = [Node::Leaf(Leaf::Like { column: 0, pattern }), Node::Not(0)];
             let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
-            let predicate = Predicate::new(nodes.unwrap());
+            let predicate = Predicate::new(env, nodes.unwrap()).unwrap();
             let mut entries = predicate.new_entries(env).unwrap();
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);

@@ -897,8 +897,11 @@ mod tests {
             error("FROM t |> SELECT 9223372036854775808 AS x"),
             (ErrorCode::NumberTooLarge, 17)
         );
-        let long = format!("FROM t |> SELECT a{} AS x", " + a".repeat(200));
-        assert_eq!(error(&long), (ErrorCode::ExpressionTooLarge, 17));
+        // A chain of operators is as deep as it is long.
+        let chain = |n| format!("FROM t |> SELECT a{} AS x", " + a".repeat(n));
+        let deepest = chain(crate::parser::NESTING_MAX - 1);
+        assert!(compile(Env::current(), &REGISTRY, &catalog(), deepest.as_bytes()).is_ok());
+        assert_eq!(error(&chain(crate::parser::NESTING_MAX)), (ErrorCode::NestingTooDeep, 17));
         assert_eq!(error("FROM t |> WHERE c > 1"), (ErrorCode::UnknownColumn, 16));
         // Computed, as a predicate can't test them.
         assert_eq!(kept("FROM t |> WHERE a > b |> SELECT a"), []);
@@ -910,10 +913,12 @@ mod tests {
             error("FROM t |> WHERE a > 9223372036854775808"),
             (ErrorCode::NumberTooLarge, 20)
         );
-        // Past the most nodes an expression has.
-        let wide = (0..100).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
-        let wide = format!("FROM t |> WHERE {wide}");
-        assert_eq!(error(&wide).0, ErrorCode::ExpressionTooLarge);
+        // As wide as nesting and the tree allow: an `OR` of comparisons nests
+        // as deep as it has terms, of four nodes each.
+        let room = crate::ast::BLOCK_NODES * crate::ast::BLOCK_SLOTS / 8;
+        let terms = (crate::parser::NESTING_MAX - 1).min(room);
+        let wide = (0..terms).map(|i| format!("a = {i}")).collect::<StdVec<_>>().join(" OR ");
+        assert_eq!(kept(&format!("FROM t |> WHERE {wide} |> SELECT a")), [1.0, 2.0]);
         assert_eq!(error("FROM t |> WHERE f IN (1)"), (ErrorCode::Unsupported, 16));
         // As `a = 'a'` is.
         assert_eq!(error("FROM t |> WHERE s IN ('a', 1)"), (ErrorCode::ExpectedOneKind, 27));

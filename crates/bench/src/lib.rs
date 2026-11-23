@@ -588,7 +588,7 @@ pub fn ipad_predicate() -> (Predicate, StringPool) {
     let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, string };
     let nodes =
         SmallVec::fixed_from(crate::env(), [Node::Leaf(leaf)].into_iter()).expect("allocates");
-    (Predicate::new(nodes), literals)
+    (Predicate::new(crate::env(), nodes).expect("allocates"), literals)
 }
 
 /// Keeps `iPad`s: 1 in 8.
@@ -612,10 +612,9 @@ pub fn predicate(shape: &str) -> Predicate {
         }
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
-    Predicate::new(
-        pipit_kernel::containers::SmallVec::fixed_from(crate::env(), nodes.iter().copied())
-            .expect("allocates"),
-    )
+    let nodes = pipit_kernel::containers::SmallVec::fixed_from(crate::env(), nodes.iter().copied())
+        .expect("allocates");
+    Predicate::new(crate::env(), nodes).expect("allocates")
 }
 
 /// Runs `predicate`, with its statement's `literals`, over `batches` batches
