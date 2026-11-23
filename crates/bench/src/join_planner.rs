@@ -8,8 +8,8 @@ use std::fmt::Debug;
 use pipit_kernel::env::Env;
 use pipit_kernel::error::Error;
 use pipit_kernel::join_planner::{
-    EquivalenceSet, Estimator, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph, ROWS_MAX,
-    Relation, RelationSet,
+    BUILD_COST, EquivalenceSet, Estimator, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph,
+    ROWS_MAX, Relation, RelationSet,
 };
 
 /// Picks a valid join tree for a graph, with memory from an `Env`.
@@ -343,8 +343,8 @@ pub enum Invalid {
 /// A tree's cost, and whether it's valid.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Costed {
-    /// `C_out`: the rows of every join, each at least 1, added up, at most
-    /// `ROWS_MAX`.
+    /// The rows of every join, each at least 1, and `BUILD_COST` for each
+    /// row of every join's smaller side, added up, at most `ROWS_MAX`.
     pub cost: f64,
     /// Whether the tree is valid, or why not.
     pub valid: Result<(), Invalid>,
@@ -396,6 +396,12 @@ fn post_order(tree: &JoinTree) -> Option<Vec<usize>> {
     (order.len() == count).then_some(order)
 }
 
+/// What a join of sides of `rows` that makes `joined` rows adds to a tree's
+/// cost, as the planner counts it.
+fn join_cost(rows: [f64; 2], joined: f64) -> f64 {
+    joined.max(1.0) + BUILD_COST * rows[0].min(rows[1])
+}
+
 /// The cost of `tree` for `graph`, and whether it's valid. A valid tree has
 /// every relation once, applies every edge where its relations meet, has no
 /// cross product unless the graph isn't connected or a side is one relation
@@ -439,7 +445,7 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
                     }
                 }
                 set.union_with(&other).map_err(fail)?;
-                total = (total + joined.max(1.0)).min(ROWS_MAX);
+                total = (total + join_cost([rows[left], rows[right]], joined)).min(ROWS_MAX);
                 (set, joined)
             }
             None => return invalid(Invalid::Shape),
@@ -579,7 +585,7 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
                 continue;
             }
             let joined = estimator.finish();
-            let total = (best[l] + best[r] + joined.max(1.0)).min(ROWS_MAX);
+            let total = (best[l] + best[r] + join_cost([rows[l], rows[r]], joined)).min(ROWS_MAX);
             if total < best[set as usize] {
                 (best[set as usize], rows[set as usize], split[set as usize]) =
                     (total, joined, left);
@@ -647,8 +653,10 @@ mod tests {
     fn costs_and_checks_trees() {
         let graph = star();
         let written = as_written(crate::env(), &graph).unwrap();
-        // 1000 * 10 / 10, then a left join keeping all 1000.
-        assert_eq!(cost(&graph, &written).unwrap(), Costed { cost: 2000.0, valid: Ok(()) });
+        // 1000 * 10 / 10, then a left join keeping all 1000, each building
+        // its smaller side's 10, then 100, rows at `BUILD_COST` each.
+        let cost_of = 2000.0 + BUILD_COST * 110.0;
+        assert_eq!(cost(&graph, &written).unwrap(), Costed { cost: cost_of, valid: Ok(()) });
         // The left join before the inner one breaks its TES.
         assert_eq!(cost(&graph, &left_deep([1, 2, 0])).unwrap().valid, Err(Invalid::Edge(1)));
         assert_eq!(cost(&graph, &left_deep([0, 2, 1])).unwrap().valid, Err(Invalid::CrossProduct));
