@@ -194,11 +194,16 @@ impl Drop for OwnedGlobal {
 /// allocated from it left.
 unsafe fn free<A: Allocator>(global: NonNull<Global>) {
     let block = global.cast::<Block<A>>();
-    // SAFETY: the block holds both fields. Dropping the `Global` first gives
-    // the fixed allocators' chunks back, so all that's left is the block,
-    // which `base` then frees from outside it.
+    // SAFETY: the block holds both fields. Dropping the fixed allocators
+    // first gives their chunks back, so all that's left is the block, which
+    // `base` then frees from outside it. They're dropped one by one, not as
+    // a `Global`, whose `&mut` would end the budget's borrow they hold; the
+    // rest needs no drop.
     unsafe {
-        (&raw mut (*block.as_ptr()).global).drop_in_place();
+        let global = &raw mut (*block.as_ptr()).global;
+        (&raw mut (*global).values).drop_in_place();
+        (&raw mut (*global).indices).drop_in_place();
+        (&raw mut (*global).small).drop_in_place();
         check!((*block.as_ptr()).global.used() == size_of::<Block<A>>());
         let base = (&raw const (*block.as_ptr()).base).read();
         base.deallocate(block.cast(), Layout::new::<Block<A>>());
