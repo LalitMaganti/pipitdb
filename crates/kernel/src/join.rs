@@ -438,8 +438,10 @@ pub(crate) fn equality(nodes: &[ExprStep]) -> Option<[ColumnId; 2]> {
 }
 
 /// The most keys a join hashes by. Equalities past them are tested, as the
-/// rest of its condition is.
-const JOIN_KEYS_MAX: usize = 4;
+/// rest of its condition is. Finding groups holds as many columns on the
+/// stack each batch, so it's no more than joins need: some get more keys
+/// than written, as the planner adds the equalities between relations.
+const JOIN_KEYS_MAX: usize = 16;
 
 /// The columns a join hashes its build side by, which its condition
 /// requires equal on both sides.

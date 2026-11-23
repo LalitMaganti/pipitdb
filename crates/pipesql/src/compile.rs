@@ -595,6 +595,10 @@ mod tests {
             "FROM t AS x |> JOIN t AS y ON x.a < y.a |> WHERE x.b + y.b = 30 |> SELECT x.a";
         assert_eq!(kept(joined), [1.0]);
         assert_eq!(error("FROM t |> JOIN t ON t.a = 1"), (ErrorCode::AmbiguousColumn, 20));
+        // More keys than the 4 a join hashed by.
+        let keys = "x.a = y.a AND x.b = y.b AND x.s = y.s AND y.a = x.a AND y.b = x.b";
+        let joined = format!("FROM t AS x |> JOIN t AS y ON {keys} |> SELECT y.b");
+        assert_eq!(values(&joined), [[10.0, 20.0]]);
         // More tables than the 64 aliases there were room for.
         let many: StdVec<_> =
             (1..70).map(|i| format!(" |> JOIN ids AS a{i} ON a0.id = a{i}.id")).collect();
