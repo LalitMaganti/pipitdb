@@ -79,10 +79,13 @@ pub(crate) struct GroupTable {
     number_groups: SlowVec<u32>,
     /// With a single key, a string, the null string's group, once it has one.
     null_group: u32,
+    /// Whether a key not found gets no group, `NONE`, rather than a new
+    /// one: a join's build side, once built.
+    frozen: bool,
 }
 
 /// No number, or no group.
-const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 
 /// A string key's dictionary, and the ids of its entries: kept while
 /// batches share it, as a chunk's do, so each entry is interned once.
@@ -123,11 +126,36 @@ impl GroupTable {
             dictionaries: SlowVec::fixed_from(allocator, (0..keys).map(|_| None))?,
             number_groups: SlowVec::new(allocator, 1 << 31)?,
             null_group: NONE,
+            frozen: false,
         })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Group `group`'s key `k`, a word: a string's id.
+    pub(crate) fn key(&self, group: u32, k: usize) -> i64 {
+        check!(k < self.keys);
+        *at!(self.records.record(group as usize), self.first + k)
+    }
+
+    /// Group `group`'s first payload word.
+    pub(crate) fn payload(&self, group: u32) -> i64 {
+        *at!(self.records.record(group as usize), self.first + self.keys)
+    }
+
+    /// Sets group `group`'s first payload word to `value`.
+    pub(crate) fn set_payload(&mut self, group: u32, value: i64) {
+        check!((group as usize) < self.len() && self.stride > self.first + self.keys);
+        // SAFETY: the group has a record, of `stride` words, checked above.
+        unsafe { *self.records.record_ptr(group as usize).add(self.first + self.keys) = value };
+    }
+
+    /// From now on, `find_or_create` finds groups only, and gives a key not
+    /// found `NONE`.
+    pub(crate) fn freeze(&mut self) {
+        self.frozen = true;
     }
 
     /// Where each block of records starts, as `Blocks::starts`, and where a
@@ -283,6 +311,7 @@ impl GroupTable {
             };
             *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
+                Err(_) if self.frozen => NONE,
                 Err(at) => self.add_row(at, hash, keys, row, null(row))?,
             };
         }
@@ -327,7 +356,8 @@ impl GroupTable {
                 NO_NUMBER => self.null_group,
                 _ => *at!(self.number_groups, number as usize),
             };
-            *group = if known == NONE { self.add_numbered(number, id)? } else { known };
+            *group =
+                if known == NONE && !self.frozen { self.add_numbered(number, id)? } else { known };
         }
         Ok(())
     }
@@ -373,6 +403,7 @@ impl GroupTable {
             };
             *group = match probe(&self.slots, hash, equal) {
                 Ok(group) => group,
+                Err(_) if self.frozen => NONE,
                 Err(at) => {
                     let record = [0, key];
                     self.add(at, hash, at!(record, 1 - first..))?
