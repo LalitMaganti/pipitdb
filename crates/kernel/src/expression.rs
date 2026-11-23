@@ -158,6 +158,7 @@ pub struct ExprStep {
 /// in SQLite. An integer overflow, which SQLite would answer with a double,
 /// fails the run.
 pub struct ExprProgram {
+    /// Its steps, each reading only steps before it.
     pub steps: SmallVec<ExprStep>,
     /// Its `In` lists' values, if it has any.
     pub values: Option<Buffer>,

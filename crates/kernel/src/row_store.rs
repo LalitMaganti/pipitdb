@@ -566,10 +566,13 @@ fn shares(batch: &RowBatch) -> bool {
 
 /// A column being packed: its values, up to a batch's, and nulls.
 struct Packing {
+    /// What type the column is.
     data_type: DataType,
     /// Each row's value: a word, or a string's view into `bytes`.
     values: Buffer,
+    /// A bit for each row, set if it isn't null.
     validity: Buffer,
+    /// Whether any row is null.
     nulls: bool,
     /// The strings' bytes, for a string column.
     bytes: Option<SmallVec<u8>>,

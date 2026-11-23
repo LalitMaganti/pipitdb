@@ -32,6 +32,7 @@ pub fn optimize(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError>
 
 /// The columns something later in a plan uses, by id.
 pub struct Needed<'e> {
+    /// Whether each column, by id, is used.
     columns: SmallVec<bool>,
     /// The plan's expressions, which ops' columns are read in.
     exprs: &'e Exprs,

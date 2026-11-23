@@ -93,7 +93,9 @@ impl Arrangements {
 /// A column of a batch, and what it holds here.
 #[derive(Clone, Copy)]
 pub struct Column {
+    /// Which column it is.
     pub id: ColumnId,
+    /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,

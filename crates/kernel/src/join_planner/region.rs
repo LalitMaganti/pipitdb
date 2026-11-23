@@ -28,8 +28,9 @@ const TREE_MAX: usize = 2 * crate::plan::PLAN_NODES_MAX;
 struct Equality {
     /// The conjunct that requires it.
     conjunct: Expr,
-    /// Its columns, and their relations.
+    /// Its columns.
     columns: [ColumnId; 2],
+    /// The relation each of `columns` is of.
     relations: [u32; 2],
 }
 

@@ -39,49 +39,31 @@ pub enum Node {
 #[derive(Clone, Copy, Debug)]
 pub enum Leaf {
     /// The column at `column` in a batch, compared with `value`.
-    Compare {
-        column: u32,
-        comparison: Comparison,
-        value: Value,
-    },
+    Compare { column: u32, comparison: Comparison, value: Value },
     /// The string column at `column` in a batch, compared byte by byte with
     /// `string`, one of the statement's literals.
-    CompareString {
-        column: u32,
-        comparison: Comparison,
-        string: Id,
-    },
+    CompareString { column: u32, comparison: Comparison, string: Id },
     /// The string column at `column` in a batch, matched with the `LIKE`
     /// pattern `pattern`, one of the statement's literals.
-    Like {
-        column: u32,
-        pattern: Id,
-    },
-    IsNull {
-        column: u32,
-    },
+    Like { column: u32, pattern: Id },
+    /// The column at `column` in a batch, null.
+    IsNull { column: u32 },
     /// The integer column at `column` in a batch, one of values
     /// `start..start + len` of the predicate's values.
-    In {
-        column: u32,
-        start: u32,
-        len: u32,
-    },
+    In { column: u32, start: u32, len: u32 },
     /// The string column at `column` in a batch, one of the strings whose
     /// ids in the statement's literals are values `start..start + len` of the
     /// predicate's values.
-    InStrings {
-        column: u32,
-        start: u32,
-        len: u32,
-    },
+    InStrings { column: u32, start: u32, len: u32 },
 }
 
 /// Its root is its last node.
 pub struct Predicate {
+    /// Its leaves, and the `And`, `Or` and `Not` nodes over them.
     nodes: SmallVec<Node>,
     /// The values of its `IN` lists, if it has any: shared by its copies.
     values: Option<Buffer>,
+    /// How many scratch selections testing it holds at once, at most.
     depth: u32,
 }
 
@@ -638,6 +620,7 @@ pub struct Filter {
     /// Computes what `predicate` reads after a batch's own columns, which
     /// are dropped once it's tested.
     pub compute: Option<Compute>,
+    /// What a row must be true for to be kept.
     pub predicate: Predicate,
 }
 

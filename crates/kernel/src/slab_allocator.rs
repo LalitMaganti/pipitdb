@@ -17,6 +17,7 @@ use crate::row_batch::BATCH_ROWS_MAX;
 /// Any layout up to its slot size gets a whole slot. It's one type for
 /// every size, so its code isn't copied for each.
 pub(crate) struct SlabAllocator<'a> {
+    /// What slabs are taken from.
     allocator: &'a dyn Allocator,
     /// How many bytes each slot has.
     slot_bytes: usize,

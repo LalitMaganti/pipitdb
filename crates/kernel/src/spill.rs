@@ -45,7 +45,9 @@ pub trait SpillStore {
 /// A column written to a log: what's needed to read it back.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SpilledColumn {
+    /// What type its values are.
     pub data_type: DataType,
+    /// How many rows it has.
     pub row_count: u32,
     /// Its values, or if its type has bytes, views into them.
     pub values: ByteRange,

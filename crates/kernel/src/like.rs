@@ -44,7 +44,9 @@ pub fn contained(pattern: &[u8]) -> Option<&[u8]> {
 /// string between: strings in order, as a page's are, are searched in one
 /// pass, not one each, as Pivot's `NeedleSearcher` does.
 pub struct Contains<'a> {
+    /// The strings' bytes.
     bytes: &'a [u8],
+    /// What it searches for.
     needle: &'a [u8],
     /// Where the last search started.
     from: Cell<usize>,

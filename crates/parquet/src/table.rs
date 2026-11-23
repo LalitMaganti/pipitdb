@@ -188,8 +188,11 @@ impl<'a> Rows<'a> {
 /// A scan of a `ParquetTable` that reads only `groups`, by file and row
 /// group in it: those whose statistics don't rule out the values kept.
 struct Pruned<'a> {
+    /// The table it scans.
     table: &'a ParquetTable<'a>,
+    /// The columns it reads, and the forms each may take.
     columns: SmallVec<(u32, Forms)>,
+    /// The row groups it reads, as a file and a row group in it.
     groups: SmallVec<(usize, usize)>,
     /// What a `TopK` above publishes a cutoff on, if anything: a row group
     /// whose rows all sort after it is skipped as it's reached.

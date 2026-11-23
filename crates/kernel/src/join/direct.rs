@@ -19,8 +19,9 @@ const KEYS_PER_ROW: u64 = 256;
 /// Finds the build row of a key by its value, as a perfect hash does: by
 /// how far it is above the smallest key.
 pub(super) struct Direct {
-    /// The smallest key, and how far above it the largest is.
+    /// The smallest key.
     min: i64,
+    /// How far above `min` the largest key is.
     span: u64,
     /// Which keys have a build row, and which. None if each key's build row
     /// is its number above `min`, as a table's ids' are.

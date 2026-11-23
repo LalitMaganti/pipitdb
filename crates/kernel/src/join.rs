@@ -61,6 +61,7 @@ pub struct JoinOp {
     /// outputs, which pruning clears: planning finds which child a column
     /// comes from by them all.
     columns: [SmallVec<ColumnId>; 2],
+    /// For each child, a bit for each of its `columns` it outputs.
     outputs: [u64; 2],
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
@@ -450,11 +451,13 @@ struct Join<'c> {
     /// The build side.
     build: DynSource<'c>,
     /// Where the first `held` build columns are in the build side's
-    /// batches: those it outputs, then those only its condition reads; and
-    /// the types of the first `outputs`, those it outputs.
+    /// batches: those it outputs, then those only its condition reads.
     build_columns: [u32; BATCH_COLUMNS_MAX as usize],
+    /// How many build columns it holds.
     held: usize,
+    /// The types of the build columns it holds.
     build_types: [DataType; BATCH_COLUMNS_MAX as usize],
+    /// How many of the build columns it holds it outputs.
     outputs: usize,
     /// Computes the condition, as a column after a pair's.
     condition: Option<Compute>,
@@ -463,6 +466,7 @@ struct Join<'c> {
     /// Whether it outputs the build rows no probe row matched, at the end,
     /// with nulls of `probe_types` for the probe side's columns.
     keeps_build: bool,
+    /// The types of the probe side's columns.
     probe_types: SmallVec<DataType>,
 }
 
@@ -470,8 +474,9 @@ struct Join<'c> {
 struct Held {
     /// Whether the build side is drained.
     drained: bool,
-    /// The build columns of every build row, in order, and how many rows.
+    /// The build columns of every build row, in order.
     rows: RowStore,
+    /// How many build rows there are.
     count: u32,
     /// Whether the input batch has had its first round.
     started: bool,
@@ -479,10 +484,11 @@ struct Held {
     /// rounds there have been.
     next: u32,
     /// With keys, each build row's group of keys, which holds its last build
-    /// row plus one; and each build row's one before it of the group, or
-    /// `NONE`; and whether any group has more than one.
+    /// row plus one.
     table: Option<GroupTable>,
+    /// With keys, each build row's one before it of its group, or `NONE`.
     before: SmallVec<u32>,
+    /// With keys, whether any group has more than one build row.
     repeats: bool,
     /// With one integer key, unique, of values close enough, how to find
     /// a key's build row by its value, in place of `table`.
@@ -504,11 +510,14 @@ struct Held {
     paired: Array<u32>,
     /// What computing the condition keeps.
     condition: Option<ComputeState>,
-    /// When it keeps the build rows: a bit for each, set once a probe row
-    /// matched it; the next it hasn't looked at for output at the end; and
-    /// a null column of each probe column's type, a batch long.
+    /// When it keeps the build rows, a bit for each, set once a probe row
+    /// matched it.
     build_matched: Bitmap,
+    /// When it keeps the build rows, the next it hasn't looked at for
+    /// output at the end.
     unmatched: u32,
+    /// When it keeps the build rows, a null column of each probe column's
+    /// type, a batch long.
     probe_nulls: SmallVec<ColumnView>,
 }
 

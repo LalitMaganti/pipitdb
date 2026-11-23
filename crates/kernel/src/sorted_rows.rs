@@ -56,6 +56,7 @@ pub(crate) struct SortedRows {
     decoded: u64,
     /// The rows in output order: the first `order_len`.
     order: Sorted,
+    /// How many of `order` there are.
     order_len: u32,
 }
 
