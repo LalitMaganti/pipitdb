@@ -845,14 +845,23 @@ pub struct FilterOp {
 impl FilterOp {
     /// The filter of `condition`, of `exprs`: its top-level conjuncts.
     pub fn new(allocator: &Global, exprs: &Exprs, condition: Expr) -> Result<FilterOp, AllocError> {
-        let mut count = 0;
-        conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
-        let mut parts = SlowVec::fixed(allocator, count)?;
-        conjuncts(exprs.nodes(condition), condition.root, &mut |root| {
-            parts.extend_within(core::iter::once(Expr { root, ..condition }));
-        });
-        Ok(FilterOp { conjuncts: parts })
+        Ok(FilterOp { conjuncts: conjuncts_of(allocator, exprs, condition)? })
     }
+}
+
+/// The top-level conjuncts of `condition`, of `exprs`: what its `AND`s join.
+pub fn conjuncts_of(
+    global: &Global,
+    exprs: &Exprs,
+    condition: Expr,
+) -> Result<Conjuncts, AllocError> {
+    let mut count = 0;
+    conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
+    let mut parts = SlowVec::fixed(global, count)?;
+    conjuncts(exprs.nodes(condition), condition.root, &mut |root| {
+        parts.extend_within(core::iter::once(Expr { root, ..condition }));
+    });
+    Ok(parts)
 }
 
 /// The conjuncts of `conjuncts` that `keep` is true for, or `None` if none.

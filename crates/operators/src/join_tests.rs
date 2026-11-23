@@ -17,7 +17,7 @@ use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::plan::{
-    DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp,
+    DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp, conjuncts_of,
 };
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
@@ -164,7 +164,11 @@ fn join(
         SlowVec::fixed_from(Global::current(), [build_k.id, build_v.id].into_iter()).unwrap();
     let probe_columns =
         SlowVec::fixed_from(Global::current(), [probe_k.id, probe_v.id].into_iter()).unwrap();
-    let join = JoinOp::new(kind, condition, [probe_columns, build_columns]);
+    let conjuncts = match condition {
+        Some(condition) => conjuncts_of(Global::current(), &plan.exprs, condition).unwrap(),
+        None => SlowVec::fixed(Global::current(), 0).unwrap(),
+    };
+    let join = JoinOp::new(kind, conjuncts, [probe_columns, build_columns]);
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(Global::current(), join).unwrap(), &children).unwrap();
     if above != Above::Nothing {
