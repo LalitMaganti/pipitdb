@@ -5,7 +5,7 @@
 //! it's false for. A null row is neither, as in SQL, so `NOT` swaps the two
 //! and every node keeps SQL's three-valued logic without building booleans.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::DataType;
 use crate::column::{ColumnView, Form};
@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::expression::{Compute, ComputeState, EXPR_NODES_MAX, Expr, ExprOp, ExprStep, Exprs};
 use crate::filter::{self, Comparison, Entries, Value};
 use crate::flat_hash_map::FlatHashMap;
+use crate::global::Global;
 use crate::murmur_hash;
 use crate::plan::ColumnId;
 use crate::row_batch::RowBatch;
@@ -98,7 +99,7 @@ impl Predicate {
 
     /// A predicate of `nodes`, whose `IN` lists are of `values`.
     pub fn with_values(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         nodes: SlowVec<Node>,
         values: &[i64],
     ) -> Result<Predicate, AllocError> {
@@ -113,7 +114,7 @@ impl Predicate {
 
     /// A predicate of one leaf, whose `IN` lists are of `values`.
     pub(crate) fn of_leaf(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         leaf: Leaf,
         values: Option<Buffer>,
     ) -> Result<Predicate, AllocError> {
@@ -126,7 +127,7 @@ impl Predicate {
     /// String lists' values are ids in `literals`.
     pub fn new_sets(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         literals: Option<&StringPool>,
     ) -> Result<SlowVec<Option<Set>>, AllocError> {
         let long = |node: &Node| match *node {
@@ -149,7 +150,7 @@ impl Predicate {
     /// `filter::IN_SCAN_MAX` of them.
     fn set_of(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         literals: Option<&StringPool>,
         node: Node,
     ) -> Result<Option<Set>, AllocError> {
@@ -226,7 +227,7 @@ impl Predicate {
     }
 
     /// Where each node keeps the dictionary entries it found, for `select`.
-    pub fn new_entries(&self, allocator: &dyn Allocator) -> Result<SlowVec<Entries>, AllocError> {
+    pub fn new_entries(&self, allocator: &Global) -> Result<SlowVec<Entries>, AllocError> {
         SlowVec::fixed_from(allocator, (0..self.nodes.len()).map(|_| Entries::default()))
     }
 
@@ -239,7 +240,7 @@ impl Predicate {
     #[inline]
     pub fn select(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         literals: Option<&StringPool>,
         sets: &[Option<Set>],
         scratch: &mut [Selection],
@@ -319,7 +320,7 @@ struct Inputs<'b> {
     /// Where each node keeps the dictionary entries it found.
     entries: &'b mut [Entries],
     /// What the entries' bits are allocated from.
-    allocator: &'b dyn Allocator,
+    allocator: &'b Global,
 }
 
 impl Leaf {
@@ -505,7 +506,7 @@ impl Predicate {
     /// `computed`: the filter computes those first, as 0, 1 or null, and
     /// keeps the rows where they aren't 0, as SQL does.
     pub fn from_expr(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         exprs: &Exprs,
         conjuncts: &[Expr],
         values: Option<Buffer>,
@@ -713,7 +714,7 @@ mod tests {
     use alloc::vec::Vec as StdVec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::{DataType, Forms};
     use crate::context::Context;
@@ -725,13 +726,15 @@ mod tests {
     const B: [Option<i64>; 6] = [None, Some(2), None, Some(4), Some(5), Some(1)];
 
     fn column(cells: [Option<i64>; 6]) -> ColumnView {
-        let mut values = Buffer::allocate(&Heap, 48).unwrap();
-        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+        let global = Global::current();
+        let mut values = Buffer::allocate(global, 48).unwrap();
+        let mut validity = Buffer::allocate(global, 1).unwrap();
         for (row, cell) in cells.iter().enumerate() {
             values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
             validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
         }
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity)).unwrap()
+        ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, Some(validity))
+            .unwrap()
     }
 
     /// A predicate to evaluate both ways: by `Predicate`, and by hand.
@@ -782,7 +785,8 @@ mod tests {
 
     /// The rows `expr` keeps of `a` and `b`.
     fn predicate_of(expr: &Expr) -> Predicate {
-        let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+        let global = Global::current();
+        let mut nodes = SlowVec::new(global, PREDICATE_NODES_MAX).unwrap();
         build(expr, &mut nodes);
         Predicate::new(nodes)
     }
@@ -793,14 +797,15 @@ mod tests {
 
     /// The rows of `a` and `b` `predicate` keeps.
     fn kept_by(predicate: &Predicate) -> StdVec<usize> {
+        let global = Global::current();
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
-        let mut entries = predicate.new_entries(&Heap).unwrap();
-        let sets = predicate.new_sets(&Heap, None).unwrap();
+        let mut entries = predicate.new_entries(global).unwrap();
+        let sets = predicate.new_sets(global, None).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(6);
         assert!(batch.push_column(column(A)).is_ok() && batch.push_column(column(B)).is_ok());
-        predicate.select(&Heap, None, &sets, &mut scratch, &mut entries, &mut batch).unwrap();
+        predicate.select(global, None, &sets, &mut scratch, &mut entries, &mut batch).unwrap();
         match batch.selection().kept() {
             Kept::Prefix => (0..6).collect(),
             Kept::None => StdVec::new(),
@@ -836,7 +841,7 @@ mod tests {
             };
             added.unwrap()
         }
-        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
         add(expr, &mut nodes);
         exprs.add(nodes.nodes()).unwrap()
     }
@@ -844,10 +849,12 @@ mod tests {
     /// The predicate testing `conjuncts`, of `exprs`, of columns at their
     /// ids' positions.
     fn from_kernel(exprs: &Exprs, conjuncts: &[crate::expression::Expr]) -> Predicate {
-        let mut computed = SlowVec::new(&Heap, 1).unwrap();
+        let global = Global::current();
+        let mut computed = SlowVec::new(global, 1).unwrap();
         let column = |column| (column, DataType::Int64);
         let predicate =
-            Predicate::from_expr(&Heap, exprs, conjuncts, None, &column, 2, &mut computed).unwrap();
+            Predicate::from_expr(global, exprs, conjuncts, None, &column, 2, &mut computed)
+                .unwrap();
         assert!(computed.is_empty());
         predicate
     }
@@ -861,13 +868,14 @@ mod tests {
         // `(a > 2 AND b IS NULL) AND (a > 4 OR a IS NULL) AND (a > 2 OR b > 2)`.
         const ALL: Expr =
             Expr::And(&Expr::And(&Expr::And(&A2, &Expr::IsNull(1)), &A4_OR_NULL), &EITHER);
-        let mut exprs = Exprs::new(&Heap).unwrap();
+        let global = Global::current();
+        let mut exprs = Exprs::new(global).unwrap();
         let all = kernel(&mut exprs, &ALL);
         assert_eq!(kept_by(&from_kernel(&exprs, &[all])), kept(&ALL));
         let mut given = |expr: &Expr, column| {
             let condition = kernel(&mut exprs, expr);
-            let mut filter = FilterOp::new(&Heap, &exprs, condition).unwrap();
-            let given = filter.give_condition(&exprs, &Heap, column).unwrap();
+            let mut filter = FilterOp::new(global, &exprs, condition).unwrap();
+            let given = filter.give_condition(&exprs, global, column).unwrap();
             let Given::Passed(condition) = given else {
                 panic!("a filter passes on its child's rows")
             };
@@ -900,7 +908,8 @@ mod tests {
         ];
         // One scratch selection per `AND` or `OR` nested in another.
         let depth = |expr: &Expr| {
-            let mut nodes = SlowVec::new(&Heap, PREDICATE_NODES_MAX).unwrap();
+            let global = Global::current();
+            let mut nodes = SlowVec::new(global, PREDICATE_NODES_MAX).unwrap();
             build(expr, &mut nodes);
             Predicate::new(nodes).depth()
         };
@@ -914,14 +923,15 @@ mod tests {
 
     #[test]
     fn keeps_rows_in_a_list() {
+        let global = Global::current();
         // `a IN (3, 5)`, `b IN (2)`, and either.
         let a_in = Leaf::In { column: 0, start: 0, len: 2 };
         let b_in = Leaf::In { column: 1, start: 2, len: 1 };
         let kept = |nodes: &[Node]| {
             // Then 100 to 119, for a list long enough for a set.
             let values: StdVec<i64> = [3, 5, 2, 7, 9, 11].into_iter().chain(100..120).collect();
-            let nodes = SlowVec::fixed_from(&Heap, nodes.iter().copied()).unwrap();
-            kept_by(&Predicate::with_values(&Heap, nodes, &values).unwrap())
+            let nodes = SlowVec::fixed_from(global, nodes.iter().copied()).unwrap();
+            kept_by(&Predicate::with_values(global, nodes, &values).unwrap())
         };
         assert_eq!(kept(&[Node::Leaf(a_in)]), [2, 4, 5]);
         // A list of more than four values.
@@ -938,9 +948,10 @@ mod tests {
 
     /// `values` as a string column, `None` null.
     fn strings(values: &[Option<&str>]) -> ColumnView {
+        let global = Global::current();
         let bytes: StdVec<u8> = values.iter().flatten().flat_map(|v| v.bytes()).collect();
-        let mut views = Buffer::allocate(&Heap, values.len() * 8).unwrap();
-        let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+        let mut views = Buffer::allocate(global, values.len() * 8).unwrap();
+        let mut validity = Buffer::allocate(global, 1).unwrap();
         let mut start = 0;
         for (i, value) in values.iter().enumerate() {
             let len = u32::try_from(value.map_or(0, str::len)).unwrap();
@@ -948,40 +959,44 @@ mod tests {
             validity.as_mut_slice::<u8>()[0] |= u8::from(value.is_some()) << i;
             start += len;
         }
-        let mut stored = Buffer::allocate(&Heap, bytes.len().max(1)).unwrap();
+        let mut stored = Buffer::allocate(global, bytes.len().max(1)).unwrap();
         stored.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(&bytes);
-        ColumnView::strings(&mut Context::new(&Heap), views, stored, Some(validity)).unwrap()
+        ColumnView::strings(&mut Context::new(global, None), views, stored, Some(validity)).unwrap()
     }
 
     /// `values` with `indices` into them, as a dictionary column.
     fn indexed(values: &ColumnView, indices: &[u32]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, indices.len() * 4).unwrap();
+        let global = Global::current();
+        let mut buffer = Buffer::allocate(global, indices.len() * 4).unwrap();
         buffer.as_mut_slice::<u32>().copy_from_slice(indices);
-        ColumnView::dictionary(&mut Context::new(&Heap), values, buffer).unwrap()
+        ColumnView::dictionary(&mut Context::new(global, None), values, buffer).unwrap()
     }
 
     /// A statement's literals, holding `strings`.
     fn literals(strings: &[&[u8]]) -> StringPool {
-        let mut literals = StringPool::new(&Heap).unwrap();
+        let global = Global::current();
+        let mut literals = StringPool::new(global).unwrap();
         for &string in strings {
-            literals.intern_string(&Heap, Some(string)).unwrap();
+            literals.intern_string(global, Some(string)).unwrap();
         }
         literals
     }
 
     /// The id of `string`, one of `literals`.
     fn id(literals: &mut StringPool, string: &[u8]) -> Id {
-        literals.intern_string(&Heap, Some(string)).unwrap()
+        let global = Global::current();
+        literals.intern_string(global, Some(string)).unwrap()
     }
 
     /// `x <comparison> 'b'`, or `NOT` that, over the first column, and its
     /// literals.
     fn compare_b(comparison: Comparison, not: bool) -> (Predicate, StringPool) {
+        let global = Global::current();
         let mut literals = literals(&[]);
         let string = id(&mut literals, b"b");
         let leaf = Leaf::CompareString { column: 0, comparison, string };
         let nodes = [Node::Leaf(leaf), Node::Not(0)];
-        let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
+        let nodes = SlowVec::fixed_from(global, nodes[..=usize::from(not)].iter().copied());
         (Predicate::new(nodes.unwrap()), literals)
     }
 
@@ -992,14 +1007,15 @@ mod tests {
         entries: &mut [Entries],
         column: &ColumnView,
     ) -> StdVec<u16> {
+        let global = Global::current();
         let mut scratch: StdVec<Selection> =
             (0..predicate.depth()).map(|_| Selection::all(0)).collect();
-        let sets = predicate.new_sets(&Heap, Some(literals)).unwrap();
+        let sets = predicate.new_sets(global, Some(literals)).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(column.row_count());
         assert!(batch.push_column(column.clone()).is_ok());
         let literals = Some(literals);
-        predicate.select(&Heap, literals, &sets, &mut scratch, entries, &mut batch).unwrap();
+        predicate.select(global, literals, &sets, &mut scratch, entries, &mut batch).unwrap();
         match batch.selection().kept() {
             Kept::Prefix => (0..u16::try_from(column.row_count()).unwrap()).collect(),
             Kept::None => StdVec::new(),
@@ -1009,6 +1025,7 @@ mod tests {
 
     #[test]
     fn filters_string_dictionaries_as_their_strings() {
+        let global = Global::current();
         // Entries out of order, one null, used in any order.
         let entries = strings(&[Some("c"), None, Some("a"), Some("b"), Some("")]);
         // Three groups of eight rows, and three after them.
@@ -1016,7 +1033,7 @@ mod tests {
         let indices = [indices.as_slice(), &[2, 3, 0]].concat();
         let dictionary = indexed(&entries, &indices);
         let mut flat = dictionary.clone();
-        flat.make_in(&mut Context::new(&Heap), Forms::FLAT).unwrap();
+        flat.make_in(&mut Context::new(global, None), Forms::FLAT).unwrap();
         for comparison in [
             Comparison::Equal,
             Comparison::NotEqual,
@@ -1027,7 +1044,7 @@ mod tests {
         ] {
             for not in [false, true] {
                 let (predicate, literals) = compare_b(comparison, not);
-                let mut entries = predicate.new_entries(&Heap).unwrap();
+                let mut entries = predicate.new_entries(global).unwrap();
                 let expected = kept_of((&predicate, &literals), &mut entries, &flat);
                 assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
             }
@@ -1041,9 +1058,9 @@ mod tests {
             let mut literals = literals(&[]);
             let pattern = id(&mut literals, b"_");
             let nodes = [Node::Leaf(Leaf::Like { column: 0, pattern }), Node::Not(0)];
-            let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
+            let nodes = SlowVec::fixed_from(global, nodes[..=usize::from(not)].iter().copied());
             let predicate = Predicate::new(nodes.unwrap());
-            let mut entries = predicate.new_entries(&Heap).unwrap();
+            let mut entries = predicate.new_entries(global).unwrap();
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
         }
@@ -1065,9 +1082,9 @@ mod tests {
             (23, true, rows_of(&[2, 4])),
         ] {
             let nodes = [Node::Leaf(Leaf::InStrings { column: 0, start: 0, len }), Node::Not(0)];
-            let nodes = SlowVec::fixed_from(&Heap, nodes[..=usize::from(not)].iter().copied());
-            let predicate = Predicate::with_values(&Heap, nodes.unwrap(), &ids).unwrap();
-            let mut entries = predicate.new_entries(&Heap).unwrap();
+            let nodes = SlowVec::fixed_from(global, nodes[..=usize::from(not)].iter().copied());
+            let predicate = Predicate::with_values(global, nodes.unwrap(), &ids).unwrap();
+            let mut entries = predicate.new_entries(global).unwrap();
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
         }
@@ -1075,10 +1092,11 @@ mod tests {
 
     #[test]
     fn keeps_all_or_none_when_every_entry_or_none_matches() {
+        let global = Global::current();
         let dictionary = indexed(&strings(&[Some("a"), Some("c")]), &[1, 0, 1]);
         let kept = |comparison| {
             let (predicate, literals) = compare_b(comparison, false);
-            let mut entries = predicate.new_entries(&Heap).unwrap();
+            let mut entries = predicate.new_entries(global).unwrap();
             kept_of((&predicate, &literals), &mut entries, &dictionary)
         };
         assert_eq!(kept(Comparison::Equal), []);
@@ -1087,9 +1105,10 @@ mod tests {
 
     #[test]
     fn keeps_a_dictionarys_entries_while_batches_share_it() {
+        let global = Global::current();
         let (predicate, literals) = compare_b(Comparison::Greater, false);
         let predicate = (&predicate, &literals);
-        let mut entries = predicate.0.new_entries(&Heap).unwrap();
+        let mut entries = predicate.0.new_entries(global).unwrap();
         let values = strings(&[Some("a"), Some("c"), None, Some("d")]);
         let first = indexed(&values, &[0, 1, 2, 3]);
         let second = indexed(&values, &[3, 3, 0, 1]);
@@ -1105,6 +1124,7 @@ mod tests {
 
     #[test]
     fn takes_dictionaries_only_of_columns_it_compares_with_strings() {
+        let global = Global::current();
         let step = |op, data_type, a, b| ExprStep {
             op,
             data_type,
@@ -1132,7 +1152,7 @@ mod tests {
             step(ExprOp::And, int, 2, 5),
             step(ExprOp::And, int, 12, 11),
         ];
-        let mut exprs = Exprs::new(&Heap).unwrap();
+        let mut exprs = Exprs::new(global).unwrap();
         let expr = exprs.add(&nodes).unwrap();
         // A string column, an integer one, one also tested for nulls, and one
         // it doesn't read.

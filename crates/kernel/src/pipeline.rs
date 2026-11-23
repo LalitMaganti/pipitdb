@@ -13,13 +13,13 @@ use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::boxed::Box;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
-use crate::query_allocators::QueryAllocators;
+use crate::global::Global;
 use crate::row_batch::RowBatch;
 use crate::slow_vec::SlowVec;
 use crate::statement::Statement;
@@ -38,17 +38,16 @@ impl<'a> Pipeline<'a> {
         Pipeline { source, steps, segment_count: operators + 1 }
     }
 
-    /// Creates the state of a run, in one allocation from `query`'s
-    /// metadata allocator, which steps' states also allocate from; batches
-    /// allocate from its other allocators. A run takes `QueryAllocators`,
-    /// not any allocator, so its column buffers always come from fixed
-    /// allocators. Its steps read its `statement`, if it has one.
+    /// Creates the state of a run, in one allocation from `global`'s base
+    /// allocator, which steps' states also allocate from; batches allocate
+    /// from its fixed allocators. Its steps read its `statement`, if it has
+    /// one.
     pub fn start<'r>(
         &'r self,
-        query: &'r QueryAllocators<'_>,
+        global: &'r Global,
         statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
-        let mut context = Context::for_query(query, statement);
+        let mut context = Context::new(global, statement);
         let run = Run::new(self, &mut context)?;
         Ok(Execution { run, context })
     }
@@ -56,7 +55,7 @@ impl<'a> Pipeline<'a> {
     /// This pipeline as a source of the batches it outputs. Each run of it
     /// is on the `Context` of the run it's in, so shares its memory, string
     /// pool and statement.
-    pub fn into_source(self, allocator: &dyn Allocator) -> Result<DynSource<'a>, AllocError> {
+    pub fn into_source(self, allocator: &Global) -> Result<DynSource<'a>, AllocError> {
         let pipeline = Box::new(allocator, self)?.erase();
         let state = Layout::new::<Run<'static>>();
         // SAFETY: each function takes this pipeline and a run of it.
@@ -496,16 +495,18 @@ mod tests {
 
     use super::*;
     use crate::allocator::Heap;
+
     use crate::column::{ColumnView, DataType};
     use crate::context::Context;
-    use crate::query_allocators::QueryAllocators;
+    use crate::global::Global;
     use crate::selection::Kept;
     use crate::step::{Breaker, DynOperator, DynTransform, Operator, Source, Transform};
 
     fn int64s(values: &[i64]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let global = Global::current();
+        let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
+        ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, None).unwrap()
     }
 
     /// `batches` batches of two rows, with two columns, `[2i, 2i + 1]` and
@@ -637,26 +638,9 @@ mod tests {
         }
     }
 
-    /// Counts the allocations it made that are live.
-    struct Counting(Cell<u32>);
-
-    // SAFETY: forwards to `Heap`.
-    unsafe impl crate::allocator::Allocator for Counting {
-        fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-            self.0.set(self.0.get() + 1);
-            Heap.allocate(layout)
-        }
-
-        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-            self.0.set(self.0.get() - 1);
-            // SAFETY: forwarded from the caller.
-            unsafe { Heap.deallocate(ptr, layout) }
-        }
-    }
-
     /// One batch of one row, its column's values allocated from `live`.
     struct Counted<'a> {
-        live: &'a Counting,
+        live: &'a Global,
     }
 
     impl Source for Counted<'_> {
@@ -672,6 +656,7 @@ mod tests {
             made: &mut bool,
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
+            let global = Global::current();
             if *made {
                 return Ok(false);
             }
@@ -679,16 +664,18 @@ mod tests {
             batch.reset(1);
             let values = Buffer::allocate(self.live, 8).unwrap();
             let column =
-                ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+                ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, None)
+                    .unwrap();
             assert!(batch.push_column(column).is_ok());
             Ok(true)
         }
     }
 
     /// Outputs nothing, and checks when it finishes that nothing allocated
-    /// from `live` is held.
+    /// from `live` is held: it uses only `empty` bytes.
     struct Released<'a> {
-        live: &'a Counting,
+        live: &'a Global,
+        empty: usize,
     }
 
     impl Operator for Released<'_> {
@@ -714,7 +701,7 @@ mod tests {
             (): &mut (),
             _: &mut RowBatch,
         ) -> Result<Progress, Error> {
-            assert_eq!(self.live.0.get(), 0);
+            assert_eq!(self.live.used(), self.empty);
             Ok(Progress::NeedInput)
         }
     }
@@ -901,30 +888,35 @@ mod tests {
     }
 
     fn transform<'a>(transform: impl Transform + 'a) -> Step<'a> {
-        Step::Transform(DynTransform::new(&Heap, transform).unwrap())
+        let global = Global::current();
+        Step::Transform(DynTransform::new(global, transform).unwrap())
     }
 
     fn operator<'a>(operator: impl Operator + 'a) -> Step<'a> {
-        Step::Operator(DynOperator::new(&Heap, operator).unwrap())
+        let global = Global::current();
+        Step::Operator(DynOperator::new(global, operator).unwrap())
     }
 
     fn pipeline<'a>(
         source: impl Source + 'a,
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
-        with_source(DynSource::new(&Heap, source).unwrap(), steps)
+        let global = Global::current();
+        with_source(DynSource::new(global, source).unwrap(), steps)
     }
 
     /// `steps` after `inner`, run as a source.
     fn nested<'a>(inner: Pipeline<'a>, steps: impl IntoIterator<Item = Step<'a>>) -> Pipeline<'a> {
-        with_source(inner.into_source(&Heap).unwrap(), steps)
+        let global = Global::current();
+        with_source(inner.into_source(global).unwrap(), steps)
     }
 
     fn with_source<'a>(
         source: DynSource<'a>,
         steps: impl IntoIterator<Item = Step<'a>>,
     ) -> Pipeline<'a> {
-        let mut owned = crate::slow_vec::SlowVec::new(&Heap, 8).unwrap();
+        let global = Global::current();
+        let mut owned = crate::slow_vec::SlowVec::new(global, 8).unwrap();
         for step in steps {
             assert!(owned.push(step).is_ok());
         }
@@ -935,8 +927,8 @@ mod tests {
     fn runs_a_source_alone() {
         let pipeline = pipeline(Numbers { batches: 2 }, []);
         let expected = [[[0, 0], [1, -1]], [[2, -2], [3, -3]]];
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
+        let query = Global::current();
+        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), expected);
     }
 
     #[test]
@@ -944,8 +936,8 @@ mod tests {
         let position = Position { live: Rc::new(()) };
         let pipeline = pipeline(Numbers { batches: 2 }, [transform(Reverse), transform(position)]);
         let expected = [[[0, 0, 0], [-1, 1, 0]], [[-2, 2, 1], [-3, 3, 1]]];
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
+        let query = Global::current();
+        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), expected);
     }
 
     #[test]
@@ -953,33 +945,35 @@ mod tests {
         let position = Position { live: Rc::new(()) };
         let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
         let expected = [[[0, 0, 0]], [[1, -1, 1]], [[2, -2, 2]], [[3, -3, 3]]];
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), expected);
+        let query = Global::current();
+        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), expected);
     }
 
     #[test]
     fn operators_finish_after_their_input_ends() {
         let steps = [operator(Split), transform(SkipOdd), operator(Sum)];
         let pipeline = pipeline(Numbers { batches: 3 }, steps);
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), [[[2 + 4]]]);
+        let query = Global::current();
+        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), [[[2 + 4]]]);
     }
 
     #[test]
     fn operators_finish_without_their_last_input() {
-        let live = Counting(Cell::new(0));
-        let pipeline = pipeline(Counted { live: &live }, [operator(Released { live: &live })]);
-        let query = QueryAllocators::new(&Heap);
-        assert!(batches(&mut pipeline.start(&query, None).unwrap()).is_empty());
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let live = unsafe { Global::new(Heap, usize::MAX) }.unwrap();
+        let empty = live.used();
+        let released = Released { live: &live, empty };
+        let pipeline = pipeline(Counted { live: &live }, [operator(released)]);
+        assert!(batches(&mut pipeline.start(Global::current(), None).unwrap()).is_empty());
     }
 
     #[test]
     fn breakers_output_once_their_input_ends() {
         let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
         assert_eq!(pipeline.describe(), "Numbers | Backwards");
-        let query = QueryAllocators::new(&Heap);
+        let query = Global::current();
         assert_eq!(
-            batches(&mut pipeline.start(&query, None).unwrap()),
+            batches(&mut pipeline.start(query, None).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
     }
@@ -987,8 +981,8 @@ mod tests {
     #[test]
     fn steps_after_an_operator_see_only_batches_with_rows() {
         let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards), transform(SkipOdd)]);
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut pipeline.start(&query, None).unwrap()), [[[5], [4]], [[1], [0]]]);
+        let query = Global::current();
+        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), [[[5], [4]], [[1], [0]]]);
     }
 
     #[test]
@@ -997,10 +991,10 @@ mod tests {
         let position = Position { live: live.clone() };
         let pipeline = pipeline(Numbers { batches: 2 }, [operator(Split), transform(position)]);
 
-        let query = QueryAllocators::new(&Heap);
-        let mut first = pipeline.start(&query, None).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut second = pipeline.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut first = pipeline.start(query, None).unwrap();
+        let query = Global::current();
+        let mut second = pipeline.start(query, None).unwrap();
         assert_eq!(batches(&mut first), batches(&mut second));
         // Ours, the pipeline's step, and a state for each run.
         assert_eq!(Rc::strong_count(&live), 4);
@@ -1013,24 +1007,24 @@ mod tests {
     #[test]
     fn states_allocate_and_can_fail() {
         let boxed = pipeline(Numbers { batches: 1 }, [transform(Boxed { fail: false })]);
-        let query = QueryAllocators::new(&Heap);
-        assert_eq!(batches(&mut boxed.start(&query, None).unwrap()), [[[0, 0, 7], [1, -1, 7]]]);
+        let query = Global::current();
+        assert_eq!(batches(&mut boxed.start(query, None).unwrap()), [[[0, 0, 7], [1, -1, 7]]]);
 
         // The states made before the one that fails are dropped.
         let live = Rc::new(());
         let position = Position { live: live.clone() };
         let steps = [transform(position), transform(Boxed { fail: true })];
         let failing = pipeline(Numbers { batches: 1 }, steps);
-        let query = QueryAllocators::new(&Heap);
-        assert!(failing.start(&query, None).is_err());
+        let query = Global::current();
+        assert!(failing.start(query, None).is_err());
         assert_eq!(Rc::strong_count(&live), 2);
     }
 
     #[test]
     fn passes_selections_on_and_skips_batches_with_none() {
         let even = pipeline(Numbers { batches: 3 }, [transform(KeepEven), transform(KeepEven)]);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = even.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = even.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut kept = alloc::vec::Vec::new();
         while execution.next(&mut batch).unwrap() {
@@ -1041,19 +1035,19 @@ mod tests {
         assert_eq!(kept, [0, 2, 4]);
 
         let none = pipeline(Numbers { batches: 3 }, [transform(KeepNone)]);
-        let query = QueryAllocators::new(&Heap);
-        assert!(!none.start(&query, None).unwrap().next(&mut RowBatch::new()).unwrap());
+        let query = Global::current();
+        assert!(!none.start(query, None).unwrap().next(&mut RowBatch::new()).unwrap());
         // Steps after one that keeps no rows don't run: this one would fail.
         let stopped =
             pipeline(Numbers { batches: 3 }, [transform(KeepNone), transform(FailSecond)]);
-        assert_eq!(stopped.start(&query, None).unwrap().next(&mut RowBatch::new()), Ok(false));
+        assert_eq!(stopped.start(query, None).unwrap().next(&mut RowBatch::new()), Ok(false));
     }
 
     #[test]
     fn a_failing_step_ends_the_run() {
         let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond)]);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = failing.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = failing.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         assert_eq!(execution.next(&mut batch), Ok(true));
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
@@ -1095,14 +1089,14 @@ mod tests {
         let inner = pipeline(Numbers { batches: 2 }, [transform(Reverse)]);
         let split = nested(inner, [operator(Split)]);
         assert_eq!(split.describe(), "Pipeline | Split");
-        let query = QueryAllocators::new(&Heap);
-        let expected = batches(&mut flat.start(&query, None).unwrap());
-        assert_eq!(batches(&mut split.start(&query, None).unwrap()), expected);
+        let query = Global::current();
+        let expected = batches(&mut flat.start(query, None).unwrap());
+        assert_eq!(batches(&mut split.start(query, None).unwrap()), expected);
 
         // A breaker within it outputs once its input ends.
         let backwards = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
         let summed = nested(backwards, [operator(Sum)]);
-        assert_eq!(batches(&mut summed.start(&query, None).unwrap()), [[[15]]]);
+        assert_eq!(batches(&mut summed.start(query, None).unwrap()), [[[15]]]);
     }
 
     #[test]
@@ -1113,8 +1107,8 @@ mod tests {
         let inner = pipeline(Numbers { batches: 1 }, steps);
         // The outer run's pool already has the inner run's string.
         let outer = nested(inner, [transform(Interns { string: b"y", number: 1 })]);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = outer.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = outer.start(query, None).unwrap();
         assert_eq!(batches(&mut execution).len(), 1);
         // Ours, the inner pipeline's step, and its run's state, dropped
         // with the outer run.
@@ -1125,15 +1119,15 @@ mod tests {
         // A failure within it ends the run it's in.
         let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond)]);
         let outer = nested(failing, [operator(Sum)]);
-        let mut execution = outer.start(&query, None).unwrap();
+        let mut execution = outer.start(query, None).unwrap();
         assert_eq!(execution.next(&mut RowBatch::new()), Err(Error::Corrupt));
     }
 
     #[test]
     fn operators_dont_finish_after_a_failure_before_them() {
         let failing = pipeline(Numbers { batches: 3 }, [transform(FailSecond), operator(Sum)]);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = failing.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = failing.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         // A sum of the first batch alone would be wrong.
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));

@@ -4,10 +4,11 @@
 
 use core::cmp::Ordering;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::DataType;
 use crate::context::Context;
 use crate::error::Error;
+use crate::global::Global;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
 use crate::slow_vec::SlowVec;
@@ -25,7 +26,7 @@ use crate::step::{Breaker, DynOperator};
 /// the cutoff: from then on, rows which don't come before it are dropped as
 /// they arrive, so on most inputs pruning soon becomes rare.
 pub fn top_k<'a>(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     keys: SlowVec<SortKey>,
     count: u32,
     publish: Option<u32>,

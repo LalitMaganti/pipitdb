@@ -119,11 +119,11 @@ mod tests {
     use core::cell::Cell;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::{ColumnView, DataType};
+    use crate::global::Global;
     use crate::pipeline::Pipeline;
-    use crate::query_allocators::QueryAllocators;
     use crate::selection::Kept;
     use crate::slow_vec::SlowVec;
     use crate::step::{DynSource, Source};
@@ -143,15 +143,17 @@ mod tests {
         }
 
         fn next(&self, _: &mut Context, i: &mut i64, batch: &mut RowBatch) -> Result<bool, Error> {
+            let global = Global::current();
             if *i == self.batches {
                 return Ok(false);
             }
             self.pulled.set(self.pulled.get() + 1);
             batch.reset(2);
-            let mut values = Buffer::allocate(&Heap, 16).unwrap();
+            let mut values = Buffer::allocate(global, 16).unwrap();
             values.as_mut_slice::<i64>().copy_from_slice(&[2 * *i, 2 * *i + 1]);
             let column =
-                ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+                ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, None)
+                    .unwrap();
             assert!(batch.push_column(column).is_ok());
             *i += 1;
             Ok(true)
@@ -160,14 +162,15 @@ mod tests {
 
     /// The rows kept, and how many batches the source made, of 5.
     fn limited(count: u64, offset: u64) -> (Vec<i64>, i64) {
+        let global = Global::current();
         let pulled = Cell::new(0);
-        let source = DynSource::new(&Heap, Counting { batches: 5, pulled: &pulled }).unwrap();
-        let mut steps = SlowVec::new(&Heap, 1).unwrap();
-        let limit = DynOperator::new(&Heap, Limit { count, offset }).unwrap();
+        let source = DynSource::new(global, Counting { batches: 5, pulled: &pulled }).unwrap();
+        let mut steps = SlowVec::new(global, 1).unwrap();
+        let limit = DynOperator::new(global, Limit { count, offset }).unwrap();
         assert!(steps.push(Step::Operator(limit)).is_ok());
         let pipeline = Pipeline::new(source, steps);
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut rows = Vec::new();
         while execution.next(&mut batch).unwrap() {

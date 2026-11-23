@@ -8,7 +8,7 @@
 //! value, as a perfect hash finds it: from an array, or with no array if
 //! each key is its row's number above the first, as a table's ids are.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::{ColumnView, DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
@@ -25,6 +25,7 @@ use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProper
 use crate::plan::{ColumnId, Given, Op, PlanNode};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
+use crate::global::Global;
 use crate::row_store::RowStore;
 use crate::scannable::Key;
 use crate::selection::{Kept, Selection};
@@ -241,7 +242,7 @@ impl<'c> Op<'c> for JoinOp {
     fn give_condition(
         &mut self,
         _: &Exprs,
-        _: &dyn Allocator,
+        _: &Global,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         if self.kind == JoinKind::Left && self.child_of(column) == 1 {
@@ -510,7 +511,7 @@ impl Direct {
     /// For the build rows of `table`'s groups, of one integer key each,
     /// if their keys are close enough.
     fn of(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         table: &GroupTable,
         count: u32,
     ) -> Result<Option<Direct>, AllocError> {
@@ -1081,15 +1082,15 @@ impl Operator for Join<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::estimate::RowEstimate;
     use crate::expression::ExprBuilder;
 
     /// The child a join of `kind` on `a = b` builds, given its children's
     /// rows and keys.
     fn built(kind: JoinKind, first: (u64, Key), second: (u64, Key)) -> u32 {
-        let mut exprs = Exprs::new(&Heap).unwrap();
-        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let mut exprs = Exprs::new(Global::current()).unwrap();
+        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
         let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
         nodes.node(ExprOp::Eq, a, b).unwrap();
         let condition = Some(exprs.add(nodes.nodes()).unwrap());
@@ -1098,7 +1099,7 @@ mod tests {
             estimate.add_key(column, key);
             estimate
         };
-        let one = |column| SlowVec::fixed_from(&Heap, [column].into_iter()).unwrap();
+        let one = |column| SlowVec::fixed_from(Global::current(), [column].into_iter()).unwrap();
         let mut join = JoinOp::new(kind, condition, [one(0), one(1)]);
         join.choose(&exprs, &[estimate(first, 0), estimate(second, 1)]);
         join.build

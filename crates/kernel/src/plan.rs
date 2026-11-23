@@ -7,7 +7,7 @@
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
@@ -18,6 +18,7 @@ use crate::expression::{
     mark_expr_columns, type_expr,
 };
 use crate::function::DynFunction;
+use crate::global::Global;
 use crate::inline_vec::InlineVec;
 use crate::lower::{LowerError, Lowering};
 use crate::names::{Name, Names};
@@ -114,7 +115,7 @@ pub trait Op<'c> {
     fn give_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         let _ = (exprs, allocator, column);
@@ -138,7 +139,7 @@ pub trait Op<'c> {
     fn split_below(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
         let _ = (exprs, allocator, below);
@@ -157,7 +158,7 @@ pub trait Op<'c> {
     fn take_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
@@ -170,7 +171,7 @@ pub trait Op<'c> {
     /// `allow` said it would make lazy.
     fn materialize(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         let _ = (allocator, columns);
@@ -188,7 +189,7 @@ pub trait Op<'c> {
     /// Whether this now makes its rows from what `child`, its one child,
     /// says of its own in `summary`, without reading them. By default, it
     /// can't.
-    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+    fn answer(&mut self, allocator: &Global, child: &DynOp<'c>) -> Result<bool, AllocError> {
         let _ = (allocator, child);
         Ok(false)
     }
@@ -253,22 +254,18 @@ pub enum Given {
 /// conjuncts of an expression, or of several.
 pub type Conjuncts = SlowVec<Expr>;
 
-type GiveCondition =
-    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, ColumnId) -> Result<Given, AllocError>;
+type GiveCondition = unsafe fn(NonNull<()>, &Exprs, &Global, ColumnId) -> Result<Given, AllocError>;
 
 type TakeCondition =
-    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, ColumnId, Conjuncts) -> Result<(), AllocError>;
+    unsafe fn(NonNull<()>, &Exprs, &Global, ColumnId, Conjuncts) -> Result<(), AllocError>;
 
-type Answer<'c> = unsafe fn(NonNull<()>, &dyn Allocator, &DynOp<'c>) -> Result<bool, AllocError>;
+type Answer<'c> = unsafe fn(NonNull<()>, &Global, &DynOp<'c>) -> Result<bool, AllocError>;
 
 type SplitBelow<'c> =
-    unsafe fn(NonNull<()>, &Exprs, &dyn Allocator, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
+    unsafe fn(NonNull<()>, &Exprs, &Global, &DynOp<'c>) -> Result<Moved<'c>, AllocError>;
 
-type Materialize<'c> = unsafe fn(
-    NonNull<()>,
-    &dyn Allocator,
-    SlowVec<(ColumnId, Forms)>,
-) -> Result<DynOp<'c>, AllocError>;
+type Materialize<'c> =
+    unsafe fn(NonNull<()>, &Global, SlowVec<(ColumnId, Forms)>) -> Result<DynOp<'c>, AllocError>;
 
 /// An `Op` of any type that lives for `'c`, owned in memory from an
 /// allocator, and the functions that know its type.
@@ -360,7 +357,7 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
 }
 
 impl<'c> DynOp<'c> {
-    pub fn new<T: Op<'c> + 'c>(allocator: &dyn Allocator, op: T) -> Result<DynOp<'c>, AllocError> {
+    pub fn new<T: Op<'c> + 'c>(allocator: &Global, op: T) -> Result<DynOp<'c>, AllocError> {
         let op = Box::new(allocator, op)?.erase();
         Ok(DynOp { op, functions: &Functions::<'c, T>::TABLE })
     }
@@ -395,7 +392,7 @@ impl<'c> DynOp<'c> {
     pub(crate) fn give_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
@@ -411,7 +408,7 @@ impl<'c> DynOp<'c> {
     pub(crate) fn take_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
@@ -423,7 +420,7 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn materialize(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         // SAFETY: the function matches the op's type.
@@ -438,7 +435,7 @@ impl<'c> DynOp<'c> {
     pub(crate) fn split_below(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
         // SAFETY: the function matches the op's type, which `self` holds
@@ -476,7 +473,7 @@ impl<'c> DynOp<'c> {
 
     pub(crate) fn answer(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         child: &DynOp<'c>,
     ) -> Result<bool, AllocError> {
         // SAFETY: the function matches the op's type.
@@ -537,7 +534,7 @@ pub struct LogicalPlan<'c> {
 }
 
 impl<'c> LogicalPlan<'c> {
-    pub fn new(allocator: &dyn Allocator) -> Result<LogicalPlan<'c>, AllocError> {
+    pub fn new(allocator: &Global) -> Result<LogicalPlan<'c>, AllocError> {
         Ok(LogicalPlan {
             names: Names::new(allocator, PLAN_NAME_BYTES_MAX)?,
             columns: SlowVec::new(allocator, PLAN_COLUMNS_MAX)?,
@@ -551,11 +548,7 @@ impl<'c> LogicalPlan<'c> {
 
     /// Adds `literal` to its literals, allocating from `allocator`, which
     /// must outlive the plan, and returns its id there.
-    pub fn add_literal(
-        &mut self,
-        allocator: &dyn Allocator,
-        literal: &[u8],
-    ) -> Result<Id, AllocError> {
+    pub fn add_literal(&mut self, allocator: &Global, literal: &[u8]) -> Result<Id, AllocError> {
         self.statement.add_literal(allocator, literal)
     }
 
@@ -564,7 +557,7 @@ impl<'c> LogicalPlan<'c> {
     /// can.
     pub fn add_function(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         function: DynFunction,
     ) -> Result<Option<u32>, AllocError> {
         self.statement.add_function(allocator, function)
@@ -688,7 +681,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn take_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
@@ -728,7 +721,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     fn materialize(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: SlowVec<(ColumnId, Forms)>,
     ) -> Result<DynOp<'c>, AllocError> {
         DynOp::new(allocator, MaterializeOp { scannable: self.scannable, columns })
@@ -851,11 +844,7 @@ pub struct FilterOp {
 
 impl FilterOp {
     /// The filter of `condition`, of `exprs`: its top-level conjuncts.
-    pub fn new(
-        allocator: &dyn Allocator,
-        exprs: &Exprs,
-        condition: Expr,
-    ) -> Result<FilterOp, AllocError> {
+    pub fn new(allocator: &Global, exprs: &Exprs, condition: Expr) -> Result<FilterOp, AllocError> {
         let mut count = 0;
         conjuncts(exprs.nodes(condition), condition.root, &mut |_| count += 1);
         let mut parts = SlowVec::fixed(allocator, count)?;
@@ -871,7 +860,7 @@ impl FilterOp {
 /// costs more than calling it.
 #[inline(never)]
 fn kept(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     conjuncts: &[Expr],
     keep: &dyn Fn(Expr) -> bool,
 ) -> Result<Option<Conjuncts>, AllocError> {
@@ -910,7 +899,7 @@ impl<'c> Op<'c> for FilterOp {
     fn split_below(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         below: &DynOp<'c>,
     ) -> Result<Moved<'c>, AllocError> {
         // Where `conjunct` goes: 0 to stay, or 1 more than the input all its
@@ -958,7 +947,7 @@ impl<'c> Op<'c> for FilterOp {
     fn give_condition(
         &mut self,
         exprs: &Exprs,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: ColumnId,
     ) -> Result<Given, AllocError> {
         let reads_only = |conjunct: Expr| {

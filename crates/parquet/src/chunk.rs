@@ -750,12 +750,12 @@ mod tests {
     use std::string::String;
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::bytes::ReadError;
     use pipit_kernel::column::Form;
 
     use super::*;
     use crate::Uncompressed;
+    use pipit_kernel::global::Global;
 
     /// Every form a reader can read in.
     const ANY: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
@@ -816,8 +816,9 @@ mod tests {
     }
 
     fn cells(view: &ColumnView) -> Vec<Cell> {
+        let global = Global::current();
         let mut view = view.clone();
-        view.make_in(&mut Context::new(&Heap), Forms::FLAT).unwrap();
+        view.make_in(&mut Context::new(global, None), Forms::FLAT).unwrap();
         (0..view.row_count())
             .map(|row| {
                 let r = row as usize;
@@ -835,9 +836,10 @@ mod tests {
 
     /// Every row of column `c` of `bytes`, read in batches of at most 1000.
     fn read_all(mut bytes: &[u8], c: usize) -> Vec<Cell> {
+        let global = Global::current();
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         let column = file.columns()[c];
         let mut all = Vec::new();
         for group in 0..file.row_groups() {
@@ -878,10 +880,11 @@ mod tests {
 
     #[test]
     fn reads_dictionaries_of_strings_as_dictionary_columns() {
+        let global = Global::current();
         let mut bytes = DICT;
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         for c in 0..3 {
             let column = file.columns()[c];
             let mut reader =
@@ -920,9 +923,10 @@ mod tests {
     /// Skips and reads by turns through each column's first chunk of
     /// `bytes`, whose row `i` of column `c` is `expected(c, i)`.
     fn skips_and_seeks_in(mut bytes: &[u8], expected: fn(usize, i64) -> Cell) {
+        let global = Global::current();
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         for c in 0..3 {
             let mut reader =
                 ChunkReader::new(source, &Uncompressed, file.columns()[c], file.chunk(0, c))
@@ -960,9 +964,10 @@ mod tests {
     /// Reads batches of each column's first chunk of `bytes` keeping some
     /// rows, then the next batch whole, which must start where they ended.
     fn reads_kept_rows_in(mut bytes: &[u8], expected: fn(usize, i64) -> Cell) {
+        let global = Global::current();
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         let patterns: [&[u16]; 4] = [&[], &[0], &[3, 4, 5, 90, 299], &[1, 7, 150, 151, 152]];
         for c in 0..3 {
             let mut reader =
@@ -996,9 +1001,10 @@ mod tests {
     /// scan of lazy columns does, then reads from them out of order, as
     /// loads do: on, back within a page, and again.
     fn goes_to_places_passed_in(mut bytes: &[u8], expected: fn(usize, i64) -> Cell) {
+        let global = Global::current();
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         for c in 0..3 {
             let reader = || {
                 ChunkReader::new(source, &Uncompressed, file.columns()[c], file.chunk(0, c))
@@ -1041,9 +1047,10 @@ mod tests {
 
     #[test]
     fn skipping_pages_reads_only_headers() {
+        let global = Global::current();
         let source = Counting(SMALL, core::cell::Cell::new(0));
-        let file = ParquetFile::open(&Heap, &source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, &source).unwrap();
+        let mut context = Context::new(global, None);
         let chunk = file.chunk(0, 0);
         let mut reader =
             ChunkReader::new(&source, &Uncompressed, file.columns()[0], chunk).unwrap();
@@ -1062,10 +1069,11 @@ mod tests {
 
     #[test]
     fn decodes_the_dictionary_only_when_values_are_read() {
+        let global = Global::current();
         let mut bytes = DICT;
         let source: &dyn ByteSource = &mut bytes;
-        let file = ParquetFile::open(&Heap, source).unwrap();
-        let mut context = Context::new(&Heap);
+        let file = ParquetFile::open(global, source).unwrap();
+        let mut context = Context::new(global, None);
         let mut reader =
             ChunkReader::new(source, &Uncompressed, file.columns()[2], file.chunk(0, 2)).unwrap();
         let left = reader.page_left(&mut context).unwrap();

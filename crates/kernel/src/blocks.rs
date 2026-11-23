@@ -4,9 +4,10 @@
 
 use core::marker::PhantomData;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::buffer::Primitive;
+use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// How many records a block holds, as a power of two, so a record's block
@@ -63,7 +64,7 @@ impl RawBlocks {
 
     /// As `Blocks::reserve`.
     #[inline(never)]
-    fn reserve(&mut self, allocator: &dyn Allocator, len: usize) -> Result<(), AllocError> {
+    fn reserve(&mut self, allocator: &Global, len: usize) -> Result<(), AllocError> {
         while self.capacity() < len {
             // The first block grows, in place of itself, until it's whole.
             let grow = self.first < BLOCK_RECORDS;
@@ -89,7 +90,7 @@ impl RawBlocks {
 }
 
 impl<T: Primitive> Blocks<T> {
-    pub(crate) fn new(allocator: &dyn Allocator, width: usize) -> Result<Blocks<T>, AllocError> {
+    pub(crate) fn new(allocator: &Global, width: usize) -> Result<Blocks<T>, AllocError> {
         check!(width > 0);
         let raw = RawBlocks {
             arrays: SlowVec::new(allocator, BLOCKS_MAX)?,
@@ -121,11 +122,7 @@ impl<T: Primitive> Blocks<T> {
 
     /// Makes room for `len` records, zeroed: the first block grows by
     /// doubling until it's whole, then whole blocks are added.
-    pub(crate) fn reserve(
-        &mut self,
-        allocator: &dyn Allocator,
-        len: usize,
-    ) -> Result<(), AllocError> {
+    pub(crate) fn reserve(&mut self, allocator: &Global, len: usize) -> Result<(), AllocError> {
         self.raw.reserve(allocator, len)
     }
 
@@ -158,13 +155,13 @@ impl<T: Primitive> Blocks<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
 
     #[test]
     fn keeps_records_across_blocks() {
-        let mut blocks = Blocks::<u64>::new(&Heap, 2).unwrap();
+        let global = Global::current();
+        let mut blocks = Blocks::<u64>::new(global, 2).unwrap();
         for i in 0..11 {
-            blocks.reserve(&Heap, i + 1).unwrap();
+            blocks.reserve(global, i + 1).unwrap();
             blocks.push().copy_from_slice(&[i as u64, 0]);
         }
         assert_eq!(blocks.len(), 11);

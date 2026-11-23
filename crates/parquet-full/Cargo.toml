@@ -22,7 +22,7 @@ snappy-cpp = ["dep:snappy_src"]
 
 [dev-dependencies]
 pipitdb-file = { path = "../file" }
-pipitdb-kernel = { path = "../kernel" }
+pipitdb-kernel = { path = "../kernel", features = ["std"] }
 
 [lints]
 workspace = true

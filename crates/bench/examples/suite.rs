@@ -15,13 +15,13 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use pipit_file::source::FileSource;
-use pipit_kernel::allocator::{Heap, LimitAllocator};
+use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
+use pipit_kernel::global::Global;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
-use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Kept;
@@ -136,11 +136,12 @@ fn main() -> Result<(), String> {
         }
         let repeat = std::env::var("REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
         for _ in 1..repeat {
-            run(&open_tables(&codecs, &sources, false)?, query, &QueryAllocators::new(&Heap))?;
+            run(&open_tables(&codecs, &sources, false)?, query, pipitdb_bench::global())?;
         }
-        let limit = LimitAllocator::new(&Heap, usize::MAX);
         // Counts what the query holds at its peak, for the report.
-        let allocators = QueryAllocators::new(&limit);
+        // SAFETY: `run` drops all it allocates, but the columns it returns,
+        // which hold none of it.
+        let global = unsafe { Global::new(Heap, usize::MAX) }.map_err(|e| format!("{e:?}"))?;
         codecs.pages.set(0);
         codecs.bytes.set(0);
         // Each query opens its tables, reading their footers, as other
@@ -148,7 +149,7 @@ fn main() -> Result<(), String> {
         let start = Instant::now();
         let tables = open_tables(&codecs, &sources, first)?;
         first = false;
-        match run(&tables, query, &allocators) {
+        match run(&tables, query, &global) {
             Ok(columns) => {
                 // Timed up to the results, as other engines' times are; turning
                 // them into text isn't.
@@ -160,7 +161,7 @@ fn main() -> Result<(), String> {
                     println!("{number}\t{}", row.join("\t"));
                 }
                 #[expect(clippy::cast_precision_loss, reason = "a report")]
-                let peak = limit.peak() as f64 / 1e6;
+                let peak = global.peak() as f64 / 1e6;
                 #[expect(clippy::cast_precision_loss, reason = "a report")]
                 let read = codecs.bytes.get() as f64 / 1e6;
                 let pages = codecs.pages.get();
@@ -183,9 +184,10 @@ fn open_tables<'a>(
 ) -> Result<Tables<'a>, String> {
     let mut tables = Vec::new();
     for (name, sources) in sources {
-        match ParquetTable::open(&Heap, codecs, sources) {
+        match ParquetTable::open(pipitdb_bench::global(), codecs, sources) {
             Ok(table) => {
-                let table = DynScannable::new(&Heap, table).map_err(|e| format!("{e:?}"))?;
+                let table = DynScannable::new(pipitdb_bench::global(), table)
+                    .map_err(|e| format!("{e:?}"))?;
                 tables.push(((*name).to_string(), table));
             }
             Err(error) if report => eprintln!("{name}: {error:?}"),
@@ -272,13 +274,13 @@ impl Output {
 
 /// The result of `query`: a column of its kept rows for each it outputs,
 /// built as each batch comes, as other engines build theirs.
-fn run(tables: &Tables, query: &str, allocators: &QueryAllocators) -> Result<Vec<Output>, String> {
+fn run(tables: &Tables, query: &str, global: &Global) -> Result<Vec<Output>, String> {
     let mut plan =
-        compile(&Heap, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
-    optimize(&Heap, &mut plan).map_err(|e| format!("{e:?}"))?;
-    let planned = plan_nodes(&Heap, &plan).map_err(|e| format!("{e:?}"))?;
-    let physical = lower(&Heap, &mut plan, &planned).map_err(|e| format!("{e:?}"))?;
-    let mut execution = physical.start(allocators).map_err(|e| format!("{e:?}"))?;
+        compile(global, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    optimize(global, &mut plan).map_err(|e| format!("{e:?}"))?;
+    let planned = plan_nodes(global, &plan).map_err(|e| format!("{e:?}"))?;
+    let physical = lower(global, &mut plan, &planned).map_err(|e| format!("{e:?}"))?;
+    let mut execution = physical.start(global).map_err(|e| format!("{e:?}"))?;
     let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
     let mut batch = RowBatch::new();
     while execution.next(&mut batch).map_err(|e| format!("{e:?}"))? {

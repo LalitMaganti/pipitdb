@@ -12,12 +12,13 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
+use crate::global::Global;
 use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
@@ -270,10 +271,7 @@ impl<'a> DynSource<'a> {
         }
     }
 
-    pub fn new<T: Source + 'a>(
-        allocator: &dyn Allocator,
-        source: T,
-    ) -> Result<DynSource<'a>, AllocError> {
+    pub fn new<T: Source + 'a>(allocator: &Global, source: T) -> Result<DynSource<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(Erased {
             step: Box::new(allocator, source)?.erase(),
@@ -380,7 +378,7 @@ impl<'a> DynTransform<'a> {
     }
 
     pub fn new<T: Transform + 'a>(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         transform: T,
     ) -> Result<DynTransform<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -420,7 +418,7 @@ impl<'a> DynTransform<'a> {
 
 impl<'a> DynOperator<'a> {
     pub fn new<T: Operator + 'a>(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         operator: T,
     ) -> Result<DynOperator<'a>, AllocError> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };

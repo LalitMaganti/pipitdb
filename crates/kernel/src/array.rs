@@ -10,6 +10,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
+use crate::global::Global;
 
 /// 2 MB: Linux's huge page on x86 and on most ARM systems.
 const HUGE_PAGE_BYTES: usize = 1 << 21;
@@ -18,8 +19,8 @@ const HUGE_PAGE_BYTES: usize = 1 << 21;
 pub(crate) struct Array<T: Primitive> {
     values: NonNull<T>,
     len: usize,
-    /// Where the values came from, which outlives them, as callers promise.
-    allocator: NonNull<dyn Allocator>,
+    /// What the values came from.
+    global: NonNull<Global>,
     owns: PhantomData<T>,
 }
 
@@ -36,17 +37,17 @@ pub(crate) fn layout(bytes: usize) -> Result<Layout, AllocError> {
 impl<T: Primitive> Array<T> {
     /// `len` zeroes: fresh memory from the system is zero already, so a big
     /// one costs nothing to make.
-    pub(crate) fn zeroed(allocator: &dyn Allocator, len: usize) -> Result<Array<T>, AllocError> {
-        Array::allocate(allocator, len, true)
+    pub(crate) fn zeroed(global: &Global, len: usize) -> Result<Array<T>, AllocError> {
+        Array::allocate(global, len, true)
     }
 
     /// `len` values, value `i` being `value(i)`, each written once.
     pub(crate) fn from_fn(
-        allocator: &dyn Allocator,
+        global: &Global,
         len: usize,
         mut value: impl FnMut(usize) -> T,
     ) -> Result<Array<T>, AllocError> {
-        let array = Array::<T>::allocate(allocator, len, false)?;
+        let array = Array::<T>::allocate(global, len, false)?;
         for i in 0..len {
             // SAFETY: there's room for `len` values.
             unsafe { array.values.as_ptr().add(i).write(value(i)) };
@@ -58,13 +59,13 @@ impl<T: Primitive> Array<T> {
     /// `write(start, out)`, which writes every one of `out`, values `start`
     /// on.
     pub(crate) fn from_chunks(
-        allocator: &dyn Allocator,
+        global: &Global,
         len: usize,
         chunk: usize,
         mut write: impl FnMut(usize, &mut [MaybeUninit<T>]),
     ) -> Result<Array<T>, AllocError> {
         check!(chunk > 0);
-        let array = Array::<T>::allocate(allocator, len, false)?;
+        let array = Array::<T>::allocate(global, len, false)?;
         for start in (0..len).step_by(chunk) {
             let count = chunk.min(len - start);
             // SAFETY: values `start..start + count` are within the array, and
@@ -79,23 +80,13 @@ impl<T: Primitive> Array<T> {
 
     /// Room for `len` values, zeroed if `zeroed`, else unwritten: callers
     /// that don't zero write each value before it's read.
-    fn allocate(
-        allocator: &dyn Allocator,
-        len: usize,
-        zeroed: bool,
-    ) -> Result<Array<T>, AllocError> {
+    fn allocate(global: &Global, len: usize, zeroed: bool) -> Result<Array<T>, AllocError> {
         let bytes = size_of::<T>().checked_mul(len).ok_or(AllocError)?;
         let values = match bytes {
             0 => NonNull::dangling(),
-            _ => allocate_bytes(allocator, bytes, zeroed)?.cast(),
+            _ => allocate_bytes(global, bytes, zeroed)?.cast(),
         };
-        // SAFETY: only the lifetime changes; the allocator outlives the values.
-        let allocator = unsafe {
-            core::mem::transmute::<NonNull<dyn Allocator + '_>, NonNull<dyn Allocator>>(
-                NonNull::from(allocator),
-            )
-        };
-        Ok(Array { values, len, allocator, owns: PhantomData })
+        Ok(Array { values, len, global: NonNull::from(global), owns: PhantomData })
     }
 }
 
@@ -121,8 +112,8 @@ impl<T: Primitive> Drop for Array<T> {
         let bytes = size_of::<T>() * self.len;
         if bytes != 0 {
             // SAFETY: allocated by `allocate_bytes`, with these bytes, from
-            // this allocator, which outlives it.
-            unsafe { free_bytes(self.allocator, self.values.cast(), bytes) };
+            // this `Global`, which outlives it.
+            unsafe { free_bytes(self.global.as_ref(), self.values.cast(), bytes) };
         }
     }
 }
@@ -130,38 +121,34 @@ impl<T: Primitive> Drop for Array<T> {
 /// `bytes` of memory, zeroed if `zeroed`. Out of line, and of no type, so
 /// every `Array` shares it.
 #[inline(never)]
-fn allocate_bytes(
-    allocator: &dyn Allocator,
-    bytes: usize,
-    zeroed: bool,
-) -> Result<NonNull<u8>, AllocError> {
+fn allocate_bytes(global: &Global, bytes: usize, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
     let layout = layout(bytes)?;
-    if zeroed { allocator.allocate_zeroed(layout) } else { allocator.allocate(layout) }
+    if zeroed { global.allocate_zeroed(layout) } else { global.allocate(layout) }
 }
 
 /// Frees `bytes` at `values`.
 ///
 /// # Safety
 ///
-/// They must be from `allocate_bytes`, with `allocator`, which still lives.
+/// They must be from `allocate_bytes`, with `global`.
 #[inline(never)]
-unsafe fn free_bytes(allocator: NonNull<dyn Allocator>, values: NonNull<u8>, bytes: usize) {
+unsafe fn free_bytes(global: &Global, values: NonNull<u8>, bytes: usize) {
     let Ok(layout) = layout(bytes) else { failed!() };
     // SAFETY: as the caller promises.
-    unsafe { allocator.as_ref().deallocate(values, layout) };
+    unsafe { global.deallocate(values, layout) };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::Heap;
 
     #[test]
     fn holds_exactly_its_values() {
-        let mut array = Array::<u32>::from_fn(&Heap, 5, |i| u32::try_from(i).unwrap()).unwrap();
+        let global = Global::current();
+        let mut array = Array::<u32>::from_fn(global, 5, |i| u32::try_from(i).unwrap()).unwrap();
         array[4] = 9;
         assert_eq!(&*array, &[0, 1, 2, 3, 9]);
-        assert!(Array::<u64>::zeroed(&Heap, 0).unwrap().is_empty());
+        assert!(Array::<u64>::zeroed(global, 0).unwrap().is_empty());
         let huge = layout(HUGE_PAGE_BYTES).unwrap().align();
         assert_eq!(huge, if cfg!(target_os = "linux") { HUGE_PAGE_BYTES } else { 64 });
     }

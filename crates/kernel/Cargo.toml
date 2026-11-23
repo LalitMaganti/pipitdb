@@ -13,6 +13,8 @@ name = "pipit_kernel"
 [features]
 # Failed checks in release builds say their line: see `check`.
 check-lines = []
+# `Global::current`, each thread's `Global`, which needs `std`.
+std = []
 
 [lints]
 workspace = true

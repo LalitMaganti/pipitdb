@@ -15,3 +15,7 @@ pipitdb-kernel = { path = "../kernel" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Tests use each thread's `Global`.
+pipitdb-kernel = { path = "../kernel", features = ["std"] }

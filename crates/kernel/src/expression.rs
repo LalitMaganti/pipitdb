@@ -4,7 +4,7 @@
 
 use core::ops::BitOr;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::estimate::Estimate;
 use crate::filter::Entries;
 use crate::function::ARGUMENTS_MAX;
+use crate::global::Global;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Column, DeriveContext, OutputProperties};
@@ -887,7 +888,7 @@ pub struct ExprBuilder {
 }
 
 impl ExprBuilder {
-    pub fn new(allocator: &dyn Allocator) -> Result<ExprBuilder, AllocError> {
+    pub fn new(allocator: &Global) -> Result<ExprBuilder, AllocError> {
         Ok(ExprBuilder { nodes: SlowVec::new(allocator, EXPR_NODES_MAX)? })
     }
 
@@ -949,7 +950,7 @@ pub struct Exprs {
 }
 
 impl Exprs {
-    pub fn new(allocator: &dyn Allocator) -> Result<Exprs, AllocError> {
+    pub fn new(allocator: &Global) -> Result<Exprs, AllocError> {
         let values = SlowVec::new(allocator, PLAN_EXPR_VALUES_MAX)?;
         Ok(Exprs { nodes: SlowVec::new(allocator, PLAN_EXPR_NODES_MAX)?, values })
     }
@@ -1508,7 +1509,7 @@ pub fn mark_expr_columns(expr: Expr, needed: &mut Needed<'_>) {
 /// columns at their positions in `rows`, and its `IN` lists of `values`. As a
 /// `condition`, its result is an integer: a double is true unless it's 0.
 pub fn type_expr(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     rows: &OutputProperties,
     nodes: &[ExprStep],
     values: Option<Buffer>,
@@ -1633,7 +1634,8 @@ mod tests {
     use alloc::vec::Vec as StdVec;
 
     use super::*;
-    use crate::allocator::Heap;
+
+    use crate::global::Global;
 
     /// A batch's `n`, with a null.
     const N: [Option<i64>; 5] = [Some(10), Some(20), None, Some(40), Some(50)];
@@ -1641,15 +1643,21 @@ mod tests {
     const U: [Option<i64>; 5] = [Some(1), Some(0), Some(3), Some(0), Some(5)];
 
     fn column(cells: &[Option<i64>]) -> ColumnView {
-        let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
-        let mut validity = Buffer::allocate(&Heap, cells.len().div_ceil(8)).unwrap();
+        let mut values = Buffer::allocate(Global::current(), cells.len() * 8).unwrap();
+        let mut validity = Buffer::allocate(Global::current(), cells.len().div_ceil(8)).unwrap();
         validity.as_mut_slice::<u8>().fill(0);
         for (row, cell) in cells.iter().enumerate() {
             values.as_mut_slice::<i64>()[row] = cell.unwrap_or(i64::MAX);
             validity.as_mut_slice::<u8>()[row / 8] |= u8::from(cell.is_some()) << (row % 8);
         }
         let validity = cells.contains(&None).then_some(validity);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+        ColumnView::new(
+            &mut Context::new(Global::current(), None),
+            DataType::Int64,
+            values,
+            validity,
+        )
+        .unwrap()
     }
 
     fn batch(columns: &[ColumnView]) -> RowBatch<'static> {
@@ -1686,21 +1694,21 @@ mod tests {
 
         fn program(self) -> ExprProgram {
             ExprProgram {
-                steps: SlowVec::fixed_from(&Heap, self.0.into_iter()).unwrap(),
+                steps: SlowVec::fixed_from(Global::current(), self.0.into_iter()).unwrap(),
                 values: None,
             }
         }
     }
 
     fn compute(programs: impl ExactSizeIterator<Item = ExprProgram>) -> Compute {
-        Compute { programs: SlowVec::fixed_from(&Heap, programs).unwrap() }
+        Compute { programs: SlowVec::fixed_from(Global::current(), programs).unwrap() }
     }
 
     /// `program`'s column of `batch`, at its kept rows, as words, or the
     /// run's error.
     fn process(program: Builder, mut batch: RowBatch) -> Result<StdVec<Option<i64>>, Error> {
         let compute = compute([program.program()].into_iter());
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(Global::current(), None);
         let mut state = compute.new_state(&mut context)?;
         compute.process(&mut context, &mut state, &mut batch)?;
         let column = batch.column(batch.column_count() - 1);
@@ -1904,10 +1912,9 @@ mod tests {
     #[test]
     fn string_constants() {
         let mut statement = crate::statement::Statement::default();
-        let hi = statement.add_literal(&Heap, b"hi").unwrap();
+        let hi = statement.add_literal(Global::current(), b"hi").unwrap();
         let string = DataType::String;
-        let query = crate::query_allocators::QueryAllocators::new(&Heap);
-        let mut context = Context::for_query(&query, Some(&statement));
+        let mut context = Context::new(Global::current(), Some(&statement));
         for (op, expected) in [(ExprOp::Constant, Some(&b"hi"[..])), (ExprOp::Null, None)] {
             let mut b = Builder(StdVec::new());
             b.push(op, string, hi.raw_id(), 0);
@@ -1932,7 +1939,7 @@ mod tests {
         let mut second = Builder(StdVec::new());
         second.push(ExprOp::Column, INT, 0, 0);
         let compute = compute([first.program(), second.program()].into_iter());
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(Global::current(), None);
         let mut state = compute.new_state(&mut context).unwrap();
         let mut batch = batch(&[column(&U)]);
         for _ in 0..2 {

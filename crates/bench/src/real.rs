@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
@@ -24,9 +23,10 @@ fn data_dir() -> PathBuf {
 
 /// The `slice` table, or `None` if there's no Perfetto checkout.
 pub fn slices() -> Option<&'static DynScannable<'static>> {
+    let global = crate::global();
     let text = std::fs::read_to_string(data_dir().join("slice_table_for_benchmarks.csv")).ok()?;
     let table = csv_table(&text)?;
-    Some(Box::leak(Box::new(DynScannable::new(&Heap, table).ok()?)))
+    Some(Box::leak(Box::new(DynScannable::new(global, table).ok()?)))
 }
 
 /// `query` over `slices`, compiled, optimized and lowered, ready to run.
@@ -60,6 +60,7 @@ impl Catalog for Slices {
 /// values aren't all numbers holds an id for each distinct string, and
 /// `[NULL]` or nothing is null.
 fn csv_table(text: &str) -> Option<Table> {
+    let global = crate::global();
     let mut lines = text.lines();
     let names = fields(lines.next()?);
     let mut columns: Vec<Vec<Option<String>>> = vec![Vec::new(); names.len()];
@@ -81,16 +82,17 @@ fn csv_table(text: &str) -> Option<Table> {
         })
         .collect();
     let groups: Vec<&[ColumnView]> = groups.iter().map(Vec::as_slice).collect();
-    Table::new(&Heap, &schema, &groups).ok()
+    Table::new(global, &schema, &groups).ok()
 }
 
 /// One column: numbers as they are, or ids for strings, with a validity
 /// bitmap if any is null.
 fn int64s(values: &[Option<String>]) -> Option<ColumnView> {
+    let global = crate::global();
     let numbers = values.iter().flatten().all(|value| value.parse::<i64>().is_ok());
     let mut ids = HashMap::new();
-    let mut data = Buffer::allocate(&Heap, values.len() * 8).ok()?;
-    let mut validity = Buffer::allocate(&Heap, values.len().div_ceil(8)).ok()?;
+    let mut data = Buffer::allocate(global, values.len() * 8).ok()?;
+    let mut validity = Buffer::allocate(global, values.len().div_ceil(8)).ok()?;
     let mut any_null = false;
     for (i, value) in values.iter().enumerate() {
         let Some(value) = value else {
@@ -103,8 +105,13 @@ fn int64s(values: &[Option<String>]) -> Option<ColumnView> {
         data.as_mut_slice::<i64>()[i] = number;
         validity.as_mut_slice::<u8>()[i / 8] |= 1 << (i % 8);
     }
-    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, data, any_null.then_some(validity))
-        .ok()
+    ColumnView::new(
+        &mut Context::new(global, None),
+        DataType::Int64,
+        data,
+        any_null.then_some(validity),
+    )
+    .ok()
 }
 
 /// The fields of a CSV line: quoted ones can hold commas, and `""` for a

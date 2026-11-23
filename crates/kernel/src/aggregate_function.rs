@@ -5,12 +5,13 @@
 use core::cmp::Ordering;
 
 use crate::aggregate::Function;
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, Validity};
 use crate::context::Context;
 use crate::error::Error;
+use crate::global::Global;
 use crate::group_table::write_strings;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::string_pool::Id;
@@ -135,7 +136,7 @@ pub(crate) struct SeenBytes {
 }
 
 impl SeenBytes {
-    pub(crate) fn new(allocator: &dyn Allocator) -> Result<SeenBytes, AllocError> {
+    pub(crate) fn new(allocator: &Global) -> Result<SeenBytes, AllocError> {
         Ok(SeenBytes { bytes: Blocks::new(allocator, 1)?, tracking: false, groups: 0 })
     }
 
@@ -143,7 +144,7 @@ impl SeenBytes {
     /// in all, whose input holds nulls if `nulls`.
     pub(crate) fn get(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         groups: usize,
         nulls: bool,
     ) -> Result<Option<&[*mut u8]>, AllocError> {

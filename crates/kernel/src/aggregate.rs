@@ -2,10 +2,11 @@
 //! group of its child's rows with the same keys, or over all of them if it
 //! has none. `hash_aggregate` makes the breaker that runs it.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
+use crate::global::Global;
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
@@ -123,7 +124,7 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// With no keys, and only `COUNT(*)`, `MIN` and `MAX`: from what `child`
     /// knows of its rows without reading them, if it knows enough.
-    fn answer(&mut self, allocator: &dyn Allocator, child: &DynOp<'c>) -> Result<bool, AllocError> {
+    fn answer(&mut self, allocator: &Global, child: &DynOp<'c>) -> Result<bool, AllocError> {
         if !self.keys.is_empty() {
             return Ok(false);
         }

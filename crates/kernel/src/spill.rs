@@ -204,9 +204,10 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::context::Context;
+    use crate::global::Global;
 
     /// Behaves as S3 does, in memory: appends are uploaded in parts of at
     /// least `PART` bytes, except the last; nothing can be read before its
@@ -284,17 +285,18 @@ mod tests {
     }
 
     fn column(values: &[i64], nulls: &[u32]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let global = Global::current();
+        let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+            let mut bits = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
             bits.as_mut_slice::<u8>().fill(0xff);
             for &row in nulls {
                 bits.as_mut_slice::<u8>()[row as usize / 8] &= !(1 << (row % 8));
             }
             bits
         });
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
+        ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, validity).unwrap()
     }
 
     fn rows(column: &ColumnView) -> StdVec<Option<i64>> {
@@ -304,6 +306,7 @@ mod tests {
 
     #[test]
     fn columns_come_back_as_they_were_written() {
+        let global = Global::current();
         let store = Strict::default();
         let values: StdVec<i64> = (0..1000).collect();
         let whole = column(&values, &[3, 500, 999]);
@@ -315,7 +318,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(global, None), &store, log, spilled).unwrap();
             assert_eq!(rows(&read), rows(column));
         }
         store.delete(log);
@@ -323,11 +326,12 @@ mod tests {
 
     #[test]
     fn string_columns_come_back_as_they_were_written() {
+        let global = Global::current();
         let store = Strict::default();
         let words: StdVec<StdVec<u8>> =
             (0..700).map(|i| alloc::format!("word{i}").into_bytes()).collect();
-        let mut views = Buffer::allocate(&Heap, words.len() * 8).unwrap();
-        let mut bytes = Buffer::allocate(&Heap, words.iter().map(StdVec::len).sum()).unwrap();
+        let mut views = Buffer::allocate(global, words.len() * 8).unwrap();
+        let mut bytes = Buffer::allocate(global, words.iter().map(StdVec::len).sum()).unwrap();
         let mut at = 0;
         for (i, word) in words.iter().enumerate() {
             bytes.as_mut_slice::<u8>()[at..at + word.len()].copy_from_slice(word);
@@ -336,10 +340,11 @@ mod tests {
                 .copy_from_slice(&[u32::try_from(at).unwrap(), len]);
             at += word.len();
         }
-        let mut validity = Buffer::allocate(&Heap, words.len().div_ceil(8)).unwrap();
+        let mut validity = Buffer::allocate(global, words.len().div_ceil(8)).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1110_1111);
         let whole =
-            ColumnView::strings(&mut Context::new(&Heap), views, bytes, Some(validity)).unwrap();
+            ColumnView::strings(&mut Context::new(global, None), views, bytes, Some(validity))
+                .unwrap();
         let columns = [whole.clone(), whole.slice(3, 600)];
 
         let log = store.create().unwrap();
@@ -347,7 +352,7 @@ mod tests {
             columns.iter().map(|c| write_column(&store, log, c).unwrap()).collect();
         store.seal(log).unwrap();
         for (column, spilled) in columns.iter().zip(&spilled) {
-            let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+            let read = read_column(&mut Context::new(global, None), &store, log, spilled).unwrap();
             let (got, want) = (read.string_values(), column.string_values());
             assert_eq!(got.len(), want.len());
             for row in 0..read.row_count() {
@@ -359,23 +364,25 @@ mod tests {
 
     #[test]
     fn strings_come_back_with_only_their_bytes() {
+        let global = Global::current();
         let store = Strict::default();
         // Longer than a chunk of appends, so they're written in parts.
         let text: StdVec<u8> =
             (0..3000_u32).map(|i| b'a' + u8::try_from(i % 26).unwrap()).collect();
-        let mut page = Buffer::allocate(&Heap, text.len()).unwrap();
+        let mut page = Buffer::allocate(global, text.len()).unwrap();
         page.as_mut_slice::<u8>().copy_from_slice(&text);
         let spans: StdVec<(u32, u32)> = (0..600).map(|i| (i * 3 % 2000, i % 7)).collect();
-        let mut views = Buffer::allocate(&Heap, spans.len() * 8).unwrap();
+        let mut views = Buffer::allocate(global, spans.len() * 8).unwrap();
         for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&spans) {
             view.copy_from_slice(&[start, len]);
         }
-        let column = ColumnView::strings(&mut Context::new(&Heap), views, page, None).unwrap();
+        let column =
+            ColumnView::strings(&mut Context::new(global, None), views, page, None).unwrap();
 
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column).unwrap();
         store.seal(log).unwrap();
-        let read = read_column(&mut Context::new(&Heap), &store, log, &spilled).unwrap();
+        let read = read_column(&mut Context::new(global, None), &store, log, &spilled).unwrap();
         let (got, want) = (read.string_values(), column.string_values());
         // The strings overlapped, from a buffer of 3,000 bytes; written out,
         // each has its own.
@@ -388,15 +395,16 @@ mod tests {
 
     #[test]
     fn logs_are_read_only_once_sealed() {
+        let global = Global::current();
         let store = Strict::default();
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(&[1, 2, 3], &[1])).unwrap();
         assert_eq!(
-            read_column(&mut Context::new(&Heap), &store, log, &spilled).err(),
+            read_column(&mut Context::new(global, None), &store, log, &spilled).err(),
             Some(Error::Io)
         );
         store.seal(log).unwrap();
-        assert!(read_column(&mut Context::new(&Heap), &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(global, None), &store, log, &spilled).is_ok());
     }
 
     #[test]

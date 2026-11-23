@@ -1,6 +1,7 @@
 //! `Names`: names copied into memory of their own, each found by a `Name`.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 pub struct Names {
@@ -16,12 +17,12 @@ pub struct Name {
 
 impl Names {
     /// Room for up to `max_bytes` of names, a power of two.
-    pub fn new(allocator: &dyn Allocator, max_bytes: usize) -> Result<Names, AllocError> {
+    pub fn new(allocator: &Global, max_bytes: usize) -> Result<Names, AllocError> {
         Ok(Names { bytes: SlowVec::new(allocator, max_bytes)? })
     }
 
     /// Room for exactly `bytes` of names, which never grows.
-    pub fn fixed(allocator: &dyn Allocator, bytes: usize) -> Result<Names, AllocError> {
+    pub fn fixed(allocator: &Global, bytes: usize) -> Result<Names, AllocError> {
         Ok(Names { bytes: SlowVec::fixed(allocator, bytes)? })
     }
 
@@ -58,13 +59,13 @@ impl Names {
 
 #[cfg(test)]
 mod tests {
-    use crate::allocator::Heap;
 
     use super::*;
 
     #[test]
     fn keeps_names() {
-        let mut names = Names::new(&Heap, 16).unwrap();
+        let global = Global::current();
+        let mut names = Names::new(global, 16).unwrap();
         let a = names.add("ts").unwrap();
         let b = names.add("dur").unwrap();
         assert_eq!((names.get(a), names.get(b)), ("ts", "dur"));

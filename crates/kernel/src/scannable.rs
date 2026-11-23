@@ -9,7 +9,7 @@ use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
 use crate::column::{Bounds, ColumnView, DataType, Forms};
@@ -17,6 +17,7 @@ use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
 use crate::context::Context;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
+use crate::global::Global;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
 use crate::slow_vec::SlowVec;
@@ -86,7 +87,7 @@ pub trait Scannable {
     /// default, `None`.
     fn scan_within<'s>(
         &'s self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
@@ -175,7 +176,7 @@ type ScannableOpen =
 
 type ScannableScanWithin<'a> = unsafe fn(
     NonNull<()>,
-    &dyn Allocator,
+    &Global,
     &[(u32, Forms)],
     &[Condition],
     Option<Cutoff>,
@@ -222,7 +223,7 @@ pub struct DynScannable<'a> {
 
 impl<'a> DynScannable<'a> {
     pub fn new<T: Scannable + 'a>(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         scannable: T,
     ) -> Result<DynScannable<'a>, AllocError> {
         const { assert!(align_of::<T::State<'a>>() <= BUFFER_ALIGNMENT_BYTES) };
@@ -344,7 +345,7 @@ impl<'a> DynScannable<'a> {
     /// columns, or sorting after `cutoff`'s.
     pub fn scan(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: impl ExactSizeIterator<Item = (u32, Forms)>,
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
@@ -395,7 +396,7 @@ impl<'a> DynScannable<'a> {
     /// `forms`.
     pub fn materialize(
         &self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         positions: SlowVec<u32>,
         forms: SlowVec<Forms>,
     ) -> Result<DynTransform<'_>, AllocError> {
@@ -511,12 +512,12 @@ mod tests {
     use core::cell::RefCell;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::ColumnView;
     use crate::context::Context;
+    use crate::global::Global;
     use crate::pipeline::Pipeline;
-    use crate::query_allocators::QueryAllocators;
     use crate::selection::Kept;
     use crate::step::{Step, Transform};
 
@@ -556,19 +557,20 @@ mod tests {
             (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
+            let global = Global::current();
             if *done {
                 return Ok(false);
             }
             batch.reset(2);
             for &(column, _) in *columns {
-                let mut values = Buffer::allocate(&Heap, 16).unwrap();
+                let mut values = Buffer::allocate(global, 16).unwrap();
                 let value = i64::from(column);
                 values.as_mut_slice::<i64>().copy_from_slice(&[value, value + 10]);
                 assert!(
                     batch
                         .push_column(
                             ColumnView::new(
-                                &mut Context::new(&Heap),
+                                &mut Context::new(global, None),
                                 DataType::Int64,
                                 values,
                                 None
@@ -585,7 +587,8 @@ mod tests {
 
     #[test]
     fn describes_its_columns() {
-        let scannable = DynScannable::new(&Heap, Columns).unwrap();
+        let global = Global::current();
+        let scannable = DynScannable::new(global, Columns).unwrap();
         assert_eq!(scannable.column_count(), 3);
         assert_eq!(scannable.column_name(1), "b");
         assert!(scannable.column_type(2) == DataType::Int64);
@@ -593,14 +596,15 @@ mod tests {
 
     #[test]
     fn scans_chosen_columns_through_a_pipeline() {
-        let scannable = DynScannable::new(&Heap, Columns).unwrap();
+        let global = Global::current();
+        let scannable = DynScannable::new(global, Columns).unwrap();
         let columns = [(2, Forms::FLAT), (0, Forms::FLAT)].into_iter();
         let pipeline = Pipeline::new(
-            scannable.scan(&Heap, columns, &[], None).unwrap(),
-            SlowVec::new(&Heap, 1).unwrap(),
+            scannable.scan(global, columns, &[], None).unwrap(),
+            SlowVec::new(global, 1).unwrap(),
         );
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query, None).unwrap();
+        let query = Global::current();
+        let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> = (0..2).map(|i| batch.column(i).int64s()).collect();
@@ -709,18 +713,20 @@ mod tests {
 
     #[test]
     fn writes_lazy_columns_and_loads_them_for_the_rows_kept() {
+        let global = Global::current();
         let loads = RefCell::new(StdVec::new());
-        let scannable = DynScannable::new(&Heap, Counted { loads: &loads }).unwrap();
-        let source =
-            scannable.scan(&Heap, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None).unwrap();
-        let keep = Step::Transform(DynTransform::new(&Heap, KeepOdd).unwrap());
-        let positions = SlowVec::fixed_from(&Heap, [0].into_iter()).unwrap();
-        let flat = SlowVec::fixed_from(&Heap, [Forms::FLAT].into_iter()).unwrap();
-        let load = Step::Transform(scannable.materialize(&Heap, positions, flat).unwrap());
+        let scannable = DynScannable::new(global, Counted { loads: &loads }).unwrap();
+        let source = scannable
+            .scan(global, [(0, Forms::FLAT | Forms::LAZY)].into_iter(), &[], None)
+            .unwrap();
+        let keep = Step::Transform(DynTransform::new(global, KeepOdd).unwrap());
+        let positions = SlowVec::fixed_from(global, [0].into_iter()).unwrap();
+        let flat = SlowVec::fixed_from(global, [Forms::FLAT].into_iter()).unwrap();
+        let load = Step::Transform(scannable.materialize(global, positions, flat).unwrap());
         let pipeline =
-            Pipeline::new(source, SlowVec::fixed_from(&Heap, [keep, load].into_iter()).unwrap());
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = pipeline.start(&query, None).unwrap();
+            Pipeline::new(source, SlowVec::fixed_from(global, [keep, load].into_iter()).unwrap());
+        let query = Global::current();
+        let mut execution = pipeline.start(query, None).unwrap();
         let mut batch = RowBatch::new();
         let mut kept = StdVec::new();
         while execution.next(&mut batch).unwrap() {

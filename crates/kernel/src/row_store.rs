@@ -1,11 +1,12 @@
 //! `RowStore`: the rows a breaker holds on to, to hand back later in any
 //! order, as Perfetto's `core/exec/row_store` holds them.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Form, GatherSource};
 use crate::context::Context;
 use crate::error::Error;
+use crate::global::Global;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::slow_vec::SlowVec;
@@ -83,7 +84,7 @@ pub(crate) struct RowStore {
 }
 
 impl RowStore {
-    pub(crate) fn new(allocator: &dyn Allocator) -> Result<RowStore, AllocError> {
+    pub(crate) fn new(allocator: &Global) -> Result<RowStore, AllocError> {
         Ok(RowStore {
             held: SlowVec::new(allocator, 1 << 31)?,
             batches: 0,
@@ -453,7 +454,7 @@ struct Copies {
 }
 
 impl Copies {
-    fn new(allocator: &dyn Allocator, columns: usize, rows: usize) -> Result<Copies, Error> {
+    fn new(allocator: &Global, columns: usize, rows: usize) -> Result<Copies, Error> {
         let batches = rows.div_ceil(BATCH_ROWS_MAX as usize);
         let buffers = SlowVec::fixed_from(allocator, (0..columns * batches).map(|_| None))?;
         Ok(Copies { buffers, rows, batches })
@@ -513,12 +514,7 @@ impl Copies {
     /// in cache: each slot's word in `words` says where in its region the
     /// value that arrived in it goes.
     /// Columns with a bit in `in_order` are left as they are.
-    fn put_in_order(
-        &self,
-        allocator: &dyn Allocator,
-        words: &[u64],
-        in_order: u64,
-    ) -> Result<(), Error> {
+    fn put_in_order(&self, allocator: &Global, words: &[u64], in_order: u64) -> Result<(), Error> {
         let mut values = SlowVec::<i64>::zeroed(allocator, 1 << REGION_BITS)?;
         for first in (0..self.rows).step_by(1 << REGION_BITS) {
             let end = self.rows.min(first + (1 << REGION_BITS));
@@ -709,7 +705,6 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
 
     /// The value row `row` of the batch from `base` holds, `None` if null.
     fn value(base: i64, row: u32) -> Option<i64> {
@@ -790,8 +785,9 @@ mod tests {
 
     #[test]
     fn hands_back_rows_shared_and_packed_in_any_order() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let global = Global::current();
+        let mut context = Context::new(global, None);
+        let mut store = RowStore::new(global).unwrap();
         // Shared, packed, shared after packed rows, and packed again.
         let keeps: [(i64, Keep); 4] = [
             (0, |_| true),
@@ -841,8 +837,9 @@ mod tests {
 
     #[test]
     fn gathers_across_batches_with_and_without_nulls() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let global = Global::current();
+        let mut context = Context::new(global, None);
+        let mut store = RowStore::new(global).unwrap();
         let with = batch(&mut context, 0, |_| true);
         store.append(&mut context, &with).unwrap();
         let without = batch_without_nulls(&mut context, 10_000);
@@ -861,8 +858,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn scatters_columns_into_an_order() {
-        let mut context = Context::new(&Heap);
-        let mut store = RowStore::new(&Heap).unwrap();
+        let global = Global::current();
+        let mut context = Context::new(global, None);
+        let mut store = RowStore::new(global).unwrap();
         let batches = 40;
         for b in 0..batches {
             let mut batch = batch_without_nulls(&mut context, i64::from(b) * 10_000);

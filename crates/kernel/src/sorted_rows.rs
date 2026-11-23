@@ -3,11 +3,12 @@
 //! rows arrive, the output order is a list of row numbers sorted by them,
 //! and rows are copied out once, in that order.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::column::{ColumnView, DataType};
 use crate::context::Context;
 use crate::error::Error;
+use crate::global::Global;
 use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_blocks::RowBlocks;
@@ -60,7 +61,7 @@ pub(crate) struct SortedRows {
 }
 
 impl SortedRows {
-    pub(crate) fn new(allocator: &dyn Allocator) -> Result<SortedRows, AllocError> {
+    pub(crate) fn new(allocator: &Global) -> Result<SortedRows, AllocError> {
         Ok(SortedRows {
             layout: None,
             columns: SlowVec::new(allocator, 1 << 6)?,
@@ -148,7 +149,7 @@ impl SortedRows {
     /// every batch's must match, as Perfetto checks.
     pub(crate) fn check_keys(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         batch: &RowBatch,
         keys: &[SortKey],
     ) -> Result<&RowLayout, Error> {
@@ -382,11 +383,7 @@ const NULL_RANK: u32 = u32::MAX;
 
 /// Each held row's rank among the strings of `column`, a string column, of
 /// the rows held: equal strings rank equally. Null rows rank `NULL_RANK`.
-fn rank_strings(
-    allocator: &dyn Allocator,
-    rows: &RowStore,
-    column: u32,
-) -> Result<Array<u32>, Error> {
+fn rank_strings(allocator: &Global, rows: &RowStore, column: u32) -> Result<Array<u32>, Error> {
     let string = |row: &u32| rows.string(column, *row);
     #[expect(clippy::cast_possible_truncation, reason = "a row held")]
     let mut order = Array::from_fn(allocator, rows.len() as usize, |row| row as u32)?;
