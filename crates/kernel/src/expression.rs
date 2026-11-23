@@ -835,7 +835,9 @@ fn nonzero(divisor: Option<(&[i64], bool)>, at: usize, count: usize) -> u64 {
 pub const EXPR_NODES_MAX: usize = 1 << 8;
 
 /// A scalar expression over the columns of a row, as a plan holds it: column
-/// references, literals, NULL and arithmetic.
+/// references, literals, NULL and arithmetic. Its nodes are in its plan's
+/// `Exprs`, from `start`, its root `root` further on, so a part of it, such
+/// as a conjunct, is the same `start` with another root.
 ///
 /// It has the shape of an `ExprProgram`: nodes in post-order, each reading
 /// only nodes before it, the last being the result. A `Column` node's `a` is
@@ -848,10 +850,60 @@ pub const EXPR_NODES_MAX: usize = 1 << 8;
 /// Only expressions whose meaning is the same as SQLite's are accepted.
 /// Arithmetic on strings is an error, and an integer overflow fails the query
 /// where SQLite would answer with a double.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Expr {
-    pub nodes: SlowVec<ExprStep>,
-    /// Its `In` lists' values, if it has any.
-    pub values: Option<Buffer>,
+    pub start: u32,
+    pub root: u32,
+}
+
+/// The most nodes of all of a plan's expressions.
+pub const PLAN_EXPR_NODES_MAX: usize = 1 << 14;
+
+/// The most values of all of a plan's `IN` lists.
+pub const PLAN_EXPR_VALUES_MAX: usize = 1 << 20;
+
+/// The nodes of a plan's expressions, each one's together, and the values
+/// of their `IN` lists, which an `In` node's `b` counts from the first of.
+pub struct Exprs {
+    nodes: SlowVec<ExprStep>,
+    values: SlowVec<i64>,
+}
+
+impl Exprs {
+    pub fn new(allocator: &dyn Allocator) -> Result<Exprs, AllocError> {
+        let values = SlowVec::new(allocator, PLAN_EXPR_VALUES_MAX)?;
+        Ok(Exprs { nodes: SlowVec::new(allocator, PLAN_EXPR_NODES_MAX)?, values })
+    }
+
+    /// Adds the expression of `nodes`, which read only each other, the last
+    /// its root.
+    pub fn add(&mut self, nodes: &[ExprStep]) -> Result<Expr, AllocError> {
+        check!(!nodes.is_empty() && nodes.len() <= EXPR_NODES_MAX);
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_NODES_MAX`")]
+        let start = self.nodes.len() as u32;
+        self.nodes.extend_from_slice(nodes)?;
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let root = nodes.len() as u32 - 1;
+        Ok(Expr { start, root })
+    }
+
+    /// Adds a value of an `IN` list, and returns where it is.
+    pub fn add_value(&mut self, value: i64) -> Result<u32, AllocError> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
+        let at = self.values.len() as u32;
+        self.values.push(value)?;
+        Ok(at)
+    }
+
+    /// `expr`'s nodes, from its start to its root, the last.
+    pub fn nodes(&self, expr: Expr) -> &[ExprStep] {
+        at!(self.nodes, expr.start as usize..=(expr.start + expr.root) as usize)
+    }
+
+    /// The values of the `IN` lists.
+    pub fn values(&self) -> &[i64] {
+        &self.values
+    }
 }
 
 /// Why an expression can't be computed: what it needed instead, or memory.
@@ -914,14 +966,18 @@ struct Typer<'t> {
 impl Typer<'_> {
     /// The type of the expression's result.
     #[inline(never)]
-    fn run(&mut self, expr: &Expr) -> Result<Option<DataType>, ExprError> {
-        check!(!expr.nodes.is_empty() && expr.nodes.len() <= EXPR_NODES_MAX);
-        for (i, node) in expr.nodes.iter().enumerate() {
-            let (data_type, register) = self.type_node(&expr.nodes, node)?;
-            let fails = self.can_fail(&expr.nodes, node, data_type);
-            *at_mut!(self.nodes, i) = (data_type, register, fails);
+    fn run(&mut self, nodes: &[ExprStep]) -> Result<Option<DataType>, ExprError> {
+        check!(!nodes.is_empty() && nodes.len() <= EXPR_NODES_MAX);
+        // Only what the root reads: the nodes before it can be others'.
+        let reached = reached(nodes);
+        for (i, node) in nodes.iter().enumerate() {
+            if *at!(reached, i) {
+                let (data_type, register) = self.type_node(nodes, node)?;
+                let fails = self.can_fail(nodes, node, data_type);
+                *at_mut!(self.nodes, i) = (data_type, register, fails);
+            }
         }
-        Ok(at!(self.nodes, expr.nodes.len() - 1).0)
+        Ok(at!(self.nodes, nodes.len() - 1).0)
     }
 
     /// The register holding node `i` as `data_type`: a null of that type for
@@ -1219,29 +1275,29 @@ fn one_type(types: impl Iterator<Item = Option<DataType>>) -> Result<Option<Data
 /// Whether `expr` can compute a null, given whether each column it reads
 /// can hold one: it can if one can, or if it divides by what may be zero,
 /// anything but a constant that isn't, or has a `NULL`.
-pub fn expr_can_be_null(expr: &Expr, nullable_of: &dyn Fn(ColumnId) -> bool) -> bool {
+pub fn expr_can_be_null(nodes: &[ExprStep], nullable_of: &dyn Fn(ColumnId) -> bool) -> bool {
     // A null test never is, whatever it tests.
-    if expr.nodes.last().is_some_and(|node| matches!(node.op, ExprOp::IsNull | ExprOp::IsNotNull)) {
+    if nodes.last().is_some_and(|node| matches!(node.op, ExprOp::IsNull | ExprOp::IsNotNull)) {
         return false;
     }
     let nonzero = |node: &ExprStep| {
         node.op == ExprOp::Constant && (node.int_value != 0 || node.double_value != 0.0)
     };
-    expr.nodes.iter().any(|node| match node.op {
+    nodes.iter().any(|node| match node.op {
         ExprOp::Column => nullable_of(node.a),
-        ExprOp::Div | ExprOp::Mod => expr.nodes.get(node.b as usize).is_none_or(|b| !nonzero(b)),
+        ExprOp::Div | ExprOp::Mod => nodes.get(node.b as usize).is_none_or(|b| !nonzero(b)),
         ExprOp::Null => true,
         _ => false,
     })
 }
 
 pub fn check_expr_type(
-    expr: &Expr,
+    nodes: &[ExprStep],
     type_of: &dyn Fn(ColumnId) -> DataType,
 ) -> Result<DataType, ExprError> {
     let mut typer = Typer { type_of, build: None, nodes: [(None, 0, false); EXPR_NODES_MAX] };
     // A result which is only ever NULL is a column of Int64 nulls.
-    Ok(typer.run(expr)?.unwrap_or(DataType::Int64))
+    Ok(typer.run(nodes)?.unwrap_or(DataType::Int64))
 }
 
 impl ExprStep {
@@ -1278,164 +1334,79 @@ impl ExprStep {
             ExprOp::Call => [(self.a, self.b), none],
         }
     }
+}
 
-    /// This, reading `renumber(n)` wherever it reads node `n`: a run's
-    /// first, whose nodes stay together.
-    fn renumbered(mut self, renumber: impl Fn(u32) -> u32) -> ExprStep {
-        match self.op {
-            ExprOp::Column | ExprOp::Constant | ExprOp::Null => {}
-            ExprOp::When if self.a == PRESENT => self.b = renumber(self.b),
-            ExprOp::Case => (self.a, self.c) = (renumber(self.a), renumber(self.c)),
-            _ => {
-                let [_, (second, count)] = self.operands();
-                self.a = renumber(self.a);
-                if count != 0 {
-                    self.b = renumber(second);
-                }
+/// The nodes the last of `nodes` reads, and it: marked from the last back,
+/// as a node's operands come before it.
+fn reached(nodes: &[ExprStep]) -> [bool; EXPR_NODES_MAX] {
+    let mut reached = [false; EXPR_NODES_MAX];
+    *at_mut!(reached, nodes.len() - 1) = true;
+    for (i, node) in nodes.iter().enumerate().rev() {
+        if *at!(reached, i) {
+            for (start, len) in node.operands() {
+                at_mut!(reached, start as usize..(start + len) as usize).fill(true);
             }
         }
-        self
+    }
+    reached
+}
+
+/// Node `node`'s top-level conjuncts, the parts of its `AND`s, of `nodes`:
+/// each passed to `each`.
+pub fn conjuncts(nodes: &[ExprStep], node: u32, each: &mut dyn FnMut(u32)) {
+    let step = at!(nodes, node as usize);
+    if step.op == ExprOp::And {
+        conjuncts(nodes, step.a, each);
+        conjuncts(nodes, step.b, each);
+    } else {
+        each(node);
     }
 }
 
-/// Gives nodes of an expression, each to the function it's given.
-type Roots<'a> = dyn Fn(&mut dyn FnMut(u32)) + 'a;
-
-impl Expr {
-    /// Node `node`'s top-level conjuncts, the parts of its `AND`s: each
-    /// passed to `each`.
-    pub fn conjuncts(&self, node: u32, each: &mut dyn FnMut(u32)) {
-        let step = at!(self.nodes, node as usize);
-        if step.op == ExprOp::And {
-            self.conjuncts(step.a, each);
-            self.conjuncts(step.b, each);
-        } else {
-            each(node);
-        }
+/// Passes each column node `node` of `nodes` reads to `each`, maybe more
+/// than once.
+pub fn columns_of(nodes: &[ExprStep], node: u32, each: &mut dyn FnMut(ColumnId)) {
+    let step = at!(nodes, node as usize);
+    if step.op == ExprOp::Column {
+        return each(step.a);
     }
-
-    /// Its root.
-    pub fn root(&self) -> u32 {
-        check!(!self.nodes.is_empty());
-        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-        let root = self.nodes.len() as u32 - 1;
-        root
-    }
-
-    /// Passes each column node `node` reads to `each`, maybe more than once.
-    pub fn columns_of(&self, node: u32, each: &mut dyn FnMut(ColumnId)) {
-        let step = at!(self.nodes, node as usize);
-        if step.op == ExprOp::Column {
-            return each(step.a);
+    for (first, count) in step.operands() {
+        for operand in first..first + count {
+            columns_of(nodes, operand, each);
         }
-        for (first, count) in step.operands() {
-            for operand in first..first + count {
-                self.columns_of(operand, each);
-            }
-        }
-    }
-
-    /// Its top-level conjuncts that `keep` is true for, joined by `AND`, or
-    /// `None` if there are none. It shares this one's `IN` lists.
-    pub fn conjuncts_where(
-        &self,
-        allocator: &dyn Allocator,
-        keep: &dyn Fn(u32) -> bool,
-    ) -> Result<Option<Expr>, AllocError> {
-        let mut any = false;
-        self.conjuncts(self.root(), &mut |node| any |= keep(node));
-        if !any {
-            return Ok(None);
-        }
-        let roots = |each: &mut dyn FnMut(u32)| {
-            self.conjuncts(self.root(), &mut |node| {
-                if keep(node) {
-                    each(node);
-                }
-            });
-        };
-        Ok(Some(self.copied(allocator, &roots)?))
-    }
-
-    /// Node `node` and what it reads, as an expression of its own.
-    pub fn subtree(&self, allocator: &dyn Allocator, node: u32) -> Result<Expr, AllocError> {
-        self.copied(allocator, &|each| each(node))
-    }
-
-    /// The nodes `roots` gives and what they read, joined by `AND`.
-    fn copied(&self, allocator: &dyn Allocator, roots: &Roots<'_>) -> Result<Expr, AllocError> {
-        // The nodes the roots read: marked from the last back, as a node's
-        // operands come before it, then copied in order, so runs stay runs.
-        let mut kept = [false; EXPR_NODES_MAX];
-        let mut count = 0;
-        roots(&mut |root| {
-            *at_mut!(kept, root as usize) = true;
-            count += 1;
-        });
-        for (i, step) in self.nodes.iter().enumerate().rev() {
-            if *at!(kept, i) {
-                for (start, len) in step.operands() {
-                    at_mut!(kept, start as usize..(start + len) as usize).fill(true);
-                }
-            }
-        }
-        let marked = kept.iter().filter(|&&marked| marked).count();
-        let mut nodes = SlowVec::fixed(allocator, marked + count - 1)?;
-        // Each copied node's place among the copies: fewer than 256.
-        let mut at = [0_u8; EXPR_NODES_MAX];
-        for (i, step) in self.nodes.iter().enumerate() {
-            if *at!(kept, i) {
-                #[expect(clippy::cast_possible_truncation, reason = "below `EXPR_NODES_MAX`")]
-                let copied = nodes.len() as u8;
-                *at_mut!(at, i) = copied;
-                nodes.push(step.renumbered(|node| u32::from(*at!(at, node as usize))))?;
-            }
-        }
-        let mut root = None;
-        roots(&mut |next| {
-            let next = u32::from(*at!(at, next as usize));
-            root = Some(match root {
-                None => next,
-                Some(root) => {
-                    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-                    let and = nodes.len() as u32;
-                    // Room was made for each `AND`.
-                    let joined = step(ExprOp::And, DataType::Int64, root, next);
-                    let Ok(()) = nodes.push(joined) else { failed!() };
-                    and
-                }
-            });
-        });
-        check!(root.is_some_and(|root| root as usize == nodes.len() - 1));
-        Ok(Expr { nodes, values: self.values.clone() })
     }
 }
 
 /// Marks the columns `expr` reads.
-pub fn mark_expr_columns(expr: &Expr, needed: &mut Needed) {
-    for node in expr.nodes.iter().filter(|node| node.op == ExprOp::Column) {
-        needed.need(node.a);
-    }
+pub fn mark_expr_columns(expr: Expr, needed: &mut Needed<'_>) {
+    let nodes = needed.exprs().nodes(expr);
+    columns_of(nodes, expr.root, &mut |column| needed.need(column));
 }
 
-/// The program computing `expr`, with columns at their positions in `rows`.
+/// The program computing the expression of `nodes`, the last its root, with
+/// columns at their positions in `rows`, and its `IN` lists of `values`. As a
+/// `condition`, its result is an integer: a double is true unless it's 0.
 pub fn type_expr(
     allocator: &dyn Allocator,
     rows: &OutputProperties,
-    expr: &Expr,
+    nodes: &[ExprStep],
+    values: Option<Buffer>,
+    condition: bool,
 ) -> Result<ExprProgram, ExprError> {
     // Each node takes at most three steps, and a NULL result one more.
     let mut steps = SlowVec::new(allocator, 4 * EXPR_NODES_MAX)?;
     let type_of = |column| rows.type_of(column);
-    let nodes = [(None, 0, false); EXPR_NODES_MAX];
-    let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes };
-    let result = typer.run(expr)?.unwrap_or(DataType::Int64);
+    let table = [(None, 0, false); EXPR_NODES_MAX];
+    let mut typer = Typer { type_of: &type_of, build: Some((rows, &mut steps)), nodes: table };
+    let result = typer.run(nodes)?.unwrap_or(DataType::Int64);
     #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
-    let register = typer.materialize(expr.nodes.len() as u32 - 1, result)?;
+    let root = nodes.len() as u32 - 1;
+    let register =
+        if condition { typer.condition(root)? } else { typer.materialize(root, result)? };
     // Unlike Perfetto's, no column is only ever NULL, so the last node's step
     // is the last.
     check!(register as usize == steps.len() - 1);
-    Ok(ExprProgram { steps, values: expr.values.clone() })
+    Ok(ExprProgram { steps, values })
 }
 
 /// A column a `ComputeOp` adds.
@@ -1492,7 +1463,7 @@ impl<'c> Op<'c> for ComputeOp {
     /// Its expressions' columns.
     fn reads(&self, reads: &mut Needed) {
         for item in self.items.iter() {
-            mark_expr_columns(&item.expr, reads);
+            mark_expr_columns(item.expr, reads);
         }
     }
 
@@ -1500,10 +1471,12 @@ impl<'c> Op<'c> for ComputeOp {
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let input = c.input(0);
         let mut out = *input;
+        let exprs = c.exprs();
         for item in self.items.iter() {
-            let data_type = check_expr_type(&item.expr, &|column| input.type_of(column))
+            let nodes = exprs.nodes(item.expr);
+            let data_type = check_expr_type(nodes, &|column| input.type_of(column))
                 .map_err(|error| lower_error(error, item.output))?;
-            let nullable = expr_can_be_null(&item.expr, &|column| input.nullable_of(column));
+            let nullable = expr_can_be_null(nodes, &|column| input.nullable_of(column));
             out.push_column(Column { id: item.output, data_type, nullable })?;
         }
         Ok(out)
@@ -1519,7 +1492,8 @@ impl<'c> Op<'c> for ComputeOp {
         let allocator = lowering.allocator();
         let mut programs = SlowVec::fixed(allocator, self.items.len())?;
         for item in self.items.iter() {
-            let program = type_expr(allocator, lowering.query_rows(), &item.expr)
+            let (nodes, values) = (lowering.exprs().nodes(item.expr), lowering.expr_values());
+            let program = type_expr(allocator, lowering.query_rows(), nodes, values, false)
                 .map_err(|error| lower_error(error, item.output))?;
             programs.push(program)?;
         }

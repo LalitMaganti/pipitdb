@@ -4,6 +4,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::Forms;
+use crate::expression::Exprs;
 use crate::plan::{
     Children, ColumnId, Given, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId,
 };
@@ -19,14 +20,26 @@ pub fn optimize(allocator: &dyn Allocator, plan: &mut LogicalPlan<'_>) -> Result
 }
 
 /// The columns something later in a plan uses, by id.
-pub struct Needed {
+pub struct Needed<'e> {
     columns: SlowVec<bool>,
+    /// The plan's expressions, which ops' columns are read in.
+    exprs: &'e Exprs,
 }
 
-impl Needed {
-    /// None of `count` columns.
-    fn none(allocator: &dyn Allocator, count: usize) -> Result<Needed, AllocError> {
-        Ok(Needed { columns: SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))? })
+impl<'e> Needed<'e> {
+    /// None of `count` columns, of a plan whose expressions are `exprs`.
+    fn none(
+        allocator: &dyn Allocator,
+        count: usize,
+        exprs: &'e Exprs,
+    ) -> Result<Needed<'e>, AllocError> {
+        let columns = SlowVec::fixed_from(allocator, core::iter::repeat_n(false, count))?;
+        Ok(Needed { columns, exprs })
+    }
+
+    /// The plan's expressions.
+    pub fn exprs(&self) -> &'e Exprs {
+        self.exprs
     }
 
     pub fn is_needed(&self, column: ColumnId) -> bool {
@@ -60,7 +73,7 @@ pub fn prune_columns(
     allocator: &dyn Allocator,
     plan: &mut LogicalPlan<'_>,
 ) -> Result<(), AllocError> {
-    let mut needed = Needed::none(allocator, plan.columns.len())?;
+    let mut needed = Needed::none(allocator, plan.columns.len(), &plan.exprs)?;
     for column in plan.output.iter() {
         needed.need(column.id);
     }
@@ -171,7 +184,8 @@ fn move_one_filter(
         let &[child] = &at!(plan.nodes, id).children[..] else { continue };
         // Children are added before their parents.
         let (below, rest) = plan.nodes.split_at_mut(id);
-        let moved = at_mut!(rest, 0).op.split_below(allocator, &at!(below, child as usize).op)?;
+        let below = &at!(below, child as usize).op;
+        let moved = at_mut!(rest, 0).op.split_below(&plan.exprs, allocator, below)?;
         if moved.filters.iter().all(Option::is_none) {
             continue;
         }
@@ -246,10 +260,11 @@ pub fn push_down_conditions(
             let mut at = *at!(parents, maker);
             while let Some((parent, _)) = at {
                 let parent_op = &mut at_mut!(plan.nodes, parent as usize).op;
-                let given = parent_op.give_condition(allocator, column)?;
+                let given = parent_op.give_condition(&plan.exprs, allocator, column)?;
                 let Given::Passed(condition) = given else { break };
                 if let Some(condition) = condition {
-                    at_mut!(plan.nodes, maker).op.take_condition(allocator, column, condition)?;
+                    let maker = &mut at_mut!(plan.nodes, maker).op;
+                    maker.take_condition(&plan.exprs, allocator, column, condition)?;
                 }
                 at = *at!(parents, parent as usize);
             }
@@ -274,10 +289,11 @@ enum Load {
 /// above the root, or nowhere; whether that's higher than `maker`'s parent;
 /// and the forms accepted by every op on the way that reads it.
 fn first_read(
+    exprs: &Exprs,
     nodes: &[PlanNode<'_>],
     parents: &[Option<(PlanNodeId, usize)>],
-    reads: &[Needed],
-    output: &Needed,
+    reads: &[Needed<'_>],
+    output: &Needed<'_>,
     maker: usize,
     column: ColumnId,
 ) -> (Load, bool, Forms) {
@@ -286,7 +302,7 @@ fn first_read(
     while let Some((parent, slot)) = at {
         let op = &at!(nodes, parent as usize).op;
         if at!(reads, parent as usize).is_needed(column) {
-            accepted = accepted & op.accepts(column);
+            accepted = accepted & op.accepts(exprs, column);
             first.get_or_insert((Load::Below(parent, slot), above_parent));
         }
         if !op.passes_through(column) {
@@ -333,11 +349,11 @@ pub fn choose_forms(
     let parents = parents(allocator, plan)?;
     let mut reads = SlowVec::fixed(allocator, nodes)?;
     for node in plan.nodes.iter() {
-        let mut read = Needed::none(allocator, columns)?;
+        let mut read = Needed::none(allocator, columns, &plan.exprs)?;
         node.op.reads(&mut read);
         reads.push(read)?;
     }
-    let mut output = Needed::none(allocator, columns)?;
+    let mut output = Needed::none(allocator, columns, &plan.exprs)?;
     for column in plan.output.iter() {
         output.need(column.id);
     }
@@ -346,7 +362,7 @@ pub fn choose_forms(
     for maker in 0..nodes {
         for column in (0..).take(columns) {
             let (load, above_parent, accepted) =
-                first_read(&plan.nodes, &parents, &reads, &output, maker, column);
+                first_read(&plan.exprs, &plan.nodes, &parents, &reads, &output, maker, column);
             // A column nothing reads may be lazy too, and isn't loaded.
             let worth = above_parent || load == Load::Never;
             let allowed = if worth { accepted | Forms::LAZY } else { accepted };
@@ -357,6 +373,9 @@ pub fn choose_forms(
             }
         }
     }
+    // They read the plan's expressions, which go on, but not the nodes,
+    // which change.
+    drop((reads, output));
     // One op loads the columns one node made lazy that are loaded at one
     // place.
     for i in 0..lazy.len() {
@@ -425,6 +444,7 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
     use crate::column::DataType;
+    use crate::expression::Exprs;
     use crate::lower::{LowerError, Lowering};
     use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{DynOp, LogicalPlan, Op, PlanNode};
@@ -457,7 +477,7 @@ mod tests {
     }
 
     impl<'c> Op<'c> for Reader {
-        fn accepts(&self, _: ColumnId) -> Forms {
+        fn accepts(&self, _: &Exprs, _: ColumnId) -> Forms {
             self.accepts
         }
 

@@ -4,6 +4,7 @@
 
 use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Forms};
+use crate::expression::Exprs;
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
@@ -108,7 +109,7 @@ impl<'c> Op<'c> for AggregateOp {
 
     /// Its keys in dictionaries too: a string key's entries are each
     /// interned once, rather than each row's. Only strings come in them.
-    fn accepts(&self, column: ColumnId) -> Forms {
+    fn accepts(&self, _: &Exprs, column: ColumnId) -> Forms {
         if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
     }
 

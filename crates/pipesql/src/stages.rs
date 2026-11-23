@@ -164,7 +164,8 @@ fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
             return Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(node)));
         }
     }
-    let filter = DynOp::new(compiler.allocator(), FilterOp { condition })?;
+    let allocator = compiler.allocator();
+    let filter = DynOp::new(allocator, FilterOp::new(allocator, &compiler.plan.exprs, condition)?)?;
     let children = [compiler.plan.root];
     compiler.plan.add_node(filter, &children)?;
     Ok(())
@@ -338,8 +339,8 @@ fn value_of(
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
     let (expr, data_type) = compile_expr(compiler, value)?;
-    let columns = &compiler.plan.columns;
-    let nullable = expr_can_be_null(&expr, &|column| at!(columns, column as usize).nullable);
+    let (columns, nodes) = (&compiler.plan.columns, compiler.plan.exprs.nodes(expr));
+    let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
     let column = compiler.plan.add_named_column(name, data_type, nullable)?;
     computed.push(ComputeItem { output: column.id, expr })?;
     Ok(column)

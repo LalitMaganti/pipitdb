@@ -12,6 +12,7 @@ use crate::allocator::{AllocError, Allocator};
 use crate::column::{DataType, Form, Forms};
 use crate::context::Context;
 use crate::error::Error;
+use crate::expression::Exprs;
 use crate::filter::{self, Range};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
@@ -64,7 +65,7 @@ impl<'c> Op<'c> for JoinOp {
     }
 
     /// Sequences of its keys, whose rows it finds by their numbers.
-    fn accepts(&self, column: ColumnId) -> Forms {
+    fn accepts(&self, _: &Exprs, column: ColumnId) -> Forms {
         if column == self.probe_key || column == self.build_key {
             Forms::FLAT | Forms::SEQUENCE
         } else {
@@ -81,7 +82,12 @@ impl<'c> Op<'c> for JoinOp {
     /// Nothing of its own: it keeps the probe side's rows whose key a build
     /// row has, and a condition above on either side's columns only drops
     /// rows it would output.
-    fn give_condition(&mut self, _: &dyn Allocator, _: ColumnId) -> Result<Given, AllocError> {
+    fn give_condition(
+        &mut self,
+        _: &Exprs,
+        _: &dyn Allocator,
+        _: ColumnId,
+    ) -> Result<Given, AllocError> {
         Ok(Given::Passed(None))
     }
 

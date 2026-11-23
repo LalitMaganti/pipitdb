@@ -4,7 +4,9 @@
 
 use crate::allocator::AllocError;
 use crate::allocator::Allocator;
+use crate::buffer::Buffer;
 use crate::error::Error;
+use crate::expression::Exprs;
 use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::{Execution, Pipeline};
@@ -86,6 +88,9 @@ pub struct Lowering<'p, 'c> {
     steps: SlowVec<Step<'c>>,
     /// What is known of the rows the steps so far output.
     rows: &'p OutputProperties,
+    /// The values of the plan's expressions' `IN` lists, which each program
+    /// and predicate shares.
+    expr_values: Option<Buffer>,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -94,6 +99,16 @@ impl<'p, 'c> Lowering<'p, 'c> {
     /// What to make steps with.
     pub fn allocator(&self) -> &'p dyn Allocator {
         self.allocator
+    }
+
+    /// The plan's expressions.
+    pub fn exprs(&self) -> &'p Exprs {
+        &self.plan.exprs
+    }
+
+    /// The values of the plan's expressions' `IN` lists, if any.
+    pub fn expr_values(&self) -> Option<Buffer> {
+        self.expr_values.clone()
     }
 
     fn lower_node(&mut self, id: PlanNodeId) -> Result<(), LowerError> {
@@ -210,7 +225,14 @@ pub fn lower<'c>(
         source: None,
         steps: SlowVec::new(allocator, LOWERED_STEPS_MAX)?,
         rows: &at!(planned, plan.root as usize).output,
+        expr_values: None,
     };
+    let values = plan.exprs.values();
+    if !values.is_empty() {
+        let mut buffer = Buffer::allocate(allocator, size_of_val(values))?;
+        buffer.as_mut_slice::<i64>().copy_from_slice(values);
+        lowering.expr_values = Some(buffer);
+    }
     lowering.lower_node(plan.root)?;
 
     let mut names = Names::new(allocator, PLAN_NAME_BYTES_MAX)?;
@@ -250,9 +272,10 @@ mod tests {
         StdVec::from([step(ExprOp::Column, column, 0, 0), constant, step(op, 0, 1, 0)])
     }
 
-    /// An expression of `nodes`.
-    fn expr(nodes: &[ExprStep]) -> Expr {
-        Expr { nodes: SlowVec::fixed_from(&Heap, nodes.iter().copied()).unwrap(), values: None }
+    /// A filter of the expression of `nodes`, added to `plan`'s.
+    fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &[ExprStep]) -> DynOp<'c> {
+        let condition = plan.exprs.add(nodes).unwrap();
+        DynOp::new(&Heap, FilterOp::new(&Heap, &plan.exprs, condition).unwrap()).unwrap()
     }
 
     use super::*;
@@ -263,7 +286,7 @@ mod tests {
     use crate::condition::{Condition, Cutoff};
     use crate::context::Context;
     use crate::error::Error;
-    use crate::expression::{Expr, ExprOp, ExprStep};
+    use crate::expression::{ExprOp, ExprStep, Exprs};
     use crate::filter::Comparison;
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
@@ -691,7 +714,7 @@ mod tests {
         let mut nodes = compared(a, Comparison::Greater, 1);
         nodes.extend([step(ExprOp::Column, b, 0, 0), step(ExprOp::IsNull, 3, 0, 0)]);
         nodes.push(step(ExprOp::Or, 2, 4, 0));
-        let filter = DynOp::new(&Heap, FilterOp { condition: expr(&nodes) }).unwrap();
+        let filter = filter(&mut plan, &nodes);
         plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
@@ -914,8 +937,7 @@ mod tests {
         let mut node = plan.add_node(scan, &[]).unwrap();
         for &(column, comparison, value) in filters {
             let column = bindings[column].id;
-            let condition = expr(&compared(column, comparison, value));
-            let filter = DynOp::new(&Heap, FilterOp { condition }).unwrap();
+            let filter = filter(&mut plan, &compared(column, comparison, value));
             let children = [node];
             node = plan.add_node(filter, &children).unwrap();
         }
@@ -1027,10 +1049,7 @@ mod tests {
         let mut node = plan.add_node(scan, &[]).unwrap();
         for stage in stages {
             let op = match *stage {
-                Stage::Filter => {
-                    let condition = expr(&compared(ids[0], Comparison::Greater, 0));
-                    DynOp::new(&Heap, FilterOp { condition }).unwrap()
-                }
+                Stage::Filter => filter(&mut plan, &compared(ids[0], Comparison::Greater, 0)),
                 Stage::OrderBy => {
                     let key = SortKey { column: ids[1], descending: true };
                     let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
@@ -1170,7 +1189,7 @@ mod tests {
             reads.need(self.column);
         }
 
-        fn accepts(&self, column: ColumnId) -> Forms {
+        fn accepts(&self, _: &Exprs, column: ColumnId) -> Forms {
             if column == self.column { self.accepts } else { Forms::FLAT }
         }
 
@@ -1203,8 +1222,7 @@ mod tests {
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
-        let condition = expr(&compared(bindings[0].id, Comparison::Greater, 0));
-        let filter = DynOp::new(&Heap, FilterOp { condition }).unwrap();
+        let filter = filter(&mut plan, &compared(bindings[0].id, Comparison::Greater, 0));
         let mut below = plan.add_node(filter, &[scan]).unwrap();
         for &accepts in accepts {
             let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();
