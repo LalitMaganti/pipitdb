@@ -4,12 +4,13 @@
 
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::boxed::{Box, ErasedBox};
 use crate::column::ColumnView;
 use crate::context::Context;
 use crate::erase::value_of;
 use crate::error::Error;
+use crate::global::Global;
 
 /// The most arguments a call has.
 pub const ARGUMENTS_MAX: usize = 8;
@@ -32,7 +33,7 @@ type Run = unsafe fn(NonNull<()>, &mut Context, &[&ColumnView]) -> Result<Column
 
 impl DynFunction {
     pub fn new<T: Function + 'static>(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         function: T,
     ) -> Result<DynFunction, AllocError> {
         let function = Box::new(allocator, function)?.erase();

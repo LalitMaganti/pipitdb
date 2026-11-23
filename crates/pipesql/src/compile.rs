@@ -2,7 +2,7 @@
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
+use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::Forms;
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::{
@@ -16,6 +16,7 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
+use pipit_kernel::global::Global;
 
 /// What a query reads rows from, compiled: its plan node, and its columns, by
 /// name.
@@ -46,7 +47,7 @@ pub struct Compiler<'q, 'c> {
     ast: &'q Ast,
     catalog: &'c dyn Catalog,
     registry: &'q Registry,
-    allocator: &'q dyn Allocator,
+    allocator: &'q Global,
     pub plan: LogicalPlan<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SlowVec<NamedColumn>,
@@ -88,7 +89,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 
     /// What to make plan nodes with.
-    pub fn allocator(&self) -> &'q dyn Allocator {
+    pub fn allocator(&self) -> &'q Global {
         self.allocator
     }
 
@@ -216,7 +217,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
 /// Parses `source` with the stages in `registry`, and compiles it, finding
 /// tables in `catalog`. The plan's result is the last stage's columns.
 pub fn compile<'c>(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     registry: &Registry,
     catalog: &'c dyn Catalog,
     source: &[u8],
@@ -251,13 +252,12 @@ mod tests {
     use std::format;
     use std::vec::Vec as StdVec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
+    use pipit_kernel::global::Global;
     use pipit_kernel::lower::lower;
     use pipit_kernel::output_properties::plan_nodes;
-    use pipit_kernel::query_allocators::QueryAllocators;
     use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
     use pipit_kernel::selection::Kept;
@@ -334,16 +334,19 @@ mod tests {
 
     fn catalog() -> Tables {
         let column = |data_type, values: [i64; 2]| {
-            let mut buffer = Buffer::allocate(&Heap, 16).unwrap();
+            let mut buffer = Buffer::allocate(Global::current(), 16).unwrap();
             buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-            ColumnView::new(&mut Context::new(&Heap), data_type, buffer, None).unwrap()
+            ColumnView::new(&mut Context::new(Global::current(), None), data_type, buffer, None)
+                .unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
-        let mut views = Buffer::allocate(&Heap, 16).unwrap();
+        let mut views = Buffer::allocate(Global::current(), 16).unwrap();
         views.as_mut_slice::<u32>().copy_from_slice(&[0, 4, 4, 0]);
-        let mut bytes = Buffer::allocate(&Heap, 4).unwrap();
+        let mut bytes = Buffer::allocate(Global::current(), 4).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(b"it's");
-        let strings = ColumnView::strings(&mut Context::new(&Heap), views, bytes, None).unwrap();
+        let strings =
+            ColumnView::strings(&mut Context::new(Global::current(), None), views, bytes, None)
+                .unwrap();
         let columns = [
             column(DataType::Int64, [1, 2]),
             column(DataType::Int64, [10, 20]),
@@ -356,25 +359,37 @@ mod tests {
             ("f", DataType::Float64),
             ("s", DataType::String),
         ];
-        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
+        let table = Table::new(Global::current(), &schema, &[&columns]).unwrap();
         let same = [column(DataType::Int64, [1, 2]), column(DataType::Int64, [3, 4])];
         let same_names = [("a", DataType::Int64), ("A", DataType::Int64)];
-        let same = Table::new(&Heap, &same_names, &[&same]).unwrap();
+        let same = Table::new(Global::current(), &same_names, &[&same]).unwrap();
         // `x` is 1 and null.
-        let mut values = Buffer::allocate(&Heap, 16).unwrap();
+        let mut values = Buffer::allocate(Global::current(), 16).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 0]);
-        let mut validity = Buffer::allocate(&Heap, 8).unwrap();
+        let mut validity = Buffer::allocate(Global::current(), 8).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-        let x = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(validity));
-        let nulls = Table::new(&Heap, &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
-        let scannable = |table| DynScannable::new(&Heap, table).unwrap();
+        let x = ColumnView::new(
+            &mut Context::new(Global::current(), None),
+            DataType::Int64,
+            values,
+            Some(validity),
+        );
+        let nulls =
+            Table::new(Global::current(), &[("x", DataType::Int64)], &[&[x.unwrap()]]).unwrap();
+        let scannable = |table| DynScannable::new(Global::current(), table).unwrap();
         // `id` is 10, 11 and 12, stored as a sequence, and `v` 1, 2 and 3.
-        let id = ColumnView::sequence(&mut Context::new(&Heap), 10, 3).unwrap();
-        let mut values = Buffer::allocate(&Heap, 24).unwrap();
+        let id = ColumnView::sequence(&mut Context::new(Global::current(), None), 10, 3).unwrap();
+        let mut values = Buffer::allocate(Global::current(), 24).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[1, 2, 3]);
-        let v = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+        let v = ColumnView::new(
+            &mut Context::new(Global::current(), None),
+            DataType::Int64,
+            values,
+            None,
+        )
+        .unwrap();
         let schema = [("id", DataType::Int64), ("v", DataType::Int64)];
-        let ids = Table::new(&Heap, &schema, &[&[id, v]]).unwrap();
+        let ids = Table::new(Global::current(), &schema, &[&[id, v]]).unwrap();
         Tables(scannable(table), scannable(same), scannable(nulls), scannable(ids))
     }
 
@@ -382,11 +397,11 @@ mod tests {
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let planned = plan_nodes(Global::current(), &plan).unwrap();
+        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         let mut columns: StdVec<_> =
             physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
@@ -422,7 +437,8 @@ mod tests {
 
     fn error(query: &str) -> (ErrorCode, u32) {
         let catalog = catalog();
-        let error = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
+        let error =
+            compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
@@ -647,7 +663,7 @@ mod tests {
     fn knows_which_columns_can_be_null() {
         let catalog = catalog();
         let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
+        let plan = compile(Global::current(), &REGISTRY, &catalog, query).unwrap();
         let nullable = |name: &str| {
             let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
             column.unwrap().nullable
@@ -731,11 +747,11 @@ mod tests {
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query).unwrap();
+        let planned = plan_nodes(Global::current(), &plan).unwrap();
+        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let overflow = execution.next(&mut RowBatch::new()).err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
     }
@@ -906,12 +922,12 @@ mod tests {
     /// result column's values.
     fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
-        let mut plan = compile(&Heap, &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        pipit_kernel::optimize::optimize(&Heap, &mut plan).unwrap();
-        let planned = plan_nodes(&Heap, &plan).unwrap();
-        let physical = lower(&Heap, &mut plan, &planned).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let mut plan = compile(Global::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        pipit_kernel::optimize::optimize(Global::current(), &mut plan).unwrap();
+        let planned = plan_nodes(Global::current(), &plan).unwrap();
+        let physical = lower(Global::current(), &mut plan, &planned).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let values = batch.column(physical.columns()[0].position).int64s().to_vec();

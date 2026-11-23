@@ -1,8 +1,9 @@
 //! `Statement`: what a statement's plan holds for its runs to read, which
 //! the physical plan takes from the logical one.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::function::DynFunction;
+use crate::global::Global;
 use crate::slow_vec::SlowVec;
 use crate::string_pool::{Id, StringPool};
 
@@ -21,11 +22,7 @@ pub struct Statement {
 impl Statement {
     /// Adds `literal` to its literals, allocating from `allocator`, which
     /// must outlive it, and returns its id there.
-    pub fn add_literal(
-        &mut self,
-        allocator: &dyn Allocator,
-        literal: &[u8],
-    ) -> Result<Id, AllocError> {
+    pub fn add_literal(&mut self, allocator: &Global, literal: &[u8]) -> Result<Id, AllocError> {
         let literals = match &mut self.literals {
             Some(literals) => literals,
             None => self.literals.insert(StringPool::new(allocator)?),
@@ -42,7 +39,7 @@ impl Statement {
     /// and returns its id, or `None` if it has `FUNCTIONS_MAX`.
     pub fn add_function(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         function: DynFunction,
     ) -> Result<Option<u32>, AllocError> {
         let functions = match &mut self.functions {

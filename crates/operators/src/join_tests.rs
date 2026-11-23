@@ -7,11 +7,11 @@ use std::vec;
 use std::vec::Vec;
 
 use crate::table::Table;
-use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::expression::{Expr, ExprBuilder, ExprOp, Exprs};
+use pipit_kernel::global::Global;
 use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
@@ -19,19 +19,18 @@ use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::plan::{
     DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp,
 };
-use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::slow_vec::SlowVec;
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
-    let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+    let mut buffer = Buffer::allocate(Global::current(), values.len() * 8).unwrap();
     for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
         *slot = value.unwrap_or(0);
     }
     // A bit a row, set where it isn't null.
     let validity = values.iter().any(Option::is_none).then(|| {
-        let mut bits = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+        let mut bits = Buffer::allocate(Global::current(), values.len().div_ceil(8)).unwrap();
         let bytes = bits.as_mut_slice::<u8>();
         bytes.fill(0);
         for (row, value) in values.iter().enumerate() {
@@ -39,7 +38,8 @@ fn int64s(values: &[Option<i64>]) -> ColumnView {
         }
         bits
     });
-    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, validity).unwrap()
+    ColumnView::new(&mut Context::new(Global::current(), None), DataType::Int64, buffer, validity)
+        .unwrap()
 }
 
 /// A table of `k`, as given, and `v`, its row number, in batches.
@@ -54,7 +54,8 @@ fn table(keys: &[Option<i64>]) -> DynScannable<'static> {
         .collect();
     let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
     let schema = [("k", DataType::Int64), ("v", DataType::Int64)];
-    DynScannable::new(&Heap, Table::new(&Heap, &schema, &groups).unwrap()).unwrap()
+    DynScannable::new(Global::current(), Table::new(Global::current(), &schema, &groups).unwrap())
+        .unwrap()
 }
 
 /// A table of `k`, stored as a sequence from each group's first for its
@@ -68,12 +69,23 @@ fn sequences(groups: &[(i64, u32)]) -> (DynScannable<'static>, Vec<Option<i64>>)
             keys.extend((first..).take(rows as usize).map(Some));
             let numbers: Vec<Option<i64>> = (row..).take(rows as usize).map(Some).collect();
             row += i64::from(rows);
-            [ColumnView::sequence(&mut Context::new(&Heap), first, rows).unwrap(), int64s(&numbers)]
+            [
+                ColumnView::sequence(&mut Context::new(Global::current(), None), first, rows)
+                    .unwrap(),
+                int64s(&numbers),
+            ]
         })
         .collect();
     let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
     let schema = [("k", DataType::Int64), ("v", DataType::Int64)];
-    (DynScannable::new(&Heap, Table::new(&Heap, &schema, &groups).unwrap()).unwrap(), keys)
+    (
+        DynScannable::new(
+            Global::current(),
+            Table::new(Global::current(), &schema, &groups).unwrap(),
+        )
+        .unwrap(),
+        keys,
+    )
 }
 
 /// A scan of `k` and `v` of `table`, as new columns of `plan`.
@@ -81,14 +93,14 @@ fn scan<'c>(
     plan: &mut LogicalPlan<'c>,
     table: &'c DynScannable<'c>,
 ) -> (PlanNodeId, [NamedColumn; 2]) {
-    let mut reads = SlowVec::new(&Heap, 2).unwrap();
+    let mut reads = SlowVec::new(Global::current(), 2).unwrap();
     let mut bound = Vec::new();
     for (i, name) in (0..).zip(["k", "v"]) {
         let binding = plan.add_column(name, DataType::Int64, true).unwrap();
         reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).unwrap();
         bound.push(binding);
     }
-    let op = DynOp::new(&Heap, ScanOp::new(table, reads)).unwrap();
+    let op = DynOp::new(Global::current(), ScanOp::new(table, reads)).unwrap();
     let node = plan.add_node(op, &[]).unwrap();
     (node, [bound[0], bound[1]])
 }
@@ -108,7 +120,7 @@ enum On {
 
 /// The condition `on`, of the probe side's `k` and `v` and the build side's.
 fn condition(exprs: &mut Exprs, on: On, [pk, pv, bk, bv]: [u32; 4]) -> Option<Expr> {
-    let mut nodes = ExprBuilder::new(&Heap).unwrap();
+    let mut nodes = ExprBuilder::new(Global::current()).unwrap();
     let mut compare = |op, a, b| {
         let (a, b) = (nodes.column(a).unwrap(), nodes.column(b).unwrap());
         nodes.node(op, a, b).unwrap()
@@ -143,18 +155,20 @@ fn join(
     on: On,
     above: Above,
 ) -> (Vec<(i64, Option<i64>)>, Vec<usize>) {
-    let mut plan = LogicalPlan::new(&Heap).unwrap();
+    let mut plan = LogicalPlan::new(Global::current()).unwrap();
     let (probe, [probe_k, probe_v]) = scan(&mut plan, probe);
     let (build, [build_k, build_v]) = scan(&mut plan, build);
     let columns = [probe_k.id, probe_v.id, build_k.id, build_v.id];
     let condition = condition(&mut plan.exprs, on, columns);
-    let build_columns = SlowVec::fixed_from(&Heap, [build_k.id, build_v.id].into_iter()).unwrap();
-    let probe_columns = SlowVec::fixed_from(&Heap, [probe_k.id, probe_v.id].into_iter()).unwrap();
+    let build_columns =
+        SlowVec::fixed_from(Global::current(), [build_k.id, build_v.id].into_iter()).unwrap();
+    let probe_columns =
+        SlowVec::fixed_from(Global::current(), [probe_k.id, probe_v.id].into_iter()).unwrap();
     let join = JoinOp::new(kind, condition, [probe_columns, build_columns]);
     let children = [probe, build];
-    let join = plan.add_node(DynOp::new(&Heap, join).unwrap(), &children).unwrap();
+    let join = plan.add_node(DynOp::new(Global::current(), join).unwrap(), &children).unwrap();
     if above != Above::Nothing {
-        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let mut nodes = ExprBuilder::new(Global::current()).unwrap();
         let column = nodes.column(build_v.id).unwrap();
         if above == Above::IsNull {
             nodes.node(ExprOp::IsNull, column, 0).unwrap();
@@ -163,14 +177,14 @@ fn join(
             nodes.node(ExprOp::Gt, column, zero).unwrap();
         }
         let condition = plan.exprs.add(nodes.nodes()).unwrap();
-        let filter = FilterOp::new(&Heap, &plan.exprs, condition).unwrap();
-        let filter = DynOp::new(&Heap, filter).unwrap();
+        let filter = FilterOp::new(Global::current(), &plan.exprs, condition).unwrap();
+        let filter = DynOp::new(Global::current(), filter).unwrap();
         let children = [join];
         plan.add_node(filter, &children).unwrap();
     }
     plan.output.push(probe_v).unwrap();
     plan.output.push(build_v).unwrap();
-    optimize(&Heap, &mut plan).unwrap();
+    optimize(Global::current(), &mut plan).unwrap();
     let mut shape = Vec::new();
     let mut pending = vec![plan.root];
     while let Some(node) = pending.pop() {
@@ -178,10 +192,10 @@ fn join(
         shape.push(children.len());
         pending.extend(children.iter().rev());
     }
-    let planned = plan_nodes(&Heap, &plan).unwrap();
-    let physical = lower(&Heap, &mut plan, &planned).unwrap();
-    let query = QueryAllocators::new(&Heap);
-    let mut execution = physical.start(&query).unwrap();
+    let planned = plan_nodes(Global::current(), &plan).unwrap();
+    let physical = lower(Global::current(), &mut plan, &planned).unwrap();
+    let query = Global::current();
+    let mut execution = physical.start(query).unwrap();
     let mut batch = RowBatch::new();
     let mut rows = Vec::new();
     let positions: Vec<u32> = physical.columns().iter().map(|column| column.position).collect();

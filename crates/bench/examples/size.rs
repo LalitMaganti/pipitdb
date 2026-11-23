@@ -7,13 +7,13 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use pipit_kernel::allocator::{Heap, LimitAllocator};
+use pipit_kernel::allocator::Heap;
 use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::context::Context;
+use pipit_kernel::global::Global;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
 use pipit_kernel::output_properties::plan_nodes;
-use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::slow_vec::SlowVec;
@@ -70,12 +70,13 @@ pub unsafe extern "C" fn run_query(
     let (files, query) = unsafe {
         (core::slice::from_raw_parts(tables, count), core::slice::from_raw_parts(query, query_len))
     };
-    let budget = LimitAllocator::new(&Heap, budget);
-    run(&budget, files, query).unwrap_or(u64::MAX)
+    // SAFETY: everything the query allocates is dropped within `run`.
+    let Ok(global) = (unsafe { Global::new(Heap, budget) }) else { return u64::MAX };
+    run(&global, files, query).unwrap_or(u64::MAX)
 }
 
 /// As `run_query`, with every allocation from `allocator`.
-fn run(allocator: &LimitAllocator<'_>, files: &[TableFile], query: &[u8]) -> Option<u64> {
+fn run(allocator: &Global, files: &[TableFile], query: &[u8]) -> Option<u64> {
     // The files, which their tables borrow for the query.
     let mut sources: SlowVec<&[u8]> = SlowVec::fixed(allocator, files.len()).ok()?;
     let mut tables = Tables {
@@ -101,9 +102,8 @@ fn run(allocator: &LimitAllocator<'_>, files: &[TableFile], query: &[u8]) -> Opt
     optimize(allocator, &mut plan).ok()?;
     let planned = plan_nodes(allocator, &plan).ok()?;
     let physical = lower(allocator, &mut plan, &planned).ok()?;
-    let allocators = QueryAllocators::new(allocator);
-    let mut execution = physical.start(&allocators).ok()?;
-    let mut context = Context::new(allocator);
+    let mut execution = physical.start(allocator).ok()?;
+    let mut context = Context::new(allocator, None);
     let mut batch = RowBatch::new();
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(0x0100_0000_01b3);

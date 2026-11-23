@@ -678,9 +678,9 @@ mod tests {
     use crate::error::ErrorCode;
     use crate::parser::parse_query;
     use crate::registry::Registry;
-    use pipit_kernel::allocator::Heap;
 
     use super::*;
+    use pipit_kernel::global::Global;
 
     static REGISTRY: Registry = Registry::new(&[RELATIONAL, AGGREGATION]);
 
@@ -711,12 +711,14 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap();
+        let global = Global::current();
+        let ast = parse_query(global, &REGISTRY, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_query(&Heap, &REGISTRY, source.as_bytes()).unwrap_err();
+        let global = Global::current();
+        let error = parse_query(global, &REGISTRY, source.as_bytes()).unwrap_err();
         (error.code, error.span.start)
     }
 

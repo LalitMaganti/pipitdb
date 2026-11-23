@@ -1,6 +1,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(any(test, feature = "std"))]
+extern crate std;
 
 #[macro_use]
 pub mod check;
@@ -22,8 +24,10 @@ pub mod error;
 pub mod estimate;
 pub mod expression;
 pub mod filter;
+mod fixed_allocator;
 pub mod flat_hash_map;
 pub mod function;
+pub mod global;
 mod group_table;
 mod hash_aggregate;
 pub mod inline_vec;
@@ -40,7 +44,6 @@ pub mod output_properties;
 pub mod pipeline;
 pub mod plan;
 pub mod predicate;
-pub mod query_allocators;
 mod radix_sort;
 pub mod row_batch;
 mod row_blocks;

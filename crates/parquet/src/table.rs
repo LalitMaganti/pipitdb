@@ -1,6 +1,6 @@
 //! `ParquetTable`: Parquet files with the same columns, scanned as one table.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
+use pipit_kernel::allocator::AllocError;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{Bounds, ColumnView, DataType, Forms};
 use pipit_kernel::condition::{Condition, Cutoff};
@@ -19,6 +19,7 @@ use pipit_kernel::step::{DynSource, Source};
 use crate::chunk::ChunkReader;
 use crate::footer::ParquetFile;
 use crate::{Codec, Error, bounds};
+use pipit_kernel::global::Global;
 
 /// The most files a table can have.
 const FILES_MAX: usize = 1 << 16;
@@ -61,7 +62,7 @@ struct Rows<'a> {
 }
 
 impl<'a> Rows<'a> {
-    fn new(allocator: &dyn Allocator, columns: usize) -> Result<Rows<'a>, Error> {
+    fn new(allocator: &Global, columns: usize) -> Result<Rows<'a>, Error> {
         let readers = SlowVec::fixed(allocator, columns)?;
         Ok(Rows { readers, started: false, left: 0, file: 0, group: 0 })
     }
@@ -235,7 +236,7 @@ impl<'a> ParquetTable<'a> {
     /// order, of types the kernel has. Their pages are decompressed with
     /// `codecs`.
     pub fn open(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         codecs: &'a dyn Codec,
         sources: &[&'a dyn ByteSource],
     ) -> Result<ParquetTable<'a>, Error> {
@@ -466,7 +467,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     /// and, as it reaches them, those that sort after the cutoff.
     fn scan_within<'s>(
         &'s self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: &[(u32, Forms)],
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
@@ -505,11 +506,10 @@ mod tests {
     use std::string::{String, ToString};
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::filter::{Comparison, Value};
+    use pipit_kernel::global::Global;
     use pipit_kernel::pipeline::Pipeline;
     use pipit_kernel::predicate::{Leaf, Node, Predicate};
-    use pipit_kernel::query_allocators::QueryAllocators;
     use pipit_kernel::scannable::DynScannable;
 
     use super::*;
@@ -520,7 +520,8 @@ mod tests {
 
     /// Every batch's rows of `columns`: each row's `id`s, or -1 for nulls.
     fn scan(table: &ParquetTable, columns: &[u32]) -> (usize, Vec<i64>) {
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let mut context = Context::new(global, None);
         let read: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
         let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
@@ -556,8 +557,9 @@ mod tests {
 
     #[test]
     fn loads_lazy_columns_as_read_eagerly() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
+        let mut context = Context::new(global, None);
         let batches = |forms: Forms, context: &mut Context| {
             let read = [(2, forms), (0, forms), (1, forms)];
             let mut state = table.open(context, &read).unwrap();
@@ -588,16 +590,18 @@ mod tests {
 
     #[test]
     fn knows_columns_without_nulls_from_their_statistics() {
+        let global = Global::current();
         // Both files' columns are optional; only `NULLS` counts any nulls.
-        let none = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let none = ParquetTable::open(global, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
         assert!((0..3).all(|column| !none.column_nullable(column)));
-        let some = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS]).unwrap();
+        let some = ParquetTable::open(global, &Uncompressed, &[&NULLS]).unwrap();
         assert!((0..3).all(|column| some.column_nullable(column)));
     }
 
     #[test]
     fn scans_files_as_one_table() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&NULLS, &NULLS]).unwrap();
         assert_eq!(table.column_count(), 3);
         assert_eq!(table.column_name(2), "name");
         assert!(table.column_type(2) == DataType::String);
@@ -611,7 +615,8 @@ mod tests {
 
     #[test]
     fn files_must_have_the_same_columns() {
-        let opened = ParquetTable::open(&Heap, &Uncompressed, &[&NULLS, &SMALL]);
+        let global = Global::current();
+        let opened = ParquetTable::open(global, &Uncompressed, &[&NULLS, &SMALL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 
@@ -624,8 +629,9 @@ mod tests {
 
     #[test]
     fn bounds_columns_by_their_row_groups_statistics() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&TYPES]).unwrap();
+        let mut context = Context::new(global, None);
         let read = [(0, Forms::FLAT), (1, Forms::FLAT), (2, Forms::FLAT)];
         let mut state = table.open(&mut context, &read).unwrap();
         let mut batch = RowBatch::new();
@@ -638,8 +644,9 @@ mod tests {
 
     #[test]
     fn reads_unsigned_integers_above_31_bits() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&TYPES]).unwrap();
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&TYPES]).unwrap();
+        let mut context = Context::new(global, None);
         let mut state = table.open(&mut context, &[(1, Forms::FLAT)]).unwrap();
         let mut batch = RowBatch::new();
         let mut values = Vec::new();
@@ -653,12 +660,14 @@ mod tests {
 
     #[test]
     fn doesnt_read_decimals_as_integers() {
-        let opened = ParquetTable::open(&Heap, &Uncompressed, &[&DECIMAL]);
+        let global = Global::current();
+        let opened = ParquetTable::open(global, &Uncompressed, &[&DECIMAL]);
         assert_eq!(opened.err(), Some(Error::Unsupported));
     }
 
     /// `min <= column 0 AND column 0 <= max`.
     fn between(min: i64, max: i64) -> Predicate {
+        let global = Global::current();
         let compare = |comparison, value| {
             Node::Leaf(Leaf::Compare { column: 0, comparison, value: Value::Int64(value) })
         };
@@ -667,23 +676,24 @@ mod tests {
             compare(Comparison::LessEqual, max),
             Node::And(0, 1),
         ];
-        Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap())
+        Predicate::new(SlowVec::fixed_from(global, nodes.into_iter()).unwrap())
     }
 
     #[test]
     fn skips_row_groups_statistics_rule_out() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-        let table = DynScannable::new(&Heap, table).unwrap();
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let table = DynScannable::new(global, table).unwrap();
         // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
         // to 4999.
         let ids = |min, max| {
             // Not exact: it only skips.
             let conditions = [Condition::new(0, &between(min, max))];
             let source =
-                table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
-            let pipeline = Pipeline::new(source, SlowVec::fixed(&Heap, 0).unwrap());
-            let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query, None).unwrap();
+                table.scan(global, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
+            let pipeline = Pipeline::new(source, SlowVec::fixed(global, 0).unwrap());
+            let query = Global::current();
+            let mut execution = pipeline.start(query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let column = batch.column(0);
@@ -715,27 +725,28 @@ mod tests {
 
     #[test]
     fn keeps_only_rows_before_a_top_k_cutoff() {
+        let global = Global::current();
         // The first 3 by `id` of two files whose row groups each hold `id`s 0
         // to 2047, 2048 to 4095 and 4096 to 4999, and how many rows the scan
         // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
         // the third is skipped, and of the second file only 0, 1 and 2 kept.
         let first = |publish: Option<u32>| {
             use pipit_kernel::step::{DynTransform, Step};
-            let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-            let table = DynScannable::new(&Heap, table).unwrap();
+            let table = ParquetTable::open(global, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+            let table = DynScannable::new(global, table).unwrap();
             let cutoff = publish.map(|slot| Cutoff { slot, column: 0, descending: false });
-            let source = table.scan(&Heap, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
+            let source = table.scan(global, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
             let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
-            let keys = SlowVec::fixed_from(&Heap, keys.into_iter()).unwrap();
+            let keys = SlowVec::fixed_from(global, keys.into_iter()).unwrap();
             let kept = core::cell::Cell::new(0);
             let steps = [
-                Step::Transform(DynTransform::new(&Heap, Rows(&kept)).unwrap()),
-                Step::Operator(pipit_kernel::top_k::top_k(&Heap, keys, 3, publish).unwrap()),
+                Step::Transform(DynTransform::new(global, Rows(&kept)).unwrap()),
+                Step::Operator(pipit_kernel::top_k::top_k(global, keys, 3, publish).unwrap()),
             ];
-            let steps = SlowVec::fixed_from(&Heap, steps.into_iter()).unwrap();
+            let steps = SlowVec::fixed_from(global, steps.into_iter()).unwrap();
             let pipeline = Pipeline::new(source, steps);
-            let query = QueryAllocators::new(&Heap);
-            let mut execution = pipeline.start(&query, None).unwrap();
+            let query = Global::current();
+            let mut execution = pipeline.start(query, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let (selection, column) = (batch.selection(), batch.column(0));
@@ -751,7 +762,8 @@ mod tests {
 
     #[test]
     fn summarizes_from_statistics() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
         let summary =
             |column| table.summary(column).map(|s| (s.rows, s.bounds.map(|b| (b.min, b.max))));
         assert_eq!(summary(None), Some((10000, None)));
@@ -764,11 +776,12 @@ mod tests {
     #[test]
     fn makes_dictionaries_where_allowed() {
         const DICT: &[u8] = include_bytes!("../tests/data/dict.parquet");
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&DICT]).unwrap();
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&DICT]).unwrap();
         // `name`, a string column of dictionary pages.
         assert!(table.forms(2).contains(Forms::DICTIONARY));
         let first = |forms: Forms| {
-            let mut context = Context::new(&Heap);
+            let mut context = Context::new(global, None);
             let read = [(2, forms)];
             let mut state = table.open(&mut context, &read).unwrap();
             let mut batch = RowBatch::new();

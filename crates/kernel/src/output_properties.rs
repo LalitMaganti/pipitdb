@@ -3,10 +3,11 @@
 //! needs of its inputs' rows, the steps that meet those needs are chosen, and
 //! the node derives what it outputs from that.
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::column::DataType;
 use crate::context::CUTOFFS_MAX;
 use crate::expression::Exprs;
+use crate::global::Global;
 use crate::lower::LowerError;
 use crate::plan::{ColumnId, LogicalPlan, PlanNodeId, SortKey};
 use crate::row_batch::BATCH_COLUMNS_MAX;
@@ -417,7 +418,7 @@ impl DeriveContext<'_, '_> {
 
 /// Works out how one input of a node meets the node's needs.
 struct InputPlanner<'p> {
-    allocator: &'p dyn Allocator,
+    allocator: &'p Global,
     node: PlanNodeId,
     input: u32,
     out: &'p mut PlannedInput,
@@ -497,10 +498,7 @@ impl InputPlanner<'_> {
 
 /// Plans each node of `plan`, by id, as Perfetto's `RunBoundPasses` does.
 /// A node's inputs come before it, so each is planned after them.
-pub fn plan_nodes(
-    allocator: &dyn Allocator,
-    plan: &LogicalPlan<'_>,
-) -> Result<Planned, LowerError> {
+pub fn plan_nodes(allocator: &Global, plan: &LogicalPlan<'_>) -> Result<Planned, LowerError> {
     let mut planned = SlowVec::fixed(allocator, plan.nodes.len())?;
     for id in 0..plan.nodes.len() {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
@@ -512,7 +510,7 @@ pub fn plan_nodes(
 /// Plans how each input of node `id` meets its needs, and derives its
 /// output. Everything below `id` must already be planned.
 fn plan_node_inputs(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     plan: &LogicalPlan<'_>,
     planned: &mut Planned,
     id: PlanNodeId,

@@ -8,6 +8,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Primitive};
+use crate::global::Global;
 
 /// A list for building things now and then, such as plans and footers. It
 /// stays small rather than fast: what doesn't depend on its values' type is
@@ -27,8 +28,8 @@ pub struct SlowVec<T> {
 struct RawVec {
     /// Room for exactly `capacity` values, the first `len` of them written.
     values: NonNull<u8>,
-    /// Where `values` came from, which outlives them, as callers promise.
-    allocator: NonNull<dyn Allocator>,
+    /// What `values` came from.
+    global: NonNull<Global>,
     /// How many values there are.
     len: usize,
     /// How many values fit: a power of two, or 0 before any are added.
@@ -42,13 +43,13 @@ impl<T> SlowVec<T> {
     /// nothing until a value is added, so never fails: a `Result` only so
     /// callers can treat every constructor alike.
     #[inline]
-    pub fn new(allocator: &dyn Allocator, max: usize) -> Result<SlowVec<T>, AllocError> {
+    pub fn new(global: &Global, max: usize) -> Result<SlowVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         check!(max.is_power_of_two());
         let Ok(max) = u32::try_from(max) else { failed!() };
         let raw = RawVec {
             values: NonNull::<Aligned>::dangling().cast(),
-            allocator: forget_lifetime(allocator),
+            global: NonNull::from(global),
             len: 0,
             capacity: 0,
             max,
@@ -59,17 +60,17 @@ impl<T> SlowVec<T> {
     /// An empty `SlowVec` with room for `len` values, rounded up, that never
     /// grows: for lists whose length is known.
     #[inline]
-    pub fn fixed(allocator: &dyn Allocator, len: usize) -> Result<SlowVec<T>, AllocError> {
-        SlowVec::empty(allocator, len, len)
+    pub fn fixed(global: &Global, len: usize) -> Result<SlowVec<T>, AllocError> {
+        SlowVec::empty(global, len, len)
     }
 
     /// `values`, in a `SlowVec` that never grows.
     #[inline]
     pub fn fixed_from(
-        allocator: &dyn Allocator,
+        global: &Global,
         values: impl ExactSizeIterator<Item = T>,
     ) -> Result<SlowVec<T>, AllocError> {
-        let mut vec = SlowVec::fixed(allocator, values.len())?;
+        let mut vec = SlowVec::fixed(global, values.len())?;
         vec.extend_within(values);
         Ok(vec)
     }
@@ -88,12 +89,12 @@ impl<T> SlowVec<T> {
     /// `len` zeros, in a `SlowVec` that never grows. Zeroed by the
     /// allocator, which on fresh pages needn't write them.
     #[inline]
-    pub fn zeroed(allocator: &dyn Allocator, len: usize) -> Result<SlowVec<T>, AllocError>
+    pub fn zeroed(global: &Global, len: usize) -> Result<SlowVec<T>, AllocError>
     where
         T: Primitive,
     {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
-        let mut raw = RawVec::new(allocator, size_of::<T>(), len, len, true)?;
+        let mut raw = RawVec::new(global, size_of::<T>(), len, len, true)?;
         raw.len = len;
         Ok(SlowVec { raw, values: PhantomData })
     }
@@ -105,14 +106,10 @@ impl<T> SlowVec<T> {
     /// An empty `SlowVec` with room for `capacity` values, 0 or `max`,
     /// rounded up.
     #[inline]
-    fn empty(
-        allocator: &dyn Allocator,
-        capacity: usize,
-        max: usize,
-    ) -> Result<SlowVec<T>, AllocError> {
+    fn empty(global: &Global, capacity: usize, max: usize) -> Result<SlowVec<T>, AllocError> {
         const { assert!(size_of::<T>() > 0 && align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         Ok(SlowVec {
-            raw: RawVec::new(allocator, size_of::<T>(), capacity, max, false)?,
+            raw: RawVec::new(global, size_of::<T>(), capacity, max, false)?,
             values: PhantomData,
         })
     }
@@ -246,25 +243,13 @@ fn layout(item: usize, capacity: usize) -> Result<Layout, AllocError> {
     Layout::from_size_align(bytes, align).map_err(|_| AllocError)
 }
 
-/// `allocator`, whose lifetime is forgotten: it outlives the values, as
-/// callers promise.
-#[inline]
-fn forget_lifetime(allocator: &dyn Allocator) -> NonNull<dyn Allocator> {
-    // SAFETY: only the lifetime changes.
-    unsafe {
-        core::mem::transmute::<NonNull<dyn Allocator + '_>, NonNull<dyn Allocator>>(NonNull::from(
-            allocator,
-        ))
-    }
-}
-
 impl RawVec {
     /// Room for `capacity` values of `item` bytes, zeroed if `zeroed`, and
     /// at most `max`, which is at least `capacity`: both rounded up to a
     /// power of two, but for a `capacity` of 0.
     #[inline(never)]
     fn new(
-        allocator: &dyn Allocator,
+        global: &Global,
         item: usize,
         capacity: usize,
         max: usize,
@@ -275,13 +260,12 @@ impl RawVec {
         let values = match capacity {
             // Nothing to allocate; aligned for any value, as slices need.
             0 => NonNull::<Aligned>::dangling().cast(),
-            _ if zeroed => allocator.allocate_zeroed(layout(item, capacity)?)?,
-            _ => allocator.allocate(layout(item, capacity)?)?,
+            _ if zeroed => global.allocate_zeroed(layout(item, capacity)?)?,
+            _ => global.allocate(layout(item, capacity)?)?,
         };
-        let allocator = forget_lifetime(allocator);
         #[expect(clippy::cast_possible_truncation, reason = "at most `max`")]
         let capacity = capacity as u32;
-        Ok(RawVec { values, allocator, len: 0, capacity, max })
+        Ok(RawVec { values, global: NonNull::from(global), len: 0, capacity, max })
     }
 
     /// Where the next value of `item` bytes goes, growing if full, and
@@ -310,9 +294,8 @@ impl RawVec {
         // Powers of two up to `max` stay powers of two up to `max`.
         let doubled = if self.capacity == 0 { 4 } else { self.capacity as usize * 2 };
         let capacity = doubled.max(needed.next_power_of_two()).min(self.max as usize);
-        // SAFETY: the allocator outlives the values.
-        let allocator = unsafe { self.allocator.as_ref() };
-        let to = allocator.allocate(layout(item, capacity)?)?;
+        // SAFETY: a `Global` outlives what's allocated from it.
+        let to = unsafe { self.global.as_ref() }.allocate(layout(item, capacity)?)?;
         // SAFETY: both hold at least `len` values. They're moved, not
         // dropped.
         unsafe { to.copy_from_nonoverlapping(self.values, self.len * item) };
@@ -337,9 +320,9 @@ impl RawVec {
             return;
         }
         let Ok(layout) = layout(item, self.capacity as usize) else { failed!() };
-        // SAFETY: allocated with this layout from this allocator, which
+        // SAFETY: allocated with this layout from this `Global`, which
         // outlives it.
-        unsafe { self.allocator.as_ref().deallocate(self.values, layout) };
+        unsafe { self.global.as_ref().deallocate(self.values, layout) };
     }
 }
 
@@ -381,7 +364,8 @@ mod tests {
     use super::*;
     use crate::allocator::Heap;
 
-    /// Allows `left` allocations, counting those still live.
+    /// Allows `left` allocations, counting those still live. A `Global`
+    /// over it takes one, for itself, and holds it while it lives.
     #[derive(Clone)]
     struct Limited {
         left: Rc<Cell<u32>>,
@@ -410,20 +394,23 @@ mod tests {
     fn grows_from_its_allocator() {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-        let mut values = SlowVec::new(&allocator, 128).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&global, 128).unwrap();
         for i in 0..100 {
             assert!(values.push(i).is_ok());
         }
         assert_eq!(values.iter().sum::<u64>(), 4950);
-        assert_eq!(live.get(), 1);
+        assert_eq!(live.get(), 2);
         drop(values);
-        assert_eq!(live.get(), 0);
+        assert_eq!(live.get(), 1);
     }
 
     #[test]
     fn drops_its_values() {
+        let global = Global::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(&Heap, 16).unwrap();
+        let mut values = SlowVec::new(global, 16).unwrap();
         for _ in 0..10 {
             assert!(values.push(value.clone()).is_ok());
         }
@@ -434,10 +421,13 @@ mod tests {
 
     #[test]
     fn gives_the_value_back_if_it_cant_grow() {
-        // An empty `SlowVec` allocates nothing; this is the room for four.
-        let left = Rc::new(Cell::new(1));
+        // An empty `SlowVec` allocates nothing; the second is the room for
+        // four.
+        let left = Rc::new(Cell::new(2));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-        let mut values = SlowVec::new(&allocator, 128).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&global, 128).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -447,9 +437,11 @@ mod tests {
 
     #[test]
     fn stops_at_its_max() {
-        let left = Rc::new(Cell::new(1));
+        let left = Rc::new(Cell::new(2));
         let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
-        let mut values = SlowVec::fixed(&allocator, 3).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::fixed(&global, 3).unwrap();
         for i in 0..4 {
             assert!(values.push(i).is_ok());
         }
@@ -461,13 +453,14 @@ mod tests {
 
     #[test]
     fn zeroed_holds_zeros() {
-        let values = SlowVec::<i64>::zeroed(&Heap, 5).unwrap();
+        let global = Global::current();
+        let values = SlowVec::<i64>::zeroed(global, 5).unwrap();
         assert_eq!(*values, [0; 5]);
         assert_eq!(values.capacity(), 8);
     }
 
     /// Records the layouts asked for.
-    struct Layouts(RefCell<StdVec<Layout>>);
+    struct Layouts(Rc<RefCell<StdVec<Layout>>>);
 
     // SAFETY: forwards to `Heap`.
     unsafe impl Allocator for Layouts {
@@ -484,35 +477,44 @@ mod tests {
 
     #[test]
     fn asks_for_exact_sizes_and_pages_when_large() {
-        let layouts = Layouts(RefCell::new(StdVec::new()));
-        drop(SlowVec::<u64>::fixed(&layouts, 100).unwrap());
-        drop(SlowVec::<u64>::fixed(&layouts, 1 << 15).unwrap());
-        let asked: StdVec<_> = layouts.0.borrow().iter().map(|l| (l.size(), l.align())).collect();
+        let layouts = Rc::new(RefCell::new(StdVec::new()));
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(Layouts(layouts.clone()), usize::MAX) }.unwrap();
+        drop(SlowVec::<u64>::fixed(&global, 100).unwrap());
+        drop(SlowVec::<u64>::fixed(&global, 1 << 15).unwrap());
+        // After the `Global`'s own.
+        let asked: StdVec<_> =
+            layouts.borrow()[1..].iter().map(|l| (l.size(), l.align())).collect();
         assert_eq!(asked, [(128 * 8, 64), (1 << 18, PAGE_BYTES)]);
     }
 
     #[test]
     fn empty_allocates_nothing() {
-        let left = Rc::new(Cell::new(0));
+        let left = Rc::new(Cell::new(1));
         let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-        let values = SlowVec::<u64>::new(&allocator, 16).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let values = SlowVec::<u64>::new(&global, 16).unwrap();
         assert!(values.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "power_of_two")]
     fn max_is_a_power_of_two() {
-        let _ = SlowVec::<u64>::new(&Heap, 100);
+        let global = Global::current();
+        let _ = SlowVec::<u64>::new(global, 100);
     }
 
     #[test]
     fn frees_and_grows_again() {
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-        let mut values = SlowVec::new(&allocator, 16).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&global, 16).unwrap();
         assert!(values.extend_from_slice(&[1_u64, 2, 3]).is_ok());
         values.free();
-        assert!(values.is_empty() && live.get() == 0);
+        assert!(values.is_empty() && live.get() == 1);
         assert!(values.push(4).is_ok());
         assert_eq!(*values, [4]);
     }
@@ -522,20 +524,23 @@ mod tests {
         let left = Rc::new(Cell::new(u32::MAX));
         let live = Rc::new(Cell::new(0));
         let allocator = Limited { left: left.clone(), live };
-        let mut values = SlowVec::new(&allocator, 16).unwrap();
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(allocator, usize::MAX) }.unwrap();
+        let mut values = SlowVec::new(&global, 16).unwrap();
         assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
         assert!(values.extend_from_slice(&[6]).is_ok());
         assert_eq!(*values, [1, 2, 3, 4, 5, 6]);
         // Nothing to start, then room grown to fit five.
-        assert_eq!(u32::MAX - left.get(), 1);
+        assert_eq!(u32::MAX - left.get(), 2);
         assert_eq!(values.extend_from_slice(&[0; 11]), Err(AllocError));
         assert_eq!(values.len(), 6);
     }
 
     #[test]
     fn retains_and_pops() {
+        let global = Global::current();
         let value = Rc::new(());
-        let mut values = SlowVec::new(&Heap, 8).unwrap();
+        let mut values = SlowVec::new(global, 8).unwrap();
         for i in 0..6 {
             assert!(values.push((i, value.clone())).is_ok());
         }
@@ -548,7 +553,8 @@ mod tests {
 
     #[test]
     fn rounds_its_room_up() {
-        let values = SlowVec::<u64>::fixed(&Heap, 5).unwrap();
+        let global = Global::current();
+        let values = SlowVec::<u64>::fixed(global, 5).unwrap();
         assert_eq!(values.capacity(), 8);
     }
 }

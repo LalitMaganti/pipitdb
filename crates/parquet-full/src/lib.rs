@@ -43,7 +43,7 @@ fn snappy(input: &[u8], output: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
+
     use pipit_kernel::column::Forms;
     use pipit_kernel::context::Context;
     use pipit_kernel::row_batch::RowBatch;
@@ -52,6 +52,7 @@ mod tests {
     use pipit_parquet::table::ParquetTable;
 
     use super::*;
+    use pipit_kernel::global::Global;
 
     /// 5000 rows: `id` is the row, null every 7th from the 3rd, and `name`
     /// "name" and the row mod 13, null every 11th from the 2nd, compressed
@@ -61,8 +62,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn reads_snappy_pages() {
-        let table = ParquetTable::open(&Heap, &Codecs, &[&SNAPPY_FILE]).unwrap();
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Codecs, &[&SNAPPY_FILE]).unwrap();
+        let mut context = Context::new(global, None);
         let mut state = table.open(&mut context, &[(0, Forms::FLAT), (1, Forms::FLAT)]).unwrap();
         let mut batch = RowBatch::new();
         let mut row = 0;
@@ -88,8 +90,9 @@ mod tests {
 
     #[test]
     fn needs_codecs_for_compressed_pages() {
-        let table = ParquetTable::open(&Heap, &Uncompressed, &[&SNAPPY_FILE]).unwrap();
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let table = ParquetTable::open(global, &Uncompressed, &[&SNAPPY_FILE]).unwrap();
+        let mut context = Context::new(global, None);
         let mut state = table.open(&mut context, &[(0, Forms::FLAT)]).unwrap();
         let mut batch = RowBatch::new();
         let read = table.next(&mut context, &mut state, &mut batch);

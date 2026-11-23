@@ -10,8 +10,8 @@ use crate::error::{Error, ErrorCode, Span};
 use crate::keywords::same_word;
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::registry::{ITEMS_MAX, Item, Point, Registry, Shared};
-use pipit_kernel::allocator::Allocator;
 use pipit_kernel::buffer::Buffer;
+use pipit_kernel::global::Global;
 use pipit_kernel::slow_vec::SlowVec;
 
 /// How deeply operators, parentheses and calls can nest. Each waiting
@@ -25,18 +25,14 @@ pub const LIST_MAX: usize = 64;
 pub const IN_LIST_MAX: usize = 1 << 16;
 
 /// Parses `source` as a query, with the stages in `registry`.
-pub fn parse_query(
-    allocator: &dyn Allocator,
-    registry: &Registry,
-    source: &[u8],
-) -> Result<Ast, Error> {
+pub fn parse_query(allocator: &Global, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
     let mut parser = Parser::new(allocator, source)?;
     let root = parser.query(registry).and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
 /// Parses `source` as a single expression.
-pub fn parse_expression(allocator: &dyn Allocator, source: &[u8]) -> Result<Ast, Error> {
+pub fn parse_expression(allocator: &Global, source: &[u8]) -> Result<Ast, Error> {
     let mut parser = Parser::new(allocator, source)?;
     let root = parser.expression().and_then(|root| parser.end(root));
     parser.finish(root)
@@ -44,7 +40,7 @@ pub fn parse_expression(allocator: &dyn Allocator, source: &[u8]) -> Result<Ast,
 
 pub(crate) struct Parser<'a> {
     /// What lists too long for the stack are gathered with.
-    allocator: &'a dyn Allocator,
+    allocator: &'a Global,
     source: &'a [u8],
     lexer: Lexer<'a>,
     current: Token,
@@ -53,7 +49,7 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(allocator: &'a dyn Allocator, source: &'a [u8]) -> Result<Parser<'a>, Error> {
+    pub(crate) fn new(allocator: &'a Global, source: &'a [u8]) -> Result<Parser<'a>, Error> {
         let mut lexer = Lexer::new(source)?;
         let current = lexer.next_token()?;
         // SAFETY: nodes are read only once written.
@@ -852,20 +848,22 @@ mod tests {
     }
 
     fn parse(source: &str) -> String {
-        let ast = parse_expression(&Heap, source.as_bytes()).unwrap();
+        let global = Global::current();
+        let ast = parse_expression(global, source.as_bytes()).unwrap();
         render(source, &ast, ast.root())
     }
 
     fn error(source: &str) -> (ErrorCode, u32) {
-        let error = parse_expression(&Heap, source.as_bytes()).err().unwrap();
+        let global = Global::current();
+        let error = parse_expression(global, source.as_bytes()).err().unwrap();
         (error.code, error.span.start)
     }
 
     #[test]
     fn running_out_of_memory_comes_before_later_errors() {
-        use pipit_kernel::allocator::LimitAllocator;
         // The first block and the slot table, but not a second block.
-        let allocator = LimitAllocator::new(&Heap, 2 * BLOCK_BYTES);
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let allocator = unsafe { Global::new(Heap, 2 * BLOCK_BYTES) }.unwrap();
         let source = format!("{}+)", "1+".repeat(BLOCK_BYTES / 8));
         let error = parse_expression(&allocator, source.as_bytes()).err().unwrap();
         assert_eq!(error.code, ErrorCode::OutOfMemory);
@@ -924,8 +922,9 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn parses_past_the_first_block() {
+        let global = Global::current();
         let long = vec!["a"; crate::ast::BLOCK_NODES].join("+");
-        let ast = parse_expression(&Heap, long.as_bytes()).unwrap();
+        let ast = parse_expression(global, long.as_bytes()).unwrap();
         assert_eq!(ast.node_count() as usize, 2 * crate::ast::BLOCK_NODES - 1);
     }
 

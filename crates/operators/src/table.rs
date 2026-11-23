@@ -1,7 +1,7 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
 //! footer, which pipelines can scan.
 
-use pipit_kernel::allocator::{AllocError, Allocator};
+use pipit_kernel::allocator::AllocError;
 use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
@@ -9,6 +9,7 @@ use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Key, Scannable, Summary};
 use pipit_kernel::slow_vec::SlowVec;
 
+use pipit_kernel::global::Global;
 use pipit_kernel::names::{Name, Names};
 
 /// Each column has a name, a type, and the forms its row groups store it
@@ -31,7 +32,7 @@ impl Table {
     /// `row_groups` of a column each, with the same number of rows, at most
     /// `BATCH_ROWS_MAX`. The columns' buffers are shared, not copied.
     pub fn new(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         columns: &[(&str, DataType)],
         row_groups: &[&[ColumnView]],
     ) -> Result<Table, AllocError> {
@@ -210,7 +211,6 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    use pipit_kernel::allocator::Heap;
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::Form;
 
@@ -218,14 +218,15 @@ mod tests {
 
     fn int64s(values: impl Iterator<Item = i64>) -> ColumnView {
         let values: Vec<i64> = values.collect();
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let mut buffer = Buffer::allocate(Global::current(), values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(&values);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).unwrap()
+        ColumnView::new(&mut Context::new(Global::current(), None), DataType::Int64, buffer, None)
+            .unwrap()
     }
 
     /// Each batch's row count, and its first row.
     fn scan(table: &Table, columns: &[u32]) -> Vec<(u32, Vec<i64>)> {
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(Global::current(), None);
         let columns: Vec<_> = columns.iter().map(|&column| (column, Forms::FLAT)).collect();
         let mut state = table.open(&mut context, &columns).unwrap();
         let mut batch = RowBatch::new();
@@ -243,7 +244,7 @@ mod tests {
         let empty = [int64s(0..0), int64s(0..0)];
         let second = [int64s(2048..2548), int64s((2048..2548).map(|i| -i))];
         let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
-        let table = Table::new(&Heap, &columns, &[&first, &empty, &second]).unwrap();
+        let table = Table::new(Global::current(), &columns, &[&first, &empty, &second]).unwrap();
 
         let expected = [(2048, vec![0, 0]), (500, vec![-2048, 2048])];
         assert_eq!(scan(&table, &[1, 0]), expected);
@@ -252,7 +253,8 @@ mod tests {
     #[test]
     fn counts_rows_without_columns() {
         let (first, second) = ([int64s(0..2048)], [int64s(0..904)]);
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&first, &second]).unwrap();
+        let table =
+            Table::new(Global::current(), &[("a", DataType::Int64)], &[&first, &second]).unwrap();
         let counts: Vec<u32> = scan(&table, &[]).iter().map(|(rows, _)| *rows).collect();
         assert_eq!(counts, [2048, 904]);
     }
@@ -261,21 +263,21 @@ mod tests {
     #[should_panic(expected = "BATCH_ROWS_MAX")]
     fn checks_row_groups_fit_in_a_batch() {
         let columns = [int64s(0..2049)];
-        let _ = Table::new(&Heap, &[("a", DataType::Int64)], &[&columns]);
+        let _ = Table::new(Global::current(), &[("a", DataType::Int64)], &[&columns]);
     }
 
     #[test]
     #[should_panic(expected = "data_type")]
     fn checks_column_types() {
         let columns = [int64s(0..1)];
-        let _ = Table::new(&Heap, &[("a", DataType::Float64)], &[&columns]);
+        let _ = Table::new(Global::current(), &[("a", DataType::Float64)], &[&columns]);
     }
 
     #[test]
     fn finds_columns_by_name() {
         let columns = [int64s(0..1), int64s(0..1)];
         let schema = [("ts", DataType::Int64), ("dur", DataType::Int64)];
-        let table = Table::new(&Heap, &schema, &[&columns]).unwrap();
+        let table = Table::new(Global::current(), &schema, &[&columns]).unwrap();
         assert_eq!((table.find_column("dur"), table.find_column("name")), (Some(1), None));
         assert_eq!(table.column_name(0), "ts");
     }
@@ -283,17 +285,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "column_count")]
     fn checks_columns_read_when_opened() {
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
-        let _ = table.open(&mut Context::new(&Heap), &[(1, Forms::FLAT)]);
+        let table =
+            Table::new(Global::current(), &[("a", DataType::Int64)], &[&[int64s(0..1)]]).unwrap();
+        let _ = table.open(&mut Context::new(Global::current(), None), &[(1, Forms::FLAT)]);
     }
 
     #[test]
     fn knows_ids_stored_as_one_sequence() {
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(Global::current(), None);
         let mut sequence = |first, rows| ColumnView::sequence(&mut context, first, rows).unwrap();
         let schema = [("id", DataType::Int64)];
-        let key =
-            |groups: &[&[ColumnView]]| Table::new(&Heap, &schema, groups).unwrap().column_key(0);
+        let key = |groups: &[&[ColumnView]]| {
+            Table::new(Global::current(), &schema, groups).unwrap().column_key(0)
+        };
         let (first, next, gap) = (sequence(0, 4), sequence(4, 2), sequence(7, 2));
         assert_eq!(key(&[core::slice::from_ref(&first), &[next]]), Key::Id);
         assert_eq!(key(&[&[first], &[gap]]), Key::None);
@@ -302,11 +306,12 @@ mod tests {
 
     #[test]
     fn keeps_stored_forms_only_where_allowed() {
-        let mut context = Context::new(&Heap);
-        let mut indices = Buffer::allocate(&Heap, 3 * 4).unwrap();
+        let mut context = Context::new(Global::current(), None);
+        let mut indices = Buffer::allocate(Global::current(), 3 * 4).unwrap();
         indices.as_mut_slice::<u32>().copy_from_slice(&[1, 0, 1]);
         let dictionary = ColumnView::dictionary(&mut context, &int64s(5..7), indices).unwrap();
-        let table = Table::new(&Heap, &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
+        let table =
+            Table::new(Global::current(), &[("a", DataType::Int64)], &[&[dictionary]]).unwrap();
         // Its dictionary's entries hold no nulls.
         assert!(!table.column_nullable(0));
         for forms in [Forms::FLAT | Forms::DICTIONARY, Forms::FLAT] {

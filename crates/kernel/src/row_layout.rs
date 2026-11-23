@@ -3,7 +3,8 @@
 //! After Arrow's row format:
 //! <https://arrow.apache.org/blog/2022/11/07/multi-column-sorts-in-arrow-rust-part-2/>
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
+use crate::global::Global;
 use crate::slow_vec::SlowVec;
 
 /// What a slot holds.
@@ -43,10 +44,7 @@ pub(crate) struct RowLayout {
 }
 
 impl RowLayout {
-    pub(crate) fn new(
-        allocator: &dyn Allocator,
-        columns: &[Column],
-    ) -> Result<RowLayout, AllocError> {
+    pub(crate) fn new(allocator: &Global, columns: &[Column]) -> Result<RowLayout, AllocError> {
         let mut slots = SlowVec::fixed(allocator, columns.len())?;
         let mut stride = 0_u32;
         for column in columns {
@@ -197,13 +195,13 @@ mod tests {
     use core::cmp::Ordering;
 
     use super::*;
-    use crate::allocator::Heap;
 
     fn expect_ordered<T: Encode>(data_type: Type, ascending: &[Option<T>], nullable: bool) {
+        let global = Global::current();
         let count = u32::try_from(ascending.len()).unwrap();
         for (descending, expected) in [(false, Ordering::Less), (true, Ordering::Greater)] {
             let layout =
-                RowLayout::new(&Heap, &[Column { data_type, nullable, descending }]).unwrap();
+                RowLayout::new(global, &[Column { data_type, nullable, descending }]).unwrap();
             let mut rows = alloc::vec![0; layout.stride() as usize * ascending.len()];
             RowLayout::write(layout.slot(0), count, |i| ascending[i as usize], &mut rows);
             let rows: Vec<_> = rows.chunks(layout.stride() as usize).collect();
@@ -226,12 +224,13 @@ mod tests {
 
     #[test]
     fn slots_sit_one_after_another() {
+        let global = Global::current();
         let columns = [
             Column { data_type: Type::Int64, nullable: false, descending: false },
             Column { data_type: Type::Float64, nullable: true, descending: false },
             Column { data_type: Type::Int64, nullable: true, descending: true },
         ];
-        let layout = RowLayout::new(&Heap, &columns).unwrap();
+        let layout = RowLayout::new(global, &columns).unwrap();
         assert_eq!(layout.slot(0).offset, 0);
         assert_eq!(layout.slot(1).offset, 8);
         assert_eq!(layout.slot(2).offset, 17);
@@ -241,11 +240,12 @@ mod tests {
 
     #[test]
     fn decodes_what_it_lays_out() {
+        let global = Global::current();
         let values = [Some(-3.5_f64), None, Some(0.0), Some(f64::MAX), Some(-0.0)];
         for (descending, float) in [(false, true), (true, true), (false, false), (true, false)] {
             let data_type = if float { Type::Float64 } else { Type::Int64 };
             let column = Column { data_type, nullable: true, descending };
-            let layout = RowLayout::new(&Heap, &[column]).unwrap();
+            let layout = RowLayout::new(global, &[column]).unwrap();
             let stride = layout.stride() as usize;
             #[expect(clippy::cast_possible_truncation, reason = "whole numbers, or floats' bits")]
             let bits = |i: u32| {

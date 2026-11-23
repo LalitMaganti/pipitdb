@@ -7,8 +7,9 @@
 
 use core::cmp::Ordering;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::array::Array;
+use crate::global::Global;
 use crate::radix_sort::{Scratch, merge, sort_words};
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::row_blocks::RowBlocks;
@@ -78,7 +79,7 @@ fn find_existing_order(rows: Rows) -> ExistingOrder {
 }
 
 /// The positions of the bytes which differ between any two rows.
-fn find_varying_bytes(allocator: &dyn Allocator, rows: Rows) -> Result<SlowVec<u32>, AllocError> {
+fn find_varying_bytes(allocator: &Global, rows: Rows) -> Result<SlowVec<u32>, AllocError> {
     let stride = rows.stride;
     let mut differs = SlowVec::<u8>::zeroed(allocator, stride)?;
     if stride >= 8 {
@@ -385,7 +386,7 @@ impl SlotInWords {
 /// Stably sorts the rows laid out in `row_layout`. Frees them once sorting
 /// no longer needs them, before the memory the rest of the sort takes.
 pub(crate) fn sort_row_layout(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     row_layout: &mut RowBlocks,
 ) -> Result<Sorted, AllocError> {
     let count = row_layout.len();
@@ -449,7 +450,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::context::Context;
 
     /// `count` rows of `stride` bytes, of a few values so many tie, with
@@ -471,7 +472,8 @@ mod tests {
     fn expect_sorted(rows: &[u8], stride: usize) {
         let count = u32::try_from(rows.len() / stride).unwrap();
         let row = |i: u32| &rows[i as usize * stride..(i as usize + 1) * stride];
-        let mut context = Context::new(&Heap);
+        let global = Global::current();
+        let mut context = Context::new(global, None);
         let mut row_layout = RowBlocks::new(&context, stride).unwrap();
         row_layout
             .extend(&mut context, count, |first, bytes| {
@@ -479,7 +481,7 @@ mod tests {
                 bytes.copy_from_slice(&rows[at..at + bytes.len()]);
             })
             .unwrap();
-        let sorted = sort_row_layout(&Heap, &mut row_layout).unwrap();
+        let sorted = sort_row_layout(global, &mut row_layout).unwrap();
         let indices: Vec<u32> = (0..count).map(|i| sorted.row(i)).collect();
         let mut expected: Vec<u32> = (0..count).collect();
         expected.sort_by(|&a, &b| row(a).cmp(row(b)));

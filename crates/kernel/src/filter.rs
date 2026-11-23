@@ -8,11 +8,12 @@
 
 use core::cmp::Ordering;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::column::{ColumnView, DataType, Form, Forms, Values};
 use crate::eight;
 use crate::flat_hash_map::{FlatHashMap, Key};
+use crate::global::Global;
 use crate::murmur_hash;
 use crate::selection::Selection;
 
@@ -377,7 +378,7 @@ impl Entries {
     /// its entries, unless found already.
     pub fn find(
         &mut self,
-        allocator: &dyn Allocator,
+        allocator: &Global,
         column: &ColumnView,
         want: bool,
         set: &dyn Fn(Values<'_>, &mut [u64]),
@@ -702,7 +703,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::allocator::Heap;
+
     use crate::buffer::Buffer;
     use crate::column::Forms;
     use crate::context::Context;
@@ -710,10 +711,11 @@ mod tests {
 
     /// `0, 1, ..., 9`, with rows in `nulls` null.
     fn int64s(nulls: &[u16]) -> ColumnView {
-        let mut values = Buffer::allocate(&Heap, 80).unwrap();
+        let global = Global::current();
+        let mut values = Buffer::allocate(global, 80).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let validity = (!nulls.is_empty()).then(|| {
-            let mut validity = Buffer::allocate(&Heap, 2).unwrap();
+            let mut validity = Buffer::allocate(global, 2).unwrap();
             for row in 0..10_u16 {
                 if !nulls.contains(&row) {
                     validity.as_mut_slice::<u8>()[row as usize / 8] |= 1 << (row % 8);
@@ -721,7 +723,7 @@ mod tests {
             }
             validity
         });
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+        ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, validity).unwrap()
     }
 
     /// The rows `filter` keeps of all ten.
@@ -750,7 +752,8 @@ mod tests {
 
     #[test]
     fn compares_sequences_by_their_rows() {
-        let context = &mut Context::new(&Heap);
+        let global = Global::current();
+        let context = &mut Context::new(global, None);
         let (flat, sequence) = (int64s(&[]), ColumnView::sequence(context, 0, 10).unwrap());
         for comparison in [
             Comparison::Equal,
@@ -777,11 +780,13 @@ mod tests {
 
     #[test]
     fn compares_at_the_ends_of_the_range() {
+        let global = Global::current();
         let cells = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
-        let mut values = Buffer::allocate(&Heap, 56).unwrap();
+        let mut values = Buffer::allocate(global, 56).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&cells);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, None)
+                .unwrap();
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
             (Comparison::NotEqual, i64::ne),
@@ -820,6 +825,7 @@ mod tests {
 
     #[test]
     fn compares_eight_rows_at_a_time() {
+        let global = Global::current();
         // Groups of eight and the rows after them, with the ends of the range
         // among values spread over it, and every third row null.
         let ends = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
@@ -830,17 +836,18 @@ mod tests {
             })
             .collect();
         let column = |nulls: bool| {
-            let mut values = Buffer::allocate(&Heap, cells.len() * 8).unwrap();
+            let mut values = Buffer::allocate(global, cells.len() * 8).unwrap();
             values.as_mut_slice::<i64>().copy_from_slice(&cells);
             let validity = nulls.then(|| {
-                let mut validity = Buffer::allocate(&Heap, cells.len().div_ceil(8)).unwrap();
+                let mut validity = Buffer::allocate(global, cells.len().div_ceil(8)).unwrap();
                 validity.as_mut_slice::<u8>().fill(0);
                 for row in (0..cells.len()).filter(|row| !row.is_multiple_of(3)) {
                     validity.as_mut_slice::<u8>()[row / 8] |= 1 << (row % 8);
                 }
                 validity
             });
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).unwrap()
+            ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, validity)
+                .unwrap()
         };
         let comparisons: [(Comparison, Holds); 6] = [
             (Comparison::Equal, i64::eq),
@@ -881,11 +888,13 @@ mod tests {
 
     #[test]
     fn compares_floats_as_duckdb_does() {
-        let mut values = Buffer::allocate(&Heap, 48).unwrap();
+        let global = Global::current();
+        let mut values = Buffer::allocate(global, 48).unwrap();
         let cells = [-1.5, -0.0, 0.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
         values.as_mut_slice::<f64>().copy_from_slice(&cells);
         let column =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Float64, values, None).unwrap();
+            ColumnView::new(&mut Context::new(global, None), DataType::Float64, values, None)
+                .unwrap();
         let rows = |comparison, value| {
             let mut selection = Selection::all(6);
             compare(&column, comparison, Value::Float64(value), &mut selection, None);
@@ -928,21 +937,24 @@ mod tests {
 
     #[test]
     fn filters_constants_once() {
-        let mut values = Buffer::allocate(&Heap, 2 * 8).unwrap();
+        let global = Global::current();
+        let mut values = Buffer::allocate(global, 2 * 8).unwrap();
         values.as_mut_slice::<i64>().copy_from_slice(&[20, 0]);
-        let mut bits = Buffer::allocate(&Heap, 1).unwrap();
+        let mut bits = Buffer::allocate(global, 1).unwrap();
         bits.as_mut_slice::<u8>()[0] = 0b01;
         let values =
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, Some(bits)).unwrap();
+            ColumnView::new(&mut Context::new(global, None), DataType::Int64, values, Some(bits))
+                .unwrap();
         let compare_on = |column: &ColumnView, value| {
             let mut selection = Selection::all(column.row_count());
             compare(column, Comparison::GreaterEqual, Value::Int64(value), &mut selection, None);
             selection.len()
         };
         let twenties =
-            ColumnView::constant(&mut Context::new(&Heap), &values.slice(0, 1), 4).unwrap();
+            ColumnView::constant(&mut Context::new(global, None), &values.slice(0, 1), 4).unwrap();
         assert_eq!((compare_on(&twenties, 15), compare_on(&twenties, 25)), (4, 0));
-        let nulls = ColumnView::constant(&mut Context::new(&Heap), &values.slice(1, 1), 4).unwrap();
+        let nulls =
+            ColumnView::constant(&mut Context::new(global, None), &values.slice(1, 1), 4).unwrap();
         assert_eq!(compare_on(&nulls, -100), 0);
         let mut selection = Selection::all(4);
         is_null(&nulls, true, &mut selection, None);
@@ -956,8 +968,9 @@ mod tests {
         [b"", b"a", b"ab", b"", b"B", "é".as_bytes(), b"ab", b"abc", b"\0", b"zz"];
 
     fn strings() -> ColumnView {
+        let global = Global::current();
         let bytes: Vec<u8> = STRINGS.concat();
-        let mut views = Buffer::allocate(&Heap, 10 * 8).unwrap();
+        let mut views = Buffer::allocate(global, 10 * 8).unwrap();
         let mut start = 0;
         for (row, string) in STRINGS.iter().enumerate() {
             let len = u32::try_from(string.len()).unwrap();
@@ -965,11 +978,11 @@ mod tests {
             views.as_mut_slice::<u32>()[2 * row..2 * row + 2].copy_from_slice(&view);
             start += len;
         }
-        let mut stored = Buffer::allocate(&Heap, bytes.len()).unwrap();
+        let mut stored = Buffer::allocate(global, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-        let mut validity = Buffer::allocate(&Heap, 2).unwrap();
+        let mut validity = Buffer::allocate(global, 2).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[!(1 << 3), 0b11]);
-        ColumnView::strings(&mut Context::new(&Heap), views, stored, Some(validity)).unwrap()
+        ColumnView::strings(&mut Context::new(global, None), views, stored, Some(validity)).unwrap()
     }
 
     #[test]
@@ -997,11 +1010,12 @@ mod tests {
 
     #[test]
     fn filters_constant_strings_once() {
-        let mut views = Buffer::allocate(&Heap, 8).unwrap();
+        let global = Global::current();
+        let mut views = Buffer::allocate(global, 8).unwrap();
         views.as_mut_slice::<u32>().copy_from_slice(&[0, 2]);
-        let mut bytes = Buffer::allocate(&Heap, 2).unwrap();
+        let mut bytes = Buffer::allocate(global, 2).unwrap();
         bytes.as_mut_slice::<u8>().copy_from_slice(b"ab");
-        let mut context = Context::new(&Heap);
+        let mut context = Context::new(global, None);
         let value = ColumnView::strings(&mut context, views, bytes, None).unwrap();
         let column = ColumnView::constant(&mut context, &value, 10).unwrap();
         let equal = kept(|s| compare_string(&column, Comparison::Equal, b"ab", s, None));

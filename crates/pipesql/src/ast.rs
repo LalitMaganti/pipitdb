@@ -336,12 +336,13 @@ fn slots(table: &Buffer) -> *const Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pipit_kernel::allocator::Heap;
+    use pipit_kernel::global::Global;
 
     #[test]
     fn nodes_span_blocks() {
+        let global = Global::current();
         // SAFETY: nodes are read only once written.
-        let first = unsafe { Buffer::allocate_uninit(&Heap, BLOCK_BYTES) }.unwrap();
+        let first = unsafe { Buffer::allocate_uninit(global, BLOCK_BYTES) }.unwrap();
         let mut nodes = Nodes::new(first);
         let count = u32::try_from(2 * BLOCK_NODES + 1).unwrap();
         for i in 0..count {

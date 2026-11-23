@@ -1,6 +1,5 @@
 //! Inputs and helpers shared by the benchmarks in `benches/`.
 
-use pipit_kernel::allocator::Heap;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
@@ -10,6 +9,7 @@ use pipit_kernel::expression::{
 };
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::flat_hash_map::FlatHashMap;
+use pipit_kernel::global::Global;
 use pipit_kernel::join::{JoinKind, JoinOp};
 use pipit_kernel::lower::{PhysicalPlan, lower};
 use pipit_kernel::optimize::optimize;
@@ -17,7 +17,6 @@ use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::pipeline::{Execution, Pipeline};
 use pipit_kernel::plan::{DynOp, LogicalPlan, ScanColumn, ScanOp};
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
-use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Selection;
@@ -31,6 +30,17 @@ use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};
 use pipit_pipesql::registry::Registry;
+
+/// This thread's `Global`, from the system's heap, without a limit, made the
+/// first time it's asked for. Not the kernel's `Global::current`, which needs
+/// its `std` feature, and so `std` in the size example, which has none.
+pub fn global() -> &'static Global {
+    std::thread_local! {
+        static GLOBAL: &'static Global = Global::leak(pipit_kernel::allocator::Heap, usize::MAX)
+            .unwrap_or_else(|_| panic!("the heap has room for a `Global`"));
+    }
+    GLOBAL.with(|global| *global)
+}
 
 pub mod real;
 
@@ -58,7 +68,7 @@ pub fn expression(terms: usize) -> String {
 }
 
 pub fn count_nodes(source: &[u8]) -> u32 {
-    parse_expression(&Heap, source).map_or(0, |ast| ast.node_count())
+    parse_expression(crate::global(), source).map_or(0, |ast| ast.node_count())
 }
 
 /// Three-stage queries, one per line.
@@ -73,7 +83,8 @@ pub fn count_query_nodes(source: &str) -> u32 {
     source
         .lines()
         .map(|query| {
-            parse_query(&Heap, &REGISTRY, query.as_bytes()).map_or(0, |ast| ast.node_count())
+            parse_query(crate::global(), &REGISTRY, query.as_bytes())
+                .map_or(0, |ast| ast.node_count())
         })
         .sum()
 }
@@ -100,10 +111,15 @@ impl Repeat {
     #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
     pub fn new(batches: u32) -> Repeat {
         let size_bytes = BATCH_ROWS_MAX as usize * 8;
-        let values = Buffer::allocate(&Heap, size_bytes).expect("allocates");
+        let values = Buffer::allocate(crate::global(), size_bytes).expect("allocates");
         Repeat {
-            column: ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
-                .expect("allocates"),
+            column: ColumnView::new(
+                &mut Context::new(global(), None),
+                DataType::Int64,
+                values,
+                None,
+            )
+            .expect("allocates"),
             batches,
         }
     }
@@ -162,8 +178,8 @@ pub fn compute_pipeline(
 ) -> Pipeline<'static> {
     let rows = BATCH_ROWS_MAX as usize;
     let column = |value: fn(usize) -> i64, scale: f64, null: usize| {
-        let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
-        let mut validity = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+        let mut values = Buffer::allocate(crate::global(), rows * 8).expect("allocates");
+        let mut validity = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
         validity.as_mut_slice::<u8>().fill(0);
         for row in 0..rows {
             #[expect(clippy::cast_precision_loss, reason = "small integers")]
@@ -175,7 +191,8 @@ pub fn compute_pipeline(
             validity.as_mut_slice::<u8>()[row / 8] |= u8::from(row % 10 != null) << (row % 8);
         }
         let validity = nulls.then_some(validity);
-        ColumnView::new(&mut Context::new(&Heap), data_type, values, validity).expect("allocates")
+        ColumnView::new(&mut Context::new(global(), None), data_type, values, validity)
+            .expect("allocates")
     };
     #[expect(clippy::cast_possible_wrap, reason = "small integers")]
     let columns = [
@@ -207,17 +224,18 @@ pub fn compute_pipeline(
         let mut case = step(ExprOp::Case, data_type, 2, 1);
         case.c = otherwise;
         let when = step(ExprOp::When, data_type, condition, value);
-        SlowVec::fixed_from(&Heap, [first, second, when, case].into_iter())
+        SlowVec::fixed_from(crate::global(), [first, second, when, case].into_iter())
     } else {
-        SlowVec::fixed_from(&Heap, [first, second, step(op, result, 0, 1)].into_iter())
+        SlowVec::fixed_from(crate::global(), [first, second, step(op, result, 0, 1)].into_iter())
     };
     let steps = steps.expect("allocates");
-    let programs = SlowVec::fixed_from(&Heap, [ExprProgram { steps, values: None }].into_iter());
+    let programs =
+        SlowVec::fixed_from(crate::global(), [ExprProgram { steps, values: None }].into_iter());
     let compute = Compute { programs: programs.expect("allocates") };
-    let mut owned = SlowVec::fixed(&Heap, 1).expect("allocates");
-    let step = Step::Transform(DynTransform::new(&Heap, compute).expect("allocates"));
+    let mut owned = SlowVec::fixed(crate::global(), 1).expect("allocates");
+    let step = Step::Transform(DynTransform::new(crate::global(), compute).expect("allocates"));
     assert!(owned.push(step).is_ok(), "fixed for one");
-    let source = DynSource::new(&Heap, Pair { columns, batches }).expect("allocates");
+    let source = DynSource::new(crate::global(), Pair { columns, batches }).expect("allocates");
     Pipeline::new(source, owned)
 }
 
@@ -298,15 +316,15 @@ impl Operator for PassOperator {
 /// Runs `pipeline` once, returning the rows out, or as many as it made
 /// before failing.
 pub fn run(pipeline: &Pipeline) -> u64 {
-    let query = QueryAllocators::new(&Heap);
-    let Ok(execution) = pipeline.start(&query, None) else { return 0 };
+    let query = global();
+    let Ok(execution) = pipeline.start(query, None) else { return 0 };
     count(execution)
 }
 
 /// Runs `plan`, returning the rows out.
 pub fn run_plan(plan: &PhysicalPlan) -> u64 {
-    let query = QueryAllocators::new(&Heap);
-    let Ok(execution) = plan.start(&query) else { return 0 };
+    let query = global();
+    let Ok(execution) = plan.start(query) else { return 0 };
     count(execution)
 }
 
@@ -323,10 +341,10 @@ fn count(mut execution: Execution<'_>) -> u64 {
 /// `query` over the tables in `catalog`, compiled, optimized and lowered,
 /// ready to run.
 pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
-    let mut plan = compile(&Heap, &REGISTRY, catalog, query.as_bytes()).ok()?;
-    optimize(&Heap, &mut plan).ok()?;
-    let planned = plan_nodes(&Heap, &plan).ok()?;
-    lower(&Heap, &mut plan, &planned).ok()
+    let mut plan = compile(crate::global(), &REGISTRY, catalog, query.as_bytes()).ok()?;
+    optimize(crate::global(), &mut plan).ok()?;
+    let planned = plan_nodes(crate::global(), &plan).ok()?;
+    lower(crate::global(), &mut plan, &planned).ok()
 }
 
 /// Plans and runs `query` over `catalog`, as an embedder would each query,
@@ -350,11 +368,12 @@ impl Catalog for Small {
 pub fn small_table(rows: u32) -> &'static dyn Catalog {
     assert!(rows <= BATCH_ROWS_MAX, "one row group");
     let column = |value: fn(i64) -> i64| {
-        let mut values = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
+        let mut values = Buffer::allocate(crate::global(), rows as usize * 8).expect("allocates");
         for (i, slot) in (0_i64..).zip(values.as_mut_slice::<i64>()) {
             *slot = value(i);
         }
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None).expect("allocates")
+        ColumnView::new(&mut Context::new(global(), None), DataType::Int64, values, None)
+            .expect("allocates")
     };
     let columns = [column(|i| i), column(|i| i * 7), column(|i| i % 10), column(|i| -i)];
     let schema = [
@@ -363,8 +382,8 @@ pub fn small_table(rows: u32) -> &'static dyn Catalog {
         ("b", DataType::Int64),
         ("c", DataType::Int64),
     ];
-    let table = Table::new(&Heap, &schema, &[columns.as_slice()]).expect("allocates");
-    let small = Small(DynScannable::new(&Heap, table).expect("allocates"));
+    let table = Table::new(crate::global(), &schema, &[columns.as_slice()]).expect("allocates");
+    let small = Small(DynScannable::new(crate::global(), table).expect("allocates"));
     Box::leak(Box::new(small))
 }
 
@@ -378,32 +397,36 @@ pub fn small_plan(rows: u32, query: &str) -> PhysicalPlan<'static> {
 /// operators.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn pass_pipeline(batches: u32, steps: usize, operators: bool) -> Pipeline<'static> {
-    let mut owned = pipit_kernel::slow_vec::SlowVec::fixed(&Heap, steps).expect("allocates");
+    let mut owned =
+        pipit_kernel::slow_vec::SlowVec::fixed(crate::global(), steps).expect("allocates");
     for _ in 0..steps {
         let step = if operators {
-            Step::Operator(DynOperator::new(&Heap, PassOperator).expect("allocates"))
+            Step::Operator(DynOperator::new(crate::global(), PassOperator).expect("allocates"))
         } else {
-            Step::Transform(DynTransform::new(&Heap, PassTransform).expect("allocates"))
+            Step::Transform(DynTransform::new(crate::global(), PassTransform).expect("allocates"))
         };
         assert!(owned.push(step).is_ok(), "fixed for `steps`");
     }
-    Pipeline::new(DynSource::new(&Heap, Repeat::new(batches)).expect("allocates"), owned)
+    Pipeline::new(DynSource::new(crate::global(), Repeat::new(batches)).expect("allocates"), owned)
 }
 
 /// `batches` full batches read through a pipeline run as a source, as a
 /// join reads its build side.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn nested_pipeline(batches: u32) -> Pipeline<'static> {
-    let inner = pass_pipeline(batches, 0, false).into_source(&Heap).expect("allocates");
-    Pipeline::new(inner, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
+    let inner = pass_pipeline(batches, 0, false).into_source(crate::global()).expect("allocates");
+    Pipeline::new(
+        inner,
+        pipit_kernel::slow_vec::SlowVec::fixed(crate::global(), 0).expect("allocates"),
+    )
 }
 
 /// `row_groups` full row groups, with four columns. Kept for the rest of the
 /// run, so pipelines can borrow it.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
-    let values = Buffer::allocate(&Heap, BATCH_ROWS_MAX as usize * 8).expect("allocates");
-    let column = ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, None)
+    let values = Buffer::allocate(crate::global(), BATCH_ROWS_MAX as usize * 8).expect("allocates");
+    let column = ColumnView::new(&mut Context::new(global(), None), DataType::Int64, values, None)
         .expect("allocates");
     let columns = [column.clone(), column.clone(), column.clone(), column];
     let row_groups = vec![columns.as_slice(); row_groups];
@@ -413,16 +436,19 @@ pub fn table(row_groups: usize) -> &'static DynScannable<'static> {
         ("c", DataType::Int64),
         ("d", DataType::Int64),
     ];
-    let table = Table::new(&Heap, &schema, &row_groups).expect("allocates");
-    Box::leak(Box::new(DynScannable::new(&Heap, table).expect("allocates")))
+    let table = Table::new(crate::global(), &schema, &row_groups).expect("allocates");
+    Box::leak(Box::new(DynScannable::new(crate::global(), table).expect("allocates")))
 }
 
 /// Scans two of `table`'s columns.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static> {
     let columns = [(3, Forms::FLAT), (1, Forms::FLAT)].into_iter();
-    let source = table.scan(&Heap, columns, &[], None).expect("allocates");
-    Pipeline::new(source, pipit_kernel::slow_vec::SlowVec::fixed(&Heap, 0).expect("allocates"))
+    let source = table.scan(crate::global(), columns, &[], None).expect("allocates");
+    Pipeline::new(
+        source,
+        pipit_kernel::slow_vec::SlowVec::fixed(crate::global(), 0).expect("allocates"),
+    )
 }
 
 /// A batch of values in `0..1000`, spread evenly but out of order, with every
@@ -430,19 +456,20 @@ pub fn scan_pipeline(table: &'static DynScannable<'static>) -> Pipeline<'static>
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn filter_column(nulls: bool) -> ColumnView {
     let rows = BATCH_ROWS_MAX as usize;
-    let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+    let mut values = Buffer::allocate(crate::global(), rows * 8).expect("allocates");
     for (i, value) in (0_i64..).zip(values.as_mut_slice::<i64>()) {
         *value = (i * 7919) % 1000;
     }
     let validity = nulls.then(|| {
-        let mut validity = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+        let mut validity = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
         validity.as_mut_slice::<u8>().fill(0xff);
         for row in (0..rows).step_by(16) {
             validity.as_mut_slice::<u8>()[row / 8] &= !(1 << (row % 8));
         }
         validity
     });
-    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity).expect("allocates")
+    ColumnView::new(&mut Context::new(global(), None), DataType::Int64, values, validity)
+        .expect("allocates")
 }
 
 /// Filters `batches` fresh selections of `column` with `filter`, returning
@@ -469,9 +496,9 @@ pub fn greater(column: &ColumnView, selection: &mut Selection) {
 /// A map whose keys are the first `len` even numbers.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn hash_map(len: i64) -> FlatHashMap<i64, ()> {
-    let mut map = FlatHashMap::for_len(&Heap, 0).expect("allocates");
+    let mut map = FlatHashMap::for_len(crate::global(), 0).expect("allocates");
     for key in 0..len {
-        map.insert(&Heap, key * 2, ()).expect("allocates");
+        map.insert(crate::global(), key * 2, ()).expect("allocates");
     }
     map
 }
@@ -490,10 +517,10 @@ pub fn strings(count: usize, distinct: usize) -> Vec<u8> {
 /// `strings`' strings interned in a new pool, and their ids.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn intern_strings(strings: &[u8]) -> (StringPool, Vec<Id>) {
-    let mut pool = StringPool::new(&Heap).expect("allocates");
+    let mut pool = StringPool::new(crate::global()).expect("allocates");
     let ids = strings
         .chunks(8)
-        .map(|string| pool.intern_string(&Heap, Some(string)).expect("allocates"))
+        .map(|string| pool.intern_string(crate::global(), Some(string)).expect("allocates"))
         .collect();
     (pool, ids)
 }
@@ -517,7 +544,7 @@ fn model(row: usize) -> usize {
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn string_column() -> ColumnView {
     let rows = BATCH_ROWS_MAX as usize;
-    let mut views = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+    let mut views = Buffer::allocate(crate::global(), rows * 8).expect("allocates");
     let mut starts = [0_u32; 8];
     let mut bytes = Vec::new();
     for (start, model) in starts.iter_mut().zip(MODELS) {
@@ -529,28 +556,28 @@ pub fn string_column() -> ColumnView {
         let len = u32::try_from(MODELS[model].len()).expect("small");
         view.copy_from_slice(&[starts[model], len]);
     }
-    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    let mut stored = Buffer::allocate(crate::global(), bytes.len()).expect("allocates");
     stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-    ColumnView::strings(&mut Context::new(&Heap), views, stored, None).expect("allocates")
+    ColumnView::strings(&mut Context::new(global(), None), views, stored, None).expect("allocates")
 }
 
 /// `string_column`'s rows as a dictionary of the eight models, as Parquet
 /// reads them.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn string_dictionary() -> ColumnView {
-    let mut views = Buffer::allocate(&Heap, MODELS.len() * 8).expect("allocates");
+    let mut views = Buffer::allocate(crate::global(), MODELS.len() * 8).expect("allocates");
     let mut bytes = Vec::new();
     for (view, model) in views.as_mut_slice::<u32>().chunks_mut(2).zip(MODELS) {
         let start = u32::try_from(bytes.len()).expect("small");
         view.copy_from_slice(&[start, u32::try_from(model.len()).expect("small")]);
         bytes.extend_from_slice(model);
     }
-    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    let mut stored = Buffer::allocate(crate::global(), bytes.len()).expect("allocates");
     stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-    let mut context = Context::new(&Heap);
+    let mut context = Context::new(global(), None);
     let entries = ColumnView::strings(&mut context, views, stored, None).expect("allocates");
     let rows = BATCH_ROWS_MAX as usize;
-    let mut indices = Buffer::allocate(&Heap, rows * 4).expect("allocates");
+    let mut indices = Buffer::allocate(crate::global(), rows * 4).expect("allocates");
     for (row, index) in indices.as_mut_slice::<u32>().iter_mut().enumerate() {
         *index = u32::try_from(model(row)).expect("small");
     }
@@ -560,10 +587,11 @@ pub fn string_dictionary() -> ColumnView {
 /// `x = 'iPad'`, over the first column, and its statement's literals.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn ipad_predicate() -> (Predicate, StringPool) {
-    let mut literals = StringPool::new(&Heap).expect("allocates");
-    let string = literals.intern_string(&Heap, Some(b"iPad")).expect("allocates");
+    let mut literals = StringPool::new(crate::global()).expect("allocates");
+    let string = literals.intern_string(crate::global(), Some(b"iPad")).expect("allocates");
     let leaf = Leaf::CompareString { column: 0, comparison: Comparison::Equal, string };
-    let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).expect("allocates");
+    let nodes =
+        SlowVec::fixed_from(crate::global(), [Node::Leaf(leaf)].into_iter()).expect("allocates");
     (Predicate::new(nodes), literals)
 }
 
@@ -589,7 +617,7 @@ pub fn predicate(shape: &str) -> Predicate {
         _ => &[compare(Comparison::Greater, 500), Node::Not(0)],
     };
     Predicate::new(
-        pipit_kernel::slow_vec::SlowVec::fixed_from(&Heap, nodes.iter().copied())
+        pipit_kernel::slow_vec::SlowVec::fixed_from(crate::global(), nodes.iter().copied())
             .expect("allocates"),
     )
 }
@@ -603,10 +631,10 @@ pub fn run_predicate(
     column: &ColumnView,
     batches: u32,
 ) -> u64 {
-    let mut context = Context::new(&Heap);
+    let mut context = Context::new(global(), None);
     context.reserve_selections(predicate.depth() as usize).expect("allocates");
-    let mut entries = predicate.new_entries(&Heap).expect("allocates");
-    let sets = predicate.new_sets(&Heap, literals).expect("allocates");
+    let mut entries = predicate.new_entries(crate::global()).expect("allocates");
+    let sets = predicate.new_sets(crate::global(), literals).expect("allocates");
     let mut batch = RowBatch::new();
     let mut kept = 0;
     for _ in 0..batches {
@@ -614,7 +642,7 @@ pub fn run_predicate(
         let _ = batch.push_column(column.clone());
         let selections = context.selections();
         predicate
-            .select(&Heap, literals, &sets, selections, &mut entries, &mut batch)
+            .select(crate::global(), literals, &sets, selections, &mut entries, &mut batch)
             .expect("allocates");
         kept += u64::from(batch.selection().len());
     }
@@ -636,16 +664,16 @@ impl Catalog for PerfettoSlices {
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn perfetto_slices() -> &'static dyn Catalog {
     let rows = BATCH_ROWS_MAX as usize;
-    let mut context = Context::new(&Heap);
+    let mut context = Context::new(global(), None);
     let names: Vec<String> = (0..64).map(|i| format!("name{i}")).collect();
-    let mut views = Buffer::allocate(&Heap, names.len() * 8).expect("allocates");
+    let mut views = Buffer::allocate(crate::global(), names.len() * 8).expect("allocates");
     let mut bytes = Vec::new();
     for (view, name) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&names) {
         let start = u32::try_from(bytes.len()).expect("small");
         view.copy_from_slice(&[start, u32::try_from(name.len()).expect("small")]);
         bytes.extend_from_slice(name.as_bytes());
     }
-    let mut stored = Buffer::allocate(&Heap, bytes.len()).expect("allocates");
+    let mut stored = Buffer::allocate(crate::global(), bytes.len()).expect("allocates");
     stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
     let entries = ColumnView::strings(&mut context, views, stored, None).expect("allocates");
     let hash = |i: usize| u32::try_from(i).expect("small").wrapping_mul(2_654_435_761);
@@ -653,26 +681,26 @@ pub fn perfetto_slices() -> &'static dyn Catalog {
     for group in 0..(1 << 20) / rows {
         let first = group * rows;
         let int = |value: &dyn Fn(usize) -> i64, valid: Option<&dyn Fn(usize) -> bool>| {
-            let mut values = Buffer::allocate(&Heap, rows * 8).expect("allocates");
+            let mut values = Buffer::allocate(crate::global(), rows * 8).expect("allocates");
             for (i, slot) in values.as_mut_slice::<i64>().iter_mut().enumerate() {
                 *slot = value(first + i);
             }
             let validity = valid.map(|valid| {
-                let mut bits = Buffer::allocate(&Heap, rows / 8).expect("allocates");
+                let mut bits = Buffer::allocate(crate::global(), rows / 8).expect("allocates");
                 bits.as_mut_slice::<u8>().fill(0);
                 for i in 0..rows {
                     bits.as_mut_slice::<u8>()[i / 8] |= u8::from(valid(first + i)) << (i % 8);
                 }
                 bits
             });
-            ColumnView::new(&mut Context::new(&Heap), DataType::Int64, values, validity)
+            ColumnView::new(&mut Context::new(global(), None), DataType::Int64, values, validity)
                 .expect("allocates")
         };
         let id = int(&|i| i64::try_from(i).expect("small"), None);
         let dur = int(&|i| i64::from((hash(i) >> 12) % 1000), None);
         let cpu = int(&|i| i64::from((hash(i) >> 8) % 8), None);
         let depth = int(&|i| i64::from((hash(i) >> 4) % 16), Some(&|i| hash(i) % 5 != 0));
-        let mut indices = Buffer::allocate(&Heap, rows * 4).expect("allocates");
+        let mut indices = Buffer::allocate(crate::global(), rows * 4).expect("allocates");
         for (i, index) in indices.as_mut_slice::<u32>().iter_mut().enumerate() {
             *index = (hash(first + i) >> 16) % 64;
         }
@@ -687,8 +715,10 @@ pub fn perfetto_slices() -> &'static dyn Catalog {
         ("depth", DataType::Int64),
         ("name", DataType::String),
     ];
-    let table = Table::new(&Heap, &schema, &groups).expect("allocates");
-    Box::leak(Box::new(PerfettoSlices(DynScannable::new(&Heap, table).expect("allocates"))))
+    let table = Table::new(crate::global(), &schema, &groups).expect("allocates");
+    Box::leak(Box::new(PerfettoSlices(
+        DynScannable::new(crate::global(), table).expect("allocates"),
+    )))
 }
 
 /// The filters Perfetto's `filter_benchmark.cc` times, by its names, over
@@ -710,23 +740,25 @@ pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
 /// and `tid`.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 fn join_op(exprs: &mut Exprs, [utid, dur]: [u32; 2], [id, tid]: [u32; 2]) -> DynOp<'static> {
-    let mut nodes = ExprBuilder::new(&Heap).expect("allocates");
+    let mut nodes = ExprBuilder::new(crate::global()).expect("allocates");
     let (a, b) = (nodes.column(utid).expect("allocates"), nodes.column(id).expect("allocates"));
     nodes.node(ExprOp::Eq, a, b).expect("allocates");
     let condition = Some(exprs.add(nodes.nodes()).expect("allocates"));
-    let columns = |list: [u32; 2]| SlowVec::fixed_from(&Heap, list.into_iter()).expect("allocates");
+    let columns =
+        |list: [u32; 2]| SlowVec::fixed_from(crate::global(), list.into_iter()).expect("allocates");
     let op = JoinOp::new(JoinKind::Inner, condition, [columns([utid, dur]), columns([id, tid])]);
-    DynOp::new(&Heap, op).expect("allocates")
+    DynOp::new(crate::global(), op).expect("allocates")
 }
 
 /// A flat column of `rows` of `values`.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 fn int64_column(values: &mut dyn Iterator<Item = i64>, rows: u32) -> ColumnView {
-    let mut buffer = Buffer::allocate(&Heap, rows as usize * 8).expect("allocates");
+    let mut buffer = Buffer::allocate(crate::global(), rows as usize * 8).expect("allocates");
     for (slot, value) in buffer.as_mut_slice::<i64>().iter_mut().zip(values) {
         *slot = value;
     }
-    ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, None).expect("allocates")
+    ColumnView::new(&mut Context::new(global(), None), DataType::Int64, buffer, None)
+        .expect("allocates")
 }
 
 /// Whether `join_plan` joins the slices to their threads, and how the
@@ -770,7 +802,7 @@ impl Joined {
 /// `dur` alone, to tell what the join costs. Kept for the rest of the run.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
 pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'static> {
-    let mut context = Context::new(&Heap);
+    let mut context = Context::new(global(), None);
     let int64s = int64_column;
     let groups = |rows: u32| {
         (0..rows.div_ceil(BATCH_ROWS_MAX)).map(move |g| {
@@ -808,22 +840,22 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
                  groups: &[[ColumnView; 2]]|
      -> &'static DynScannable<'static> {
         let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
-        let table = Table::new(&Heap, schema, &groups).expect("allocates");
-        Box::leak(Box::new(DynScannable::new(&Heap, table).expect("allocates")))
+        let table = Table::new(crate::global(), schema, &groups).expect("allocates");
+        Box::leak(Box::new(DynScannable::new(crate::global(), table).expect("allocates")))
     };
     let thread = table(&[("id", DataType::Int64), ("tid", DataType::Int64)], &thread_groups);
     let slice = table(&[("utid", DataType::Int64), ("dur", DataType::Int64)], &slice_groups);
 
-    let mut plan = LogicalPlan::new(&Heap).expect("allocates");
+    let mut plan = LogicalPlan::new(crate::global()).expect("allocates");
     let scan_of = |plan: &mut LogicalPlan<'static>, table, names: [&str; 2]| {
-        let mut reads = SlowVec::fixed(&Heap, 2).expect("allocates");
+        let mut reads = SlowVec::fixed(crate::global(), 2).expect("allocates");
         let mut bound = [None; 2];
         for (i, name) in (0..).zip(names) {
             let binding = plan.add_column(name, DataType::Int64, false).expect("allocates");
             reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).expect("fixed");
             bound[i as usize] = Some(binding);
         }
-        let op = DynOp::new(&Heap, ScanOp::new(table, reads)).expect("allocates");
+        let op = DynOp::new(crate::global(), ScanOp::new(table, reads)).expect("allocates");
         let node = plan.add_node(op, &[]);
         (node.expect("allocates"), bound.map(|b| b.expect("bound")))
     };
@@ -836,7 +868,7 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
         plan.add_node(op, &children).expect("allocates");
         plan.output.push(tid).expect("allocates");
     }
-    optimize(&Heap, &mut plan).expect("optimizes");
-    let planned = plan_nodes(&Heap, &plan).expect("plans");
-    lower(&Heap, &mut plan, &planned).expect("lowers")
+    optimize(crate::global(), &mut plan).expect("optimizes");
+    let planned = plan_nodes(crate::global(), &plan).expect("plans");
+    lower(crate::global(), &mut plan, &planned).expect("lowers")
 }

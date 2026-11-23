@@ -5,8 +5,9 @@ use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::buffer::{BUFFER_ALIGNMENT_BYTES, Buffer};
+use crate::global::Global;
 
 /// The value lives in a `Buffer`, which also remembers the allocator, so a
 /// `Box` isn't generic over it.
@@ -16,7 +17,7 @@ pub struct Box<T> {
 }
 
 impl<T> Box<T> {
-    pub fn new(allocator: &dyn Allocator, value: T) -> Result<Box<T>, AllocError> {
+    pub fn new(allocator: &Global, value: T) -> Result<Box<T>, AllocError> {
         const { assert!(align_of::<T>() <= BUFFER_ALIGNMENT_BYTES) };
         // SAFETY: the value is written before anything reads it.
         let mut buffer = unsafe { Buffer::allocate_uninit(allocator, size_of::<T>())? };
@@ -89,12 +90,12 @@ mod tests {
     use alloc::rc::Rc;
 
     use super::*;
-    use crate::allocator::Heap;
 
     #[test]
     fn holds_and_drops_its_value() {
+        let global = Global::current();
         let live = Rc::new(());
-        let mut boxed = Box::new(&Heap, (1, live.clone())).unwrap();
+        let mut boxed = Box::new(global, (1, live.clone())).unwrap();
         boxed.0 += 1;
         assert_eq!(boxed.0, 2);
         assert_eq!(Rc::strong_count(&live), 2);
@@ -104,8 +105,9 @@ mod tests {
 
     #[test]
     fn drops_its_value_once_erased() {
+        let global = Global::current();
         let live = Rc::new(());
-        let erased = Box::new(&Heap, live.clone()).unwrap().erase();
+        let erased = Box::new(global, live.clone()).unwrap().erase();
         // SAFETY: it holds an `Rc<()>`.
         assert_eq!(unsafe { erased.as_ptr().cast::<Rc<()>>().as_ref() }, &live);
         assert_eq!(Rc::strong_count(&live), 2);

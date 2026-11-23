@@ -130,25 +130,29 @@ fn open_unnamed(dir: &Path) -> std::io::Result<File> {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::allocator::Heap;
+
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
     use pipit_kernel::spill::{read_column, write_column};
 
     use super::*;
+    use pipit_kernel::global::Global;
 
     fn column(values: &[i64]) -> ColumnView {
-        let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
+        let global = Global::current();
+        let mut buffer = Buffer::allocate(global, values.len() * 8).unwrap();
         buffer.as_mut_slice::<i64>().copy_from_slice(values);
-        let mut validity = Buffer::allocate(&Heap, values.len().div_ceil(8)).unwrap();
+        let mut validity = Buffer::allocate(global, values.len().div_ceil(8)).unwrap();
         validity.as_mut_slice::<u8>().fill(0b1111_1101);
-        ColumnView::new(&mut Context::new(&Heap), DataType::Int64, buffer, Some(validity)).unwrap()
+        ColumnView::new(&mut Context::new(global, None), DataType::Int64, buffer, Some(validity))
+            .unwrap()
     }
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri can't use real files")]
     fn spills_columns_to_files_and_back() {
+        let global = Global::current();
         let store = FileSpill::new(std::env::temp_dir());
         let values: Vec<i64> = (0..2048).collect();
         let columns = [column(&values), column(&values).slice(3, 2000)];
@@ -162,7 +166,8 @@ mod tests {
         store.seal(b).unwrap();
         for (column, (in_a, in_b)) in columns.iter().zip(&spilled) {
             for (log, spilled) in [(a, in_a), (b, in_b)] {
-                let read = read_column(&mut Context::new(&Heap), &store, log, spilled).unwrap();
+                let read =
+                    read_column(&mut Context::new(global, None), &store, log, spilled).unwrap();
                 assert_eq!(read.int64s(), column.int64s());
                 let nulls = |c: &ColumnView| (0..c.row_count()).filter(|&r| c.is_null(r)).count();
                 assert_eq!(nulls(&read), nulls(column));
@@ -170,7 +175,7 @@ mod tests {
         }
         store.delete(a);
         assert_eq!(
-            read_column(&mut Context::new(&Heap), &store, a, &spilled[0].0).err(),
+            read_column(&mut Context::new(global, None), &store, a, &spilled[0].0).err(),
             Some(Error::Io)
         );
         store.delete(b);
@@ -179,15 +184,16 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri can't use real files")]
     fn logs_are_read_only_once_sealed() {
+        let global = Global::current();
         let store = FileSpill::new(std::env::temp_dir());
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column(&[1, 2, 3])).unwrap();
         assert_eq!(
-            read_column(&mut Context::new(&Heap), &store, log, &spilled).err(),
+            read_column(&mut Context::new(global, None), &store, log, &spilled).err(),
             Some(Error::Io)
         );
         store.seal(log).unwrap();
-        assert!(read_column(&mut Context::new(&Heap), &store, log, &spilled).is_ok());
+        assert!(read_column(&mut Context::new(global, None), &store, log, &spilled).is_ok());
         assert_eq!(store.append(log, &[0]).err(), Some(Error::Io));
         store.delete(log);
     }

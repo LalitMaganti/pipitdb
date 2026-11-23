@@ -1,5 +1,5 @@
-//! `QueryAllocators`: the allocators a query's batches and metadata come
-//! from, and `FixedAllocator`, which hands out blocks of one size.
+//! `FixedAllocator`, which hands out blocks of one size, and the sizes of a
+//! query's blocks for its batches.
 
 use core::alloc::Layout;
 use core::cell::Cell;
@@ -137,78 +137,48 @@ impl Drop for FixedAllocator<'_> {
 }
 
 /// A block for a batch's 8-byte values, with their buffer's header.
-const VALUES_BYTES: usize = HEADER_BYTES + BATCH_ROWS_MAX as usize * 8;
+pub(crate) const VALUES_BYTES: usize = HEADER_BYTES + BATCH_ROWS_MAX as usize * 8;
 
 /// A block for a batch's 4-byte values, such as dictionary indices, or
 /// string offsets, of which there's one more than rows.
-const INDICES_BYTES: usize =
+pub(crate) const INDICES_BYTES: usize =
     (HEADER_BYTES + (BATCH_ROWS_MAX as usize + 1) * 4).next_multiple_of(BUFFER_ALIGNMENT_BYTES);
 
 /// A block for the small things a batch's columns need: their headers,
 /// validity bitmaps, lazy columns' handles.
-const SMALL_BYTES: usize = 512;
-
-/// The allocators a query uses: one for its metadata (plans, states,
-/// lists, and column data of no fixed size, such as string bytes), and a
-/// `FixedAllocator` for each kind of column buffer its batches are made
-/// of. The fixed ones hand blocks out again as batches are dropped, so
-/// filling a batch neither searches nor zeroes, and each block is exactly
-/// its size, where a general-purpose allocator rounds a batch's words and
-/// their header up by as much as a third. They take their chunks from the
-/// metadata allocator: under a `LimitAllocator`, everything a query takes
-/// counts against its limit.
-///
-/// It must outlive what's allocated from it, results included: dropping it
-/// while a block is still handed out fails a check.
-pub struct QueryAllocators<'a> {
-    pub(crate) metadata: &'a dyn Allocator,
-    pub(crate) values: FixedAllocator<'a>,
-    pub(crate) indices: FixedAllocator<'a>,
-    pub(crate) small: FixedAllocator<'a>,
-}
-
-impl<'a> QueryAllocators<'a> {
-    /// The allocators for a query, all taking memory from `allocator`.
-    pub fn new(allocator: &'a dyn Allocator) -> QueryAllocators<'a> {
-        QueryAllocators {
-            metadata: allocator,
-            values: FixedAllocator::new(allocator, VALUES_BYTES),
-            indices: FixedAllocator::new(allocator, INDICES_BYTES),
-            small: FixedAllocator::new(allocator, SMALL_BYTES),
-        }
-    }
-}
+pub(crate) const SMALL_BYTES: usize = 512;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::allocator::{Heap, LimitAllocator};
+    use crate::allocator::Heap;
     use crate::buffer::Buffer;
+    use crate::global::{Global, Kind};
 
     #[test]
     fn carves_blocks_exactly_and_hands_them_out_again() {
-        let limit = LimitAllocator::new(&Heap, usize::MAX);
-        let query = QueryAllocators::new(&limit);
+        let global = Global::current();
         let words = BATCH_ROWS_MAX as usize * 8;
-        let a = Buffer::allocate(&query.values, words).unwrap();
-        let b = Buffer::allocate(&query.values, words).unwrap();
+        let before = global.used();
+        let a = Buffer::allocate_in(global, Kind::Values, words).unwrap();
+        let b = Buffer::allocate_in(global, Kind::Values, words).unwrap();
         // One chunk counts, and the second block is right after the first.
-        let chunk = limit.used();
+        let chunk = global.used() - before;
         let (pa, pb) = (a.as_slice::<u8>().as_ptr(), b.as_slice::<u8>().as_ptr());
         assert_eq!(pb.addr() - pa.addr(), VALUES_BYTES);
         drop(b);
-        let c = Buffer::allocate(&query.values, words).unwrap();
+        let c = Buffer::allocate_in(global, Kind::Values, words).unwrap();
         assert_eq!(c.as_slice::<u8>().as_ptr(), pb);
-        assert_eq!(limit.used(), chunk);
+        assert_eq!(global.used() - before, chunk);
         drop((a, c));
     }
 
     #[test]
     fn hands_out_a_whole_block_for_less() {
-        let query = QueryAllocators::new(&Heap);
+        let global = Global::current();
         let rows = BATCH_ROWS_MAX as usize;
-        let offsets = Buffer::allocate(&query.indices, (rows + 1) * 4).unwrap();
-        let short = Buffer::allocate(&query.indices, 10 * 4).unwrap();
+        let offsets = Buffer::allocate_in(global, Kind::Indices, (rows + 1) * 4).unwrap();
+        let short = Buffer::allocate_in(global, Kind::Indices, 10 * 4).unwrap();
         assert_eq!(short.size_bytes(), 40);
         drop((offsets, short));
     }
@@ -216,25 +186,27 @@ mod tests {
     #[test]
     #[should_panic(expected = "block_bytes")]
     fn checks_nothing_asks_for_more_than_a_block() {
-        let query = QueryAllocators::new(&Heap);
+        let global = Global::current();
         // With its header, it's more than a small block.
-        let _ = Buffer::allocate(&query.small, SMALL_BYTES);
+        let _ = Buffer::allocate_in(global, Kind::Small, SMALL_BYTES);
     }
 
     #[test]
     fn zeroes_blocks_handed_out_again_when_asked() {
-        let query = QueryAllocators::new(&Heap);
-        let mut a = Buffer::allocate(&query.small, 100).unwrap();
+        let global = Global::current();
+        let mut a = Buffer::allocate_in(global, Kind::Small, 100).unwrap();
         a.as_mut_slice::<u8>().fill(7);
         drop(a);
-        assert_eq!(Buffer::allocate(&query.small, 100).unwrap().as_slice::<u8>(), [0; 100]);
+        let b = Buffer::allocate_in(global, Kind::Small, 100).unwrap();
+        assert_eq!(b.as_slice::<u8>(), [0; 100]);
     }
 
     #[test]
     fn chunks_count_against_a_limit() {
-        let limit = LimitAllocator::new(&Heap, 1000);
-        let query = QueryAllocators::new(&limit);
-        assert!(Buffer::allocate(&query.small, 100).is_err());
-        assert_eq!(limit.used(), 0);
+        // SAFETY: declared before what's allocated from it, so dropped after.
+        let global = unsafe { Global::new(Heap, 1000) }.unwrap();
+        let before = global.used();
+        assert!(Buffer::allocate_in(&global, Kind::Small, 100).is_err());
+        assert_eq!(global.used(), before);
     }
 }

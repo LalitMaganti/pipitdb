@@ -3,15 +3,14 @@
 //! and what it outputs; lowering then only adds the steps that does.
 
 use crate::allocator::AllocError;
-use crate::allocator::Allocator;
 use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::expression::Exprs;
+use crate::global::Global;
 use crate::names::{Name, Names};
 use crate::output_properties::{InputStep, OutputProperties, Planned};
 use crate::pipeline::{Execution, Pipeline};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
-use crate::query_allocators::QueryAllocators;
 use crate::slow_vec::SlowVec;
 use crate::sort::sort;
 use crate::statement::Statement;
@@ -60,8 +59,8 @@ impl<'c> PhysicalPlan<'c> {
     }
 
     /// Starts a run, as `Pipeline::start` does, of its statement.
-    pub fn start<'r>(&'r self, query: &'r QueryAllocators<'_>) -> Result<Execution<'r>, Error> {
-        self.pipeline.start(query, Some(&self.statement))
+    pub fn start<'r>(&'r self, global: &'r Global) -> Result<Execution<'r>, Error> {
+        self.pipeline.start(global, Some(&self.statement))
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
@@ -81,7 +80,7 @@ pub struct Lowering<'p, 'c> {
     /// What planning decided of each node.
     planned: &'p Planned,
     /// What steps are made with.
-    allocator: &'p dyn Allocator,
+    allocator: &'p Global,
     /// The pipeline's source, once a node sets it.
     source: Option<DynSource<'c>>,
     /// The steps after it, in order.
@@ -97,7 +96,7 @@ pub struct Lowering<'p, 'c> {
 /// pipeline, and `query_` ones only read what's known.
 impl<'p, 'c> Lowering<'p, 'c> {
     /// What to make steps with.
-    pub fn allocator(&self) -> &'p dyn Allocator {
+    pub fn allocator(&self) -> &'p Global {
         self.allocator
     }
 
@@ -214,7 +213,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
 /// root, with memory from `allocator`. The physical plan takes the plan's
 /// statement.
 pub fn lower<'c>(
-    allocator: &dyn Allocator,
+    allocator: &Global,
     plan: &mut LogicalPlan<'c>,
     planned: &Planned,
 ) -> Result<PhysicalPlan<'c>, LowerError> {
@@ -254,6 +253,7 @@ mod tests {
 
     /// The nodes of `column <comparison> value`.
     fn compared(column: ColumnId, comparison: Comparison, value: i64) -> ExprBuilder {
+        let global = Global::current();
         let op = match comparison {
             Comparison::Equal => ExprOp::Eq,
             Comparison::NotEqual => ExprOp::Ne,
@@ -262,7 +262,7 @@ mod tests {
             Comparison::Greater => ExprOp::Gt,
             Comparison::GreaterEqual => ExprOp::Ge,
         };
-        let mut nodes = ExprBuilder::new(&Heap).unwrap();
+        let mut nodes = ExprBuilder::new(global).unwrap();
         let (column, value) = (nodes.column(column).unwrap(), nodes.int(value).unwrap());
         nodes.node(op, column, value).unwrap();
         nodes
@@ -270,12 +270,13 @@ mod tests {
 
     /// A filter of the expression of `nodes`, added to `plan`'s.
     fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &ExprBuilder) -> DynOp<'c> {
+        let global = Global::current();
         let condition = plan.exprs.add(nodes.nodes()).unwrap();
-        DynOp::new(&Heap, FilterOp::new(&Heap, &plan.exprs, condition).unwrap()).unwrap()
+        DynOp::new(global, FilterOp::new(global, &plan.exprs, condition).unwrap()).unwrap()
     }
 
     use super::*;
-    use crate::allocator::{AllocError, Allocator, Heap};
+    use crate::allocator::AllocError;
     use crate::buffer::Buffer;
     use crate::column::Bounds;
     use crate::column::{ColumnView, DataType, Forms};
@@ -284,11 +285,11 @@ mod tests {
     use crate::error::Error;
     use crate::expression::{ExprBuilder, ExprOp, Exprs};
     use crate::filter::Comparison;
+    use crate::global::Global;
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
     use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{ColumnId, DynOp, FilterOp, NamedColumn, Op, PlanNode, ScanColumn, ScanOp};
-    use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable, Summary};
     use crate::selection::{Kept, Selection};
@@ -296,8 +297,9 @@ mod tests {
 
     /// Plans `plan`, then lowers it.
     fn lower_planned<'c>(plan: &mut LogicalPlan<'c>) -> Result<PhysicalPlan<'c>, LowerError> {
-        let planned = plan_nodes(&Heap, plan)?;
-        lower(&Heap, plan, &planned)
+        let global = Global::current();
+        let planned = plan_nodes(global, plan)?;
+        lower(global, plan, &planned)
     }
 
     /// One batch of two rows: column `a` holds 1 and 2, `b` 10 and 20,
@@ -344,19 +346,20 @@ mod tests {
             (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
+            let global = Global::current();
             if *done {
                 return Ok(false);
             }
             batch.reset(2);
             for &(column, _) in *columns {
-                let mut values = Buffer::allocate(&Heap, 16).unwrap();
+                let mut values = Buffer::allocate(global, 16).unwrap();
                 let first = [1, 10][column as usize];
                 values.as_mut_slice::<i64>().copy_from_slice(&[first, first * 2]);
                 assert!(
                     batch
                         .push_column(
                             ColumnView::new(
-                                &mut Context::new(&Heap),
+                                &mut Context::new(global, None),
                                 DataType::Int64,
                                 values,
                                 None
@@ -373,15 +376,16 @@ mod tests {
 
     #[test]
     fn lowers_a_scan_with_its_output_in_order() {
-        let table = DynScannable::new(&Heap, AB).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, AB).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let b = plan.add_column("b", DataType::Int64, true).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let a_column = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
         let b_column = ScanColumn { column: 1, binding: b, forms: Forms::FLAT };
         assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         plan.add_node(scan, &[]).unwrap();
         assert!(plan.output.push(b).is_ok() && plan.output.push(a).is_ok());
 
@@ -389,8 +393,8 @@ mod tests {
         let names: StdVec<&str> = physical.columns().iter().map(|&c| physical.name(c)).collect();
         assert_eq!(names, ["b", "a"]);
 
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
@@ -443,22 +447,23 @@ mod tests {
 
     /// As `knows`, of `table`.
     fn knows_of(table: Ab, read: &[u32], asks: &[Ask]) -> (StdVec<bool>, usize) {
+        let global = Global::current();
         let (known, sorted_by_b) = (RefCell::new(StdVec::new()), RefCell::new(0));
-        let table = DynScannable::new(&Heap, table).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let table = DynScannable::new(global, table).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
         let bindings = [
             plan.add_column("a", DataType::Int64, true).unwrap(),
             plan.add_column("b", DataType::Int64, true).unwrap(),
         ];
-        let mut columns = SlowVec::fixed(&Heap, read.len()).unwrap();
+        let mut columns = SlowVec::fixed(global, read.len()).unwrap();
         for &column in read {
             let binding = bindings[column as usize];
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let op = Knows { asks, known: &known, sorted_by_b: &sorted_by_b };
-        let op = DynOp::new(&Heap, op).unwrap();
+        let op = DynOp::new(global, op).unwrap();
         plan.add_node(op, &[scan]).unwrap();
         assert!(plan.output.push(bindings[read[0] as usize]).is_ok());
         lower_planned(&mut plan).unwrap();
@@ -499,16 +504,17 @@ mod tests {
         keys: &[(usize, bool)],
         limit: Option<(u64, u64)>,
     ) -> alloc::string::String {
-        let table = DynScannable::new(&Heap, AB).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, AB).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let mut input = plan.add_node(scan, &[]).unwrap();
         if let Some(groups) = groups {
             let binding = plan.add_column("n", DataType::Int64, true).unwrap();
@@ -516,23 +522,23 @@ mod tests {
             let aggregate =
                 crate::aggregate::Aggregate { function, input: None, distinct: false, binding };
             let aggregate = crate::aggregate::AggregateOp {
-                keys: SlowVec::fixed_from(&Heap, groups.iter().map(|&g| bindings[g].id)).unwrap(),
-                aggregates: SlowVec::fixed_from(&Heap, [aggregate].into_iter()).unwrap(),
+                keys: SlowVec::fixed_from(global, groups.iter().map(|&g| bindings[g].id)).unwrap(),
+                aggregates: SlowVec::fixed_from(global, [aggregate].into_iter()).unwrap(),
                 answer: None,
             };
-            let aggregate = DynOp::new(&Heap, aggregate).unwrap();
+            let aggregate = DynOp::new(global, aggregate).unwrap();
             let children = [input];
             input = plan.add_node(aggregate, &children).unwrap();
         }
         let sort_keys =
             keys.iter().map(|&(key, descending)| SortKey { column: bindings[key].id, descending });
         let order_by =
-            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(&Heap, sort_keys).unwrap() };
-        let order_by = DynOp::new(&Heap, order_by).unwrap();
+            crate::order_by::OrderByOp { keys: SlowVec::fixed_from(global, sort_keys).unwrap() };
+        let order_by = DynOp::new(global, order_by).unwrap();
         let children = [input];
         let ordered = plan.add_node(order_by, &children).unwrap();
         if let Some((count, offset)) = limit {
-            let limit = DynOp::new(&Heap, crate::limit::LimitOp { count, offset }).unwrap();
+            let limit = DynOp::new(global, crate::limit::LimitOp { count, offset }).unwrap();
             plan.add_node(limit, &[ordered]).unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
@@ -566,21 +572,22 @@ mod tests {
 
     #[test]
     fn drops_a_sort_a_later_sort_makes_pointless() {
-        let table = DynScannable::new(&Heap, AB).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, AB).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             ids.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let mut node = plan.add_node(scan, &[]).unwrap();
         for (column, descending) in [(1, false), (0, true)] {
             let key = SortKey { column: ids[column].id, descending };
-            let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
-            let order_by = DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap();
+            let keys = SlowVec::fixed_from(global, [key].into_iter()).unwrap();
+            let order_by = DynOp::new(global, crate::order_by::OrderByOp { keys }).unwrap();
             let children = [node];
             node = plan.add_node(order_by, &children).unwrap();
         }
@@ -590,25 +597,26 @@ mod tests {
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
     fn pruned(output: &[usize]) -> (usize, StdVec<i64>) {
-        let table = DynScannable::new(&Heap, AB).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, AB).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         plan.add_node(scan, &[]).unwrap();
         for &i in output {
             assert!(plan.output.push(bindings[i]).is_ok());
         }
-        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        crate::optimize::optimize(global, &mut plan).unwrap();
 
         let physical = lower_planned(&mut plan).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
@@ -663,6 +671,7 @@ mod tests {
             (done, columns): &mut (bool, &[(u32, Forms)]),
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
+            let global = Global::current();
             if *done {
                 return Ok(false);
             }
@@ -670,14 +679,14 @@ mod tests {
             for &(column, _) in *columns {
                 let cells =
                     [[Some(1), Some(2), None, Some(0)], [Some(10), Some(20), Some(30), None]];
-                let mut values = Buffer::allocate(&Heap, 32).unwrap();
-                let mut validity = Buffer::allocate(&Heap, 1).unwrap();
+                let mut values = Buffer::allocate(global, 32).unwrap();
+                let mut validity = Buffer::allocate(global, 1).unwrap();
                 for (row, cell) in cells[column as usize].iter().enumerate() {
                     values.as_mut_slice::<i64>()[row] = cell.unwrap_or(0);
                     validity.as_mut_slice::<u8>()[0] |= u8::from(cell.is_some()) << row;
                 }
                 let column = ColumnView::new(
-                    &mut Context::new(&Heap),
+                    &mut Context::new(global, None),
                     DataType::Int64,
                     values,
                     Some(validity),
@@ -695,16 +704,17 @@ mod tests {
     /// batches have.
     #[test]
     fn filters_and_keeps_the_columns_it_reads() {
-        let table = DynScannable::new(&Heap, Nullable).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, Nullable).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let (a, b) = (bindings[0].id, bindings[1].id);
         let mut nodes = compared(a, Comparison::Greater, 1);
@@ -715,11 +725,11 @@ mod tests {
         let filter = filter(&mut plan, &nodes);
         plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
-        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        crate::optimize::optimize(global, &mut plan).unwrap();
 
         let physical = lower_planned(&mut plan).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);
@@ -768,10 +778,11 @@ mod tests {
 
     #[test]
     fn fails_to_lower_batches_too_wide() {
-        let table = DynScannable::new(&Heap, Wide(70)).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, Wide(70)).unwrap();
         let plan = |output: usize| {
-            let mut plan = LogicalPlan::new(&Heap).unwrap();
-            let mut columns = SlowVec::fixed(&Heap, 70).unwrap();
+            let mut plan = LogicalPlan::new(global).unwrap();
+            let mut columns = SlowVec::fixed(global, 70).unwrap();
             for column in 0..70 {
                 let binding = plan.add_column("c", DataType::Int64, true).unwrap();
                 assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
@@ -779,14 +790,14 @@ mod tests {
                     assert!(plan.output.push(binding).is_ok());
                 }
             }
-            let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+            let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
             plan.add_node(scan, &[]).unwrap();
             plan
         };
         assert_eq!(lower_planned(&mut plan(70)).err(), Some(LowerError::TooManyColumns));
         // Pruned to the two in the output, it fits.
         let mut narrow = plan(2);
-        crate::optimize::optimize(&Heap, &mut narrow).unwrap();
+        crate::optimize::optimize(global, &mut narrow).unwrap();
         assert!(lower_planned(&mut narrow).is_ok());
     }
 
@@ -860,7 +871,7 @@ mod tests {
         /// Notes them, and reads with `open`.
         fn scan_within<'s>(
             &'s self,
-            _: &dyn Allocator,
+            _: &Global,
             _: &[(u32, Forms)],
             conditions: &[Condition],
             cutoff: Option<Cutoff>,
@@ -923,15 +934,16 @@ mod tests {
         filters: &[(usize, Comparison, i64)],
         output: &[usize],
     ) -> (StdVec<StdVec<i64>>, u32, alloc::string::String) {
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 3).unwrap();
+        let global = Global::current();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 3).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b"), (2, "c")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(table, columns)).unwrap();
         let mut node = plan.add_node(scan, &[]).unwrap();
         for &(column, comparison, value) in filters {
             let column = bindings[column].id;
@@ -942,11 +954,11 @@ mod tests {
         for &i in output {
             assert!(plan.output.push(bindings[i]).is_ok());
         }
-        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        crate::optimize::optimize(global, &mut plan).unwrap();
 
         let physical = lower_planned(&mut plan).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         let (mut kept, mut rows) = (StdVec::new(), 0);
         while execution.next(&mut batch).unwrap() {
@@ -966,9 +978,10 @@ mod tests {
 
     #[test]
     fn loads_lazy_columns_where_read_for_the_rows_kept() {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = DynScannable::new(
-            &Heap,
+            global,
             Counted { lazy: true, loads: &loads, conditions: &conditions },
         )
         .unwrap();
@@ -988,9 +1001,10 @@ mod tests {
 
     #[test]
     fn never_loads_columns_nothing_reads() {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = DynScannable::new(
-            &Heap,
+            global,
             Counted { lazy: true, loads: &loads, conditions: &conditions },
         )
         .unwrap();
@@ -1001,9 +1015,10 @@ mod tests {
 
     #[test]
     fn pushes_conditions_down_to_scans() {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = Counted { lazy: false, loads: &loads, conditions: &conditions };
-        let table = DynScannable::new(&Heap, table).unwrap();
+        let table = DynScannable::new(global, table).unwrap();
         let filters =
             [(0, Comparison::Greater, 11), (1, Comparison::Less, 122), (0, Comparison::Less, 21)];
         // The filters still test them.
@@ -1017,9 +1032,10 @@ mod tests {
 
     #[test]
     fn reads_eagerly_from_tables_that_cant_be_lazy() {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = DynScannable::new(
-            &Heap,
+            global,
             Counted { lazy: false, loads: &loads, conditions: &conditions },
         )
         .unwrap();
@@ -1032,29 +1048,30 @@ mod tests {
     /// What `Counted`'s scan is given to skip by, under `stages`, bottom up:
     /// a filter `a > 0`, `ORDER BY b DESC` or a `LIMIT` of their count.
     fn skipped_by(stages: &[Stage]) -> StdVec<SkippedBy> {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = Counted { lazy: false, loads: &loads, conditions: &conditions };
-        let table = DynScannable::new(&Heap, table).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let table = DynScannable::new(global, table).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             ids.push(binding.id);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let mut node = plan.add_node(scan, &[]).unwrap();
         for stage in stages {
             let op = match *stage {
                 Stage::Filter => filter(&mut plan, &compared(ids[0], Comparison::Greater, 0)),
                 Stage::OrderBy => {
                     let key = SortKey { column: ids[1], descending: true };
-                    let keys = SlowVec::fixed_from(&Heap, [key].into_iter()).unwrap();
-                    DynOp::new(&Heap, crate::order_by::OrderByOp { keys }).unwrap()
+                    let keys = SlowVec::fixed_from(global, [key].into_iter()).unwrap();
+                    DynOp::new(global, crate::order_by::OrderByOp { keys }).unwrap()
                 }
                 Stage::Limit(count) => {
-                    DynOp::new(&Heap, crate::limit::LimitOp { count, offset: 0 }).unwrap()
+                    DynOp::new(global, crate::limit::LimitOp { count, offset: 0 }).unwrap()
                 }
             };
             let children = [node];
@@ -1062,7 +1079,7 @@ mod tests {
         }
         let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
         assert!(plan.output.push(a).is_ok());
-        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        crate::optimize::optimize(global, &mut plan).unwrap();
         lower_planned(&mut plan).unwrap();
         drop(plan);
         conditions.borrow().clone()
@@ -1132,12 +1149,13 @@ mod tests {
     /// pipeline's steps and its one row, or none.
     fn summarized(knows: bool) -> (alloc::string::String, StdVec<i64>) {
         use crate::aggregate::{Aggregate, AggregateOp, Function};
-        let table = DynScannable::new(&Heap, Summarized { knows }).unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
+        let global = Global::current();
+        let table = DynScannable::new(global, Summarized { knows }).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
-        let columns = SlowVec::fixed_from(&Heap, columns.into_iter()).unwrap();
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let columns = SlowVec::fixed_from(global, columns.into_iter()).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let mut aggregates = StdVec::new();
         for (function, input) in
@@ -1148,16 +1166,16 @@ mod tests {
             assert!(plan.output.push(binding).is_ok());
         }
         let aggregate = AggregateOp {
-            keys: SlowVec::fixed(&Heap, 0).unwrap(),
-            aggregates: SlowVec::fixed_from(&Heap, aggregates.into_iter()).unwrap(),
+            keys: SlowVec::fixed(global, 0).unwrap(),
+            aggregates: SlowVec::fixed_from(global, aggregates.into_iter()).unwrap(),
             answer: None,
         };
-        let aggregate = DynOp::new(&Heap, aggregate).unwrap();
+        let aggregate = DynOp::new(global, aggregate).unwrap();
         plan.add_node(aggregate, &[scan]).unwrap();
-        crate::optimize::optimize(&Heap, &mut plan).unwrap();
+        crate::optimize::optimize(global, &mut plan).unwrap();
         let physical = lower_planned(&mut plan).unwrap();
-        let query = QueryAllocators::new(&Heap);
-        let mut execution = physical.start(&query).unwrap();
+        let query = Global::current();
+        let mut execution = physical.start(query).unwrap();
         let mut batch = RowBatch::new();
         let mut row = StdVec::new();
         if execution.next(&mut batch).unwrap() {
@@ -1204,30 +1222,31 @@ mod tests {
     /// `Counted`, a filter on `a`, and ops reading `b`, each in its forms of
     /// `accepts`, in turn.
     fn nodes_with(accepts: &[Forms]) -> usize {
+        let global = Global::current();
         let (loads, conditions) = (RefCell::new(StdVec::new()), RefCell::new(StdVec::new()));
         let table = DynScannable::new(
-            &Heap,
+            global,
             Counted { lazy: true, loads: &loads, conditions: &conditions },
         )
         .unwrap();
-        let mut plan = LogicalPlan::new(&Heap).unwrap();
-        let mut columns = SlowVec::fixed(&Heap, 2).unwrap();
+        let mut plan = LogicalPlan::new(global).unwrap();
+        let mut columns = SlowVec::fixed(global, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
             assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
             bindings.push(binding);
         }
-        let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
+        let scan = DynOp::new(global, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let filter = filter(&mut plan, &compared(bindings[0].id, Comparison::Greater, 0));
         let mut below = plan.add_node(filter, &[scan]).unwrap();
         for &accepts in accepts {
-            let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();
+            let reads = DynOp::new(global, Reads { column: bindings[1].id, accepts }).unwrap();
             let children = [below];
             below = plan.add_node(reads, &children).unwrap();
         }
-        choose_forms(&Heap, &mut plan).unwrap();
+        choose_forms(global, &mut plan).unwrap();
         plan.nodes.len()
     }
 

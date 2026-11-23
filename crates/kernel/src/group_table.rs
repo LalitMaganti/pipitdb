@@ -3,7 +3,7 @@
 //! run's `StringPool`.
 
 use crate::aggregate_function::{gathered, is_valid};
-use crate::allocator::{AllocError, Allocator};
+use crate::allocator::AllocError;
 use crate::array::Array;
 use crate::blocks::{Blocks, address};
 use crate::buffer::Buffer;
@@ -11,6 +11,7 @@ use crate::column::{ColumnView, DataType, Form};
 use crate::context::Context;
 use crate::error::Error;
 use crate::flat_hash_map::prefetch;
+use crate::global::Global;
 use crate::murmur_hash::mix;
 use crate::row_batch::BATCH_ROWS_MAX;
 use crate::slow_vec::SlowVec;
@@ -100,7 +101,7 @@ impl GroupTable {
     /// `nullable_keys` possibly null, with `payload_words` zeroed words after
     /// each group's keys for the caller to store per-group data.
     pub(crate) fn new(
-        allocator: &dyn Allocator,
+        allocator: &Global,
         keys: usize,
         string_keys: u64,
         nullable_keys: u64,
@@ -421,7 +422,7 @@ impl GroupTable {
 
     /// Doubles the slots until at most two thirds are used by `groups`
     /// groups, and puts each group back in its slot.
-    fn grow(&mut self, allocator: &dyn Allocator, groups: usize) -> Result<(), Error> {
+    fn grow(&mut self, allocator: &Global, groups: usize) -> Result<(), Error> {
         self.records.reserve(allocator, groups.min(GROUPS_MAX))?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
