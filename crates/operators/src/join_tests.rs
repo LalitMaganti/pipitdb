@@ -11,7 +11,7 @@ use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::filter::{Comparison, Value};
+use pipit_kernel::expression::{Expr, ExprOp, ExprStep};
 use pipit_kernel::join::JoinOp;
 use pipit_kernel::lower::lower;
 use pipit_kernel::optimize::optimize;
@@ -19,11 +19,30 @@ use pipit_kernel::output_properties::plan_nodes;
 use pipit_kernel::plan::{
     DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp,
 };
-use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::query_allocators::QueryAllocators;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::DynScannable;
 use pipit_kernel::slow_vec::SlowVec;
+
+/// A node of `op` reading `a` and `b`, or of value `value`.
+fn node(op: ExprOp, a: u32, b: u32, value: i64) -> ExprStep {
+    let data_type = DataType::Int64;
+    ExprStep { op, data_type, a, b, c: 0, int_value: value, double_value: 0.0 }
+}
+
+/// Adds the nodes of `column > value`, and returns its root.
+fn greater(nodes: &mut Vec<ExprStep>, column: u32, value: i64) -> u32 {
+    nodes.push(node(ExprOp::Column, column, 0, 0));
+    nodes.push(node(ExprOp::Constant, 0, 0, value));
+    let at = u32::try_from(nodes.len()).unwrap();
+    nodes.push(node(ExprOp::Gt, at - 2, at - 1, 0));
+    at
+}
+
+/// The expression of `nodes`.
+fn expr(nodes: Vec<ExprStep>) -> Expr {
+    Expr { nodes: SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap(), values: None }
+}
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
     let mut buffer = Buffer::allocate(&Heap, values.len() * 8).unwrap();
@@ -103,11 +122,9 @@ fn join(
     let mut plan = LogicalPlan::new(&Heap).unwrap();
     let (mut probe, probe_columns) = scan(&mut plan, slice, &["utid", "dur"]);
     if let Some(value) = above {
-        let comparison = Comparison::Greater;
-        let leaf =
-            Leaf::Compare { column: probe_columns[1].id, comparison, value: Value::Int64(value) };
-        let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-        let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
+        let mut nodes = Vec::new();
+        greater(&mut nodes, probe_columns[1].id, value);
+        let filter = DynOp::new(&Heap, FilterOp { condition: expr(nodes) }).unwrap();
         let children = [probe];
         probe = plan.add_node(filter, &children).unwrap();
     }
@@ -178,17 +195,13 @@ fn filtered_above(
     let op = JoinOp { probe_key: utid.id, build_key: id.id, build_columns: joined };
     let children = [probe, build];
     let join = plan.add_node(DynOp::new(&Heap, op).unwrap(), &children).unwrap();
-    let greater = |column: u32, value| {
-        Node::Leaf(Leaf::Compare {
-            column,
-            comparison: Comparison::Greater,
-            value: Value::Int64(value),
-        })
-    };
-    let nodes = [greater(dur.id, durs), greater(tid.id, tids), Node::And(0, 1)];
-    let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
+    let mut nodes = Vec::new();
+    let a = greater(&mut nodes, dur.id, durs);
+    let b = greater(&mut nodes, tid.id, tids);
+    nodes.push(node(ExprOp::And, a, b, 0));
+    let condition = expr(nodes);
     let children = [join];
-    plan.add_node(DynOp::new(&Heap, FilterOp { predicate }).unwrap(), &children).unwrap();
+    plan.add_node(DynOp::new(&Heap, FilterOp { condition }).unwrap(), &children).unwrap();
     plan.output.push(dur).unwrap();
     plan.output.push(tid).unwrap();
     optimize(&Heap, &mut plan).unwrap();

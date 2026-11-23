@@ -230,6 +230,31 @@ mod tests {
     use alloc::vec::Vec as StdVec;
     use core::cell::RefCell;
 
+    /// A node of `op` reading `a` and `b`, or of value `value`.
+    fn step(op: ExprOp, a: u32, b: u32, value: i64) -> ExprStep {
+        let data_type = DataType::Int64;
+        ExprStep { op, data_type, a, b, c: 0, int_value: value, double_value: 0.0 }
+    }
+
+    /// The nodes of `column <comparison> value`.
+    fn compared(column: ColumnId, comparison: Comparison, value: i64) -> StdVec<ExprStep> {
+        let op = match comparison {
+            Comparison::Equal => ExprOp::Eq,
+            Comparison::NotEqual => ExprOp::Ne,
+            Comparison::Less => ExprOp::Lt,
+            Comparison::LessEqual => ExprOp::Le,
+            Comparison::Greater => ExprOp::Gt,
+            Comparison::GreaterEqual => ExprOp::Ge,
+        };
+        let constant = step(ExprOp::Constant, 0, 0, value);
+        StdVec::from([step(ExprOp::Column, column, 0, 0), constant, step(op, 0, 1, 0)])
+    }
+
+    /// An expression of `nodes`.
+    fn expr(nodes: &[ExprStep]) -> Expr {
+        Expr { nodes: SlowVec::fixed_from(&Heap, nodes.iter().copied()).unwrap(), values: None }
+    }
+
     use super::*;
     use crate::allocator::{AllocError, Allocator, Heap};
     use crate::buffer::Buffer;
@@ -238,12 +263,12 @@ mod tests {
     use crate::condition::{Condition, Cutoff};
     use crate::context::Context;
     use crate::error::Error;
-    use crate::filter::{Comparison, Value};
+    use crate::expression::{Expr, ExprOp, ExprStep};
+    use crate::filter::Comparison;
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
     use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{ColumnId, DynOp, FilterOp, NamedColumn, Op, PlanNode, ScanColumn, ScanOp};
-    use crate::predicate::{Leaf, Node, Predicate};
     use crate::query_allocators::QueryAllocators;
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable, Summary};
@@ -663,11 +688,10 @@ mod tests {
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
         let (a, b) = (bindings[0].id, bindings[1].id);
-        let greater =
-            Leaf::Compare { column: a, comparison: Comparison::Greater, value: Value::Int64(1) };
-        let nodes = [Node::Leaf(greater), Node::Leaf(Leaf::IsNull { column: b }), Node::Or(0, 1)];
-        let predicate = Predicate::new(SlowVec::fixed_from(&Heap, nodes.into_iter()).unwrap());
-        let filter = DynOp::new(&Heap, FilterOp { predicate }).unwrap();
+        let mut nodes = compared(a, Comparison::Greater, 1);
+        nodes.extend([step(ExprOp::Column, b, 0, 0), step(ExprOp::IsNull, 3, 0, 0)]);
+        nodes.push(step(ExprOp::Or, 2, 4, 0));
+        let filter = DynOp::new(&Heap, FilterOp { condition: expr(&nodes) }).unwrap();
         plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());
         crate::optimize::optimize(&Heap, &mut plan).unwrap();
@@ -890,9 +914,8 @@ mod tests {
         let mut node = plan.add_node(scan, &[]).unwrap();
         for &(column, comparison, value) in filters {
             let column = bindings[column].id;
-            let leaf = Leaf::Compare { column, comparison, value: Value::Int64(value) };
-            let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-            let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
+            let condition = expr(&compared(column, comparison, value));
+            let filter = DynOp::new(&Heap, FilterOp { condition }).unwrap();
             let children = [node];
             node = plan.add_node(filter, &children).unwrap();
         }
@@ -1005,13 +1028,8 @@ mod tests {
         for stage in stages {
             let op = match *stage {
                 Stage::Filter => {
-                    let leaf = Leaf::Compare {
-                        column: ids[0],
-                        comparison: Comparison::Greater,
-                        value: Value::Int64(0),
-                    };
-                    let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-                    DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap()
+                    let condition = expr(&compared(ids[0], Comparison::Greater, 0));
+                    DynOp::new(&Heap, FilterOp { condition }).unwrap()
                 }
                 Stage::OrderBy => {
                     let key = SortKey { column: ids[1], descending: true };
@@ -1185,13 +1203,8 @@ mod tests {
         }
         let scan = DynOp::new(&Heap, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
-        let leaf = Leaf::Compare {
-            column: bindings[0].id,
-            comparison: Comparison::Greater,
-            value: Value::Int64(0),
-        };
-        let nodes = SlowVec::fixed_from(&Heap, [Node::Leaf(leaf)].into_iter()).unwrap();
-        let filter = DynOp::new(&Heap, FilterOp { predicate: Predicate::new(nodes) }).unwrap();
+        let condition = expr(&compared(bindings[0].id, Comparison::Greater, 0));
+        let filter = DynOp::new(&Heap, FilterOp { condition }).unwrap();
         let mut below = plan.add_node(filter, &[scan]).unwrap();
         for &accepts in accepts {
             let reads = DynOp::new(&Heap, Reads { column: bindings[1].id, accepts }).unwrap();

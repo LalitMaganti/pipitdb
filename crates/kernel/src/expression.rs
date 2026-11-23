@@ -1277,6 +1277,173 @@ pub fn check_expr_type(
     Ok(typer.run(expr)?.unwrap_or(DataType::Int64))
 }
 
+impl ExprStep {
+    /// The nodes this reads, as `a`, `b` and `c` say by its op: the first
+    /// of a run, and how many, or one.
+    pub(crate) fn operands(&self) -> [(u32, u32); 2] {
+        let one = |node| (node, 1);
+        let none = (0, 0);
+        match self.op {
+            ExprOp::Column | ExprOp::Constant | ExprOp::Null => [none, none],
+            ExprOp::ToDouble
+            | ExprOp::Like
+            | ExprOp::IsNull
+            | ExprOp::IsNotNull
+            | ExprOp::Not
+            | ExprOp::In
+            | ExprOp::Argument => [one(self.a), none],
+            ExprOp::When if self.a == PRESENT => [one(self.b), none],
+            ExprOp::Add
+            | ExprOp::Sub
+            | ExprOp::Mul
+            | ExprOp::Div
+            | ExprOp::Mod
+            | ExprOp::Eq
+            | ExprOp::Ne
+            | ExprOp::Lt
+            | ExprOp::Le
+            | ExprOp::Gt
+            | ExprOp::Ge
+            | ExprOp::And
+            | ExprOp::Or
+            | ExprOp::When => [one(self.a), one(self.b)],
+            ExprOp::Case => [(self.a, self.b), one(self.c)],
+            ExprOp::Call => [(self.a, self.b), none],
+        }
+    }
+
+    /// This, reading `renumber(n)` wherever it reads node `n`: a run's
+    /// first, whose nodes stay together.
+    fn renumbered(mut self, renumber: impl Fn(u32) -> u32) -> ExprStep {
+        match self.op {
+            ExprOp::Column | ExprOp::Constant | ExprOp::Null => {}
+            ExprOp::When if self.a == PRESENT => self.b = renumber(self.b),
+            ExprOp::Case => (self.a, self.c) = (renumber(self.a), renumber(self.c)),
+            _ => {
+                let [_, (second, count)] = self.operands();
+                self.a = renumber(self.a);
+                if count != 0 {
+                    self.b = renumber(second);
+                }
+            }
+        }
+        self
+    }
+}
+
+/// Gives nodes of an expression, each to the function it's given.
+type Roots<'a> = dyn Fn(&mut dyn FnMut(u32)) + 'a;
+
+impl Expr {
+    /// Node `node`'s top-level conjuncts, the parts of its `AND`s: each
+    /// passed to `each`.
+    pub fn conjuncts(&self, node: u32, each: &mut dyn FnMut(u32)) {
+        let step = at!(self.nodes, node as usize);
+        if step.op == ExprOp::And {
+            self.conjuncts(step.a, each);
+            self.conjuncts(step.b, each);
+        } else {
+            each(node);
+        }
+    }
+
+    /// Its root.
+    pub fn root(&self) -> u32 {
+        check!(!self.nodes.is_empty());
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let root = self.nodes.len() as u32 - 1;
+        root
+    }
+
+    /// Passes each column node `node` reads to `each`, maybe more than once.
+    pub fn columns_of(&self, node: u32, each: &mut dyn FnMut(ColumnId)) {
+        let step = at!(self.nodes, node as usize);
+        if step.op == ExprOp::Column {
+            return each(step.a);
+        }
+        for (first, count) in step.operands() {
+            for operand in first..first + count {
+                self.columns_of(operand, each);
+            }
+        }
+    }
+
+    /// Its top-level conjuncts that `keep` is true for, joined by `AND`, or
+    /// `None` if there are none. It shares this one's `IN` lists.
+    pub fn conjuncts_where(
+        &self,
+        allocator: &dyn Allocator,
+        keep: &dyn Fn(u32) -> bool,
+    ) -> Result<Option<Expr>, AllocError> {
+        let mut any = false;
+        self.conjuncts(self.root(), &mut |node| any |= keep(node));
+        if !any {
+            return Ok(None);
+        }
+        let roots = |each: &mut dyn FnMut(u32)| {
+            self.conjuncts(self.root(), &mut |node| {
+                if keep(node) {
+                    each(node);
+                }
+            });
+        };
+        Ok(Some(self.copied(allocator, &roots)?))
+    }
+
+    /// Node `node` and what it reads, as an expression of its own.
+    pub fn subtree(&self, allocator: &dyn Allocator, node: u32) -> Result<Expr, AllocError> {
+        self.copied(allocator, &|each| each(node))
+    }
+
+    /// The nodes `roots` gives and what they read, joined by `AND`.
+    fn copied(&self, allocator: &dyn Allocator, roots: &Roots<'_>) -> Result<Expr, AllocError> {
+        // The nodes the roots read: marked from the last back, as a node's
+        // operands come before it, then copied in order, so runs stay runs.
+        let mut kept = [false; EXPR_NODES_MAX];
+        let mut count = 0;
+        roots(&mut |root| {
+            *at_mut!(kept, root as usize) = true;
+            count += 1;
+        });
+        for (i, step) in self.nodes.iter().enumerate().rev() {
+            if *at!(kept, i) {
+                for (start, len) in step.operands() {
+                    at_mut!(kept, start as usize..(start + len) as usize).fill(true);
+                }
+            }
+        }
+        let marked = kept.iter().filter(|&&marked| marked).count();
+        let mut nodes = SlowVec::fixed(allocator, marked + count - 1)?;
+        // Each copied node's place among the copies: fewer than 256.
+        let mut at = [0_u8; EXPR_NODES_MAX];
+        for (i, step) in self.nodes.iter().enumerate() {
+            if *at!(kept, i) {
+                #[expect(clippy::cast_possible_truncation, reason = "below `EXPR_NODES_MAX`")]
+                let copied = nodes.len() as u8;
+                *at_mut!(at, i) = copied;
+                nodes.push(step.renumbered(|node| u32::from(*at!(at, node as usize))))?;
+            }
+        }
+        let mut root = None;
+        roots(&mut |next| {
+            let next = u32::from(*at!(at, next as usize));
+            root = Some(match root {
+                None => next,
+                Some(root) => {
+                    #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+                    let and = nodes.len() as u32;
+                    // Room was made for each `AND`.
+                    let joined = step(ExprOp::And, DataType::Int64, root, next);
+                    let Ok(()) = nodes.push(joined) else { failed!() };
+                    and
+                }
+            });
+        });
+        check!(root.is_some_and(|root| root as usize == nodes.len() - 1));
+        Ok(Expr { nodes, values: self.values.clone() })
+    }
+}
+
 /// Marks the columns `expr` reads.
 pub fn mark_expr_columns(expr: &Expr, needed: &mut Needed) {
     for node in expr.nodes.iter().filter(|node| node.op == ExprOp::Column) {
