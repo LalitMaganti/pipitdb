@@ -339,3 +339,19 @@ fn filters_above_a_left_join() {
         assert_eq!(rows, expected(&probe_keys, &build_keys, JoinKind::Left, On::Equal, above));
     }
 }
+
+#[test]
+fn finds_no_build_row_for_a_null_among_ids() {
+    // The build side's keys are its rows' numbers but for a null, so a key
+    // finds its row by its value, but the null row is no key's.
+    let ids: Vec<Option<i64>> = (0..40).map(|i| (i != 5).then_some(i)).collect();
+    let probe_keys: Vec<Option<i64>> = (0..50).map(Some).collect();
+    let (probe, build) = (table(&probe_keys), table(&ids));
+    for kind in KINDS {
+        assert_eq!(
+            join(&probe, &build, kind, On::Equal, Above::Nothing).0,
+            expected(&probe_keys, &ids, kind, On::Equal, Above::Nothing),
+            "{kind:?}"
+        );
+    }
+}

@@ -478,7 +478,11 @@ struct Direct {
 impl Direct {
     /// For the build rows of `table`'s groups, of one integer key each,
     /// if their keys are close enough.
-    fn of(allocator: &dyn Allocator, table: &GroupTable) -> Result<Option<Direct>, AllocError> {
+    fn of(
+        allocator: &dyn Allocator,
+        table: &GroupTable,
+        count: u32,
+    ) -> Result<Option<Direct>, AllocError> {
         #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
         let groups = table.len() as u32;
         let keys = (0..groups).map(|group| table.key(group, 0));
@@ -488,7 +492,10 @@ impl Direct {
             return Ok(None);
         }
         let above = |group| table.key(group, 0).wrapping_sub(min).cast_unsigned();
-        if (0..groups).all(|group| u64::from(last_of(table, group)) == above(group)) {
+        // Each build row its key's number above the first: none is a null
+        // key's, which has no group.
+        let each = (0..groups).all(|group| u64::from(last_of(table, group)) == above(group));
+        if groups == count && each {
             return Ok(Some(Direct { min, span, rows: SlowVec::fixed(allocator, 0)? }));
         }
         #[expect(clippy::cast_possible_truncation, reason = "below `DIRECT_SPAN_MAX`")]
@@ -686,7 +693,7 @@ impl Join<'_> {
             held.direct = Some(Direct { min, span, rows: SlowVec::fixed(context.allocator(), 0)? });
             held.table = None;
         } else if let (true, false, Some(table)) = (self.one_integer(), held.repeats, &held.table) {
-            held.direct = Direct::of(context.allocator(), table)?;
+            held.direct = Direct::of(context.allocator(), table, held.count)?;
             if held.direct.is_some() {
                 held.table = None;
             }
