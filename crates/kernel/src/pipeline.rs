@@ -20,6 +20,7 @@ use core::alloc::Layout;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::allocator::AllocError;
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
@@ -28,10 +29,12 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
+use crate::plan::PLAN_NODES_MAX;
 use crate::row_batch::RowBatch;
 use crate::statement::Statement;
 use crate::step::{
-    DynSink, DynSource, ErasedBatch, Progress, Sink, SourceNext, Step, StepFunctions,
+    Breaker, DynSink, DynSource, ErasedBatch, Progress, Sink, Source, SourceNext, Step,
+    StepFunctions,
 };
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
@@ -56,16 +59,18 @@ impl<'a> Pipeline<'a> {
         env: &'r Env,
         statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
-        self.start_with_sinks(env, statement, &[])
+        let mut context = Context::new(env, statement);
+        let run = Run::new(self, &mut context)?;
+        Ok(Execution { run, context })
     }
 
     /// As `start`, of a plan whose pipelines that end in sinks are `sinks`,
     /// which its steps read by their ids.
-    pub(crate) fn start_with_sinks<'r>(
+    pub fn start_with_sinks<'r>(
         &'r self,
         env: &'r Env,
         statement: Option<&'r Statement>,
-        sinks: &'r [SinkPipeline<'r>],
+        sinks: &'r Sinks<'r>,
     ) -> Result<Execution<'r>, Error> {
         let mut context = Context::with_sinks(env, statement, sinks);
         let run = Run::new(self, &mut context)?;
@@ -106,14 +111,67 @@ impl<'a> Pipeline<'a> {
 
 /// A pipeline that ends in a sink: what a step reads whole, such as a
 /// join's build side.
-pub struct SinkPipeline<'a> {
+pub(crate) struct SinkPipeline<'a> {
     pub(crate) pipeline: Pipeline<'a>,
     pub(crate) sink: DynSink<'a>,
 }
 
-/// The id of a plan's sink of type `T`, from `Lowering::add_sink`: so the
-/// state `with_built` gives for it is a `T`'s.
-pub struct SinkId<T>(u32, PhantomData<fn() -> T>);
+/// A plan's pipelines that end in sinks, which the steps of its other
+/// pipelines read by id, with `with_built`.
+pub struct Sinks<'a> {
+    pipelines: SmallVec<SinkPipeline<'a>>,
+    /// A number no other list has, which its ids carry, so an id is only
+    /// read in a run of its own list's plan.
+    list: u32,
+}
+
+/// The next list's number. 0 is no list's: a run without sinks has it.
+static LISTS: AtomicU32 = AtomicU32::new(1);
+
+impl<'a> Sinks<'a> {
+    pub fn new(env: &Env) -> Result<Sinks<'a>, AllocError> {
+        let pipelines = SmallVec::new(env, PLAN_NODES_MAX)?;
+        Ok(Sinks { pipelines, list: LISTS.fetch_add(1, Ordering::Relaxed) })
+    }
+
+    /// Ends `pipeline` in `sink`, and returns its id.
+    pub fn add<T: Sink + 'a>(
+        &mut self,
+        env: &Env,
+        pipeline: Pipeline<'a>,
+        sink: T,
+    ) -> Result<SinkId<T>, AllocError> {
+        let index = self.add_dyn(SinkPipeline { pipeline, sink: DynSink::new(env, sink)? })?;
+        Ok(SinkId { index, list: self.list, sink: PhantomData })
+    }
+
+    /// As `add`, of any type, returning where it is.
+    fn add_dyn(&mut self, pipeline: SinkPipeline<'a>) -> Result<u32, AllocError> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
+        let index = self.pipelines.len() as u32;
+        self.pipelines.push(pipeline)?;
+        Ok(index)
+    }
+
+    pub(crate) fn get(&self, index: u32) -> &SinkPipeline<'a> {
+        at!(self.pipelines, index as usize)
+    }
+
+    pub(crate) fn list(&self) -> u32 {
+        self.list
+    }
+}
+
+/// The id of a sink of type `T` in a list of `Sinks`, which makes it: so
+/// the state `with_built` gives for it is a `T`'s.
+pub struct SinkId<T> {
+    /// Where it is in its list.
+    index: u32,
+    /// Its list's number.
+    list: u32,
+    /// Its type.
+    sink: PhantomData<fn() -> T>,
+}
 
 impl<T> Clone for SinkId<T> {
     fn clone(&self) -> SinkId<T> {
@@ -123,27 +181,103 @@ impl<T> Clone for SinkId<T> {
 
 impl<T> Copy for SinkId<T> {}
 
-impl<T> SinkId<T> {
-    /// The id of sink `id`, which must be a `T`.
-    pub(crate) fn new(id: u32) -> SinkId<T> {
-        SinkId(id, PhantomData)
-    }
+/// The source that serves what `breaker` builds: the first of the pipeline
+/// after it.
+pub fn served<'a, B: Breaker + 'a>(
+    env: &Env,
+    breaker: SinkId<B>,
+) -> Result<DynSource<'a>, AllocError> {
+    let (index, list) = (breaker.index, breaker.list);
+    DynSource::new(env, Served { index, list, serve: serve::<B> })
 }
 
-/// Calls `f` with sink `id`'s state, finalized, as `built` gives it.
+/// Serves the next rows of what breaker `B`, at `breaker`, built, at
+/// `state`, as `Breaker::serve`.
+///
+/// # Safety
+///
+/// `breaker` must be a `B`, and `state` its state, finalized.
+unsafe fn serve<B: Breaker>(
+    breaker: NonNull<()>,
+    context: &mut Context,
+    state: NonNull<u8>,
+    output: &mut RowBatch,
+) -> Result<bool, Error> {
+    // SAFETY: upheld by the caller.
+    let (breaker, state) = unsafe { (value_of::<B>(breaker), state_of::<Option<B::State>>(state)) };
+    let Some(state) = state else { failed!() };
+    breaker.serve(context, state, output)
+}
+
+/// Calls `f` with sink `id`, and its state, finalized, as `built` gives it.
 /// Only the step `id` was made for reads it, so it changes it alone.
 pub(crate) fn with_built<T: Sink, R>(
     context: &mut Context,
     id: SinkId<T>,
-    f: impl FnOnce(&mut Context, &mut T::State) -> R,
+    f: impl FnOnce(&mut Context, &T, &mut T::State) -> R,
 ) -> Result<R, Error> {
-    let state = built(context, id.0)?;
+    let (sink, state) = built_in(context, id.index, id.list)?;
     // SAFETY: sink `id` is a `T`, as only `Lowering::add_sink` makes ids,
-    // so its state is a `T::State`. It's in memory of its own, apart from
-    // the context's, and the one step that reads it isn't running `f`
-    // already.
-    let state = unsafe { state.cast::<T::State>().as_mut() };
-    Ok(f(context, state))
+    // so its state is a `T::State`. The plan holds the sink while the run
+    // lasts. The state is in memory of its own, apart from the context's,
+    // and the one step that reads it isn't running `f` already.
+    let (sink, state) = unsafe { (sink.cast::<T>().as_ref(), state.cast::<T::State>().as_mut()) };
+    Ok(f(context, sink, state))
+}
+
+/// The source of a pipeline after a breaker, which serves what the breaker
+/// built of the pipeline before. One type for every breaker's, which only
+/// its `serve` knows.
+struct Served {
+    /// Where the breaker, the sink of the pipeline before, is in its list.
+    index: u32,
+    /// Its list's number.
+    list: u32,
+    /// The breaker's `serve`.
+    serve: Serve,
+}
+
+/// A breaker's `serve`, given it and its state.
+type Serve =
+    unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
+
+impl Source for Served {
+    /// Whether the breaker has served all it holds.
+    type State = bool;
+
+    fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
+        Ok(false)
+    }
+
+    fn next(
+        &self,
+        context: &mut Context,
+        done: &mut bool,
+        batch: &mut RowBatch,
+    ) -> Result<bool, Error> {
+        if *done {
+            return Ok(false);
+        }
+        batch.reset(0);
+        let (breaker, state) = built_in(context, self.index, self.list)?;
+        // SAFETY: `served` made this source for its breaker, of its type,
+        // which `built_in` checked is the run's.
+        let more = unsafe { (self.serve)(breaker, context, state, batch)? };
+        *done = !more;
+        Ok(true)
+    }
+}
+
+/// Sink `index` of list `list`, which must be the run's, and its state,
+/// finalized, as `built` gives it.
+fn built_in(
+    context: &mut Context,
+    index: u32,
+    list: u32,
+) -> Result<(NonNull<()>, NonNull<u8>), Error> {
+    check!(list == context.sinks_list());
+    let state = built(context, index)?;
+    Ok((context.sink_pipeline(index).sink.step(), state))
 }
 
 /// Sink `id`'s state, finalized: built by running its pipeline to its end
@@ -174,6 +308,35 @@ pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error
     let built = state.as_ptr();
     context.keep_built(id, state)?;
     Ok(built)
+}
+
+/// `after`, run after `breaker` of `input`'s rows, as a plan runs them:
+/// `input` ends in it, and `after` starts with the source that serves it.
+/// Returns the sinks the second reads, and it.
+#[cfg(test)]
+pub(crate) fn after_breaker<'a, B: Breaker + 'a>(
+    input: Pipeline<'a>,
+    breaker: B,
+    after: impl IntoIterator<Item = Step<'a>, IntoIter: ExactSizeIterator>,
+) -> (Sinks<'a>, Pipeline<'a>) {
+    let env = Env::current();
+    let mut sinks = Sinks::new(env).unwrap();
+    let breaker = sinks.add(env, input, breaker).unwrap();
+    let steps = SmallVec::fixed_from(env, after.into_iter()).unwrap();
+    (sinks, Pipeline::new(served(env, breaker).unwrap(), steps))
+}
+
+#[cfg(test)]
+impl Sinks<'_> {
+    /// Each pipeline, then the sink it ends in, as `Pipeline::describe`
+    /// does, and `then` after: such as `Scan | Sort / Served`.
+    pub(crate) fn describe(&self, then: &Pipeline) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        for SinkPipeline { pipeline, sink } in self.pipelines.iter() {
+            out = out + &pipeline.describe() + " | " + sink.name + " / ";
+        }
+        out + &then.describe()
+    }
 }
 
 #[cfg(test)]
@@ -1016,7 +1179,7 @@ mod tests {
             input: &RowBatch,
             output: &mut RowBatch,
         ) -> Result<Progress, Error> {
-            let total = with_built(context, self.total, |_, total| *total)?;
+            let total = with_built(context, self.total, |_, _, total| *total)?;
             output.copy_from(input);
             let column = int64s(&alloc::vec![total; input.row_count() as usize]);
             assert!(output.push_column(column).is_ok());
@@ -1128,20 +1291,23 @@ mod tests {
 
     #[test]
     fn breakers_output_once_their_input_ends() {
-        let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
-        assert_eq!(pipeline.describe(), "Numbers | Backwards");
+        let input = pipeline(Numbers { batches: 3 }, []);
+        let (sinks, pipeline) = after_breaker(input, Backwards, []);
+        assert_eq!(pipeline.describe(), "Served");
         let query = Env::current();
         assert_eq!(
-            batches(&mut pipeline.start(query, None).unwrap()),
+            batches(&mut pipeline.start_with_sinks(query, None, &sinks).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
     }
 
     #[test]
-    fn steps_after_an_operator_see_only_batches_with_rows() {
-        let pipeline = pipeline(Numbers { batches: 3 }, [operator(Backwards), transform(SkipOdd)]);
+    fn steps_after_a_source_see_only_batches_with_rows() {
+        let input = pipeline(Numbers { batches: 3 }, []);
+        let (sinks, pipeline) = after_breaker(input, Backwards, [transform(SkipOdd)]);
         let query = Env::current();
-        assert_eq!(batches(&mut pipeline.start(query, None).unwrap()), [[[5], [4]], [[1], [0]]]);
+        let mut execution = pipeline.start_with_sinks(query, None, &sinks).unwrap();
+        assert_eq!(batches(&mut execution), [[[5], [4]], [[1], [0]]]);
     }
 
     #[test]
@@ -1251,11 +1417,6 @@ mod tests {
         let query = Env::current();
         let expected = batches(&mut flat.start(query, None).unwrap());
         assert_eq!(batches(&mut split.start(query, None).unwrap()), expected);
-
-        // A breaker within it outputs once its input ends.
-        let backwards = pipeline(Numbers { batches: 3 }, [operator(Backwards)]);
-        let summed = nested(backwards, [operator(Sum)]);
-        assert_eq!(batches(&mut summed.start(query, None).unwrap()), [[[15]]]);
     }
 
     #[test]
@@ -1286,9 +1447,8 @@ mod tests {
     fn builds_a_sink_once_when_first_read() {
         let (env, builds) = (Env::current(), Cell::new(0));
         let built = pipeline(Numbers { batches: 2 }, []);
-        let sink = DynSink::new(env, Total { builds: &builds }).unwrap();
-        let sinks = [SinkPipeline { pipeline: built, sink }];
-        let total = SinkId::new(0);
+        let mut sinks = Sinks::new(env).unwrap();
+        let total = sinks.add(env, built, Total { builds: &builds }).unwrap();
         let reads = pipeline(Numbers { batches: 2 }, [operator(WithTotal { total })]);
         let mut execution = reads.start_with_sinks(env, None, &sinks).unwrap();
         // 0 + 1 + 2 + 3, built once for both batches.

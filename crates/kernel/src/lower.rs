@@ -11,14 +11,12 @@ use crate::expression::Exprs;
 use crate::names::{Name, Names};
 use crate::optimize::optimize;
 use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
-use crate::pipeline::{Execution, Pipeline, SinkId, SinkPipeline};
-use crate::plan::{
-    ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PLAN_NODES_MAX, PlanNode, PlanNodeId, SortKey,
-};
+use crate::pipeline::{Execution, Pipeline, SinkId, Sinks, served};
+use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
 use crate::settings::build_setting;
 use crate::sort::sort;
 use crate::statement::Statement;
-use crate::step::{DynSink, DynSource, Sink, Step};
+use crate::step::{Breaker, DynSource, Sink, Step};
 use crate::top_k::top_k;
 
 /// Why a plan couldn't be planned or lowered.
@@ -59,7 +57,7 @@ pub struct OutputColumn {
 pub struct PhysicalPlan<'c> {
     pipeline: Pipeline<'c>,
     /// The pipelines that end in sinks, which its steps read by id.
-    sinks: SmallVec<SinkPipeline<'c>>,
+    sinks: Sinks<'c>,
     names: Names,
     columns: SmallVec<OutputColumn>,
     statement: Statement,
@@ -79,6 +77,12 @@ impl<'c> PhysicalPlan<'c> {
 
     pub fn pipeline(&self) -> &Pipeline<'c> {
         &self.pipeline
+    }
+
+    /// Its pipelines' steps, as `Sinks::describe` prints them.
+    #[cfg(test)]
+    pub(crate) fn describe(&self) -> alloc::string::String {
+        self.sinks.describe(&self.pipeline)
     }
 
     /// Starts a run, as `Pipeline::start` does, of its statement.
@@ -116,7 +120,7 @@ pub struct Lowering<'p, 'c> {
     /// How many nodes are being lowered, each within the last.
     depth: usize,
     /// The pipelines that end in sinks, by id.
-    sinks: SmallVec<SinkPipeline<'c>>,
+    sinks: Sinks<'c>,
 }
 
 /// Its methods are named by what they do. Building ones add to the
@@ -172,11 +176,26 @@ impl<'p, 'c> Lowering<'p, 'c> {
             descending: key.descending,
         });
         let keys = SmallVec::fixed_from(self.env, keys)?;
-        let operator = match *keep {
-            Some(count) => top_k(self.env, keys, count, *publish)?,
-            None => sort(self.env, keys)?,
-        };
-        self.add_operator(Step::Operator(operator))
+        match *keep {
+            Some(count) => self.add_breaker(top_k(keys, count, *publish)),
+            None => self.add_breaker(sort(keys)),
+        }
+    }
+
+    /// Ends the pipeline so far in `breaker`, as a sink, and starts the next
+    /// with the source that serves what it builds.
+    pub fn add_breaker<B: Breaker + 'c>(&mut self, breaker: B) -> Result<(), LowerError> {
+        let input = self.end_pipeline()?;
+        let breaker = self.add_sink(input, breaker)?;
+        self.source = Some(served(self.env, breaker)?);
+        Ok(())
+    }
+
+    /// The pipeline so far, ended, for the next to start afresh.
+    fn end_pipeline(&mut self) -> Result<Pipeline<'c>, LowerError> {
+        let Some(source) = self.source.take() else { failed!() };
+        let after = SmallVec::new(self.env, LOWERED_STEPS_MAX)?;
+        Ok(Pipeline::new(source, core::mem::replace(&mut self.steps, after)))
     }
 
     /// Lowers input `input` of `node`, the node being lowered, as a pipeline
@@ -208,16 +227,7 @@ impl<'p, 'c> Lowering<'p, 'c> {
         pipeline: Pipeline<'c>,
         sink: T,
     ) -> Result<SinkId<T>, LowerError> {
-        let sink = DynSink::new(self.env, sink)?;
-        Ok(SinkId::new(self.add_dyn_sink(SinkPipeline { pipeline, sink })?))
-    }
-
-    /// As `add_sink`, of any type, returning its id.
-    fn add_dyn_sink(&mut self, pipeline: SinkPipeline<'c>) -> Result<u32, LowerError> {
-        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
-        let id = self.sinks.len() as u32;
-        self.sinks.push(pipeline)?;
-        Ok(id)
+        Ok(self.sinks.add(self.env, pipeline, sink)?)
     }
 
     /// How many of its first rows the open sort just below outputs, if it
@@ -277,7 +287,7 @@ pub fn lower<'c>(
         rows: &at!(planned, plan.root as usize).output,
         expr_values: None,
         depth: 0,
-        sinks: SmallVec::new(env, PLAN_NODES_MAX)?,
+        sinks: Sinks::new(env)?,
     };
     let values = plan.exprs.values();
     if !values.is_empty() {
@@ -589,7 +599,7 @@ mod tests {
             plan.add_node(limit, &[ordered]).unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
-        lower_planned(&mut plan).unwrap().pipeline().describe()
+        lower_planned(&mut plan).unwrap().describe()
     }
 
     #[test]
@@ -597,24 +607,30 @@ mod tests {
         // `Ab` is sorted by `a` and then `b`.
         assert_eq!(ordered(None, &[(0, false)], None), "Scan");
         assert_eq!(ordered(None, &[(0, false), (1, false)], None), "Scan");
-        assert_eq!(ordered(None, &[(1, false)], None), "Scan | Sort");
-        assert_eq!(ordered(None, &[(0, true)], None), "Scan | Sort");
+        assert_eq!(ordered(None, &[(1, false)], None), "Scan | Sort / Served");
+        assert_eq!(ordered(None, &[(0, true)], None), "Scan | Sort / Served");
         // Groups come out in the order first seen, so in `a`'s order.
-        assert_eq!(ordered(Some(&[0]), &[(0, false)], None), "Scan | HashAggregate");
-        assert_eq!(ordered(Some(&[1]), &[(1, false)], None), "Scan | HashAggregate | Sort");
+        assert_eq!(ordered(Some(&[0]), &[(0, false)], None), "Scan | HashAggregate / Served");
+        assert_eq!(
+            ordered(Some(&[1]), &[(1, false)], None),
+            "Scan | HashAggregate / Served | Sort / Served"
+        );
     }
 
     #[test]
     fn keeps_only_the_first_rows_a_limit_reads() {
-        assert_eq!(ordered(None, &[(1, false)], Some((10, 0))), "Scan | TopK");
-        assert_eq!(ordered(None, &[(1, false)], Some((10, 5))), "Scan | TopK | Limit");
+        assert_eq!(ordered(None, &[(1, false)], Some((10, 0))), "Scan | TopK / Served");
+        assert_eq!(ordered(None, &[(1, false)], Some((10, 5))), "Scan | TopK / Served | Limit");
         // A TopK counts its rows in `u32`, so keeping more is a sort and a
         // LIMIT, which counts in `u64`.
-        assert_eq!(ordered(None, &[(1, false)], Some((1 << 40, 0))), "Scan | Sort | Limit");
+        assert_eq!(
+            ordered(None, &[(1, false)], Some((1 << 40, 0))),
+            "Scan | Sort / Served | Limit"
+        );
         // Rows already in order are only limited.
         assert_eq!(ordered(None, &[(0, false)], Some((10, 0))), "Scan | Limit");
         let grouped = ordered(Some(&[1]), &[(1, true)], Some((1, 0)));
-        assert_eq!(grouped, "Scan | HashAggregate | TopK");
+        assert_eq!(grouped, "Scan | HashAggregate / Served | TopK / Served");
     }
 
     #[test]
@@ -639,7 +655,7 @@ mod tests {
             node = plan.add_node(order_by, &children).unwrap();
         }
         assert!(plan.output.push(ids[0]).is_ok());
-        assert_eq!(lower_planned(&mut plan).unwrap().pipeline().describe(), "Scan | Sort");
+        assert_eq!(lower_planned(&mut plan).unwrap().describe(), "Scan | Sort / Served");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -1020,7 +1036,7 @@ mod tests {
                 kept.push(columns.map(|column| column.int64s()[usize::from(row)]).collect());
             }
         }
-        (kept, rows, physical.pipeline().describe())
+        (kept, rows, physical.describe())
     }
 
     #[test]
@@ -1222,7 +1238,7 @@ mod tests {
         if execution.next(&mut batch).unwrap() {
             row = physical.columns().iter().map(|c| batch.column(c.position).int64s()[0]).collect();
         }
-        (physical.pipeline().describe(), row)
+        (physical.describe(), row)
     }
 
     #[test]
@@ -1232,7 +1248,7 @@ mod tests {
         assert_eq!(row, [7, -3, 9]);
         // Without a summary, it's scanned, and with no rows, has a row of
         // zero and nulls.
-        assert_eq!(summarized(false).0, "Scan | HashAggregate");
+        assert_eq!(summarized(false).0, "Scan | HashAggregate / Served");
     }
 
     /// Reads one column, taking it in `accepts`; it's never lowered.

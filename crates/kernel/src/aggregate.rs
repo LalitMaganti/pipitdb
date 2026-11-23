@@ -16,7 +16,6 @@ use crate::output_properties::{DeriveContext, OutputProperties};
 use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
 use crate::scannable::Key;
 use crate::step::DynSource;
-use crate::step::Step;
 use crate::values::Values;
 
 /// An aggregate function, as Perfetto's `AggregateCall::Function`. Each reads
@@ -239,8 +238,7 @@ impl<'c> Op<'c> for AggregateOp {
             nullable_keys |= u64::from(lowering.query_rows().nullable_of(key)) << k;
         }
         let spec = HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates };
-        let operator = hash_aggregate(env, spec)?;
-        lowering.add_operator(Step::Operator(operator))
+        lowering.add_breaker(hash_aggregate(spec))
     }
 }
 

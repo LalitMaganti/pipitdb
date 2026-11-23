@@ -81,8 +81,8 @@ pub trait Operator {
 }
 
 /// Holds back every row of its input, then outputs rows made from them, such
-/// as a sort or an aggregation: an operator, which consumes each input, then
-/// finalizes and serves once the input ends.
+/// as a sort or an aggregation: the sink of the pipeline it consumes, which
+/// it finalizes once that ends, and served by the source of the next.
 pub trait Breaker {
     type State;
 
@@ -108,37 +108,45 @@ pub trait Breaker {
     ) -> Result<bool, Error>;
 }
 
-impl<B: Breaker> Operator for B {
-    /// The breaker's state, and whether it's finalized.
-    type State = (B::State, bool);
+/// A breaker is the sink of the pipeline it consumes: one run's state, as
+/// merging runs' comes with the executor that runs more than one. A
+/// `Served` source serves it, as the next pipeline's.
+impl<B: Breaker> Sink for B {
+    type State = Option<B::State>;
+    type Local = Option<B::State>;
 
-    fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
-        Ok((Breaker::new_state(self, context)?, false))
+    fn new_state(&self, _: &mut Context) -> Result<Self::State, Error> {
+        Ok(None)
     }
 
-    fn execute(
+    fn new_local(&self, context: &mut Context) -> Result<Self::Local, Error> {
+        Ok(Some(Breaker::new_state(self, context)?))
+    }
+
+    fn consume(
         &self,
         context: &mut Context,
-        (state, _): &mut Self::State,
+        local: &mut Self::Local,
         input: &RowBatch,
-        _: &mut RowBatch,
-    ) -> Result<Progress, Error> {
-        self.consume(context, state, input)?;
-        Ok(Progress::NeedInput)
+    ) -> Result<(), Error> {
+        let Some(local) = local else { failed!() };
+        Breaker::consume(self, context, local, input)
     }
 
-    fn finish(
+    fn combine(
         &self,
-        context: &mut Context,
-        (state, finalized): &mut Self::State,
-        output: &mut RowBatch,
-    ) -> Result<Progress, Error> {
-        if !*finalized {
-            self.finalize(context, state)?;
-            *finalized = true;
-        }
-        let more = self.serve(context, state, output)?;
-        Ok(if more { Progress::MoreOutput } else { Progress::NeedInput })
+        _: &mut Context,
+        state: &mut Self::State,
+        local: &mut Self::Local,
+    ) -> Result<(), Error> {
+        check!(state.is_none());
+        *state = local.take();
+        Ok(())
+    }
+
+    fn finalize(&self, context: &mut Context, state: &mut Self::State) -> Result<(), Error> {
+        let Some(state) = state else { failed!() };
+        Breaker::finalize(self, context, state)
     }
 }
 
@@ -635,6 +643,11 @@ impl Drop for OwnedState {
 }
 
 impl<F> Erased<'_, F> {
+    /// The step, of its type.
+    pub(crate) fn step(&self) -> NonNull<()> {
+        self.step.as_ptr()
+    }
+
     /// Makes this step's state at `state`, unless it fails.
     ///
     /// # Safety

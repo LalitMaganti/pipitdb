@@ -40,7 +40,7 @@ impl KeyColumn {
     }
 }
 
-pub(crate) struct SortedRows {
+pub struct SortedRows {
     /// How each row's keys are laid out in `keys`, once the first batch says
     /// their types.
     layout: Option<RowLayout>,

@@ -4,16 +4,14 @@
 
 use core::cmp::Ordering;
 
-use crate::allocator::AllocError;
 use crate::column::{DataType, Values};
 use crate::containers::SmallVec;
 use crate::context::Context;
-use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_layout::{Encode, RowLayout, Word, decode, encode_nullable};
 use crate::sorted_rows::{KeyColumn, SortKey, SortedRows, lay_out_keys_from};
-use crate::step::{Breaker, DynOperator};
+use crate::step::Breaker;
 
 /// The breaker that outputs the first `count` rows sorted by `keys`. If it
 /// has a slot to `publish` in, whenever it prunes it publishes the first key
@@ -25,16 +23,11 @@ use crate::step::{Breaker, DynOperator};
 /// appending them in order to rows held afresh. The last of those becomes
 /// the cutoff: from then on, rows which don't come before it are dropped as
 /// they arrive, so on most inputs pruning soon becomes rare.
-pub fn top_k<'a>(
-    env: &Env,
-    keys: SmallVec<SortKey>,
-    count: u32,
-    publish: Option<u32>,
-) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(env, TopK { keys, count, publish })
+pub fn top_k(keys: SmallVec<SortKey>, count: u32, publish: Option<u32>) -> TopK {
+    TopK { keys, count, publish }
 }
 
-struct TopK {
+pub struct TopK {
     keys: SmallVec<SortKey>,
     count: u32,
     publish: Option<u32>,
@@ -42,7 +35,7 @@ struct TopK {
 
 /// The rows held, the cutoff once there is one, and the keys of a batch's
 /// rows laid out.
-struct Kept {
+pub struct Kept {
     rows: SortedRows,
     cutoff: Option<Cutoff>,
     keys: SmallVec<u8>,

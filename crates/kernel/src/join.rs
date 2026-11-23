@@ -952,7 +952,7 @@ impl Join {
         probing: &mut Probing,
         f: impl FnOnce(&mut Context, &mut Built, &mut Probing) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        with_built(context, self.build, |context, built| {
+        with_built(context, self.build, |context, _, built| {
             let Some(built) = built else { failed!() };
             if !probing.read_build {
                 probing.read_build = true;

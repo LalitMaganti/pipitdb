@@ -2,23 +2,21 @@
 //! `core/exec/sort` does. Nulls sort as in SQLite: first ascending, last
 //! descending.
 
-use crate::allocator::AllocError;
 use crate::containers::SmallVec;
 use crate::context::Context;
-use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
-use crate::step::{Breaker, DynOperator};
+use crate::step::Breaker;
 
 /// The breaker that sorts rows by `keys`, the first first, which must be
 /// columns of numbers.
-pub fn sort<'a>(env: &Env, keys: SmallVec<SortKey>) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(env, Sort { keys })
+pub fn sort(keys: SmallVec<SortKey>) -> Sort {
+    Sort { keys }
 }
 
-struct Sort {
+pub struct Sort {
     keys: SmallVec<SortKey>,
 }
 
@@ -56,6 +54,7 @@ impl Breaker for Sort {
 #[cfg(test)]
 mod tests {
     use crate::containers::BitSlice;
+    use crate::pipeline::after_breaker;
     use alloc::vec::Vec;
 
     use super::*;
@@ -65,7 +64,7 @@ mod tests {
     use crate::env::Env;
     use crate::pipeline::Pipeline;
     use crate::selection::Kept;
-    use crate::step::{DynSource, Source, Step};
+    use crate::step::{DynSource, Source};
     use crate::top_k::top_k;
 
     /// Rows of a key, maybe null, a value and a name.
@@ -139,14 +138,13 @@ mod tests {
     /// By the key ascending, then the value descending.
     const KEY_THEN_VALUE: &[(u32, bool)] = &[(0, false), (1, true)];
 
-    /// Each row out of `step`, in order.
-    fn run(rows: Rows, step: DynOperator<'static>) -> Vec<(Option<i64>, i64, Vec<u8>)> {
+    /// Each row out of `breaker`, in order.
+    fn run<B: Breaker + 'static>(rows: Rows, breaker: B) -> Vec<(Option<i64>, i64, Vec<u8>)> {
         let env = Env::current();
-        let mut steps = SmallVec::new(env, 1).unwrap();
-        assert!(steps.push(Step::Operator(step)).is_ok());
-        let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
-        let query = Env::current();
-        let mut execution = pipeline.start(query, None).unwrap();
+        let input =
+            Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
+        let (sinks, pipeline) = after_breaker(input, breaker, []);
+        let mut execution = pipeline.start_with_sinks(env, None, &sinks).unwrap();
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch).unwrap() {
@@ -163,7 +161,6 @@ mod tests {
 
     #[test]
     fn sorts_by_keys_with_nulls_first() {
-        let env = Env::current();
         let rows = Rows {
             batches: alloc::vec![
                 alloc::vec![(Some(2), 1, "a"), (None, 5, "n"), (Some(1), 1, "b")],
@@ -171,7 +168,7 @@ mod tests {
             ],
             drop: None,
         };
-        let sorted = run(rows, sort(env, by(KEY_THEN_VALUE)).unwrap());
+        let sorted = run(rows, sort(by(KEY_THEN_VALUE)));
         let names: Vec<Vec<u8>> = sorted.into_iter().map(|row| row.2).collect();
         // Nulls first, `5` before `3`; `b` and `e` tie and stay in order.
         assert_eq!(
@@ -226,16 +223,15 @@ mod tests {
                 .collect();
             let batches: Vec<Vec<Row>> = rows.chunks(2048).map(<[Row]>::to_vec).collect();
             let rows = || Rows { batches: batches.clone(), drop: Some(5) };
-            let env = Env::current();
-            let sorted = run(rows(), sort(env, by(KEY_THEN_VALUE)).unwrap());
+            let sorted = run(rows(), sort(by(KEY_THEN_VALUE)));
             assert!(sorted.windows(2).all(|w| (w[0].0, -w[0].1) <= (w[1].0, -w[1].1)));
-            let sorted = run(rows(), sort(env, by(&[(2, false)])).unwrap());
+            let sorted = run(rows(), sort(by(&[(2, false)])));
             // By name, then in the order rows came, as their values are.
             assert!(sorted.windows(2).all(|w| (&w[0].2, w[0].1) < (&w[1].2, w[1].1)));
             for keys in [KEY_THEN_VALUE, &[(0, false)], &[(2, false)], &[(2, true), (0, false)]] {
-                let all = run(rows(), sort(env, by(keys)).unwrap());
+                let all = run(rows(), sort(by(keys)));
                 for count in [0, 1, 100, 3000, u32::MAX] {
-                    let top = run(rows(), top_k(env, by(keys), count, None).unwrap());
+                    let top = run(rows(), top_k(by(keys), count, None));
                     assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
                 }
             }

@@ -737,6 +737,7 @@ mod tests {
         // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
         // the third is skipped, and of the second file only 0, 1 and 2 kept.
         let first = |publish: Option<u32>| {
+            use pipit_kernel::pipeline::{Sinks, served};
             use pipit_kernel::step::{DynTransform, Step};
             let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
             let table = DynScannable::new(env, table).unwrap();
@@ -745,14 +746,15 @@ mod tests {
             let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
             let keys = SmallVec::fixed_from(env, keys.into_iter()).unwrap();
             let kept = core::cell::Cell::new(0);
-            let steps = [
-                Step::Transform(DynTransform::new(env, Rows(&kept)).unwrap()),
-                Step::Operator(pipit_kernel::top_k::top_k(env, keys, 3, publish).unwrap()),
-            ];
+            let steps = [Step::Transform(DynTransform::new(env, Rows(&kept)).unwrap())];
             let steps = SmallVec::fixed_from(env, steps.into_iter()).unwrap();
-            let pipeline = Pipeline::new(source, steps);
+            let mut sinks = Sinks::new(env).unwrap();
+            let top_k = pipit_kernel::top_k::top_k(keys, 3, publish);
+            let top_k = sinks.add(env, Pipeline::new(source, steps), top_k).unwrap();
+            let after = SmallVec::fixed(env, 0).unwrap();
+            let pipeline = Pipeline::new(served(env, top_k).unwrap(), after);
             let query = Env::current();
-            let mut execution = pipeline.start(query, None).unwrap();
+            let mut execution = pipeline.start_with_sinks(query, None, &sinks).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let (selection, column) = (batch.selection(), batch.column(0));
