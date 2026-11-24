@@ -170,8 +170,8 @@ pub struct Columns {
 pub struct Joining {
     /// How rows are paired.
     kind: JoinKind,
-    /// The probe side's node, then the build side's.
-    children: [PlanNodeId; 2],
+    /// The probe side, then the build side.
+    inputs: [Relation; 2],
     /// Each side's columns.
     columns: [SmallVec<ColumnId>; 2],
 }
@@ -285,11 +285,11 @@ impl<'e> Builder<'e> {
         let first = self.plan.columns.len() as ColumnId;
         for column in 0..count {
             let data_type = table.column_type(column);
-            let binding = self.plan.add_unnamed_column(data_type, table.column_nullable(column))?;
+            let binding = self.add_column(data_type, table.column_nullable(column))?.0;
             reads.push(ScanColumn { column, binding, forms: Forms::FLAT })?;
         }
-        let node = self.plan.add_node(DynOp::new(self.env, ScanOp::new(table, reads))?, &[])?;
-        Ok((Relation(node), Columns { first, count }))
+        let node = self.add(DynOp::new(self.env, ScanOp::new(table, reads))?, [])?;
+        Ok((node, Columns { first, count }))
     }
 
     /// The rows of `relation` that `condition`, an integer, is true for: not
@@ -303,7 +303,7 @@ impl<'e> Builder<'e> {
     pub fn filter(&mut self, relation: Relation, condition: Expr) -> Result<Relation, Error> {
         check_condition(condition.data_type)?;
         let filter = FilterOp::new(self.env, &self.plan.exprs, condition.plan_expr())?;
-        self.add(DynOp::new(self.env, filter)?, relation)
+        self.add(DynOp::new(self.env, filter)?, [relation])
     }
 
     /// A join of `probe` and `build`, as `kind` says, whose columns are
@@ -328,7 +328,7 @@ impl<'e> Builder<'e> {
             }
         }
         let columns = [probe_columns, build_columns];
-        Ok(Joining { kind, children: [probe.0, build.0], columns })
+        Ok(Joining { kind, inputs: [probe, build], columns })
     }
 
     /// Each pair of `joining`'s rows that `condition` is true for, or every
@@ -340,7 +340,7 @@ impl<'e> Builder<'e> {
     /// [`Error::OutOfMemory`] if `env` has too little left.
     pub fn joined(&mut self, joining: Joining, condition: Option<Expr>) -> Result<Relation, Error> {
         let env = self.env;
-        let Joining { kind, children, columns } = joining;
+        let Joining { kind, inputs, columns } = joining;
         let conjuncts = match condition {
             Some(condition) => {
                 check_condition(condition.data_type)?;
@@ -349,7 +349,7 @@ impl<'e> Builder<'e> {
             None => SmallVec::fixed(env, 0)?,
         };
         let op = JoinOp::new(env, kind, conjuncts, columns)?;
-        Ok(Relation(self.plan.add_node(DynOp::new(env, op)?, &children)?))
+        self.add(DynOp::new(env, op)?, inputs)
     }
 
     /// The rows of `relation`, to be extended by up to `len` columns, which
@@ -372,9 +372,9 @@ impl<'e> Builder<'e> {
         let (data_type, expr) = (expr.data_type, expr.plan_expr());
         let (columns, nodes) = (&self.plan.columns, self.plan.exprs.nodes(expr));
         let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
-        let column = self.plan.add_unnamed_column(data_type, nullable)?;
-        extension.items.push(ComputeItem { output: column, expr })?;
-        Ok(Column(column))
+        let column = self.add_column(data_type, nullable)?;
+        extension.items.push(ComputeItem { output: column.0, expr })?;
+        Ok(column)
     }
 
     /// The rows of `extension`, with its columns.
@@ -387,7 +387,7 @@ impl<'e> Builder<'e> {
         if items.is_empty() {
             return Ok(relation);
         }
-        self.add(DynOp::new(self.env, ComputeOp { items })?, relation)
+        self.add(DynOp::new(self.env, ComputeOp { items })?, [relation])
     }
 
     /// Groups `grouping` by `column` too.
@@ -439,7 +439,7 @@ impl<'e> Builder<'e> {
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
         let output_type = function.output_type(input_type);
-        let binding = self.plan.add_unnamed_column(output_type, nullable)?;
+        let binding = self.add_column(output_type, nullable)?.0;
         // The least or greatest of the distinct values is that of them all.
         let distinct = distinct && !matches!(function, Function::Min | Function::Max);
         grouping.aggregates.push(Aggregate { function, input, distinct, binding })?;
@@ -454,7 +454,7 @@ impl<'e> Builder<'e> {
     pub fn grouped(&mut self, relation: Relation, grouping: Grouping) -> Result<Relation, Error> {
         let Grouping { keys, aggregates } = grouping;
         let aggregate = AggregateOp { keys, aggregates, answer: None };
-        self.add(DynOp::new(self.env, aggregate)?, relation)
+        self.add(DynOp::new(self.env, aggregate)?, [relation])
     }
 
     /// The rows of `relation`, to be sorted by up to `len` keys, which
@@ -474,7 +474,7 @@ impl<'e> Builder<'e> {
     /// [`Error::OutOfMemory`] if `env` has too little left.
     pub fn sorted(&mut self, sorting: Sorting) -> Result<Relation, Error> {
         let Sorting { relation, keys } = sorting;
-        self.add(DynOp::new(self.env, OrderByOp { keys })?, relation)
+        self.add(DynOp::new(self.env, OrderByOp { keys })?, [relation])
     }
 
     /// The first `count` rows of `relation`, after skipping `offset`.
@@ -488,7 +488,7 @@ impl<'e> Builder<'e> {
         count: u64,
         offset: u64,
     ) -> Result<Relation, Error> {
-        self.add(DynOp::new(self.env, LimitOp { count, offset })?, relation)
+        self.add(DynOp::new(self.env, LimitOp { count, offset })?, [relation])
     }
 
     // Expressions.
@@ -698,10 +698,27 @@ impl<'e> Builder<'e> {
         Ok(Value(self.nodes.push(step)?))
     }
 
-    /// Adds `op`, reading `relation`.
-    #[expect(clippy::needless_pass_by_value, reason = "a relation is read once")]
-    fn add(&mut self, op: DynOp<'e>, relation: Relation) -> Result<Relation, Error> {
-        Ok(Relation(self.plan.add_node(op, &[relation.0])?))
+    /// Adds `op`, reading `inputs`, and returns the rows it makes.
+    pub(crate) fn add<const N: usize>(
+        &mut self,
+        op: DynOp<'e>,
+        inputs: [Relation; N],
+    ) -> Result<Relation, Error> {
+        self.add_node(op, &inputs.map(|input| input.0))
+    }
+
+    /// As `add`, of the nodes `children`.
+    fn add_node(&mut self, op: DynOp<'e>, children: &[PlanNodeId]) -> Result<Relation, Error> {
+        Ok(Relation(self.plan.add_node(op, children)?))
+    }
+
+    /// A column an op makes, of `data_type`, nullable if `nullable`.
+    pub(crate) fn add_column(
+        &mut self,
+        data_type: DataType,
+        nullable: bool,
+    ) -> Result<Column, Error> {
+        Ok(Column(self.plan.add_unnamed_column(data_type, nullable)?))
     }
 }
 
