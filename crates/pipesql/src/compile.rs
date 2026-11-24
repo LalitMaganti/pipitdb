@@ -599,10 +599,13 @@ mod tests {
         let keys = "x.a = y.a AND x.b = y.b AND x.s = y.s AND y.a = x.a AND y.b = x.b";
         let joined = format!("FROM t AS x |> JOIN t AS y ON {keys} |> SELECT y.b");
         assert_eq!(values(&joined), [[10.0, 20.0]]);
-        // More tables than the 64 aliases there were room for.
+        // More tables than the 64 aliases there were room for, unless plans
+        // are built shallower: each join is a level.
+        let tables = 70.min(pipit_kernel::lower::PLAN_DEPTH_MAX - 6);
         let many: StdVec<_> =
-            (1..70).map(|i| format!(" |> JOIN ids AS a{i} ON a0.id = a{i}.id")).collect();
-        let many = format!("FROM ids AS a0{} |> SELECT a0.v, a69.v", many.concat());
+            (1..tables).map(|i| format!(" |> JOIN ids AS a{i} ON a0.id = a{i}.id")).collect();
+        let last = tables - 1;
+        let many = format!("FROM ids AS a0{} |> SELECT a0.v, a{last}.v", many.concat());
         assert_eq!(values(&many).len(), 2);
     }
 
