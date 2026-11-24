@@ -35,20 +35,12 @@ pub struct Query<'e> {
     pub(crate) plan: LogicalPlan<'e>,
 }
 
-impl<'e> Query<'e> {
-    /// The plan the front end built.
-    pub fn plan(&self) -> &LogicalPlan<'e> {
-        &self.plan
-    }
-}
-
 /// Builds a query, a relation at a time.
 pub struct Builder<'e> {
     /// Where the query's memory comes from.
     env: &'e Env,
     /// The plan built so far.
-    #[doc(hidden)]
-    pub plan: LogicalPlan<'e>,
+    plan: LogicalPlan<'e>,
     /// The nodes of the expression being built.
     nodes: ExprBuilder,
 }
@@ -656,5 +648,57 @@ impl<'e> Builder<'e> {
     #[expect(clippy::needless_pass_by_value, reason = "a relation is read once")]
     fn add(&mut self, op: DynOp<'e>, relation: Relation) -> Result<Relation, Error> {
         Ok(Relation(self.plan.add_node(op, &[relation.0])?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::vec::Vec;
+
+    use super::*;
+    use crate::buffer::Buffer;
+    use crate::column::ColumnView;
+    use crate::context::Context;
+    use crate::table::Table;
+
+    fn int64s(values: &[i64]) -> ColumnView {
+        let mut buffer = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
+        buffer.as_mut_slice::<i64>().copy_from_slice(values);
+        ColumnView::new(&mut Context::new(Env::current(), None), DataType::Int64, buffer, None)
+            .unwrap()
+    }
+
+    #[test]
+    fn works_out_which_columns_can_be_null() {
+        let env = Env::current();
+        let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
+        let table = Table::new(env, &columns, &[&[int64s(&[1, 2]), int64s(&[10, 20])]]).unwrap();
+        let table = DynScannable::new(env, table).unwrap();
+        let mut builder = Builder::new(env).unwrap();
+        let (rows, columns) = builder.scan(&table).unwrap();
+        let [a, b] = columns.iter().collect::<Vec<_>>()[..] else { panic!() };
+        let mut extension = builder.extend(rows, 2).unwrap();
+        // Dividing by a constant that isn't zero can't make a null, but
+        // dividing by a column may.
+        let (value, sixty) = (builder.column_value(a).unwrap(), builder.int(60).unwrap());
+        builder.binary(Binary::Divide, value, sixty).unwrap();
+        let (expr, data_type) = builder.expr().unwrap();
+        let x = builder.compute(&mut extension, expr, data_type).unwrap();
+        let (value, by) = (builder.column_value(a).unwrap(), builder.column_value(b).unwrap());
+        builder.binary(Binary::Divide, value, by).unwrap();
+        let (expr, data_type) = builder.expr().unwrap();
+        let y = builder.compute(&mut extension, expr, data_type).unwrap();
+        let rows = builder.extended(extension).unwrap();
+        // A count is never null, but a sum of no values is.
+        let mut grouping = builder.group(1, 2).unwrap();
+        grouping.by(x).unwrap();
+        let count = builder.aggregate(&mut grouping, Function::CountStar, None, false).unwrap();
+        let total = builder.aggregate(&mut grouping, Function::Sum, Some(b), false).unwrap();
+        builder.grouped(rows, grouping).unwrap();
+        let nullable = |column: Column| builder.plan.columns[column.0 as usize].nullable;
+        assert!(!nullable(a) && !nullable(x) && !nullable(count));
+        assert!(nullable(y) && nullable(total));
     }
 }

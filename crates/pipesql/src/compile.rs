@@ -767,22 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn knows_which_columns_can_be_null() {
-        let catalog = catalog();
-        let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let query = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
-        let plan = query.plan();
-        let nullable = |name: &str| {
-            let output = plan.output.iter().find(|column| plan.names.get(column.name) == name);
-            plan.columns[output.unwrap().id as usize].nullable
-        };
-        // The table has no nulls; dividing by a column may make one, and a
-        // sum of none is one, but dividing by a constant that isn't zero can't.
-        assert!(!nullable("x") && !nullable("c"));
-        assert!(nullable("y") && nullable("total"));
-    }
-
-    #[test]
     fn computes_columns() {
         assert_eq!(kept("FROM t |> SELECT a + b AS c"), [11.0, 22.0]);
         assert_eq!(kept("FROM t |> EXTEND b - a * 2 AS c |> SELECT c"), [8.0, 16.0]);
