@@ -591,8 +591,19 @@ impl ColumnView {
         // their bytes, so no string is copied.
         let words = values.slice_of::<i64>();
         let mut out = context.values_buffer(rows * 8)?;
-        for (row, word) in (0..).zip(out.as_mut_slice::<i64>()) {
-            *word = *at!(words, index(row) as usize);
+        let gathered = at_mut!(out.as_mut_slice::<i64>(), ..rows);
+        match form {
+            Form::Dictionary(indices) => {
+                let indices = at!(indices, ..rows);
+                // Checked together, so each row's gather needn't be.
+                let max = indices.iter().fold(0, |max, &i| max.max(i));
+                check!(rows == 0 || (max as usize) < words.len());
+                for (word, &i) in gathered.iter_mut().zip(indices) {
+                    // SAFETY: every index is below `words.len()`, checked above.
+                    *word = unsafe { *words.get_unchecked(i as usize) };
+                }
+            }
+            Form::Flat | Form::Constant | Form::Sequence(_) => gathered.fill(*at!(words, 0)),
         }
         if let Some(bytes) = &values.header.bytes {
             return ColumnView::strings(context, out, bytes.clone(), validity);
