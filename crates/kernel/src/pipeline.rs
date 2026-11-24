@@ -60,7 +60,7 @@ impl<'a> Pipeline<'a> {
         statement: Option<&'r Statement>,
     ) -> Result<Execution<'r>, Error> {
         let mut context = Context::new(env, statement);
-        let run = Run::new(self, &mut context)?;
+        let run = Run::new(self, &mut context, true, None)?;
         Ok(Execution { run, context })
     }
 
@@ -71,9 +71,10 @@ impl<'a> Pipeline<'a> {
         env: &'r Env,
         statement: Option<&'r Statement>,
         sinks: &'r Sinks<'r>,
+        memory: Option<&'r mut Array<u8>>,
     ) -> Result<Execution<'r>, Error> {
         let mut context = Context::with_sinks(env, statement, sinks);
-        let run = Run::new(self, &mut context)?;
+        let run = Run::new(self, &mut context, true, memory)?;
         Ok(Execution { run, context })
     }
 
@@ -86,13 +87,15 @@ impl<'a> Pipeline<'a> {
         Ok(unsafe { DynSource::from_parts(pipeline, &PIPELINE_SOURCE, "Pipeline") })
     }
 
-    /// A `Segment` per segment, a `Slot` per step, then the source's state,
-    /// then each step's. Calls `state` with each state's step, or `None` for
-    /// the source, and its offset. Returns the slots' offset too.
+    /// A `Segment` per segment, a `Slot` per step, the source's state, each
+    /// step's, then if `output`, a batch for the run's output. Calls `state`
+    /// with each state's step, or `None` for the source, and its offset.
+    /// Returns the slots' offset and the output's too.
     fn layout(
         &self,
+        output: bool,
         mut state: impl FnMut(Option<usize>, usize),
-    ) -> Result<(Layout, usize), AllocError> {
+    ) -> Result<(Layout, usize, Option<usize>), AllocError> {
         let segments = Layout::array::<Segment>(self.segment_count).map_err(|_| AllocError)?;
         let slots = Layout::array::<Slot>(self.steps.len()).map_err(|_| AllocError)?;
         let (layout, slots) = segments.extend(slots).map_err(|_| AllocError)?;
@@ -104,8 +107,14 @@ impl<'a> Pipeline<'a> {
             (layout, offset) = layout.extend(step.state_layout()).map_err(|_| AllocError)?;
             state(Some(i), offset);
         }
+        let mut batch = None;
+        if output {
+            let offset;
+            (layout, offset) = layout.extend(Layout::new::<RowBatch>()).map_err(|_| AllocError)?;
+            batch = Some(offset);
+        }
         check!(layout.align() <= BUFFER_ALIGNMENT_BYTES);
-        Ok((layout, slots))
+        Ok((layout, slots, batch))
     }
 }
 
@@ -291,7 +300,7 @@ pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error
     // One run, consuming into one local state, which it combines.
     let local = sink.new_local(context)?;
     {
-        let mut run = Run::new(pipeline, context)?;
+        let mut run = Run::new(pipeline, context, false, None)?;
         let mut batch = RowBatch::new();
         while run.next(context, &mut batch)? {
             // SAFETY: `local` is the sink's.
@@ -425,11 +434,13 @@ struct Run<'p> {
     source_state: usize,
     /// How many states are made: the source's, then each step's, in order.
     made: usize,
+    /// Where its output batch is in `memory`, if it has one of its own.
+    output: Option<usize>,
     /// Why a step failed, if one has. Its segment then reports that it
     /// ended, so the loop pays for failures only where segments end.
     failed: Cell<Option<Error>>,
-    /// Frees `memory`.
-    _memory: Array<u8>,
+    /// Frees `memory`, unless it's lent.
+    _memory: Option<Array<u8>>,
 }
 
 /// A pipeline's functions as a source, whose state is a run of it.
@@ -453,7 +464,7 @@ unsafe fn new_run(
     // SAFETY: a source outlives its states, so `'static` stands in for how
     // long the pipeline lives, which its run doesn't outlive.
     let pipeline = unsafe { value_of::<Pipeline<'static>>(pipeline) };
-    let run = Run::new(pipeline, context)?;
+    let run = Run::new(pipeline, context, false, None)?;
     // SAFETY: `state` has room for a run, as the source's layout says.
     unsafe { write_state(state, run) };
     Ok(())
@@ -480,25 +491,58 @@ impl<'p> Execution<'p> {
     pub fn next(&mut self, output: &mut RowBatch<'p>) -> Result<bool, Error> {
         self.run.next(&mut self.context, output)
     }
+
+    /// The next batch, in the run's own output batch, lent until the next
+    /// call, or `None` once there are no more.
+    pub(crate) fn next_batch(&mut self) -> Result<Option<&RowBatch<'p>>, Error> {
+        let Some(offset) = self.run.output else { failed!() };
+        // SAFETY: the run's layout has a batch at `offset`, which `Run::new`
+        // made, and which nothing else borrows: the run reaches its memory
+        // only through its slots and states.
+        let output = unsafe { self.run.memory.add(offset).cast::<RowBatch<'p>>().as_mut() };
+        if self.run.next(&mut self.context, output)? { Ok(Some(output)) } else { Ok(None) }
+    }
 }
 
 impl<'p> Run<'p> {
     /// A run of `pipeline` on `context`, whose `Env` its memory is from,
     /// with every state made, or, if one fails, those made dropped.
-    fn new(pipeline: &'p Pipeline<'p>, context: &mut Context) -> Result<Run<'p>, Error> {
-        let Ok((layout, slots)) = pipeline.layout(|_, _| {}) else {
+    fn new(
+        pipeline: &'p Pipeline<'p>,
+        context: &mut Context,
+        output: bool,
+        lent: Option<&'p mut Array<u8>>,
+    ) -> Result<Run<'p>, Error> {
+        let Ok((layout, slots, output)) = pipeline.layout(output, |_, _| {}) else {
             failed!();
         };
-        // SAFETY: what follows writes every byte it reads.
-        let owned = unsafe { Array::<u8>::uninit(context.env(), layout.size())? };
-        let memory = owned.as_non_null();
+        // In memory lent to it, grown if it's too small, or of its own. What
+        // follows writes every byte it reads, so what an earlier run left in
+        // lent memory is never read.
+        let (memory, owned) = if let Some(lent) = lent {
+            if lent.len() < layout.size() {
+                // SAFETY: as above.
+                *lent = unsafe { Array::<u8>::uninit(context.env(), layout.size())? };
+            }
+            (lent.as_non_null(), None)
+        } else {
+            // SAFETY: as above.
+            let owned = unsafe { Array::<u8>::uninit(context.env(), layout.size())? };
+            (owned.as_non_null(), Some(owned))
+        };
+        if let Some(offset) = output {
+            // SAFETY: the layout has room for a batch at `offset`, built in
+            // place as it's too big to build and then copy.
+            unsafe { RowBatch::init(memory.add(offset).cast().as_ptr()) };
+        }
         let failed = Cell::new(None);
+        let (source_state, made) = (0, 0);
         let mut run =
-            Run { pipeline, memory, slots, source_state: 0, made: 0, failed, _memory: owned };
+            Run { pipeline, memory, slots, source_state, made, output, failed, _memory: owned };
         let mut failed = None;
         // SAFETY: the memory was allocated with this layout, so it has room
         // for each state at its offset, and for the slots.
-        let layout = pipeline.layout(|i, state| unsafe {
+        let layout = pipeline.layout(output.is_some(), |i, state| unsafe {
             if failed.is_some() {
                 return;
             }
@@ -724,6 +768,10 @@ impl<'p> Run<'p> {
 
 impl Drop for Run<'_> {
     fn drop(&mut self) {
+        if let Some(offset) = self.output {
+            // SAFETY: made by `Run::new`, and dropped once.
+            unsafe { self.memory.add(offset).cast::<RowBatch>().drop_in_place() };
+        }
         let pipeline = self.pipeline;
         if self.made == 0 {
             return;
@@ -1295,7 +1343,7 @@ mod tests {
         assert_eq!(pipeline.describe(), "Served");
         let query = Env::current();
         assert_eq!(
-            batches(&mut pipeline.start_with_sinks(query, None, &sinks).unwrap()),
+            batches(&mut pipeline.start_with_sinks(query, None, &sinks, None).unwrap()),
             [[[5], [4]], [[3], [2]], [[1], [0]]]
         );
     }
@@ -1305,7 +1353,7 @@ mod tests {
         let input = pipeline(Numbers { batches: 3 }, []);
         let (sinks, pipeline) = after_breaker(input, Backwards, [transform(SkipOdd)]);
         let query = Env::current();
-        let mut execution = pipeline.start_with_sinks(query, None, &sinks).unwrap();
+        let mut execution = pipeline.start_with_sinks(query, None, &sinks, None).unwrap();
         assert_eq!(batches(&mut execution), [[[5], [4]], [[1], [0]]]);
     }
 
@@ -1449,14 +1497,14 @@ mod tests {
         let mut sinks = Sinks::new(env).unwrap();
         let total = sinks.add(env, built, Total { builds: &builds }).unwrap();
         let reads = pipeline(Numbers { batches: 2 }, [operator(WithTotal { total })]);
-        let mut execution = reads.start_with_sinks(env, None, &sinks).unwrap();
+        let mut execution = reads.start_with_sinks(env, None, &sinks, None).unwrap();
         // 0 + 1 + 2 + 3, built once for both batches.
         let expected = [[[0, 0, 6], [1, -1, 6]], [[2, -2, 6], [3, -3, 6]]];
         assert_eq!(batches(&mut execution), expected);
         assert_eq!(builds.get(), 1);
         // A step with no input never reads it, so it isn't built.
         let empty = pipeline(Numbers { batches: 0 }, [operator(WithTotal { total })]);
-        let mut execution = empty.start_with_sinks(env, None, &sinks).unwrap();
+        let mut execution = empty.start_with_sinks(env, None, &sinks, None).unwrap();
         assert!(batches(&mut execution).is_empty());
         assert_eq!(builds.get(), 1);
     }

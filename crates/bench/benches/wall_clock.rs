@@ -37,17 +37,17 @@ fn query(c: &mut Criterion) {
 fn small(c: &mut Criterion) {
     let query = "FROM t |> WHERE id = 42 |> SELECT a, b";
     let catalog = pipitdb_bench::small_table(100);
-    let plan = pipitdb_bench::small_plan(100, query);
+    let mut plan = pipitdb_bench::small_plan(100, query);
     let mut group = c.benchmark_group("small");
     group.bench_function("point", |b| {
         b.iter(|| pipitdb_bench::plan_and_run(black_box(catalog), black_box(query)));
     });
     group.bench_function("point_planned", |b| {
-        b.iter(|| pipitdb_bench::run_plan(black_box(&plan)));
+        b.iter(|| black_box(&mut plan).run());
     });
-    let order = pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b");
+    let mut order = pipitdb_bench::small_plan(2048, "FROM t |> ORDER BY b");
     group.bench_function("order", |b| {
-        b.iter(|| pipitdb_bench::run_plan(black_box(&order)));
+        b.iter(|| black_box(&mut order).run());
     });
     group.finish();
 }
@@ -87,8 +87,8 @@ fn join(c: &mut Criterion) {
         ("spread", Joined::Spread),
     ];
     for (name, joined) in joins {
-        let plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
-        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
+        let mut plan = pipitdb_bench::join_plan(1 << 20, 1 << 16, joined);
+        group.bench_function(name, |b| b.iter(|| black_box(&mut plan).run()));
     }
     group.finish();
 }
@@ -114,8 +114,8 @@ fn slices(c: &mut Criterion) {
         ),
     ];
     for (name, query) in queries {
-        let Some(plan) = pipitdb_bench::real::slice_query(slices, query) else { continue };
-        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
+        let Some(mut plan) = pipitdb_bench::real::slice_query(slices, query) else { continue };
+        group.bench_function(name, |b| b.iter(|| black_box(&mut plan).run()));
     }
     group.finish();
 }
@@ -163,8 +163,8 @@ fn perfetto_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("perfetto_filter");
     group.throughput(Throughput::Elements(1 << 20));
     for (i, (name, _)) in pipitdb_bench::PERFETTO_FILTERS.iter().enumerate() {
-        let plan = pipitdb_bench::perfetto_filter_plan(i);
-        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run_plan(black_box(&plan))));
+        let mut plan = pipitdb_bench::perfetto_filter_plan(i);
+        group.bench_function(*name, |b| b.iter(|| black_box(&mut plan).run()));
     }
     group.finish();
 }

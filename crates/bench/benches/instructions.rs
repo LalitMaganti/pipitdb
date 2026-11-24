@@ -10,10 +10,10 @@ use std::hint::black_box;
 use gungraun::prelude::*;
 use pipit_file::source::FileSource;
 use pipit_kernel::bytes::ByteSource;
-use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_parquet::table::ParquetTable;
 use pipit_parquet_full::Codecs;
+use pipitdb_bench::Ready;
 
 #[library_benchmark]
 #[bench::typical(pipitdb_bench::queries(100))]
@@ -43,8 +43,8 @@ library_benchmark_group!(name = small_group, benchmarks = [small]);
 #[bench::lt_int64(pipitdb_bench::perfetto_filter_plan(1))]
 #[bench::eq_nullable(pipitdb_bench::perfetto_filter_plan(2))]
 #[bench::eq_string(pipitdb_bench::perfetto_filter_plan(3))]
-fn perfetto_filter(plan: PhysicalPlan<'static>) -> u64 {
-    black_box(pipitdb_bench::run_plan(black_box(&plan)))
+fn perfetto_filter(mut ready: Ready) -> u64 {
+    black_box(black_box(&mut ready).run())
 }
 
 library_benchmark_group!(name = perfetto_filter_group, benchmarks = [perfetto_filter]);
@@ -55,8 +55,8 @@ library_benchmark_group!(name = perfetto_filter_group, benchmarks = [perfetto_fi
 #[bench::slice_thread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Ids))]
 #[bench::shuffled(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Shuffled))]
 #[bench::spread(pipitdb_bench::join_plan(1 << 16, 1 << 12, pipitdb_bench::Joined::Spread))]
-fn join(plan: PhysicalPlan<'static>) -> u64 {
-    black_box(pipitdb_bench::run_plan(black_box(&plan)))
+fn join(mut ready: Ready) -> u64 {
+    black_box(black_box(&mut ready).run())
 }
 
 library_benchmark_group!(name = join_group, benchmarks = [join]);
@@ -77,7 +77,7 @@ impl Catalog for Hits {
 /// `$PIPIT_CLICKBENCH` says where it should be, as in CI: anything else
 /// failing is a broken benchmark, not one to skip.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
+fn hits_query(name: &str) -> Option<Ready> {
     let set = std::env::var("PIPIT_CLICKBENCH").ok();
     let dir = set.clone().unwrap_or_else(|| {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/clickbench").to_string()
@@ -122,8 +122,8 @@ fn hits_query(name: &str) -> Option<PhysicalPlan<'static>> {
 #[bench::q15(hits_query("15"))]
 #[bench::q24t(hits_query("24t"))]
 #[bench::q25(hits_query("25"))]
-fn clickbench(plan: Option<PhysicalPlan<'static>>) -> u64 {
-    plan.map_or(0, |plan| black_box(pipitdb_bench::run_plan(black_box(&plan))))
+fn clickbench(ready: Option<Ready>) -> u64 {
+    ready.map_or(0, |mut ready| black_box(black_box(&mut ready).run()))
 }
 
 library_benchmark_group!(name = clickbench_group, benchmarks = [clickbench]);
@@ -172,8 +172,8 @@ fn tpc(suite: &str, number: &str) -> Option<(&'static dyn Catalog, &'static str)
 /// Compiles, plans and runs `query` over `catalog`, as a user would.
 #[expect(clippy::expect_used, reason = "a benchmark of a query that fails is broken")]
 fn run_query(catalog: &'static dyn Catalog, query: &str) -> u64 {
-    let plan = pipitdb_bench::plan(black_box(catalog), black_box(query)).expect("compiles");
-    pipitdb_bench::run_plan(&plan)
+    let mut ready = pipitdb_bench::plan(black_box(catalog), black_box(query)).expect("compiles");
+    ready.run()
 }
 
 // TPC-H's and TPC-DS's queries that pipitdb runs, at scale 0.01: realistic
