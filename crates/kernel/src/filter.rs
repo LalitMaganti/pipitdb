@@ -309,6 +309,7 @@ pub fn compare_string(
     check_covers(column, selection);
     check!(column.data_type() == DataType::String);
     let strings = column.values().strings();
+    check!(strings.len() >= selection.rows() as usize);
     let valid = valid_rows(column);
     // Equality needn't order: most cells differ in length, so aren't read.
     // One test for both `=` and `<>`, so the loop isn't copied.
@@ -316,7 +317,9 @@ pub fn compare_string(
     let len = string.len();
     retain(selection, dropped, |row| {
         let at = usize::from(row);
-        let same = strings.len_of(at) == len && (len == 0 || strings.get(at) == string);
+        // SAFETY: every kept row is below `rows()`, which `strings` covers.
+        let same = unsafe { strings.len_of_unchecked(at) } == len
+            && (len == 0 || strings.get(at) == string);
         valid(row) && same == equal
     });
 }

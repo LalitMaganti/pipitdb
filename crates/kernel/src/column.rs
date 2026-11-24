@@ -771,6 +771,17 @@ impl<'a> Strings<'a> {
         *at!(self.views, 2 * row + 1) as usize
     }
 
+    /// As `len_of`, without checking `row` is one of the strings.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be below `len()`.
+    #[inline]
+    pub unsafe fn len_of_unchecked(self, row: usize) -> usize {
+        // SAFETY: guaranteed by the caller.
+        unsafe { *self.views.get_unchecked(2 * row + 1) as usize }
+    }
+
     #[inline]
     pub fn get(self, row: usize) -> &'a [u8] {
         let (start, len) = (*at!(self.views, 2 * row) as usize, *at!(self.views, 2 * row + 1));
