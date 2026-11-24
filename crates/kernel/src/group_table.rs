@@ -131,12 +131,6 @@ impl GroupTable {
         self.records.len()
     }
 
-    /// Group `group`'s key `k`, a word: a string's id.
-    pub(crate) fn key(&self, group: u32, k: usize) -> i64 {
-        check!(k < self.keys);
-        *at!(self.records.record(group as usize), self.first + k)
-    }
-
     /// Group `group`'s first payload word.
     pub(crate) fn payload(&self, group: u32) -> i64 {
         *at!(self.records.record(group as usize), self.first + self.keys)

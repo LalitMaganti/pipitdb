@@ -525,6 +525,9 @@ struct Built {
     /// row's has been its number above it, as a table's ids are: then none
     /// is hashed, as `direct` finds them all.
     sequence: Sequence,
+    /// With one integer key, while `sequence` is `Held`, each build row's
+    /// key: hashed only if `direct` can't find their rows.
+    keys: SmallVec<i64>,
 }
 
 /// What probing keeps, from one input batch to the next.
@@ -657,45 +660,113 @@ impl HashBuild {
                 Sequence::From(min) => {
                     (min.checked_add(i64::from(first)) == Some(start)).then_some(min)
                 }
-                Sequence::Broken => None,
+                Sequence::Held | Sequence::Broken => None,
             };
             if let Some(min) = follows {
                 built.sequence = Sequence::From(min);
                 return Ok(());
             }
         }
-        let Some(table) = &mut built.table else { failed!() };
-        if let Sequence::From(min) = built.sequence {
-            // The rows before, held as a sequence, are hashed now.
-            let mut row = 0;
-            while row < first {
-                let count = (first - row).min(BATCH_ROWS_MAX);
-                let mut keys = ColumnView::sequence(context, min + i64::from(row), count)?;
-                keys.make_in(context, Forms::FLAT)?;
-                let groups = at_mut!(next_of, ..count as usize);
-                table.find_or_create(context, &[&keys], &[], groups)?;
-                for &group in groups.iter() {
-                    built.before.push(NONE)?;
-                    table.set_payload(group, i64::from(row) + 1);
-                    row += 1;
+        match built.sequence {
+            // The rows before, held as a sequence, are held as keys now.
+            Sequence::From(min) => {
+                built.keys.extend_zeroed(first as usize)?;
+                for (key, row) in built.keys.iter_mut().zip(0..) {
+                    *key = min.wrapping_add(row);
                 }
+                built.sequence = Sequence::Held;
             }
+            Sequence::Empty => built.sequence = Sequence::Held,
+            Sequence::Held | Sequence::Broken => {}
         }
-        built.sequence = Sequence::Broken;
+        if built.sequence == Sequence::Held {
+            if hold(context, &mut built.keys, key, selection)? {
+                return Ok(());
+            }
+            // The rows before are hashed now, and the rest as they come.
+            Self::hash_held(context, built)?;
+            built.sequence = Sequence::Broken;
+        }
+        let Some(table) = &mut built.table else { failed!() };
         let groups = at_mut!(next_of, ..selection.len() as usize);
         find_groups(context, table, batch, at!(keys.build, ..keys.count), groups)?;
-        for (row, &group) in (first..).zip(groups.iter()) {
-            if group == NONE {
-                built.before.push(NONE)?;
-                continue;
-            }
-            let last = last_of(table, group);
-            built.repeats |= last != NONE;
-            built.before.push(last)?;
-            table.set_payload(group, i64::from(row) + 1);
+        chain(table, &mut built.before, &mut built.repeats, groups, first)
+    }
+
+    /// Hashes the keys `built` holds, a batch at a time, and frees them.
+    fn hash_held(context: &mut Context, built: &mut Built) -> Result<(), Error> {
+        let Built { table: Some(table), keys, before, repeats, .. } = built else { failed!() };
+        let batch = BATCH_ROWS_MAX as usize;
+        let mut groups = context.indices_buffer(batch * size_of::<u32>())?;
+        for (held, first) in keys.chunks(batch).zip((0..).step_by(batch)) {
+            let mut values = context.values_buffer(size_of_val(held))?;
+            at_mut!(values.as_mut_slice::<i64>(), ..held.len()).copy_from_slice(held);
+            let column = ColumnView::new(context, DataType::Int64, values, None)?;
+            let groups = at_mut!(groups.as_mut_slice::<u32>(), ..held.len());
+            table.find_or_create(context, &[&column], &[], groups)?;
+            chain(table, before, repeats, groups, first)?;
         }
+        keys.free();
         Ok(())
     }
+}
+
+/// Adds the kept rows of `column`, a join's one integer key, to `keys`,
+/// unless one is null or they're too far apart for `Direct`: then adds
+/// none, and returns false.
+fn hold(
+    context: &mut Context,
+    keys: &mut SmallVec<i64>,
+    column: &ColumnView,
+    selection: &Selection,
+) -> Result<bool, Error> {
+    let mut flat = None;
+    if !column.is_in(Forms::FLAT) {
+        flat = Some(column.clone());
+        let Some(flat) = &mut flat else { failed!() };
+        flat.make_in(context, Forms::FLAT)?;
+    }
+    let column = flat.as_ref().unwrap_or(column);
+    let kept = selection.kept();
+    let rows = (0..selection.len()).map(|i| kept.row(i));
+    if column.validity().is_some() && rows.clone().any(|row| column.is_null(row)) {
+        return Ok(false);
+    }
+    let values = column.int64s();
+    let start = keys.len();
+    keys.extend_zeroed(selection.len() as usize)?;
+    for (key, row) in at_mut!(keys, start..).iter_mut().zip(rows) {
+        *key = *at!(values, row as usize);
+    }
+    let bounds = |(min, max): (i64, i64), &key: &i64| (key.min(min), key.max(max));
+    let (min, max) = at!(keys, start..).iter().fold((i64::MAX, i64::MIN), bounds);
+    if max.wrapping_sub(min).cast_unsigned() > u32::MAX.into() {
+        keys.truncate(start);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Chains build rows `first` on, of groups `groups` of `table`: each one's
+/// last before it of its group to `before`, and it as its group's last.
+fn chain(
+    table: &mut GroupTable,
+    before: &mut SmallVec<u32>,
+    repeats: &mut bool,
+    groups: &[u32],
+    first: u32,
+) -> Result<(), Error> {
+    for (row, &group) in (first..).zip(groups) {
+        if group == NONE {
+            before.push(NONE)?;
+            continue;
+        }
+        let last = last_of(table, group);
+        *repeats |= last != NONE;
+        before.push(last)?;
+        table.set_payload(group, i64::from(row) + 1);
+    }
+    Ok(())
 }
 
 impl Sink for HashBuild {
@@ -721,6 +792,7 @@ impl Sink for HashBuild {
             repeats: false,
             direct: None,
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
+            keys: SmallVec::new(env, 1 << 31)?,
         };
         let groups = context.indices_buffer(BATCH_ROWS_MAX as usize * size_of::<u32>())?;
         Ok(Building { built: Some(built), groups })
@@ -778,19 +850,23 @@ impl Sink for HashBuild {
 
     fn finalize(&self, context: &mut Context, state: &mut Option<Built>) -> Result<(), Error> {
         let Some(built) = state else { failed!() };
+        // One integer key, each in one build row, is found by its value.
+        match built.sequence {
+            Sequence::From(min) => built.direct = Some(Direct::sequence(min, built.count)),
+            Sequence::Held => {
+                built.direct = Direct::of(context.env(), &built.keys)?;
+                if built.direct.is_none() {
+                    Self::hash_held(context, built)?;
+                }
+                built.keys.free();
+            }
+            Sequence::Empty | Sequence::Broken => {}
+        }
+        if built.direct.is_some() {
+            built.table = None;
+        }
         if let Some(table) = &mut built.table {
             table.freeze();
-        }
-        // One integer key, each in one build row, is found by its value.
-        if let Sequence::From(min) = built.sequence {
-            built.direct = Some(Direct::sequence(min, built.count));
-            built.table = None;
-        } else if let (true, false, Some(table)) = (self.one_integer(), built.repeats, &built.table)
-        {
-            built.direct = Direct::of(context.env(), table, built.count)?;
-            if built.direct.is_some() {
-                built.table = None;
-            }
         }
         built.rows.flush(context)
     }
