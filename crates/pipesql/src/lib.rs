@@ -14,6 +14,8 @@ pub mod compile;
 pub mod diagnostics;
 pub mod error;
 pub mod expression;
+#[cfg(test)]
+mod join_tests;
 pub mod keywords;
 pub mod lexer;
 pub mod parser;
