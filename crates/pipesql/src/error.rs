@@ -145,6 +145,15 @@ pub struct Error {
 
 /// Running out of memory, which isn't about any one part of the query, so
 /// points at its start.
+/// The kernel's error: only running out of memory, as the compiler checks
+/// what else a builder would.
+impl From<pipit_kernel::error::Error> for Error {
+    fn from(error: pipit_kernel::error::Error) -> Error {
+        check!(error == pipit_kernel::error::Error::OutOfMemory);
+        Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 })
+    }
+}
+
 impl From<AllocError> for Error {
     fn from(_: AllocError) -> Error {
         Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 })

@@ -4,15 +4,11 @@
 
 #![allow(unsafe_code)]
 
-use pipit_kernel::column::Forms;
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{
-    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId, ScanColumn,
-    ScanOp,
-};
+use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
+use pipit_kernel::query::{Builder, Query};
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::session::Query;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
@@ -60,8 +56,8 @@ pub struct Compiler<'q, 'c> {
     registry: &'q Registry,
     /// What the plan's memory comes from.
     env: &'q Env,
-    /// The plan so far.
-    pub plan: LogicalPlan<'c>,
+    /// What builds the query.
+    pub builder: Builder<'c>,
     /// The columns the stages so far make, by name.
     pub scope: SmallVec<NamedColumn>,
     /// The aliases `t.x` can name columns by.
@@ -102,7 +98,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return Ok(None);
         }
         let id = crate::expression::string(self, node)?;
-        Ok(Some(self.plan.literal(id)))
+        Ok(Some(self.builder.plan.literal(id)))
     }
 
     /// The stages and functions queries can use.
@@ -119,7 +115,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// columns must each have their own, as in Perfetto.
     #[inline(never)]
     fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
-        let name = |i: usize| self.plan.names.get(at!(columns, i).name);
+        let name = |i: usize| self.builder.plan.names.get(at!(columns, i).name);
         (1..columns.len())
             .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
     }
@@ -137,7 +133,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let mut found = self
             .aliases
             .iter()
-            .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
+            .filter(|a| same_word(self.builder.plan.names.get(a.name).as_bytes(), wanted));
         let Some(alias) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
@@ -160,8 +156,9 @@ impl<'q, 'c> Compiler<'q, 'c> {
         text: &[u8],
         span: Span,
     ) -> Result<NamedColumn, Error> {
-        let named =
-            |column: &&NamedColumn| same_word(self.plan.names.get(column.name).as_bytes(), text);
+        let named = |column: &&NamedColumn| {
+            same_word(self.builder.plan.names.get(column.name).as_bytes(), text)
+        };
         let mut found = columns.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, span));
@@ -181,26 +178,23 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let Some(table) = self.catalog.find(self.text(span)) else {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
-        let count = table.column_count();
-        let mut reads = SmallVec::fixed(self.env, count as usize)?;
+        let (relation, made) = self.builder.scan(table)?;
         let mut columns = SmallVec::new(self.env, PLAN_COLUMNS_MAX)?;
-        for i in 0..count {
-            let (name, data_type) = (table.column_name(i), table.column_type(i));
-            let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
-            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
-            columns.push(binding)?;
+        for column in made.iter() {
+            let id = Builder::column_id(column);
+            columns
+                .push(NamedColumn { name: at!(self.builder.plan.columns, id as usize).name, id })?;
         }
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let op = DynOp::new(self.env, ScanOp::new(table, reads))?;
-        let node = self.plan.add_node(op, &[])?;
+        let node = Builder::node(&relation);
         Ok(Relation { node, columns })
     }
 
     /// Adds the alias `name`, a name, for `columns`.
     pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
-        let name = self.plan.names.add(self.text(name.span()))?;
+        let name = self.builder.plan.names.add(self.text(name.span()))?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
         let start = self.alias_columns.len() as u32;
         self.alias_columns.extend_from_slice(columns)?;
@@ -241,28 +235,27 @@ pub fn compile<'e>(
     catalog: &'e dyn Catalog,
     source: &[u8],
 ) -> Result<Query<'e>, Error> {
-    Query::new(env, |env| {
-        let ast = parse_query(env, registry, source)?;
-        let mut compiler = Compiler {
-            source,
-            ast: &ast,
-            catalog,
-            registry,
-            plan: LogicalPlan::new(env)?,
-            scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
-            aliases: SpillVec::new(env, ALIASES_MAX),
-            alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
-            env,
-        };
-        let query = ast.node(ast.root());
-        for i in 0..query.child_count() {
-            let stage = ast.node(query.first_child() + i);
-            (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
-        }
-        let Compiler { mut plan, scope, .. } = compiler;
-        plan.output = scope;
-        Ok(plan)
-    })
+    let ast = parse_query(env, registry, source)?;
+    let mut compiler = Compiler {
+        source,
+        ast: &ast,
+        catalog,
+        registry,
+        builder: Builder::new(env)?,
+        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+        aliases: SpillVec::new(env, ALIASES_MAX),
+        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+        env,
+    };
+    let query = ast.node(ast.root());
+    for i in 0..query.child_count() {
+        let stage = ast.node(query.first_child() + i);
+        (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
+    }
+    let Compiler { mut builder, scope, .. } = compiler;
+    builder.plan.output = scope;
+    let root = Builder::relation(builder.plan.root);
+    Ok(builder.finish(root))
 }
 
 #[cfg(test)]

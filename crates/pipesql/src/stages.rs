@@ -207,9 +207,9 @@ fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, E
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
     let env = compiler.env();
-    let filter = DynOp::new(env, FilterOp::new(env, &compiler.plan.exprs, condition)?)?;
-    let children = [compiler.plan.root];
-    compiler.plan.add_node(filter, &children)?;
+    let filter = DynOp::new(env, FilterOp::new(env, &compiler.builder.plan.exprs, condition)?)?;
+    let children = [compiler.builder.plan.root];
+    compiler.builder.plan.add_node(filter, &children)?;
     Ok(())
 }
 
@@ -250,7 +250,7 @@ fn join(
     kind: JoinKind,
     condition: Option<(Node, Node)>,
 ) -> Result<(), Error> {
-    let probe = compiler.plan.root;
+    let probe = compiler.builder.plan.root;
     let env = compiler.env();
     let probe_columns = SmallVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
@@ -260,7 +260,7 @@ fn join(
     compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
     if kind == JoinKind::Left {
         for column in build.columns.iter() {
-            at_mut!(compiler.plan.columns, column.id as usize).nullable = true;
+            at_mut!(compiler.builder.plan.columns, column.id as usize).nullable = true;
         }
     }
     let condition = match condition {
@@ -286,12 +286,12 @@ fn join(
     let build_columns = SmallVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
     let columns = [probe_columns, build_columns];
     let conjuncts = match condition {
-        Some(condition) => conjuncts_of(env, &compiler.plan.exprs, condition)?,
+        Some(condition) => conjuncts_of(env, &compiler.builder.plan.exprs, condition)?,
         None => SmallVec::fixed(env, 0)?,
     };
     let op = DynOp::new(env, JoinOp::new(env, kind, conjuncts, columns)?)?;
     let children = [probe, build.node];
-    compiler.plan.add_node(op, &children)?;
+    compiler.builder.plan.add_node(op, &children)?;
     Ok(())
 }
 
@@ -375,7 +375,7 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let name = match alias {
-            Some(alias) => Some(compiler.plan.names.add(compiler.text(alias.span()))?),
+            Some(alias) => Some(compiler.builder.plan.names.add(compiler.text(alias.span()))?),
             None => None,
         };
         scope.push(value_of(compiler, value, name, &mut computed)?)?;
@@ -404,7 +404,7 @@ fn named(
     alias: Option<Node>,
 ) -> Result<NamedColumn, Error> {
     let Some(alias) = alias else { return Ok(column) };
-    let name = compiler.plan.names.add(compiler.text(alias.span()))?;
+    let name = compiler.builder.plan.names.add(compiler.text(alias.span()))?;
     Ok(NamedColumn { name, id: column.id })
 }
 
@@ -417,7 +417,7 @@ fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
         let name = listed_once(compiler, list, i, 0)?;
         let text = compiler.text(name.span()).as_bytes();
         let kept = |column: &NamedColumn| {
-            !same_word(compiler.plan.names.get(column.name).as_bytes(), text)
+            !same_word(compiler.builder.plan.names.get(column.name).as_bytes(), text)
         };
         if scope.iter().all(kept) {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
@@ -466,7 +466,7 @@ fn change_in_place(
         let column = at_mut!(scope, at);
         if renames {
             let alias = compiler.node(item.first_child() + 1);
-            column.name = compiler.plan.names.add(compiler.text(alias.span()))?;
+            column.name = compiler.builder.plan.names.add(compiler.text(alias.span()))?;
         } else {
             let value = compiler.node(item.first_child());
             column.id = value_of(compiler, value, Some(found.name), &mut computed)?.id;
@@ -514,9 +514,10 @@ fn value_of(
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
     let (expr, data_type) = compile_expr(compiler, value)?;
-    let (columns, nodes) = (&compiler.plan.columns, compiler.plan.exprs.nodes(expr));
+    let (columns, nodes) =
+        (&compiler.builder.plan.columns, compiler.builder.plan.exprs.nodes(expr));
     let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
-    let column = compiler.plan.add_named_column(name, data_type, nullable)?;
+    let column = compiler.builder.plan.add_named_column(name, data_type, nullable)?;
     computed.push(ComputeItem { output: column.id, expr })?;
     Ok(column)
 }
@@ -531,8 +532,8 @@ fn add_compute(
     }
     let env = compiler.env();
     let compute = DynOp::new(env, ComputeOp { items: computed })?;
-    let children = [compiler.plan.root];
-    compiler.plan.add_node(compute, &children)?;
+    let children = [compiler.builder.plan.root];
+    compiler.builder.plan.add_node(compute, &children)?;
     Ok(())
 }
 
@@ -553,8 +554,8 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         keys.push(SortKey { column, descending: key.descending() })?;
     }
     let order_by = DynOp::new(env, OrderByOp { keys })?;
-    let children = [compiler.plan.root];
-    compiler.plan.add_node(order_by, &children)?;
+    let children = [compiler.builder.plan.root];
+    compiler.builder.plan.add_node(order_by, &children)?;
     Ok(())
 }
 
@@ -573,8 +574,8 @@ fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
     };
     let env = compiler.env();
     let limit = DynOp::new(env, LimitOp { count, offset })?;
-    let children = [compiler.plan.root];
-    compiler.plan.add_node(limit, &children)?;
+    let children = [compiler.builder.plan.root];
+    compiler.builder.plan.add_node(limit, &children)?;
     Ok(())
 }
 
@@ -601,7 +602,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         let column = input_column(compiler, key, alias, &mut computed)?;
-        let data_type = at!(compiler.plan.columns, column.id as usize).data_type;
+        let data_type = at!(compiler.builder.plan.columns, column.id as usize).data_type;
         if !matches!(data_type, DataType::Int64 | DataType::String) {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
@@ -631,13 +632,14 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             Tag::Star => return Err(unsupported),
             _ => (function, Some(input_column(compiler, argument, alias, &mut computed)?.id)),
         };
-        let input_type =
-            input.map_or(DataType::Int64, |id| at!(compiler.plan.columns, id as usize).data_type);
+        let input_type = input.map_or(DataType::Int64, |id| {
+            at!(compiler.builder.plan.columns, id as usize).data_type
+        });
         if input.is_some() && !function.reads(input_type) {
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let name = if let Some(alias) = alias {
-            compiler.plan.names.add(compiler.text(alias.span()))?
+            compiler.builder.plan.names.add(compiler.text(alias.span()))?
         } else {
             // Unnamed, the argument is `*` or a column's name.
             let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
@@ -646,7 +648,7 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
         let output_type = function.output_type(input_type);
-        let binding = compiler.plan.add_named_column(name, output_type, nullable)?;
+        let binding = compiler.builder.plan.add_named_column(name, output_type, nullable)?;
         // The least or greatest of the distinct values is that of them all.
         let distinct = distinct && !matches!(function, Function::Min | Function::Max);
         aggregates.push(Aggregate { function, input, distinct, binding })?;
@@ -654,8 +656,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     }
     add_compute(compiler, computed)?;
     let aggregate = DynOp::new(env, AggregateOp { keys, aggregates, answer: None })?;
-    let children = [compiler.plan.root];
-    compiler.plan.add_node(aggregate, &children)?;
+    let children = [compiler.builder.plan.root];
+    compiler.builder.plan.add_node(aggregate, &children)?;
     compiler.scope = scope;
     compiler.clear_aliases();
     Ok(())
@@ -673,7 +675,7 @@ fn input_column(
         return compiler.find_column(value);
     }
     let name = match alias {
-        Some(alias) => Some(compiler.plan.names.add(compiler.text(alias.span()))?),
+        Some(alias) => Some(compiler.builder.plan.names.add(compiler.text(alias.span()))?),
         None => None,
     };
     value_of(compiler, value, name, computed)
@@ -687,7 +689,7 @@ fn aggregate_name(
     argument: &str,
 ) -> Result<Name, Error> {
     let distinct = if distinct { "DISTINCT " } else { "" };
-    Ok(compiler.plan.names.add_parts(&[function, "(", distinct, argument, ")"])?)
+    Ok(compiler.builder.plan.names.add_parts(&[function, "(", distinct, argument, ")"])?)
 }
 
 #[cfg(test)]

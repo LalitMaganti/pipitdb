@@ -43,6 +43,7 @@ pub(crate) mod output_properties;
 pub(crate) mod pipeline;
 pub mod plan;
 pub mod predicate;
+pub mod query;
 mod radix_sort;
 pub mod row_batch;
 mod row_blocks;

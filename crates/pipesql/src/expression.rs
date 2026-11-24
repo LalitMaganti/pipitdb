@@ -34,7 +34,7 @@ pub fn add_expr(
     nodes: &ExprBuilder,
     node: Node,
 ) -> Result<(Expr, DataType), Error> {
-    let type_of = |column| at!(compiler.plan.columns, column as usize).data_type;
+    let type_of = |column| at!(compiler.builder.plan.columns, column as usize).data_type;
     let data_type = check_expr_type(compiler.env(), nodes.nodes(), &type_of).map_err(|error| {
         let span = compiler.span(node);
         let code = match error {
@@ -53,7 +53,7 @@ pub fn add_expr(
         };
         Error::new(code, span)
     })?;
-    let expr = compiler.plan.exprs.add(nodes.nodes())?;
+    let expr = compiler.builder.plan.exprs.add(nodes.nodes())?;
     Ok((expr, data_type))
 }
 
@@ -88,11 +88,11 @@ fn in_list(
     let operand = nodes.last();
     let list = compiler.node(node.first_child() + 1);
     let len = list.child_count();
-    if compiler.plan.exprs.values().len() + len as usize > PLAN_EXPR_VALUES_MAX {
+    if compiler.builder.plan.exprs.values().len() + len as usize > PLAN_EXPR_VALUES_MAX {
         return Err(Error::new(ErrorCode::ConditionTooLarge, compiler.span(list)));
     }
     #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
-    let start = compiler.plan.exprs.values().len() as u32;
+    let start = compiler.builder.plan.exprs.values().len() as u32;
     let mut kind = None;
     for i in 0..len {
         // A literal, compiled as any is, then taken back off as a value.
@@ -108,7 +108,7 @@ fn in_list(
             return Err(Error::new(ErrorCode::ExpectedOneKind, compiler.span(item)));
         }
         kind = Some(item_kind);
-        compiler.plan.exprs.add_value(listed)?;
+        compiler.builder.plan.exprs.add_value(listed)?;
     }
     let mut test = ExprStep::new(ExprOp::In, operand, start, 0);
     (test.c, test.data_type) = (len, kind.unwrap_or(DataType::Int64));
@@ -264,7 +264,7 @@ pub fn call_bound(
     let values = compile_arguments(compiler, (node, depth), nodes, count, count)?;
     let function = bind(compiler, node)?;
     let env = compiler.env();
-    let Some(id) = compiler.plan.add_function(env, function)? else {
+    let Some(id) = compiler.builder.plan.add_function(env, function)? else {
         return Err(Error::new(ErrorCode::ExpressionTooLarge, compiler.span(node)));
     };
     let mut first = None;
@@ -425,7 +425,7 @@ pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> 
     let inside = at!(quoted, 1..quoted.len() - 1);
     let env = compiler.env();
     if !inside.windows(2).any(|pair| pair == b"''") {
-        return Ok(compiler.plan.add_literal(env, inside)?);
+        return Ok(compiler.builder.plan.add_literal(env, inside)?);
     }
     let mut unquoted = SmallVec::fixed(env, inside.len())?;
     let mut quote = false;
@@ -436,5 +436,5 @@ pub fn string(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Id, Error> 
             unquoted.push(byte)?;
         }
     }
-    Ok(compiler.plan.add_literal(env, &unquoted)?)
+    Ok(compiler.builder.plan.add_literal(env, &unquoted)?)
 }
