@@ -5,13 +5,13 @@ use pipit_kernel::aggregate::Function;
 use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::{Expr, ExprBuilder, ExprOp};
-use pipit_kernel::join::{JoinKind, JoinOp};
+use pipit_kernel::join::JoinKind;
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{DynOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
+use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX};
 use pipit_kernel::query::{Builder, Extension, Order};
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::{Compiler, Scanned};
+use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::expression::{add_expr, compile_expr, is_null};
 use crate::keywords::same_word;
@@ -246,19 +246,15 @@ fn join(
     kind: JoinKind,
     condition: Option<(Node, Node)>,
 ) -> Result<(), Error> {
-    let probe = Builder::node(&compiler.rows());
-    let env = compiler.env();
-    let probe_columns = SmallVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
         table = only(compiler, table)?;
     }
     let build = compiler.compile_relation(table)?;
     compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
-    if kind == JoinKind::Left {
-        for column in build.columns.iter() {
-            at_mut!(compiler.builder.plan.columns, column.id as usize).nullable = true;
-        }
-    }
+    let probe = compiler.rows();
+    let probe = (probe, compiler.scope.iter().map(|column| Builder::column(column.id)));
+    let build_columns = build.columns.iter().map(|column| Builder::column(column.id));
+    let joining = compiler.builder.join(kind, probe, (build.rows, build_columns))?;
     let condition = match condition {
         Some((on, using)) if on.child_count() == 0 && using.child_count() == 0 => {
             return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
@@ -267,7 +263,7 @@ fn join(
             return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using)));
         }
         Some((_, using)) if using.child_count() != 0 => {
-            Some(using_columns(compiler, &build, using)?)
+            Some(using_columns(compiler, &build.columns, using)?)
         }
         Some((on, _)) => {
             compiler.scope.extend_from_slice(&build.columns)?;
@@ -278,17 +274,8 @@ fn join(
             None
         }
     };
-    let env = compiler.env();
-    let build_columns = SmallVec::fixed_from(env, build.columns.iter().map(|c| c.id))?;
-    let columns = [probe_columns, build_columns];
-    let conjuncts = match condition {
-        Some(condition) => conjuncts_of(env, &compiler.builder.plan.exprs, condition)?,
-        None => SmallVec::fixed(env, 0)?,
-    };
-    let op = DynOp::new(env, JoinOp::new(env, kind, conjuncts, columns)?)?;
-    let children = [probe, Builder::node(&build.rows)];
-    let joined = compiler.builder.plan.add_node(op, &children)?;
-    compiler.set_rows(Builder::relation(joined));
+    let joined = compiler.builder.joined(joining, condition)?;
+    compiler.set_rows(joined);
     Ok(())
 }
 
@@ -297,7 +284,7 @@ fn join(
 /// rest of `build`'s.
 fn using_columns(
     compiler: &mut Compiler<'_, '_>,
-    build: &Scanned,
+    build: &[NamedColumn],
     using: Node,
 ) -> Result<Expr, Error> {
     let env = compiler.env();
@@ -307,7 +294,7 @@ fn using_columns(
     let mut joined = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..using.child_count() {
         let name = listed_once(compiler, using, i, 0)?;
-        let (left, right) = (compiler.find_column(name)?, compiler.find_in(&build.columns, name)?);
+        let (left, right) = (compiler.find_column(name)?, compiler.find_in(build, name)?);
         let before = (i > 0).then(|| nodes.last());
         let (a, b) = (nodes.column(left.id)?, nodes.column(right.id)?);
         let equal = nodes.node(ExprOp::Eq, a, b)?;
@@ -326,7 +313,7 @@ fn using_columns(
             scope.push(*column)?;
         }
     }
-    for column in build.columns.iter() {
+    for column in build {
         if !joined.contains(&column.id) {
             scope.push(*column)?;
         }

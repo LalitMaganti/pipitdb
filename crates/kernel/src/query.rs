@@ -11,11 +11,13 @@ use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
 use crate::expression::{ComputeItem, ComputeOp, Expr, expr_can_be_null};
+pub use crate::join::JoinKind;
+use crate::join::JoinOp;
 use crate::limit::LimitOp;
 use crate::names::Name;
 use crate::order_by::OrderByOp;
 use crate::plan::{
-    ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey,
+    ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey, conjuncts_of,
 };
 use crate::scannable::DynScannable;
 
@@ -53,6 +55,16 @@ pub struct Column(ColumnId);
 pub struct Columns {
     first: ColumnId,
     count: u32,
+}
+
+/// Two relations being joined, until their condition is built.
+pub struct Joining {
+    /// How rows are paired.
+    kind: JoinKind,
+    /// The probe side's node, then the build side's.
+    children: [PlanNodeId; 2],
+    /// Each side's columns.
+    columns: [SmallVec<ColumnId>; 2],
 }
 
 /// Rows being extended, by computed columns added one at a time.
@@ -164,6 +176,48 @@ impl<'e> Builder<'e> {
     pub fn filter(&mut self, relation: Relation, condition: Expr) -> Result<Relation, Error> {
         let filter = FilterOp::new(self.env, &self.plan.exprs, condition)?;
         self.add(DynOp::new(self.env, filter)?, relation)
+    }
+
+    /// A join of `probe` and `build`, as `kind` says, whose columns are
+    /// `probe_columns` of `probe`, then `build_columns` of `build`, which a
+    /// left join makes nullable. [`Builder::joined`] gives it its condition.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn join(
+        &mut self,
+        kind: JoinKind,
+        (probe, probe_columns): (Relation, impl ExactSizeIterator<Item = Column>),
+        (build, build_columns): (Relation, impl ExactSizeIterator<Item = Column>),
+    ) -> Result<Joining, Error> {
+        let env = self.env;
+        let probe_columns = SmallVec::fixed_from(env, probe_columns.map(|column| column.0))?;
+        let build_columns = SmallVec::fixed_from(env, build_columns.map(|column| column.0))?;
+        if kind == JoinKind::Left {
+            for &column in build_columns.iter() {
+                at_mut!(self.plan.columns, column as usize).nullable = true;
+            }
+        }
+        let columns = [probe_columns, build_columns];
+        Ok(Joining { kind, children: [probe.0, build.0], columns })
+    }
+
+    /// Each pair of `joining`'s rows that `condition` is true for, or every
+    /// pair without one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn joined(&mut self, joining: Joining, condition: Option<Expr>) -> Result<Relation, Error> {
+        let env = self.env;
+        let Joining { kind, children, columns } = joining;
+        let conjuncts = match condition {
+            Some(condition) => conjuncts_of(env, &self.plan.exprs, condition)?,
+            None => SmallVec::fixed(env, 0)?,
+        };
+        let op = JoinOp::new(env, kind, conjuncts, columns)?;
+        Ok(Relation(self.plan.add_node(DynOp::new(env, op)?, &children)?))
     }
 
     /// The rows of `relation`, to be extended by up to `len` columns, which
