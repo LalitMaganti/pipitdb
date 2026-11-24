@@ -11,8 +11,8 @@ use pipit_kernel::plan::{
     DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId, ScanColumn,
     ScanOp,
 };
+use pipit_kernel::query::Query;
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::session::Query;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};

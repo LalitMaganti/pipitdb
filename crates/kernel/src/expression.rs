@@ -992,6 +992,29 @@ impl Exprs {
         Ok(Expr { start, root })
     }
 
+    /// Appends `step` to the expression being built, whose nodes are from
+    /// its start: the nodes it reads are counted from there.
+    pub(crate) fn push(&mut self, step: ExprStep) -> Result<(), AllocError> {
+        self.nodes.push(step)
+    }
+
+    /// Drops the last node, as when it couldn't be typed.
+    pub(crate) fn pop(&mut self) {
+        self.nodes.pop();
+    }
+
+    /// How many nodes all its expressions have.
+    pub(crate) fn len(&self) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_NODES_MAX`")]
+        let len = self.nodes.len() as u32;
+        len
+    }
+
+    /// The nodes from `start`, those of the expression being built.
+    pub(crate) fn nodes_from(&self, start: u32) -> &[ExprStep] {
+        at!(self.nodes, start as usize..)
+    }
+
     /// Adds a value of an `IN` list, and returns where it is.
     pub fn add_value(&mut self, value: i64) -> Result<u32, AllocError> {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
@@ -1110,7 +1133,26 @@ struct Typer<'t> {
 
 /// A node's type, the register holding it, and whether computing it can
 /// fail, as `Typer` finds them.
-type Typed = (Option<DataType>, u32, bool);
+pub(crate) type Typed = (Option<DataType>, u32, bool);
+
+/// Types the last of `nodes`, an expression's so far, whose earlier nodes'
+/// types and whether they can fail are in `typed`, as is then its own.
+/// Returns its type: `None` for a bare `NULL`.
+pub(crate) fn type_last(
+    env: &Env,
+    type_of: &dyn Fn(ColumnId) -> DataType,
+    nodes: &[ExprStep],
+    typed: &mut [Typed],
+) -> Result<Option<DataType>, ExprError> {
+    check!(!nodes.is_empty() && nodes.len() == typed.len());
+    let Some(node) = nodes.last() else { failed!() };
+    let mut checker = Typer { env, type_of, build: None, nodes: typed };
+    let (data_type, register) = checker.type_node(nodes, node)?;
+    let fails = checker.can_fail(nodes, node, data_type);
+    let Some(last) = checker.nodes.last_mut() else { failed!() };
+    *last = (data_type, register, fails);
+    Ok(data_type)
+}
 
 impl Typer<'_> {
     /// The type of the expression's result.

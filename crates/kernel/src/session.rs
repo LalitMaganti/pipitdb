@@ -9,7 +9,8 @@
 //! ```
 //! use pipit_kernel::env::Env;
 //! use pipit_kernel::error::Error;
-//! use pipit_kernel::session::{Query, Session};
+//! use pipit_kernel::query::Query;
+//! use pipit_kernel::session::Session;
 //!
 //! /// Runs `query` twice, and returns how many rows each run made.
 //! fn count_twice<'e>(env: &'e Env, query: Query<'e>) -> Result<[u64; 2], Error> {
@@ -48,14 +49,13 @@
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::allocator::AllocError;
 use crate::containers::Array;
 use crate::env::Env;
 use crate::error::Error;
 pub use crate::lower::OutputColumn;
 use crate::lower::PhysicalPlan;
 use crate::pipeline::Execution;
-use crate::plan::LogicalPlan;
+use crate::query::Query;
 use crate::row_batch::RowBatch;
 
 /// The next session's id.
@@ -91,26 +91,6 @@ impl<'e> Session<'e> {
     pub fn prepare(&self, mut query: Query<'e>) -> Result<Prepared<'e>, Error> {
         let plan = PhysicalPlan::from_logical(self.env, &mut query.plan)?;
         Ok(Prepared { plan, session: self.id })
-    }
-}
-
-/// What a front end asks to compute: a query, built but not yet prepared.
-pub struct Query<'e> {
-    plan: LogicalPlan<'e>,
-}
-
-impl<'e> Query<'e> {
-    /// The query `build` makes, with memory from `env`.
-    pub fn new<E: From<AllocError>>(
-        env: &'e Env,
-        build: impl FnOnce(&'e Env) -> Result<LogicalPlan<'e>, E>,
-    ) -> Result<Query<'e>, E> {
-        Ok(Query { plan: build(env)? })
-    }
-
-    /// The plan the front end built.
-    pub fn plan(&self) -> &LogicalPlan<'e> {
-        &self.plan
     }
 }
 
