@@ -501,6 +501,13 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_top_rows_by_a_computed_column() {
+        // The key isn't the scan's, so the scan can't skip by it.
+        let query = "FROM t |> EXTEND a + b AS c |> ORDER BY c DESC |> LIMIT 1 |> SELECT c";
+        assert_eq!(kept(query), [22.0]);
+    }
+
+    #[test]
     fn explains_how_a_query_runs() {
         let (catalog, session) = (catalog(), Session::new(Env::current()));
         let prepared = prepare(&session, &catalog, b"FROM t |> ORDER BY a |> LIMIT 1");
