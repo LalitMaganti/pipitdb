@@ -105,6 +105,13 @@ appear in the other. Each rule names its source.
   rows), Perfetto's heuristic. It has no grounding and is replaced by
   distinct counts once metadata provides them. Both are documented
   divergences.
+- **Composite keys.** Equalities between the same two relations, such as
+  `l_partkey = ps_partkey AND l_suppkey = ps_suppkey`, are one key, whose
+  columns aren't independent. In place of the product of their domains,
+  the join divides once by the smaller relation's rows before filters,
+  which assumes that side holds the key. DuckDB's `ApplyJoinPairCap` does
+  the same, and like it, the cap applies only within 8 times the largest
+  of the domains, so a join of two broad tables keeps the product.
 - **Cross products.** left × right, with no division.
 
 ## Budgets
@@ -136,7 +143,7 @@ What it needs of a function is its cost per call and its selectivity.
 | Query shape | Status |
 |---|---|
 | Inner equi-joins | Planned |
-| Joins on several columns | Planned: one edge per condition, each equivalence set divided once |
+| Joins on several columns | Planned: one edge per condition, each equivalence set divided once, and those between the same two relations capped as a composite key |
 | Left, semi and anti joins | Planned, conservatively: some legal reorderings aren't tried. The optimizer passes only inner joins so far |
 | The same table twice | Planned: each use is its own relation |
 | Joins the operator can't run | None so far. Respected, through the executable-join hook |

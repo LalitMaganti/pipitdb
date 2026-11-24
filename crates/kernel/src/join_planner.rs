@@ -40,7 +40,7 @@ pub fn plan(env: &Env, graph: &QueryGraph) -> Result<Option<JoinTree>, Error> {
         return Ok(None);
     }
     let mut stamps = Array::zeroed(env, Estimator::stamps(graph.equivalences.len()))?;
-    let mut estimator = Estimator::new(&graph.equivalences, &mut stamps);
+    let mut estimator = Estimator::new(graph, &mut stamps);
     if let Some(tree) = exact::plan(env, graph, &mut estimator)? {
         return Ok(Some(tree));
     }

@@ -466,12 +466,12 @@ mod tests {
     fn one_row_relations_join_anything() {
         // Two joined relations, and one of a row with no edge to them.
         let mut graph = graph(&[(100, 100), (10, 10), (1, 1)], &[(0, 1, 10)]);
-        let mut estimator = Estimator::new(&graph.equivalences, &mut []);
+        let mut estimator = Estimator::new(&graph, &mut []);
         let tree = plan(Env::current(), &graph, &mut estimator).unwrap();
         assert_eq!(tree.map(|tree| tree.nodes.len()), Some(5));
         // Without its bound of a row, it needs a cross product.
         at_mut!(graph.relations, 2).max_rows = 2;
-        let mut estimator = Estimator::new(&graph.equivalences, &mut []);
+        let mut estimator = Estimator::new(&graph, &mut []);
         assert!(plan(Env::current(), &graph, &mut estimator).unwrap().is_none());
     }
 }
