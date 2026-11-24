@@ -12,6 +12,7 @@ use pipit_kernel::plan::{
     ScanOp,
 };
 use pipit_kernel::scannable::Catalog;
+use pipit_kernel::session::Query;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
@@ -231,34 +232,37 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 }
 
-/// Parses `source` with the stages in `registry`, and compiles it, finding
-/// tables in `catalog`. The plan's result is the last stage's columns.
-pub fn compile<'c>(
-    env: &Env,
+/// Parses `source` with the stages in `registry`, and compiles it into a
+/// query with memory from `env`, finding tables in `catalog`. The query's
+/// result is the last stage's columns.
+pub fn compile<'e>(
+    env: &'e Env,
     registry: &Registry,
-    catalog: &'c dyn Catalog,
+    catalog: &'e dyn Catalog,
     source: &[u8],
-) -> Result<LogicalPlan<'c>, Error> {
-    let ast = parse_query(env, registry, source)?;
-    let mut compiler = Compiler {
-        source,
-        ast: &ast,
-        catalog,
-        registry,
-        plan: LogicalPlan::new(env)?,
-        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
-        aliases: SpillVec::new(env, ALIASES_MAX),
-        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
-        env,
-    };
-    let query = ast.node(ast.root());
-    for i in 0..query.child_count() {
-        let stage = ast.node(query.first_child() + i);
-        (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
-    }
-    let Compiler { mut plan, scope, .. } = compiler;
-    plan.output = scope;
-    Ok(plan)
+) -> Result<Query<'e>, Error> {
+    Query::new(env, |env| {
+        let ast = parse_query(env, registry, source)?;
+        let mut compiler = Compiler {
+            source,
+            ast: &ast,
+            catalog,
+            registry,
+            plan: LogicalPlan::new(env)?,
+            scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+            aliases: SpillVec::new(env, ALIASES_MAX),
+            alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+            env,
+        };
+        let query = ast.node(ast.root());
+        for i in 0..query.child_count() {
+            let stage = ast.node(query.first_child() + i);
+            (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
+        }
+        let Compiler { mut plan, scope, .. } = compiler;
+        plan.output = scope;
+        Ok(plan)
+    })
 }
 
 #[cfg(test)]
@@ -272,10 +276,9 @@ mod tests {
     use pipit_kernel::column::{ColumnView, DataType};
     use pipit_kernel::context::Context;
     use pipit_kernel::env::Env;
-    use pipit_kernel::lower::PhysicalPlan;
-    use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::DynScannable;
     use pipit_kernel::selection::Kept;
+    use pipit_kernel::session::{Prepared, Session};
     use pipit_operators::table::Table;
 
     use super::*;
@@ -437,24 +440,28 @@ mod tests {
         Tables(scannable(table), scannable(same), scannable(nulls), scannable(ids))
     }
 
+    /// `query` over `catalog`, compiled and prepared in `session`.
+    fn prepare<'e>(session: &Session<'e>, catalog: &'e Tables, query: &[u8]) -> Prepared<'e> {
+        let query = compile(Env::current(), &REGISTRY, catalog, query).unwrap();
+        session.prepare(query).unwrap()
+    }
+
     /// Runs `query`, returning each result column's name and the values of
     /// the rows kept, as floats.
     fn run(query: &str) -> StdVec<(StdVec<u8>, StdVec<f64>)> {
         let catalog = catalog();
-        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
-        let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
-        let mut batch = RowBatch::new();
+        let mut session = Session::new(Env::current());
+        let prepared = prepare(&session, &catalog, query.as_bytes());
+        let mut rows = prepared.run(&mut session).unwrap();
         let mut columns: StdVec<_> =
-            physical.columns().iter().map(|&c| (physical.name(c).into(), StdVec::new())).collect();
-        while execution.next(&mut batch).unwrap() {
+            prepared.columns().iter().map(|&c| (prepared.name(c).into(), StdVec::new())).collect();
+        while let Some(batch) = rows.next().unwrap() {
             let rows: StdVec<usize> = match batch.selection().kept() {
                 Kept::Prefix => (0..batch.selection().len() as usize).collect(),
                 Kept::None => StdVec::new(),
                 Kept::Select(rows) => rows.iter().map(|&row| usize::from(row)).collect(),
             };
-            for (&c, (_, values)) in physical.columns().iter().zip(&mut columns) {
+            for (&c, (_, values)) in prepared.columns().iter().zip(&mut columns) {
                 let column = batch.column(c.position);
                 values.extend(rows.iter().map(|&row| match column.data_type() {
                     // A null, which no test value is.
@@ -482,6 +489,15 @@ mod tests {
         let catalog = catalog();
         let error = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).err().unwrap();
         (error.code, error.span.start)
+    }
+
+    #[test]
+    fn runs_only_in_the_session_it_was_prepared_in() {
+        let catalog = catalog();
+        let (mut first, mut second) = (Session::new(Env::current()), Session::new(Env::current()));
+        let prepared = prepare(&first, &catalog, b"FROM t");
+        assert_eq!(prepared.run(&mut second).err(), Some(pipit_kernel::error::Error::WrongSession));
+        assert!(prepared.run(&mut first).unwrap().next().unwrap().is_some());
     }
 
     #[test]
@@ -723,7 +739,8 @@ mod tests {
     fn knows_which_columns_can_be_null() {
         let catalog = catalog();
         let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
+        let query = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
+        let plan = query.plan();
         let nullable = |name: &str| {
             let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
             column.unwrap().nullable
@@ -807,11 +824,9 @@ mod tests {
         // An integer overflow fails the query.
         let catalog = catalog();
         let query = b"FROM t |> SELECT -(-9223372036854775808) AS x";
-        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
-        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
-        let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
-        let overflow = execution.next(&mut RowBatch::new()).err();
+        let mut session = Session::new(Env::current());
+        let prepared = prepare(&session, &catalog, query);
+        let overflow = prepared.run(&mut session).unwrap().next().err();
         assert_eq!(overflow, Some(pipit_kernel::error::Error::Overflow));
     }
 
@@ -935,9 +950,9 @@ mod tests {
         assert_eq!(kept(&format!("{} |> SELECT a", limits(deepest))), [2.0]);
         let deep = limits(pipit_kernel::lower::PLAN_DEPTH_MAX);
         let catalog = catalog();
-        let mut plan = compile(Env::current(), &REGISTRY, &catalog, deep.as_bytes()).unwrap();
-        let lowered = PhysicalPlan::from_logical(Env::current(), &mut plan);
-        assert_eq!(lowered.err(), Some(pipit_kernel::lower::LowerError::TooDeep));
+        let query = compile(Env::current(), &REGISTRY, &catalog, deep.as_bytes()).unwrap();
+        let prepared = Session::new(Env::current()).prepare(query);
+        assert_eq!(prepared.err(), Some(pipit_kernel::error::Error::TooDeep));
     }
 
     #[test]
@@ -1019,13 +1034,11 @@ mod tests {
     /// result column's values.
     fn optimized(query: &str) -> (u32, StdVec<i64>) {
         let catalog = catalog();
-        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
-        let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
-        let mut batch = RowBatch::new();
-        assert!(execution.next(&mut batch).unwrap());
-        let values = batch.column(physical.columns()[0].position).int64s().to_vec();
+        let mut session = Session::new(Env::current());
+        let prepared = prepare(&session, &catalog, query.as_bytes());
+        let mut rows = prepared.run(&mut session).unwrap();
+        let batch = rows.next().unwrap().unwrap();
+        let values = batch.column(prepared.columns()[0].position).int64s().to_vec();
         (batch.column_count(), values)
     }
 

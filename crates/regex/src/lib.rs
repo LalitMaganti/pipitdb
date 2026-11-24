@@ -195,10 +195,9 @@ mod engine {
 mod tests {
     use pipit_kernel::buffer::Buffer;
     use pipit_kernel::env::Env;
-    use pipit_kernel::lower::PhysicalPlan;
-    use pipit_kernel::row_batch::RowBatch;
     use pipit_kernel::scannable::{Catalog, DynScannable};
     use pipit_kernel::selection::Kept;
+    use pipit_kernel::session::Session;
     use pipit_operators::table::Table;
     use pipit_pipesql::compile::compile;
     use pipit_pipesql::registry::Registry;
@@ -238,14 +237,14 @@ mod tests {
     /// The strings of `query`'s one column, a null as `None`.
     fn strings(query: &str) -> Vec<Option<String>> {
         let catalog = catalog();
-        let mut plan = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
-        let physical = PhysicalPlan::from_logical(Env::current(), &mut plan).unwrap();
-        let mut execution = physical.start(Env::current()).unwrap();
-        let mut batch = RowBatch::new();
+        let mut session = Session::new(Env::current());
+        let query = compile(Env::current(), &REGISTRY, &catalog, query.as_bytes()).unwrap();
+        let prepared = session.prepare(query).unwrap();
+        let mut rows = prepared.run(&mut session).unwrap();
         let mut out = Vec::new();
-        while execution.next(&mut batch).unwrap() {
+        while let Some(batch) = rows.next().unwrap() {
             assert!(matches!(batch.selection().kept(), Kept::Prefix));
-            let column = batch.column(physical.columns()[0].position);
+            let column = batch.column(prepared.columns()[0].position);
             for row in 0..batch.selection().len() {
                 let string = column.string_values().get(row as usize);
                 let string = String::from_utf8(string.to_vec()).unwrap();

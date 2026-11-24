@@ -13,9 +13,8 @@ use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::env::{Env, Memory};
-use pipit_kernel::lower::PhysicalPlan;
-use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
+use pipit_kernel::session::Session;
 use pipit_parquet::Uncompressed;
 use pipit_parquet::table::ParquetTable;
 use pipit_pipesql::choices::CHOICES;
@@ -96,15 +95,14 @@ fn run(env: &Env, files: &[TableFile], query: &[u8]) -> Option<u64> {
         let table = ParquetTable::open(env, &Uncompressed, &[source]).ok()?;
         tables.tables.push(DynScannable::new(env, table).ok()?).ok()?;
     }
-    let mut plan = compile(env, &REGISTRY, &tables, query).ok()?;
-    let physical = PhysicalPlan::from_logical(env, &mut plan).ok()?;
-    let mut execution = physical.start(env).ok()?;
+    let mut session = Session::new(env);
+    let prepared = session.prepare(compile(env, &REGISTRY, &tables, query).ok()?).ok()?;
+    let mut rows = prepared.run(&mut session).ok()?;
     let mut context = Context::new(env, None);
-    let mut batch = RowBatch::new();
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(0x0100_0000_01b3);
-    while execution.next(&mut batch).ok()? {
-        for column in physical.columns() {
+    while let Some(batch) = rows.next().ok()? {
+        for column in prepared.columns() {
             let mut values = batch.column(column.position).clone();
             values.make_in(&mut context, Forms::FLAT).ok()?;
             let selection = batch.selection();

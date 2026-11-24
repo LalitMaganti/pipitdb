@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
-use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_operators::table::Table;
@@ -31,10 +30,7 @@ pub fn slices() -> Option<&'static DynScannable<'static>> {
 }
 
 /// `query` over `slices`, compiled, optimized and lowered, ready to run.
-pub fn slice_query(
-    slices: &'static DynScannable<'static>,
-    query: &str,
-) -> Option<PhysicalPlan<'static>> {
+pub fn slice_query(slices: &'static DynScannable<'static>, query: &str) -> Option<crate::Ready> {
     crate::plan(Box::leak(Box::new(Slices(slices))), query)
 }
 

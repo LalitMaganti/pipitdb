@@ -4,7 +4,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::containers::SmallVec;
+use crate::containers::{Array, SmallVec};
 use crate::env::Env;
 use crate::error::Error;
 use crate::expression::Exprs;
@@ -87,7 +87,16 @@ impl<'c> PhysicalPlan<'c> {
 
     /// Starts a run, as `Pipeline::start` does, of its statement.
     pub fn start<'r>(&'r self, env: &'r Env) -> Result<Execution<'r>, Error> {
-        self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks)
+        self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks, None)
+    }
+
+    /// As `start`, in `memory`, which the run grows if it's too small.
+    pub(crate) fn start_in<'r>(
+        &'r self,
+        env: &'r Env,
+        memory: &'r mut Array<u8>,
+    ) -> Result<Execution<'r>, Error> {
+        self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks, Some(memory))
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
