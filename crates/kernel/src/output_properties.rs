@@ -397,30 +397,38 @@ impl<'p> DeriveContext<'p, '_> {
 
     /// Makes the open sort `sort` output only its first `rows` rows, so it
     /// is lowered as a `TopK`. If the rows it sorts are of a scan, and its
-    /// first key is an `Int64`, the `TopK` publishes a cutoff on it for the
-    /// scan to skip by.
+    /// first key is an `Int64` the scan reads, the `TopK` publishes a cutoff
+    /// on it for the scan to skip by.
     pub fn limit_sort(&mut self, sort: OpenSort, rows: u32) {
         // Each publishing `TopK` has a slot of its own, so one in another
         // pipeline never cuts off this scan.
         let slots = self.planned.iter().filter(|node| node.cutoff.is_some()).count();
-        let node = at_mut!(self.planned, sort.node as usize);
-        let Some(InputStep::Sort { keys, keep, publish, scan, .. }) =
-            &mut at_mut!(node.inputs, sort.input as usize).step
-        else {
+        let Some(InputStep::Sort { keys, keep, scan, .. }) = self.sort_step(sort) else {
             failed!()
         };
         *keep = Some(rows);
-        let first = *at!(keys, 0);
-        let Some(scan) = *scan else { return };
+        let (first, scan) = (*at!(keys, 0), *scan);
+        let Some(scan) = scan else { return };
         if at!(self.plan.columns, first.column as usize).data_type != DataType::Int64 {
+            return;
+        }
+        // A key computed above the scan can't cut it off.
+        if at!(self.planned, scan as usize).output.position_of(first.column).is_none() {
             return;
         }
         let Ok(slot) = u32::try_from(slots) else { return };
         if slot >= CUTOFFS_MAX {
             return;
         }
+        let Some(InputStep::Sort { publish, .. }) = self.sort_step(sort) else { failed!() };
         *publish = Some(slot);
         at_mut!(self.planned, scan as usize).cutoff = Some((first, slot));
+    }
+
+    /// The step of the open sort `sort`.
+    fn sort_step(&mut self, sort: OpenSort) -> &mut Option<InputStep> {
+        let node = at_mut!(self.planned, sort.node as usize);
+        &mut at_mut!(node.inputs, sort.input as usize).step
     }
 }
 
