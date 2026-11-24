@@ -936,8 +936,9 @@ impl RawBlocks {
             let mut block = Array::zeroed(env, records * self.record_bytes)?;
             if grow && let Some(old) = self.arrays.pop() {
                 self.starts.pop();
-                let used = self.len * self.record_bytes;
-                at_mut!(block, ..used).copy_from_slice(at!(old, ..used));
+                // All of it, not just the records pushed: any in the room
+                // `reserve` made can be written, through `record_ptr`.
+                at_mut!(block, ..old.len()).copy_from_slice(&old);
             }
             if grow {
                 self.first = records;
@@ -1552,6 +1553,19 @@ mod tests {
             );
             // The first block grew to a whole one; the rest are whole.
             assert_eq!(blocks.starts().len(), 11_usize.div_ceil(BLOCK_RECORDS));
+        }
+
+        #[test]
+        fn keeps_records_written_in_room_reserved() {
+            let env = Env::current();
+            let mut blocks = Blocks::<u8>::new(env, 1).unwrap();
+            blocks.reserve(env, 1).unwrap();
+            // SAFETY: record 0 is in the room reserved.
+            unsafe { *blocks.record_ptr(0) = 7 };
+            // The first block grows in place of itself, never pushed to.
+            blocks.reserve(env, BLOCK_RECORDS).unwrap();
+            // SAFETY: as above.
+            assert_eq!(unsafe { *blocks.record_ptr(0) }, 7);
         }
     }
 

@@ -576,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn keeps_which_groups_have_values_as_groups_are_added() {
+        // A null in the first batch, then groups enough to grow where it
+        // keeps which have values.
+        let rows = Rows {
+            batches: alloc::vec![
+                alloc::vec![(Some(1), Some(5)), (Some(2), None)],
+                alloc::vec![(Some(3), Some(7)), (Some(4), Some(8))],
+            ],
+            dropped: Vec::new(),
+        };
+        let expected = [
+            alloc::vec![Some(1), Some(1), Some(1), Some(5), Some(5), Some(5)],
+            alloc::vec![Some(2), Some(1), Some(0), None, None, None],
+            alloc::vec![Some(3), Some(1), Some(1), Some(7), Some(7), Some(7)],
+            alloc::vec![Some(4), Some(1), Some(1), Some(8), Some(8), Some(8)],
+        ];
+        assert_eq!(run(rows, spec(&[0])).unwrap(), expected);
+    }
+
+    #[test]
     fn groups_keys_that_cant_be_null_without_null_bits() {
         let rows = || Rows {
             batches: alloc::vec![alloc::vec![
