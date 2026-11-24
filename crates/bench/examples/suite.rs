@@ -20,7 +20,7 @@ use pipit_file::source::FileSource;
 use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
-use pipit_kernel::env::Env;
+use pipit_kernel::env::{Env, Memory};
 use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
@@ -140,9 +140,7 @@ fn main() -> Result<(), String> {
             run(&open_tables(&codecs, &sources, false)?, query, pipitdb_bench::env())?;
         }
         // Counts what the query holds at its peak, for the report.
-        // SAFETY: `run` drops all it allocates, but the columns it returns,
-        // which hold none of it.
-        let env = unsafe { Env::new(Heap, usize::MAX) }.map_err(|e| format!("{e:?}"))?;
+        let env = Env::new(Memory::new(Heap, usize::MAX)).map_err(|e| format!("{e:?}"))?;
         codecs.pages.set(0);
         codecs.bytes.set(0);
         // Each query opens its tables, reading their footers, as other

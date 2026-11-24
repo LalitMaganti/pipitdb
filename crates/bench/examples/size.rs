@@ -12,7 +12,7 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::column::{DataType, Forms};
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
-use pipit_kernel::env::Env;
+use pipit_kernel::env::{Env, Memory};
 use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
@@ -69,8 +69,7 @@ pub unsafe extern "C" fn run_query(
     let (files, query) = unsafe {
         (core::slice::from_raw_parts(tables, count), core::slice::from_raw_parts(query, query_len))
     };
-    // SAFETY: everything the query allocates is dropped within `run`.
-    let Ok(env) = (unsafe { Env::new(Heap, budget) }) else { return u64::MAX };
+    let Ok(env) = Env::new(Memory::new(Heap, budget)) else { return u64::MAX };
     run(&env, files, query).unwrap_or(u64::MAX)
 }
 
