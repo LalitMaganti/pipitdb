@@ -13,12 +13,10 @@ mod report;
 mod tree;
 mod windows;
 
-pub use estimate::{Estimator, ROWS_MAX};
-pub use graph::{
-    EquivalenceSet, Executable, JoinEdge, JoinKind, QueryGraph, Relation, RelationSet,
-};
+pub use estimate::Estimator;
+pub use graph::{EquivalenceSet, JoinEdge, QueryGraph, Relation, RelationSet};
 pub(crate) use region::plan_regions;
-pub use tree::{JoinNode, JoinTree, Node};
+pub use tree::{JoinNode, JoinTree};
 
 use crate::containers::Array;
 use crate::env::Env;

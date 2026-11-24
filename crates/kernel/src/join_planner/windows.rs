@@ -245,7 +245,7 @@ fn can_run(
 mod tests {
     use crate::env::Env;
     use crate::join_planner::{
-        EquivalenceSet, JoinEdge, JoinKind, JoinNode, QueryGraph, Relation, RelationSet, plan,
+        EquivalenceSet, JoinEdge, JoinNode, QueryGraph, Relation, RelationSet, plan,
     };
 
     /// A graph of relations of `rows`, each a pair of rows and the most rows,
@@ -253,7 +253,7 @@ mod tests {
     fn graph(rows: &[(u64, u64)], edges: &[(u32, u32, u64)]) -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for &(rows, max_rows) in rows {
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows }).unwrap();
         }
         for (equivalence, &(left, right, domain)) in (0..).zip(edges) {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
@@ -263,8 +263,8 @@ mod tests {
             );
             left_set.insert(left).unwrap();
             right_set.insert(right).unwrap();
-            let (left, right, kind) = (left_set, right_set, JoinKind::Inner);
-            graph.edges.push(JoinEdge { left, right, kind, equivalence }).unwrap();
+            let (left, right) = (left_set, right_set);
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
         graph
     }

@@ -51,39 +51,6 @@ impl RelationSet {
         Ok(())
     }
 
-    pub fn contains(&self, relation: u32) -> bool {
-        self.word(relation as usize / 64).bit(relation as usize % 64)
-    }
-
-    /// Adds every relation of `other`.
-    pub fn union_with(&mut self, other: &RelationSet) -> Result<(), AllocError> {
-        if other.words() > self.words() {
-            self.rest.extend_zeroed(other.words() - self.words())?;
-        }
-        for i in 0..other.words() {
-            *self.word_mut(i) |= other.word(i);
-        }
-        Ok(())
-    }
-
-    /// How many relations it has.
-    pub fn count(&self) -> u32 {
-        (0..self.words()).map(|i| self.word(i).count_ones()).sum()
-    }
-
-    pub fn is_subset(&self, of: &RelationSet) -> bool {
-        (0..self.words()).all(|i| self.word(i) & !of.word(i) == 0)
-    }
-
-    /// Whether every relation of `self` is in `a` or `b`.
-    pub fn is_subset_of_union(&self, a: &RelationSet, b: &RelationSet) -> bool {
-        (0..self.words()).all(|i| self.word(i) & !(a.word(i) | b.word(i)) == 0)
-    }
-
-    pub fn overlaps(&self, other: &RelationSet) -> bool {
-        (0..self.words().min(other.words())).any(|i| self.word(i) & other.word(i) != 0)
-    }
-
     /// Whether it has any relation of `set`, given as words, and whether all
     /// its relations are in `set`.
     pub fn meets(&self, set: &[u64]) -> (bool, bool) {
@@ -116,8 +83,6 @@ impl PartialEq for RelationSet {
 pub struct Relation {
     /// Its estimated rows after its filters.
     pub rows: u64,
-    /// Its rows before its filters.
-    pub unfiltered_rows: u64,
     /// The most rows it can have, guaranteed, unlike `rows`. A relation of
     /// at most one row may be cross-joined to anything.
     pub max_rows: u64,
@@ -133,31 +98,14 @@ pub struct EquivalenceSet {
     pub domain: u64,
 }
 
-/// Which rows a join returns.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum JoinKind {
-    /// The rows that match.
-    Inner,
-    /// The rows that match, and the left side's rows that don't, with nulls.
-    Left,
-    /// The left side's rows that match.
-    Semi,
-    /// The left side's rows that don't match.
-    Anti,
-}
-
 /// A join between two sets of relations. It's an edge of the graph, or a
 /// hyperedge if either side has more than one relation.
 pub struct JoinEdge {
     /// The relations that must be on one side of a join for this edge to
-    /// apply there. They are the relations its condition reads and, for a
-    /// non-inner join, the left of its total eligibility set: the side whose
-    /// rows it keeps.
+    /// apply there: the relations its condition reads.
     pub left: RelationSet,
     /// The same for the other side.
     pub right: RelationSet,
-    /// Which rows the join returns.
-    pub kind: JoinKind,
     /// The equivalence set it joins on, by index.
     pub equivalence: u32,
 }
@@ -260,14 +208,8 @@ mod tests {
 
     #[test]
     fn sets_grow_past_a_word() {
-        let mut a = set(&[1, 70, 200]);
+        let a = set(&[1, 70, 200]);
         assert_eq!((a.words(), a.word(1), a.word(2)), (4, 1 << 6, 0));
-        assert!(set(&[70]).is_subset(&a) && !a.is_subset(&set(&[1, 70])));
-        assert!(set(&[3]).is_subset_of_union(&a, &set(&[3])));
-        assert!(a.overlaps(&set(&[200])) && !a.overlaps(&set(&[2])));
-        a.union_with(&set(&[500])).unwrap();
-        assert_eq!(a.count(), 4);
-        assert!(a.contains(500) && !a.contains(499));
         let b = set(&[1, 70]);
         assert!(b.meets(&[2, 0]) == (true, false) && b.meets(&[2, 1 << 6]) == (true, true));
         assert!(set(&[3]) == set(&[3]) && set(&[3]) != set(&[3, 64]));
