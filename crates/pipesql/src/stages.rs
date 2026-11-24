@@ -8,14 +8,12 @@ use pipit_kernel::expression::{
     ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, expr_can_be_null,
 };
 use pipit_kernel::join::{JoinKind, JoinOp};
-use pipit_kernel::limit::LimitOp;
 use pipit_kernel::names::Name;
-use pipit_kernel::order_by::OrderByOp;
-use pipit_kernel::plan::SortKey;
-use pipit_kernel::plan::{DynOp, FilterOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
+use pipit_kernel::plan::{DynOp, NamedColumn, PLAN_COLUMNS_MAX, conjuncts_of};
+use pipit_kernel::query::{Builder, Order};
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::{Compiler, Relation};
+use crate::compile::{Compiler, Scanned};
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::expression::{add_expr, compile_expr, is_null};
 use crate::keywords::same_word;
@@ -174,6 +172,7 @@ fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     let alias = alias_or(compiler, compiler.node(stage.first_child() + 1), table)?;
     compiler.add_alias(alias, &relation.columns)?;
     compiler.scope = relation.columns;
+    compiler.set_rows(relation.rows);
     Ok(())
 }
 
@@ -206,10 +205,9 @@ fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, E
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
-    let env = compiler.env();
-    let filter = DynOp::new(env, FilterOp::new(env, &compiler.builder.plan.exprs, condition)?)?;
-    let children = [compiler.builder.plan.root];
-    compiler.builder.plan.add_node(filter, &children)?;
+    let rows = compiler.rows();
+    let rows = compiler.builder.filter(rows, condition)?;
+    compiler.set_rows(rows);
     Ok(())
 }
 
@@ -250,7 +248,7 @@ fn join(
     kind: JoinKind,
     condition: Option<(Node, Node)>,
 ) -> Result<(), Error> {
-    let probe = compiler.builder.plan.root;
+    let probe = Builder::node(&compiler.rows());
     let env = compiler.env();
     let probe_columns = SmallVec::fixed_from(env, compiler.scope.iter().map(|c| c.id))?;
     if table.tag() == Tag::List {
@@ -290,8 +288,9 @@ fn join(
         None => SmallVec::fixed(env, 0)?,
     };
     let op = DynOp::new(env, JoinOp::new(env, kind, conjuncts, columns)?)?;
-    let children = [probe, build.node];
-    compiler.builder.plan.add_node(op, &children)?;
+    let children = [probe, Builder::node(&build.rows)];
+    let joined = compiler.builder.plan.add_node(op, &children)?;
+    compiler.set_rows(Builder::relation(joined));
     Ok(())
 }
 
@@ -300,7 +299,7 @@ fn join(
 /// rest of `build`'s.
 fn using_columns(
     compiler: &mut Compiler<'_, '_>,
-    build: &Relation,
+    build: &Scanned,
     using: Node,
 ) -> Result<Expr, Error> {
     let env = compiler.env();
@@ -532,8 +531,9 @@ fn add_compute(
     }
     let env = compiler.env();
     let compute = DynOp::new(env, ComputeOp { items: computed })?;
-    let children = [compiler.builder.plan.root];
-    compiler.builder.plan.add_node(compute, &children)?;
+    let children = [Builder::node(&compiler.rows())];
+    let computed = compiler.builder.plan.add_node(compute, &children)?;
+    compiler.set_rows(Builder::relation(computed));
     Ok(())
 }
 
@@ -541,8 +541,8 @@ fn add_compute(
 /// stably. Keys are columns.
 fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
     let list = compiler.node(stage.first_child());
-    let env = compiler.env();
-    let mut keys = SmallVec::fixed(env, list.child_count() as usize)?;
+    let rows = compiler.rows();
+    let mut sorting = compiler.builder.sort(rows, list.child_count() as usize)?;
     for i in 0..list.child_count() {
         let key = compiler.node(list.first_child() + i);
         let column = compiler.node(key.first_child());
@@ -550,12 +550,11 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         if column.tag() != Tag::Name {
             return Err(unsupported);
         }
-        let column = compiler.find_column(column)?.id;
-        keys.push(SortKey { column, descending: key.descending() })?;
+        let column = Builder::column(compiler.find_column(column)?.id);
+        sorting.by(column, if key.descending() { Order::Descending } else { Order::Ascending })?;
     }
-    let order_by = DynOp::new(env, OrderByOp { keys })?;
-    let children = [compiler.builder.plan.root];
-    compiler.builder.plan.add_node(order_by, &children)?;
+    let rows = compiler.builder.sorted(sorting)?;
+    compiler.set_rows(rows);
     Ok(())
 }
 
@@ -572,10 +571,9 @@ fn compile_limit(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Err
             return Err(Error::unsupported(Unsupported::Limit, compiler.span(second)));
         }
     };
-    let env = compiler.env();
-    let limit = DynOp::new(env, LimitOp { count, offset })?;
-    let children = [compiler.builder.plan.root];
-    compiler.builder.plan.add_node(limit, &children)?;
+    let rows = compiler.rows();
+    let rows = compiler.builder.limit(rows, count, offset)?;
+    compiler.set_rows(rows);
     Ok(())
 }
 
@@ -656,8 +654,9 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     }
     add_compute(compiler, computed)?;
     let aggregate = DynOp::new(env, AggregateOp { keys, aggregates, answer: None })?;
-    let children = [compiler.builder.plan.root];
-    compiler.builder.plan.add_node(aggregate, &children)?;
+    let children = [Builder::node(&compiler.rows())];
+    let grouped = compiler.builder.plan.add_node(aggregate, &children)?;
+    compiler.set_rows(Builder::relation(grouped));
     compiler.scope = scope;
     compiler.clear_aliases();
     Ok(())

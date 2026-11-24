@@ -6,8 +6,8 @@
 
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
-use pipit_kernel::query::{Builder, Query};
+use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
+use pipit_kernel::query::{Builder, Query, Relation};
 use pipit_kernel::scannable::Catalog;
 
 use crate::ast::{Ast, Node, Tag};
@@ -17,10 +17,10 @@ use crate::parser::parse_query;
 use crate::registry::Registry;
 use pipit_kernel::env::Env;
 
-/// What a query reads rows from, compiled: its plan node, and its columns, by
+/// What a query reads rows from, compiled: its rows, and its columns, by
 /// name.
-pub struct Relation {
-    pub node: PlanNodeId,
+pub struct Scanned {
+    pub rows: Relation,
     pub columns: SmallVec<NamedColumn>,
 }
 
@@ -58,6 +58,8 @@ pub struct Compiler<'q, 'c> {
     env: &'q Env,
     /// What builds the query.
     pub builder: Builder<'c>,
+    /// The rows the stages so far make, once `FROM` has made some.
+    rows: Option<Relation>,
     /// The columns the stages so far make, by name.
     pub scope: SmallVec<NamedColumn>,
     /// The aliases `t.x` can name columns by.
@@ -67,6 +69,17 @@ pub struct Compiler<'q, 'c> {
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
+    /// The rows the stages so far make, which the next stage reads.
+    pub fn rows(&mut self) -> Relation {
+        let Some(rows) = self.rows.take() else { failed!() };
+        rows
+    }
+
+    /// Makes `rows` those the stages so far make.
+    pub fn set_rows(&mut self, rows: Relation) {
+        self.rows = Some(rows);
+    }
+
     pub fn node(&self, index: u32) -> Node {
         self.ast.node(index)
     }
@@ -173,7 +186,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// scanned. Every source of rows is compiled through this, so a query
     /// read by another can be one more kind of relation.
     #[inline]
-    pub fn compile_relation(&mut self, name: Node) -> Result<Relation, Error> {
+    pub fn compile_relation(&mut self, name: Node) -> Result<Scanned, Error> {
         let span = name.span();
         let Some(table) = self.catalog.find(self.text(span)) else {
             return Err(Error::new(ErrorCode::UnknownTable, span));
@@ -188,8 +201,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let node = Builder::node(&relation);
-        Ok(Relation { node, columns })
+        Ok(Scanned { rows: relation, columns })
     }
 
     /// Adds the alias `name`, a name, for `columns`.
@@ -242,6 +254,7 @@ pub fn compile<'e>(
         catalog,
         registry,
         builder: Builder::new(env)?,
+        rows: None,
         scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
         aliases: SpillVec::new(env, ALIASES_MAX),
         alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
@@ -252,10 +265,10 @@ pub fn compile<'e>(
         let stage = ast.node(query.first_child() + i);
         (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
     }
+    let rows = compiler.rows();
     let Compiler { mut builder, scope, .. } = compiler;
     builder.plan.output = scope;
-    let root = Builder::relation(builder.plan.root);
-    Ok(builder.finish(root))
+    Ok(builder.finish(rows))
 }
 
 #[cfg(test)]

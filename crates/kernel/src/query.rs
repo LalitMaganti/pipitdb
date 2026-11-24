@@ -8,7 +8,12 @@ use crate::column::Forms;
 use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
-use crate::plan::{ColumnId, DynOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp};
+use crate::expression::Expr;
+use crate::limit::LimitOp;
+use crate::order_by::OrderByOp;
+use crate::plan::{
+    ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey,
+};
 use crate::scannable::DynScannable;
 
 /// What a front end asks to compute: a query, built but not yet prepared.
@@ -45,6 +50,34 @@ pub struct Column(ColumnId);
 pub struct Columns {
     first: ColumnId,
     count: u32,
+}
+
+/// Rows being sorted, by keys added one at a time.
+pub struct Sorting {
+    /// The rows sorted.
+    relation: Relation,
+    /// The keys, in turn.
+    keys: SmallVec<SortKey>,
+}
+
+impl Sorting {
+    /// Sorts by `column`, in `order`, after the keys before.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if there are more keys than the sorting was
+    /// made for.
+    pub fn by(&mut self, column: Column, order: Order) -> Result<(), Error> {
+        let descending = order == Order::Descending;
+        Ok(self.keys.push(SortKey { column: column.0, descending })?)
+    }
+}
+
+/// Which way a sort key orders rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Order {
+    Ascending,
+    Descending,
 }
 
 impl Columns {
@@ -91,6 +124,57 @@ impl<'e> Builder<'e> {
         Ok((Relation(node), Columns { first, count }))
     }
 
+    /// The rows of `relation` that `condition`, an integer, is true for: not
+    /// null or 0.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn filter(&mut self, relation: Relation, condition: Expr) -> Result<Relation, Error> {
+        let filter = FilterOp::new(self.env, &self.plan.exprs, condition)?;
+        self.add(DynOp::new(self.env, filter)?, relation)
+    }
+
+    /// The rows of `relation`, to be sorted by up to `len` keys, which
+    /// [`Sorting::by`] adds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn sort(&mut self, relation: Relation, len: usize) -> Result<Sorting, Error> {
+        Ok(Sorting { relation, keys: SmallVec::fixed(self.env, len)? })
+    }
+
+    /// The rows of `sorting`, sorted by its keys in turn, stably.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn sorted(&mut self, sorting: Sorting) -> Result<Relation, Error> {
+        let Sorting { relation, keys } = sorting;
+        self.add(DynOp::new(self.env, OrderByOp { keys })?, relation)
+    }
+
+    /// The first `count` rows of `relation`, after skipping `offset`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn limit(
+        &mut self,
+        relation: Relation,
+        count: u64,
+        offset: u64,
+    ) -> Result<Relation, Error> {
+        self.add(DynOp::new(self.env, LimitOp { count, offset })?, relation)
+    }
+
+    /// Adds `op`, reading `relation`.
+    #[expect(clippy::needless_pass_by_value, reason = "a relation is read once")]
+    fn add(&mut self, op: DynOp<'e>, relation: Relation) -> Result<Relation, Error> {
+        Ok(Relation(self.plan.add_node(op, &[relation.0])?))
+    }
+
     // What front ends not yet building through it reach the plan by.
 
     #[doc(hidden)]
@@ -106,5 +190,10 @@ impl<'e> Builder<'e> {
     #[doc(hidden)]
     pub fn column_id(column: Column) -> ColumnId {
         column.0
+    }
+
+    #[doc(hidden)]
+    pub fn column(id: ColumnId) -> Column {
+        Column(id)
     }
 }
