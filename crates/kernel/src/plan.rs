@@ -27,7 +27,7 @@ use crate::names::Names;
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate, compared_with};
-use crate::query::{Column, Named};
+use crate::query::Named;
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
 use crate::statement::Statement;
@@ -556,13 +556,6 @@ impl<'c> LogicalPlan<'c> {
         self.statement.add_literal(env, literal)
     }
 
-    /// The literal whose id is `id`.
-    pub fn literal(&self, id: Id) -> &[u8] {
-        let literal = self.statement.literals().and_then(|literals| literals.get(id));
-        let Some(literal) = literal else { failed!() };
-        literal
-    }
-
     /// Binds `function` to it, allocating from `env`, which must
     /// outlive the plan, and returns its id, or `None` if it has the most it
     /// can.
@@ -580,6 +573,7 @@ impl<'c> LogicalPlan<'c> {
     }
 
     /// A new column, and a copy of `name`, which it can be output as.
+    #[cfg(test)]
     pub fn add_column(
         &mut self,
         name: &str,
@@ -587,7 +581,8 @@ impl<'c> LogicalPlan<'c> {
         nullable: bool,
     ) -> Result<Named, AllocError> {
         let name = self.names.add(name)?;
-        Ok(Named { name, column: Column(self.add_unnamed_column(data_type, nullable)?) })
+        let column = crate::query::Column(self.add_unnamed_column(data_type, nullable)?);
+        Ok(Named { name, column })
     }
 
     /// A new column, which has a name only if it's output.

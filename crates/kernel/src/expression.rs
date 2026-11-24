@@ -358,27 +358,6 @@ fn run(
     Ok(result)
 }
 
-/// Which rows of `columns`, of one batch, are null in none of them, or
-/// `None` if none can be: a function's result's, null where an argument is.
-pub fn validity_of(
-    context: &mut Context,
-    columns: &[&ColumnView],
-) -> Result<Option<Buffer>, AllocError> {
-    let Some(first) = columns.first() else { failed!() };
-    if columns.iter().all(|column| column.validity().is_none()) {
-        return Ok(None);
-    }
-    let rows = first.row_count() as usize;
-    let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
-    for (i, bytes) in buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate() {
-        let (at, count) = (i * 64, (rows - i * 64).min(64));
-        let word = columns.iter().fold(!0, |w, column| w & word(column.validity(), at, count));
-        let word = word.to_le_bytes();
-        bytes.copy_from_slice(at!(word, ..bytes.len()));
-    }
-    Ok(Some(buffer))
-}
-
 /// How many arguments a call holds in place: more than most functions take.
 const ARGUMENTS_INLINE: usize = 8;
 
@@ -834,6 +813,27 @@ fn validity(
     Ok(Some(buffer))
 }
 
+/// Which rows of `columns`, of one batch, are null in none of them, or
+/// `None` if none can be: a function's result's, null where an argument is.
+pub fn validity_of(
+    context: &mut Context,
+    columns: &[&ColumnView],
+) -> Result<Option<Buffer>, AllocError> {
+    let Some(first) = columns.first() else { failed!() };
+    if columns.iter().all(|column| column.validity().is_none()) {
+        return Ok(None);
+    }
+    let rows = first.row_count() as usize;
+    let mut buffer = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
+    for (i, bytes) in buffer.as_mut_slice::<u8>().chunks_mut(8).enumerate() {
+        let (at, count) = (i * 64, (rows - i * 64).min(64));
+        let word = columns.iter().fold(!0, |w, column| w & word(column.validity(), at, count));
+        let word = word.to_le_bytes();
+        bytes.copy_from_slice(at!(word, ..bytes.len()));
+    }
+    Ok(Some(buffer))
+}
+
 /// Which of the `count` rows from `at`, a multiple of 64, aren't null, as
 /// the bits of a word.
 #[inline(never)]
@@ -923,24 +923,6 @@ impl ExprBuilder {
         Ok(self.last())
     }
 
-    /// Adds a node of `op` reading `a` and `b`, as `ExprStep::new`.
-    #[inline(never)]
-    pub fn node(&mut self, op: ExprOp, a: u32, b: u32) -> Result<u32, AllocError> {
-        self.push(ExprStep::new(op, a, b, 0))
-    }
-
-    /// Adds column `column`, an `Int64`.
-    #[inline(never)]
-    pub fn column(&mut self, column: ColumnId) -> Result<u32, AllocError> {
-        self.push(ExprStep::new(ExprOp::Column, column, 0, 0))
-    }
-
-    /// Adds the integer `value`.
-    #[inline(never)]
-    pub fn int(&mut self, value: i64) -> Result<u32, AllocError> {
-        self.push(ExprStep::new(ExprOp::Constant, 0, 0, value))
-    }
-
     /// Where the last node added is.
     pub fn last(&self) -> u32 {
         #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
@@ -958,17 +940,8 @@ impl ExprBuilder {
         self.nodes.truncate(0);
     }
 
-    /// Takes the last node off.
-    pub fn pop(&mut self) -> Option<ExprStep> {
-        self.nodes.pop()
-    }
-
     pub fn nodes(&self) -> &[ExprStep] {
         &self.nodes
-    }
-
-    pub fn nodes_mut(&mut self) -> &mut [ExprStep] {
-        &mut self.nodes
     }
 }
 

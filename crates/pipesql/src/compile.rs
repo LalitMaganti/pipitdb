@@ -6,9 +6,9 @@
 
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
 pub use pipit_kernel::query::Named;
 use pipit_kernel::query::{Builder, Query, Relation};
+use pipit_kernel::query::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
 use pipit_kernel::scannable::Catalog;
 
 use crate::ast::{Ast, Node, Tag};
@@ -288,7 +288,7 @@ mod tests {
     use pipit_kernel::table::Table;
 
     use super::*;
-    use pipit_kernel::expression::validity_of;
+    use pipit_kernel::function::validity_of;
     use pipit_kernel::function::{DynFunction, Function};
 
     use crate::choices::CHOICES;

@@ -1,12 +1,9 @@
 //! The stages PipeSQL comes with, as rules for a registry. They use the same
 //! API as any extension.
 
-use pipit_kernel::aggregate::Function;
 use pipit_kernel::containers::SmallVec;
-use pipit_kernel::join::JoinKind;
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::PLAN_COLUMNS_MAX;
-use pipit_kernel::query::{Binary, Expr, Extension, Order};
+use pipit_kernel::query::{Binary, Expr, Extension, Function, JoinKind, Order, PLAN_COLUMNS_MAX};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::{Compiler, Named};

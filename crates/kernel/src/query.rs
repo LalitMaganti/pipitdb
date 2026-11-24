@@ -14,6 +14,7 @@ use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::{Error, TypeError};
+pub use crate::expression::EXPR_NODES_MAX;
 use crate::expression::{
     ComputeItem, ComputeOp, Expr as PlanExpr, ExprBuilder, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX,
     PRESENT, check_expr_type, expr_can_be_null,
@@ -27,6 +28,7 @@ use crate::order_by::OrderByOp;
 use crate::plan::{
     ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey, conjuncts_of,
 };
+pub use crate::plan::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
 use crate::scannable::DynScannable;
 
 /// What a front end asks to compute: a query, built but not yet prepared.

@@ -315,19 +315,16 @@ mod tests {
     use crate::row_batch::BATCH_ROWS_MAX;
 
     /// The nodes of `column <comparison> value`.
-    fn compared(column: ColumnId, comparison: Comparison, value: i64) -> ExprBuilder {
-        let env = Env::current();
-        let op = ExprOp::from(comparison);
-        let mut nodes = ExprBuilder::new(env).unwrap();
-        let (column, value) = (nodes.column(column).unwrap(), nodes.int(value).unwrap());
-        nodes.node(op, column, value).unwrap();
-        nodes
+    fn compared(column: ColumnId, comparison: Comparison, value: i64) -> StdVec<ExprStep> {
+        let column = ExprStep::new(ExprOp::Column, column, 0, 0);
+        let value = ExprStep::new(ExprOp::Constant, 0, 0, value);
+        [column, value, ExprStep::new(ExprOp::from(comparison), 0, 1, 0)].to_vec()
     }
 
     /// A filter of the expression of `nodes`, added to `plan`'s.
-    fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &ExprBuilder) -> DynOp<'c> {
+    fn filter<'c>(plan: &mut LogicalPlan<'c>, nodes: &[ExprStep]) -> DynOp<'c> {
         let env = Env::current();
-        let condition = plan.exprs.add(nodes.nodes()).unwrap();
+        let condition = plan.exprs.add(nodes).unwrap();
         DynOp::new(env, FilterOp::new(env, &plan.exprs, condition).unwrap()).unwrap()
     }
 
@@ -340,7 +337,7 @@ mod tests {
     use crate::context::Context;
     use crate::env::Env;
     use crate::error::Error;
-    use crate::expression::{ExprBuilder, ExprOp, Exprs};
+    use crate::expression::{ExprOp, ExprStep, Exprs};
     use crate::filter::Comparison;
     use crate::optimize::{Needed, choose_forms};
     use crate::output_properties::plan_nodes;
@@ -816,10 +813,9 @@ mod tests {
         let scan = plan.add_node(scan, &[]).unwrap();
         let (a, b) = (bindings[0].column.0, bindings[1].column.0);
         let mut nodes = compared(a, Comparison::Greater, 1);
-        let greater = nodes.last();
-        let b = nodes.column(b).unwrap();
-        let null = nodes.node(ExprOp::IsNull, b, 0).unwrap();
-        nodes.node(ExprOp::Or, greater, null).unwrap();
+        nodes.push(ExprStep::new(ExprOp::Column, b, 0, 0));
+        nodes.push(ExprStep::new(ExprOp::IsNull, 3, 0, 0));
+        nodes.push(ExprStep::new(ExprOp::Or, 2, 4, 0));
         let filter = filter(&mut plan, &nodes);
         plan.add_node(filter, &[scan]).unwrap();
         assert!(plan.output.push(bindings[1]).is_ok());

@@ -14,6 +14,7 @@ use crate::context::Context;
 use crate::env::Env;
 use crate::erase::value_of;
 use crate::error::Error;
+pub use crate::expression::validity_of;
 
 pub trait Function {
     /// Computes it at every row of a batch from its arguments' columns, of

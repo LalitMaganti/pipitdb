@@ -24,18 +24,21 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::allocator::AllocError;
 use crate::buffer::BUFFER_ALIGNMENT_BYTES;
-use crate::containers::{Array, Box, SmallVec};
+#[cfg(test)]
+use crate::containers::Box;
+use crate::containers::{Array, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
-use crate::erase::{drop_state, state_of, value_of, write_state};
+#[cfg(test)]
+use crate::erase::{drop_state, write_state};
+use crate::erase::{state_of, value_of};
 use crate::error::Error;
 use crate::plan::PLAN_NODES_MAX;
 use crate::row_batch::RowBatch;
 use crate::statement::Statement;
-use crate::step::{
-    Breaker, DynSink, DynSource, ErasedBatch, Name, Progress, Sink, Source, SourceNext, Step,
-    StepFunctions,
-};
+use crate::step::{Breaker, DynSink, DynSource, Progress, Sink, Source, Step};
+#[cfg(test)]
+use crate::step::{ErasedBatch, Name, SourceNext, StepFunctions};
 
 /// Read-only, so it can be run any number of times. Owns its source and steps.
 pub struct Pipeline<'a> {
@@ -50,6 +53,7 @@ impl<'a> Pipeline<'a> {
         Pipeline { source, steps, segment_count: operators + 1 }
     }
 
+    #[cfg(test)]
     /// Creates the state of a run, in one allocation from `env`'s base
     /// allocator, which steps' states also allocate from; batches allocate
     /// from its slab allocators. Its steps read its `statement`, if it has
@@ -78,6 +82,7 @@ impl<'a> Pipeline<'a> {
         Ok(Execution { run, context })
     }
 
+    #[cfg(test)]
     /// This pipeline as a source of the batches it outputs. Each run of it
     /// is on the `Context` of the run it's in, so shares its memory, string
     /// pool and statement.
@@ -437,6 +442,7 @@ struct Run<'p> {
     _memory: Option<Array<u8>>,
 }
 
+#[cfg(test)]
 /// A pipeline's functions as a source, whose state is a run of it.
 const PIPELINE_SOURCE: StepFunctions<SourceNext> = StepFunctions {
     name: Name::new("Pipeline"),
@@ -446,6 +452,7 @@ const PIPELINE_SOURCE: StepFunctions<SourceNext> = StepFunctions {
     run: next_of_run,
 };
 
+#[cfg(test)]
 /// Makes a run of `pipeline`, a `Pipeline`, at `state`, as a source's state.
 ///
 /// # Safety
@@ -465,6 +472,7 @@ unsafe fn new_run(
     Ok(())
 }
 
+#[cfg(test)]
 /// Fills `batch` from the run at `state`, as a source's next batch.
 ///
 /// # Safety
@@ -482,6 +490,7 @@ unsafe fn next_of_run(
 }
 
 impl<'p> Execution<'p> {
+    #[cfg(test)]
     /// As `Run::next`.
     pub fn next(&mut self, output: &mut RowBatch<'p>) -> Result<bool, Error> {
         self.run.next(&mut self.context, output)

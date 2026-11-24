@@ -489,7 +489,7 @@ mod tests {
 
     use crate::column::DataType;
     use crate::estimate::Estimate;
-    use crate::expression::{Expr, ExprBuilder, ExprOp, Exprs};
+    use crate::expression::{Expr, ExprOp, ExprStep, Exprs};
     use crate::lower::{LowerError, Lowering};
     use crate::output_properties::{DeriveContext, OutputProperties};
     use crate::plan::{Conjuncts, DynOp, Given, LogicalPlan, Op, PlanNode};
@@ -668,10 +668,8 @@ mod tests {
         let (taken, seen) = (Cell::new(false), Cell::new(None));
         let mut plan = LogicalPlan::new(Env::current()).unwrap();
         let column = plan.add_column("a", DataType::Int64, true).unwrap();
-        let mut null = ExprBuilder::new(Env::current()).unwrap();
-        let a = null.column(0).unwrap();
-        null.node(ExprOp::IsNull, a, 0).unwrap();
-        let null = plan.exprs.add(null.nodes()).unwrap();
+        let read = ExprStep::new(ExprOp::Column, 0, 0, 0);
+        let null = plan.exprs.add(&[read, ExprStep::new(ExprOp::IsNull, 0, 0, 0)]).unwrap();
         let mut node =
             plan.add_node(DynOp::new(Env::current(), Taker(&taken)).unwrap(), &[]).unwrap();
         for op in [

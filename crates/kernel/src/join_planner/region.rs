@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::column::{Bounds, DataType, Forms};
     use crate::context::Context;
-    use crate::expression::{ExprBuilder, ExprOp};
+    use crate::expression::{ExprOp, ExprStep};
     use crate::plan::{ScanColumn, ScanOp, conjuncts_of};
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable, Summary};
@@ -398,10 +398,9 @@ mod tests {
                 previous = b.column.0;
                 continue;
             };
-            let mut nodes = ExprBuilder::new(env).unwrap();
-            let (x, y) = (nodes.column(previous).unwrap(), nodes.column(a.column.0).unwrap());
-            nodes.node(ExprOp::Eq, x, y).unwrap();
-            let condition = plan.exprs.add(nodes.nodes()).unwrap();
+            let column = |id| ExprStep::new(ExprOp::Column, id, 0, 0);
+            let nodes = [column(previous), column(a.column.0), ExprStep::new(ExprOp::Eq, 0, 1, 0)];
+            let condition = plan.exprs.add(&nodes).unwrap();
             let conjuncts = conjuncts_of(env, &plan.exprs, condition).unwrap();
             let mut all = SmallVec::new(env, PLAN_COLUMNS_MAX).unwrap();
             for &column in left_columns.iter().chain(&[a.column.0, b.column.0]) {

@@ -128,10 +128,7 @@ fn expression(code: ErrorCode) -> (String, String) {
     match code {
         ErrorCode::ExpressionTooLarge => (
             "the expression is too large".into(),
-            format!(
-                "expressions are limited to {} parts",
-                pipit_kernel::expression::EXPR_NODES_MAX
-            ),
+            format!("expressions are limited to {} parts", pipit_kernel::query::EXPR_NODES_MAX),
         ),
         ErrorCode::ExpectedNumber => {
             ("arithmetic needs numbers".into(), "this reads a string".into())

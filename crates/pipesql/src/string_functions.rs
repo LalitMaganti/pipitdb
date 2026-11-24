@@ -3,7 +3,7 @@
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::validity_of;
+use pipit_kernel::function::validity_of;
 use pipit_kernel::function::{DynFunction, Function};
 
 use crate::expression::{Bind, call_bound};
