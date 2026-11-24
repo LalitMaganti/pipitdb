@@ -279,7 +279,7 @@ mod tests {
     use pipit_kernel::scannable::DynScannable;
     use pipit_kernel::selection::Kept;
     use pipit_kernel::session::{Prepared, Session};
-    use pipit_operators::table::Table;
+    use pipit_kernel::table::Table;
 
     use super::*;
     use pipit_kernel::expression::validity_of;

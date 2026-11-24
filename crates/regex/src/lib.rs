@@ -198,7 +198,7 @@ mod tests {
     use pipit_kernel::scannable::{Catalog, DynScannable};
     use pipit_kernel::selection::Kept;
     use pipit_kernel::session::Session;
-    use pipit_operators::table::Table;
+    use pipit_kernel::table::Table;
     use pipit_pipesql::compile::compile;
     use pipit_pipesql::registry::Registry;
     use pipit_pipesql::stages::RELATIONAL;

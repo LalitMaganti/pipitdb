@@ -10,7 +10,6 @@ publish = false
 
 [dependencies]
 pipitdb-kernel = { path = "../kernel" }
-pipitdb-operators = { path = "../operators" }
 pipitdb-parquet = { path = "../parquet" }
 pipitdb-pipesql = { path = "../pipesql" }
 

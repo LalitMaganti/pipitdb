@@ -785,7 +785,6 @@ dependencies = [
  "gungraun",
  "pipitdb-file",
  "pipitdb-kernel",
- "pipitdb-operators",
  "pipitdb-parquet",
  "pipitdb-parquet-full",
  "pipitdb-pipesql",
@@ -806,13 +805,6 @@ dependencies = [
 [[package]]
 name = "pipitdb-kernel"
 version = "0.0.0"
-
-[[package]]
-name = "pipitdb-operators"
-version = "0.0.0"
-dependencies = [
- "pipitdb-kernel",
-]
 
 [[package]]
 name = "pipitdb-parquet"
@@ -839,7 +831,6 @@ version = "0.0.0"
 dependencies = [
  "pipitdb-diagnostics",
  "pipitdb-kernel",
- "pipitdb-operators",
 ]
 
 [[package]]
@@ -847,7 +838,6 @@ name = "pipitdb-regex"
 version = "0.0.0"
 dependencies = [
  "pipitdb-kernel",
- "pipitdb-operators",
  "pipitdb-pipesql",
  "regex",
  "regex-lite",

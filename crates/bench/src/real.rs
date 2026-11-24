@@ -11,7 +11,7 @@ use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
-use pipit_operators::table::Table;
+use pipit_kernel::table::Table;
 
 fn data_dir() -> PathBuf {
     let perfetto = std::env::var_os("PIPIT_PERFETTO").map_or_else(
