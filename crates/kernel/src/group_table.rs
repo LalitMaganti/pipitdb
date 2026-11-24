@@ -708,7 +708,8 @@ fn run_starts(keys: &[&[i64]], nulls: Option<&[u64]>, starts: &mut [u32]) -> usi
         let start = *at!(starts, row) != 0;
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's rows")]
         let row_index = row as u32;
-        *at_mut!(starts, runs) = row_index;
+        // SAFETY: `runs` is at most `row`, which is below `count`.
+        unsafe { *starts.get_unchecked_mut(runs) = row_index };
         runs += usize::from(start);
     }
     runs
