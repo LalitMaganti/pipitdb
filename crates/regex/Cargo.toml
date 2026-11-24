@@ -17,7 +17,6 @@ regex = { version = "1.13", optional = true }
 regex-lite = { version = "0.1.9", optional = true }
 
 [dev-dependencies]
-pipitdb-operators = { path = "../operators" }
 
 [features]
 default = ["lite"]

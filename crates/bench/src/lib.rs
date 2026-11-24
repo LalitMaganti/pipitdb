@@ -10,7 +10,7 @@ use pipit_kernel::env::{Env, ThreadEnv};
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::session::{Prepared, Session};
-use pipit_operators::table::Table;
+use pipit_kernel::table::Table;
 use pipit_pipesql::compile::compile;
 use pipit_pipesql::lexer::{Lexer, TokenKind};
 use pipit_pipesql::parser::{parse_expression, parse_query};

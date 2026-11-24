@@ -1,16 +1,16 @@
 //! `Table`: named columns in row groups, the shape of a Parquet file's
-//! footer, which pipelines can scan.
+//! footer, held in memory, which queries can scan.
 
-use pipit_kernel::allocator::AllocError;
-use pipit_kernel::column::{ColumnView, DataType, Form, Forms};
-use pipit_kernel::containers::SmallVec;
-use pipit_kernel::context::Context;
-use pipit_kernel::error::Error;
-use pipit_kernel::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
-use pipit_kernel::scannable::{Key, Scannable, Summary};
+use crate::allocator::AllocError;
+use crate::column::{ColumnView, DataType, Form, Forms};
+use crate::containers::SmallVec;
+use crate::context::Context;
+use crate::error::Error;
+use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
+use crate::scannable::{Key, Scannable, Summary};
 
-use pipit_kernel::env::Env;
-use pipit_kernel::names::{Name, Names};
+use crate::env::Env;
+use crate::names::{Name, Names};
 
 /// Each column has a name, a type, and the forms its row groups store it
 /// in, which, with flat, are the forms a scan can make it in.
@@ -188,7 +188,7 @@ impl Scannable for Table {
                     let mut flat = view.clone();
                     flat.make_in(context, forms)?;
                     let Ok(()) = batch.push_column(flat) else {
-                        pipit_kernel::failed!();
+                        crate::failed!();
                     };
                 }
             }
@@ -204,8 +204,8 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
-    use pipit_kernel::buffer::Buffer;
-    use pipit_kernel::column::Form;
+    use crate::buffer::Buffer;
+    use crate::column::Form;
 
     use super::*;
 

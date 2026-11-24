@@ -16,7 +16,7 @@ use pipit_kernel::env::Env;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::session::Session;
-use pipit_operators::table::Table;
+use pipit_kernel::table::Table;
 
 use crate::compile::compile;
 use crate::registry::Registry;
