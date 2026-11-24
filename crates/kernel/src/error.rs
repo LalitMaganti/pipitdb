@@ -25,6 +25,14 @@ pub enum Error {
     WrongType,
     /// A query nests deeper than a plan can.
     TooDeep,
+    /// A query, or one of its expressions, is bigger than a plan can hold.
+    TooLarge,
+    /// A relation, column or expression of one builder was given to
+    /// another.
+    WrongBuilder,
+    /// A query reads a column where it isn't: not of the table, or not of
+    /// the relation an operation reads.
+    NotInScope,
 }
 
 impl From<AllocError> for Error {
