@@ -937,7 +937,7 @@ impl Join {
             }
             probing.next = 1;
             let paired = at_mut!(probing.paired, ..pairs.row_count() as usize);
-            direct.pair(context, *at!(keys.probe, 0), built.count, paired, pairs)?;
+            direct.pair(context, *at!(keys.probe, 0), paired, pairs)?;
             return Ok((!pairs.selection().is_empty()).then_some(false));
         }
         let (paired, next_of, before) = (&mut probing.paired, &mut probing.next_of, &built.before);

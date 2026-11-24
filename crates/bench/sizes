@@ -1,4 +1,4 @@
-aarch64-apple-darwin 246662
-aarch64-unknown-linux-gnu 244682
-x86_64-unknown-linux-gnu 268270
-wasm32-unknown-unknown 286304
+aarch64-apple-darwin 246534
+aarch64-unknown-linux-gnu 244554
+x86_64-unknown-linux-gnu 268142
+wasm32-unknown-unknown 286120
