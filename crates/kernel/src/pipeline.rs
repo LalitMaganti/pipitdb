@@ -319,22 +319,6 @@ pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error
     Ok(built)
 }
 
-/// `after`, run after `breaker` of `input`'s rows, as a plan runs them:
-/// `input` ends in it, and `after` starts with the source that serves it.
-/// Returns the sinks the second reads, and it.
-#[cfg(test)]
-pub(crate) fn after_breaker<'a, B: Breaker + 'a>(
-    input: Pipeline<'a>,
-    breaker: B,
-    after: impl IntoIterator<Item = Step<'a>, IntoIter: ExactSizeIterator>,
-) -> (Sinks<'a>, Pipeline<'a>) {
-    let env = Env::current();
-    let mut sinks = Sinks::new(env).unwrap();
-    let breaker = sinks.add(env, input, breaker).unwrap();
-    let steps = SmallVec::fixed_from(env, after.into_iter()).unwrap();
-    (sinks, Pipeline::new(served(env, breaker).unwrap(), steps))
-}
-
 #[cfg(test)]
 impl Sinks<'_> {
     /// Each pipeline, then the sink it ends in, as `Pipeline::describe`
@@ -788,7 +772,7 @@ impl Drop for Run<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::buffer::Buffer;
     use alloc::rc::Rc;
     use alloc::vec::Vec;
@@ -801,6 +785,21 @@ mod tests {
     use crate::env::Env;
     use crate::selection::Kept;
     use crate::step::{Breaker, DynOperator, DynTransform, Operator, Sink, Source, Transform};
+
+    /// `after`, run after `breaker` of `input`'s rows, as a plan runs them:
+    /// `input` ends in it, and `after` starts with the source that serves it.
+    /// Returns the sinks the second reads, and it.
+    pub(crate) fn after_breaker<'a, B: Breaker + 'a>(
+        input: Pipeline<'a>,
+        breaker: B,
+        after: impl IntoIterator<Item = Step<'a>, IntoIter: ExactSizeIterator>,
+    ) -> (Sinks<'a>, Pipeline<'a>) {
+        let env = Env::current();
+        let mut sinks = Sinks::new(env).unwrap();
+        let breaker = sinks.add(env, input, breaker).unwrap();
+        let steps = SmallVec::fixed_from(env, after.into_iter()).unwrap();
+        (sinks, Pipeline::new(served(env, breaker).unwrap(), steps))
+    }
 
     fn int64s(values: &[i64]) -> ColumnView {
         let env = Env::current();

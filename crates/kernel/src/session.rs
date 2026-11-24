@@ -52,7 +52,8 @@ use crate::allocator::AllocError;
 use crate::containers::Array;
 use crate::env::Env;
 use crate::error::Error;
-use crate::lower::{OutputColumn, PhysicalPlan};
+pub use crate::lower::OutputColumn;
+use crate::lower::PhysicalPlan;
 use crate::pipeline::Execution;
 use crate::plan::LogicalPlan;
 use crate::row_batch::RowBatch;
@@ -135,7 +136,7 @@ impl Prepared<'_> {
         if session.id != self.session {
             return Err(Error::WrongSession);
         }
-        let execution = self.plan.start_in(session.env, &mut session.memory)?;
+        let execution = self.plan.start(session.env, &mut session.memory)?;
         Ok(Rows { execution, session: PhantomData })
     }
 

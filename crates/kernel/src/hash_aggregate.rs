@@ -371,7 +371,7 @@ impl Breaker for HashAggregate {
 #[cfg(test)]
 mod tests {
     use crate::containers::BitSlice;
-    use crate::pipeline::after_breaker;
+    use crate::pipeline::tests::after_breaker;
     use alloc::format;
     use alloc::string::String;
     use alloc::vec::Vec;

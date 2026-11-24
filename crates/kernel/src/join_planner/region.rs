@@ -11,9 +11,7 @@ use crate::join::{JoinKind as Kind, JoinOp, equality};
 use crate::plan::{ColumnId, DynOp, LogicalPlan, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId};
 use crate::scannable::Key;
 
-use super::{
-    EquivalenceSet, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph, Relation, RelationSet,
-};
+use super::{EquivalenceSet, JoinEdge, JoinNode, JoinTree, QueryGraph, Relation, RelationSet};
 
 /// No relation, or no node.
 const NONE: u32 = u32::MAX;
@@ -178,11 +176,7 @@ fn graph(
         // A filter lowers a relation's estimate, but not the most it can
         // have: its rows before filters.
         let rows = estimate.rows;
-        graph.relations.push(Relation {
-            rows: rows.estimated,
-            unfiltered_rows: rows.max,
-            max_rows: rows.max,
-        })?;
+        graph.relations.push(Relation { rows: rows.estimated, max_rows: rows.max })?;
     }
     // Each column's equivalence set: columns joined by equality, directly or
     // through others, hold the same values.
@@ -234,7 +228,7 @@ fn graph(
         left.insert(a)?;
         right.insert(b)?;
         let equivalence = *at!(set_of, column as usize);
-        graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence })?;
+        graph.edges.push(JoinEdge { left, right, equivalence })?;
     }
     Ok(graph)
 }

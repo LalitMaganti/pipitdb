@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(values(&joined), [[10.0, 20.0]]);
         // More tables than the 64 aliases there were room for, unless plans
         // are built shallower: each join is a level.
-        let tables = 70.min(pipit_kernel::lower::PLAN_DEPTH_MAX - 6);
+        let tables = 70.min(pipit_kernel::settings::PLAN_DEPTH_MAX - 6);
         let many: StdVec<_> =
             (1..tables).map(|i| format!(" |> JOIN ids AS a{i} ON a0.id = a{i}.id")).collect();
         let last = tables - 1;
@@ -949,9 +949,9 @@ mod tests {
         // A filter can't move below a limit, so each stays a node.
         let limits = |n: usize| format!("FROM t{}", " |> LIMIT 9 |> WHERE a > 1".repeat(n));
         // Two nodes a stage pair, under a projection and over a scan.
-        let deepest = (pipit_kernel::lower::PLAN_DEPTH_MAX - 2) / 2;
+        let deepest = (pipit_kernel::settings::PLAN_DEPTH_MAX - 2) / 2;
         assert_eq!(kept(&format!("{} |> SELECT a", limits(deepest))), [2.0]);
-        let deep = limits(pipit_kernel::lower::PLAN_DEPTH_MAX);
+        let deep = limits(pipit_kernel::settings::PLAN_DEPTH_MAX);
         let catalog = catalog();
         let query = compile(Env::current(), &REGISTRY, &catalog, deep.as_bytes()).unwrap();
         let prepared = Session::new(Env::current()).prepare(query);

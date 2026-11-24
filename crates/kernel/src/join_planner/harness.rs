@@ -8,11 +8,13 @@ use std::string::String;
 use std::vec::Vec;
 use std::{format, vec};
 
+use crate::allocator::AllocError;
 use crate::env::Env;
 use crate::error::Error;
+use crate::join_planner::estimate::ROWS_MAX;
 use crate::join_planner::{
-    BUILD_COST, EquivalenceSet, Estimator, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph,
-    ROWS_MAX, Relation, RelationSet,
+    BUILD_COST, EquivalenceSet, Estimator, JoinEdge, JoinNode, JoinTree, QueryGraph, Relation,
+    RelationSet,
 };
 
 /// Picks a valid join tree for a graph, with memory from an `Env`.
@@ -120,17 +122,17 @@ fn relation_set(relations: impl IntoIterator<Item = u32>) -> Result<RelationSet,
     Ok(set)
 }
 
-/// A graph's name, such as `star-10-mixed`.
-pub fn name(shape: Shape, count: usize, mixed: bool) -> String {
-    format!("{}-{count}-{}", shape.name(), if mixed { "mixed" } else { "inner" })
+/// A graph's name, such as `star-10`.
+pub fn name(shape: Shape, count: usize) -> String {
+    format!("{}-{count}", shape.name())
 }
 
 /// A graph of `shape` with `count` relations, written left-deep in their
 /// order: each relation after the first joins one before it, its parent, and
-/// maybe more. If `mixed`, about 20% of relations join by LEFT, SEMI or ANTI.
+/// maybe more.
 #[expect(clippy::too_many_lines, reason = "one generator for every shape")]
-pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, String> {
-    let seed = name(shape, count, mixed)
+pub fn generate(shape: Shape, count: usize) -> Result<QueryGraph, String> {
+    let seed = name(shape, count)
         .bytes()
         .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
     let mut rng = Rng(seed);
@@ -146,22 +148,25 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
             _ => Role::Dimension,
         })
         .collect();
-    let relations: Vec<Relation> = roles
+    // Each relation's rows before its filters.
+    let unfiltered: Vec<u64> = roles
         .iter()
         .map(|role| {
-            let unfiltered = match role {
+            round(match role {
                 Role::Fact => rng.log_uniform(1e6, 1e9),
                 Role::Dimension if shape == Shape::Snowflake => rng.log_uniform(1e3, 1e5),
                 Role::Dimension => rng.log_uniform(1e2, 1e5),
                 Role::SubDimension => rng.log_uniform(1e2, 1e4),
-            };
+            })
+        })
+        .collect();
+    let relations: Vec<Relation> = unfiltered
+        .iter()
+        .map(|&max_rows| {
             let selectivity = if rng.chance(0.4) { 1.0 } else { rng.log_uniform(1e-3, 1.0) };
-            let unfiltered_rows = round(unfiltered);
-            Relation {
-                rows: round(unfiltered * selectivity),
-                unfiltered_rows,
-                max_rows: unfiltered_rows,
-            }
+            #[expect(clippy::cast_precision_loss, reason = "an estimate")]
+            let rows = round(max_rows as f64 * selectivity);
+            Relation { rows, max_rows }
         })
         .collect();
 
@@ -204,11 +209,10 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
     let mut groups: HashMap<usize, u32> = HashMap::new();
     let mut equivalences = Vec::with_capacity(pairs.len());
     for &(i, j) in &pairs {
-        let (a, b) = (relations[i].unfiltered_rows, relations[j].unfiltered_rows);
+        let (a, b) = (unfiltered[i], unfiltered[j]);
         if let (Some(g), true) = (group(i), group(i) == group(j)) {
             let id = *groups.entry(g).or_insert_with(|| {
-                let fewest =
-                    (g * 4..(g * 4 + 4).min(count)).map(|r| relations[r].unfiltered_rows).min();
+                let fewest = (g * 4..(g * 4 + 4).min(count)).map(|r| unfiltered[r]).min();
                 domains.push(fewest.unwrap_or(1));
                 u32::try_from(domains.len() - 1).unwrap_or(u32::MAX)
             });
@@ -230,23 +234,6 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
         equivalences.push(u32::try_from(domains.len() - 1).unwrap_or(u32::MAX));
     }
 
-    // Which relations join by a non-inner join, and how. A relation others
-    // join to later can only be a LEFT join's, whose rows they can see.
-    let mut kinds = vec![JoinKind::Inner; count];
-    if mixed {
-        for (k, kind) in kinds.iter_mut().enumerate().skip(1) {
-            if !rng.chance(0.2) {
-                continue;
-            }
-            let later = pairs.iter().any(|&(i, _)| i == k);
-            *kind = match rng.below(if later { 1 } else { 3 }) {
-                0 => JoinKind::Left,
-                1 => JoinKind::Semi,
-                _ => JoinKind::Anti,
-            };
-        }
-    }
-
     let mut graph = QueryGraph::new(Env::current()).map_err(fail)?;
     for relation in relations {
         graph.relations.push(relation).map_err(fail)?;
@@ -254,20 +241,56 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
     for domain in domains {
         graph.equivalences.push(EquivalenceSet { domain }).map_err(fail)?;
     }
-    // A non-inner join's TES is everything before it as written. So is an
-    // inner join's that reads a LEFT join's right side, which it can't pass.
     for (&(i, j), equivalence) in pairs.iter().zip(equivalences) {
         #[expect(clippy::cast_possible_truncation, reason = "at most 1000")]
         let (i, j) = (i as u32, j as u32);
-        let (left, kind) = match kinds[j as usize] {
-            JoinKind::Inner if kinds[i as usize] == JoinKind::Left => (0..j, JoinKind::Inner),
-            JoinKind::Inner => (i..i + 1, JoinKind::Inner),
-            kind => (0..j, kind),
-        };
-        let (left, right) = (relation_set(left)?, relation_set([j])?);
-        graph.edges.push(JoinEdge { left, right, kind, equivalence }).map_err(fail)?;
+        let (left, right) = (relation_set([i])?, relation_set([j])?);
+        graph.edges.push(JoinEdge { left, right, equivalence }).map_err(fail)?;
     }
     Ok(graph)
+}
+
+/// Set operations the planner itself doesn't need, for checking its plans.
+pub trait SetOps {
+    fn contains(&self, relation: u32) -> bool;
+    fn count(&self) -> u32;
+    fn is_subset(&self, of: &RelationSet) -> bool;
+    /// Whether every relation of `self` is in `a` or `b`.
+    fn is_subset_of_union(&self, a: &RelationSet, b: &RelationSet) -> bool;
+    fn overlaps(&self, other: &RelationSet) -> bool;
+    /// Adds every relation of `other`.
+    fn union_with(&mut self, other: &RelationSet) -> Result<(), AllocError>;
+}
+
+impl SetOps for RelationSet {
+    fn contains(&self, relation: u32) -> bool {
+        self.word(relation as usize / 64) & 1 << (relation % 64) != 0
+    }
+
+    fn count(&self) -> u32 {
+        (0..self.words()).map(|i| self.word(i).count_ones()).sum()
+    }
+
+    fn is_subset(&self, of: &RelationSet) -> bool {
+        (0..self.words()).all(|i| self.word(i) & !of.word(i) == 0)
+    }
+
+    fn is_subset_of_union(&self, a: &RelationSet, b: &RelationSet) -> bool {
+        (0..self.words()).all(|i| self.word(i) & !(a.word(i) | b.word(i)) == 0)
+    }
+
+    fn overlaps(&self, other: &RelationSet) -> bool {
+        (0..self.words()).any(|i| self.word(i) & other.word(i) != 0)
+    }
+
+    fn union_with(&mut self, other: &RelationSet) -> Result<(), AllocError> {
+        for relation in (0..64 * other.words()).filter_map(|r| u32::try_from(r).ok()) {
+            if other.contains(relation) {
+                self.insert(relation)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The words of `set`.
@@ -286,10 +309,11 @@ pub fn estimate(
     estimator.start(left_rows, right_rows);
     let mut any = false;
     for edge in graph.edges.iter() {
-        let forward = edge.left.is_subset(left) && edge.right.is_subset(right);
-        if forward || edge.left.is_subset(right) && edge.right.is_subset(left) {
+        if edge.left.is_subset(left) && edge.right.is_subset(right)
+            || edge.left.is_subset(right) && edge.right.is_subset(left)
+        {
             any = true;
-            estimator.apply(edge, forward);
+            estimator.apply(edge);
         }
     }
     (estimator.finish(), any)
@@ -475,7 +499,7 @@ pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
     for relation in 0..count as u32 {
         #[expect(clippy::cast_precision_loss, reason = "an estimate")]
         let leaf_rows = graph.relations.get(relation as usize).map_or(0.0, |r| r.rows as f64);
-        let leaf = tree.relation(relation, leaf_rows)?;
+        let leaf = tree.add(JoinNode::Relation(relation), leaf_rows);
         let mut set = RelationSet::new(env)?;
         set.insert(relation)?;
         (root, rows) = if relation == 0 {
@@ -483,7 +507,7 @@ pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
         } else {
             let joined_rows =
                 estimate(&mut estimator, graph, [(&joined, rows), (&set, leaf_rows)]).0;
-            (tree.join(root, leaf, joined_rows)?, joined_rows)
+            (tree.add(JoinNode::Join { left: root, right: leaf }, joined_rows), joined_rows)
         };
         joined.union_with(&set)?;
     }
@@ -535,14 +559,11 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
             // the graph isn't connected.
             estimator.start(rows[l], rows[r]);
             let (mut any, mut valid) = (false, true);
-            for &&(edge_left, edge_right, edge) in &within {
-                let forward = edge_left & !left == 0 && edge_right & !right == 0;
-                if forward || edge_left & !right == 0 && edge_right & !left == 0 {
+            for &&(l_edge, r_edge, edge) in &within {
+                if l_edge & !left | r_edge & !right == 0 || l_edge & !right | r_edge & !left == 0 {
                     any = true;
-                    estimator.apply(edge, forward);
-                } else if (edge_left | edge_right) & !left != 0
-                    && (edge_left | edge_right) & !right != 0
-                {
+                    estimator.apply(edge);
+                } else if (l_edge | r_edge) & !left != 0 && (l_edge | r_edge) & !right != 0 {
                     valid = false;
                 }
             }
@@ -577,36 +598,33 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
 /// node.
 fn build(tree: &mut JoinTree, split: &[u32], rows: &[f64], set: usize) -> Result<u32, String> {
     if set.is_power_of_two() {
-        return tree.relation(set.trailing_zeros(), rows[set]).map_err(fail);
+        return Ok(tree.add(JoinNode::Relation(set.trailing_zeros()), rows[set]));
     }
     let left = build(tree, split, rows, split[set] as usize)?;
     let right = build(tree, split, rows, set ^ split[set] as usize)?;
-    tree.join(left, right, rows[set]).map_err(fail)
+    Ok(tree.add(JoinNode::Join { left, right }, rows[set]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A fact of 1000 rows, joined to a dimension of 10 on its key, and
-    /// left joined to another of 100, which then joins the first dimension.
+    /// A fact of 1000 rows, joined to a dimension of 10 on its key, and to
+    /// another of 100 by a condition on both, which also joins the first
+    /// dimension.
     fn star() -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for rows in [1000, 10, 100] {
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows: rows }).unwrap();
         }
         for domain in [10, 100] {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
         }
-        let edges = [
-            (&[0][..], 1, JoinKind::Inner, 0),
-            (&[0, 1], 2, JoinKind::Left, 1),
-            (&[1], 2, JoinKind::Inner, 1),
-        ];
-        for (left, right, kind, equivalence) in edges {
+        let edges = [(&[0][..], 1, 0), (&[0, 1], 2, 1), (&[1], 2, 1)];
+        for (left, right, equivalence) in edges {
             let (left, right) =
                 (relation_set(left.iter().copied()).unwrap(), relation_set([right]).unwrap());
-            graph.edges.push(JoinEdge { left, right, kind, equivalence }).unwrap();
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
         graph
     }
@@ -614,10 +632,11 @@ mod tests {
     /// A tree joining `first` and `second`, then that to `third`.
     fn left_deep([first, second, third]: [u32; 3]) -> JoinTree {
         let mut tree = JoinTree::new(Env::current(), 3).unwrap();
-        let (a, b) = (tree.relation(first, 0.0).unwrap(), tree.relation(second, 0.0).unwrap());
-        let joined = tree.join(a, b, 0.0).unwrap();
-        let c = tree.relation(third, 0.0).unwrap();
-        tree.join(joined, c, 0.0).unwrap();
+        let (a, b) =
+            (tree.add(JoinNode::Relation(first), 0.0), tree.add(JoinNode::Relation(second), 0.0));
+        let joined = tree.add(JoinNode::Join { left: a, right: b }, 0.0);
+        let c = tree.add(JoinNode::Relation(third), 0.0);
+        tree.add(JoinNode::Join { left: joined, right: c }, 0.0);
         tree
     }
 
@@ -625,11 +644,11 @@ mod tests {
     fn costs_and_checks_trees() {
         let graph = star();
         let written = as_written(Env::current(), &graph).unwrap();
-        // 1000 * 10 / 10, then a left join keeping all 1000, each building
-        // its smaller side's 10, then 100, rows at `BUILD_COST` each.
+        // 1000 * 10 / 10, then 1000 * 100 / 100, each building its smaller
+        // side's 10, then 100, rows at `BUILD_COST` each.
         let cost_of = 2000.0 + BUILD_COST * 110.0;
         assert_eq!(cost(&graph, &written).unwrap(), Costed { cost: cost_of, valid: Ok(()) });
-        // The left join before the inner one breaks its TES.
+        // Joining 1 and 2 first leaves no join for the edge from 0 and 1.
         assert_eq!(cost(&graph, &left_deep([1, 2, 0])).unwrap().valid, Err(Invalid::Edge(1)));
         assert_eq!(cost(&graph, &left_deep([0, 2, 1])).unwrap().valid, Err(Invalid::CrossProduct));
     }
@@ -641,18 +660,18 @@ mod tests {
         assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
     }
 
-    /// Each relation left joined to all those before it: a long graph with
-    /// few connected sets, so it's planned exactly.
-    fn left_chain(count: u32) -> QueryGraph {
+    /// Each relation joined to all those before it by one condition on them
+    /// all: a long graph with few connected sets, so it's planned exactly.
+    fn hyperchain(count: u32) -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for relation in 0..count {
             let rows = 10 + u64::from(relation * 7919 % 1000);
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows: rows }).unwrap();
             graph.equivalences.push(EquivalenceSet { domain: rows }).unwrap();
             if relation > 0 {
                 let (left, right) =
                     (relation_set(0..relation).unwrap(), relation_set([relation]).unwrap());
-                let edge = JoinEdge { left, right, kind: JoinKind::Left, equivalence: relation };
+                let edge = JoinEdge { left, right, equivalence: relation };
                 graph.edges.push(edge).unwrap();
             }
         }
@@ -663,8 +682,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn small_graphs_are_planned_optimally() {
         for shape in SHAPES {
-            for (count, mixed) in [(2, false), (3, true), (7, false), (10, true)] {
-                let graph = generate(shape, count, mixed).unwrap();
+            for count in [2, 3, 7, 10] {
+                let graph = generate(shape, count).unwrap();
                 let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
                 let (_, optimum) = exhaustive(&graph).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= optimum * (1.0 + 1e-9));
@@ -676,8 +695,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn larger_graphs_get_valid_plans() {
         for shape in SHAPES {
-            for (count, mixed) in [(20, true), (70, false), (70, true)] {
-                let graph = generate(shape, count, mixed).unwrap();
+            for count in [20, 70] {
+                let graph = generate(shape, count).unwrap();
                 let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
                 let written = cost(&graph, &as_written(Env::current(), &graph).unwrap()).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= written.cost);
@@ -689,15 +708,15 @@ mod tests {
     #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn disconnected_graphs_take_cross_products() {
         for count in [5, 70] {
-            let mut graph = generate(Shape::Chain, count, true).unwrap();
-            graph.relations.push(Relation { rows: 3, unfiltered_rows: 3, max_rows: 3 }).unwrap();
+            let mut graph = generate(Shape::Chain, count).unwrap();
+            graph.relations.push(Relation { rows: 3, max_rows: 3 }).unwrap();
             assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
         }
     }
 
     #[test]
     fn long_graphs_with_few_connected_sets_are_planned_exactly() {
-        let graph = left_chain(50);
+        let graph = hyperchain(50);
         let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
         let written = cost(&graph, &as_written(Env::current(), &graph).unwrap()).unwrap();
         assert_eq!(planned, written);
@@ -708,14 +727,14 @@ mod tests {
     fn one_row_star(connected: bool) -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for (rows, max_rows) in [(1000, 1000), (10, 10), (20, 20), (1, 1)] {
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows }).unwrap();
         }
         let joined: &[u32] = if connected { &[1, 2, 3] } else { &[1, 2] };
         for &dimension in joined {
             let domain = graph.relations.get(dimension as usize).unwrap().rows;
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
             let (left, right) = (relation_set([0]).unwrap(), relation_set([dimension]).unwrap());
-            let edge = JoinEdge { left, right, kind: JoinKind::Inner, equivalence: dimension - 1 };
+            let edge = JoinEdge { left, right, equivalence: dimension - 1 };
             graph.edges.push(edge).unwrap();
         }
         graph
@@ -728,12 +747,12 @@ mod tests {
             // The one-row relation joins a dimension, with no edge between.
             let mut tree = JoinTree::new(Env::current(), 4).unwrap();
             let (dimension, one) =
-                (tree.relation(1, 10.0).unwrap(), tree.relation(3, 1.0).unwrap());
-            let crossed = tree.join(dimension, one, 10.0).unwrap();
-            let fact = tree.relation(0, 1000.0).unwrap();
-            let joined = tree.join(fact, crossed, 0.0).unwrap();
-            let other = tree.relation(2, 20.0).unwrap();
-            tree.join(joined, other, 0.0).unwrap();
+                (tree.add(JoinNode::Relation(1), 10.0), tree.add(JoinNode::Relation(3), 1.0));
+            let crossed = tree.add(JoinNode::Join { left: dimension, right: one }, 10.0);
+            let fact = tree.add(JoinNode::Relation(0), 1000.0);
+            let joined = tree.add(JoinNode::Join { left: fact, right: crossed }, 0.0);
+            let other = tree.add(JoinNode::Relation(2), 20.0);
+            tree.add(JoinNode::Join { left: joined, right: other }, 0.0);
             assert!(cost(&graph, &tree).unwrap().valid.is_ok());
             let (tree, optimum) = exhaustive(&graph).unwrap();
             assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
@@ -751,12 +770,12 @@ mod tests {
         // A chain of 3, whose first two relations can't be joined directly.
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for rows in [10, 20, 30] {
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows: rows }).unwrap();
             graph.equivalences.push(EquivalenceSet { domain: 10 }).unwrap();
         }
         for (left, right, equivalence) in [(0, 1, 0), (1, 2, 1)] {
             let (left, right) = (relation_set([left]).unwrap(), relation_set([right]).unwrap());
-            graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence }).unwrap();
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
         let written = as_written(Env::current(), &graph).unwrap();
@@ -765,7 +784,7 @@ mod tests {
         assert!(cost(&graph, &tree).unwrap().valid.is_ok());
         assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
         // Too big for exact search, so planned greedily, then by windows.
-        let mut graph = generate(Shape::Chain, 70, false).unwrap();
+        let mut graph = generate(Shape::Chain, 70).unwrap();
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
         assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
     }

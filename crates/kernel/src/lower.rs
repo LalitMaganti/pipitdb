@@ -13,7 +13,7 @@ use crate::optimize::optimize;
 use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
 use crate::pipeline::{Execution, Pipeline, SinkId, Sinks, served};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
-use crate::settings::build_setting;
+use crate::settings::PLAN_DEPTH_MAX;
 use crate::sort::sort;
 use crate::statement::Statement;
 use crate::step::{Breaker, DynSource, Sink, Step};
@@ -40,10 +40,6 @@ impl From<AllocError> for LowerError {
 
 /// The most steps a pipeline from a plan can have.
 pub const LOWERED_STEPS_MAX: usize = 1 << 16;
-
-/// How deep a plan can be. Lowering recurses, as Perfetto's does, taking
-/// stack for each level. Set at build time with `PIPIT_PLAN_DEPTH_MAX`.
-pub const PLAN_DEPTH_MAX: usize = build_setting(option_env!("PIPIT_PLAN_DEPTH_MAX"), 1000);
 
 /// A column of a plan's result: its name, and its position in the batches
 /// the pipeline makes.
@@ -75,23 +71,15 @@ impl<'c> PhysicalPlan<'c> {
         lower(env, plan, &planned)
     }
 
-    pub fn pipeline(&self) -> &Pipeline<'c> {
-        &self.pipeline
-    }
-
     /// Its pipelines' steps, as `Sinks::describe` prints them.
     #[cfg(test)]
     pub(crate) fn describe(&self) -> alloc::string::String {
         self.sinks.describe(&self.pipeline)
     }
 
-    /// Starts a run, as `Pipeline::start` does, of its statement.
-    pub fn start<'r>(&'r self, env: &'r Env) -> Result<Execution<'r>, Error> {
-        self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks, None)
-    }
-
-    /// As `start`, in `memory`, which the run grows if it's too small.
-    pub(crate) fn start_in<'r>(
+    /// Starts a run of its statement, in `memory`, which the run grows if
+    /// it's too small.
+    pub(crate) fn start<'r>(
         &'r self,
         env: &'r Env,
         memory: &'r mut Array<u8>,
@@ -462,7 +450,8 @@ mod tests {
         assert_eq!(names, ["b", "a"]);
 
         let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
+        let mut memory = Array::empty(query);
+        let mut execution = physical.start(query, &mut memory).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let rows: StdVec<&[i64]> =
@@ -690,7 +679,8 @@ mod tests {
 
         let physical = lower_planned(&mut plan).unwrap();
         let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
+        let mut memory = Array::empty(query);
+        let mut execution = physical.start(query, &mut memory).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         (batch.column_count() as usize, batch.column(0).int64s().into())
@@ -803,7 +793,8 @@ mod tests {
 
         let physical = lower_planned(&mut plan).unwrap();
         let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
+        let mut memory = Array::empty(query);
+        let mut execution = physical.start(query, &mut memory).unwrap();
         let mut batch = RowBatch::new();
         assert!(execution.next(&mut batch).unwrap());
         let b = batch.column(physical.columns()[0].position);
@@ -1032,7 +1023,8 @@ mod tests {
 
         let physical = lower_planned(&mut plan).unwrap();
         let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
+        let mut memory = Array::empty(query);
+        let mut execution = physical.start(query, &mut memory).unwrap();
         let mut batch = RowBatch::new();
         let (mut kept, mut rows) = (StdVec::new(), 0);
         while execution.next(&mut batch).unwrap() {
@@ -1259,7 +1251,8 @@ mod tests {
         assert!(plan.output.push(a).is_ok());
         crate::optimize::optimize(env, &mut plan).unwrap();
         let physical = lower_planned(&mut plan).unwrap();
-        let mut execution = physical.start(env).unwrap();
+        let mut memory = Array::empty(env);
+        let mut execution = physical.start(env, &mut memory).unwrap();
         let (mut batch, mut rows) = (RowBatch::new(), StdVec::new());
         while execution.next(&mut batch).unwrap() {
             let (selection, column) = (batch.selection(), batch.column(0));
@@ -1341,7 +1334,8 @@ mod tests {
         crate::optimize::optimize(env, &mut plan).unwrap();
         let physical = lower_planned(&mut plan).unwrap();
         let query = Env::current();
-        let mut execution = physical.start(query).unwrap();
+        let mut memory = Array::empty(query);
+        let mut execution = physical.start(query, &mut memory).unwrap();
         let mut batch = RowBatch::new();
         let mut row = StdVec::new();
         if execution.next(&mut batch).unwrap() {
