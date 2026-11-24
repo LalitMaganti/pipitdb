@@ -324,6 +324,8 @@ mod tests {
     use alloc::vec::Vec as StdVec;
     use core::cell::RefCell;
 
+    use crate::row_batch::BATCH_ROWS_MAX;
+
     /// The nodes of `column <comparison> value`.
     fn compared(column: ColumnId, comparison: Comparison, value: i64) -> ExprBuilder {
         let env = Env::current();
@@ -1170,6 +1172,104 @@ mod tests {
         // whatever their keys, so nothing can be skipped.
         assert_eq!(skipped_by(&[OrderBy, Filter, Limit(2)]), skipped);
         assert!(skipped_by(&[Limit(5), OrderBy, Limit(2)]).is_empty());
+    }
+
+    /// Three batches of 2,048 rows of `a`, each its row's number. Before each
+    /// batch, it notes in `seen` the cutoff it's been told to read, if any.
+    struct Ascending<'a> {
+        slot: core::cell::Cell<Option<u32>>,
+        seen: &'a RefCell<StdVec<Option<i64>>>,
+    }
+
+    impl Scannable for Ascending<'_> {
+        type State<'s>
+            = u32
+        where
+            Self: 's;
+        type Loader = ();
+
+        fn column_count(&self) -> u32 {
+            1
+        }
+
+        fn column_name(&self, _: u32) -> &'static str {
+            "a"
+        }
+
+        fn column_type(&self, _: u32) -> DataType {
+            DataType::Int64
+        }
+
+        fn open(&self, _: &mut Context, _: &[(u32, Forms)]) -> Result<u32, Error> {
+            Ok(0)
+        }
+
+        fn next(
+            &self,
+            context: &mut Context,
+            batches: &mut u32,
+            batch: &mut RowBatch,
+        ) -> Result<bool, Error> {
+            if *batches == 3 {
+                return Ok(false);
+            }
+            self.seen.borrow_mut().push(self.slot.get().and_then(|slot| context.cutoff(slot)));
+            batch.reset(BATCH_ROWS_MAX);
+            let mut values = context.values_buffer(BATCH_ROWS_MAX as usize * 8).unwrap();
+            let first = i64::from(*batches * BATCH_ROWS_MAX);
+            for (row, value) in (first..).zip(values.as_mut_slice::<i64>()) {
+                *value = row;
+            }
+            let column = ColumnView::new(context, DataType::Int64, values, None).unwrap();
+            assert!(batch.push_column(column).is_ok());
+            *batches += 1;
+            Ok(true)
+        }
+
+        fn scan_within<'s>(
+            &'s self,
+            _: &Env,
+            _: &[(u32, Forms)],
+            _: &[Condition],
+            cutoff: Option<Cutoff>,
+        ) -> Result<Option<DynSource<'s>>, AllocError> {
+            self.slot.set(cutoff.map(|cutoff| cutoff.slot));
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn publishes_a_top_k_cutoff_to_the_scan_below() {
+        let env = Env::current();
+        let seen = RefCell::new(StdVec::new());
+        let table = Ascending { slot: core::cell::Cell::new(None), seen: &seen };
+        let table = DynScannable::new(env, table).unwrap();
+        let mut plan = LogicalPlan::new(env).unwrap();
+        let a = plan.add_column("a", DataType::Int64, false).unwrap();
+        let read = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
+        let columns = SmallVec::fixed_from(env, [read].into_iter()).unwrap();
+        let scan = plan.add_node(DynOp::new(env, ScanOp::new(&table, columns)).unwrap(), &[]);
+        let key = SortKey { column: a.id, descending: false };
+        let keys = SmallVec::fixed_from(env, [key].into_iter()).unwrap();
+        let children = [scan.unwrap()];
+        let order_by = DynOp::new(env, crate::order_by::OrderByOp { keys }).unwrap();
+        let children = [plan.add_node(order_by, &children).unwrap()];
+        let limit = DynOp::new(env, crate::limit::LimitOp { count: 3, offset: 0 }).unwrap();
+        plan.add_node(limit, &children).unwrap();
+        assert!(plan.output.push(a).is_ok());
+        crate::optimize::optimize(env, &mut plan).unwrap();
+        let physical = lower_planned(&mut plan).unwrap();
+        let mut execution = physical.start(env).unwrap();
+        let (mut batch, mut rows) = (RowBatch::new(), StdVec::new());
+        while execution.next(&mut batch).unwrap() {
+            let (selection, column) = (batch.selection(), batch.column(0));
+            let kept = (0..selection.len()).map(|i| selection.kept().row(i) as usize);
+            rows.extend(kept.map(|row| column.int64s()[row]));
+        }
+        drop(execution);
+        assert_eq!(rows, [0, 1, 2]);
+        // Once it holds two batches, the `TopK` publishes its third row.
+        assert_eq!(*seen.borrow(), [None, None, Some(2)]);
     }
 
     /// A table of one column, `a`, of 7 rows from -3 to 9, which it says
