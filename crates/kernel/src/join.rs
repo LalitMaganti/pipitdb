@@ -910,7 +910,7 @@ impl Join {
         if self.held > 0 {
             let paired = at!(probing.paired, ..pairs.row_count() as usize);
             let mut gathered = RowBatch::new();
-            built.rows.gather_held(context, &mut gathered, paired)?;
+            built.rows.gather_held(context, &mut gathered, (paired, pairs.selection().kept()))?;
             for c in 0..gathered.column_count() {
                 let Ok(()) = pairs.push_column(gathered.column(c).clone()) else { failed!() };
             }
@@ -1094,7 +1094,8 @@ impl Join {
             let Ok(()) = output.push_column(null.slice(0, count)) else { failed!() };
         }
         let mut gathered = RowBatch::new();
-        built.rows.gather_held(context, &mut gathered, at!(probing.paired, ..count as usize))?;
+        let paired = at!(probing.paired, ..count as usize);
+        built.rows.gather_held(context, &mut gathered, (paired, Kept::Prefix))?;
         for c in 0..self.outputs {
             #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
             let column = gathered.column(c as u32).clone();

@@ -193,6 +193,11 @@ impl GatherSource {
         &self.view
     }
 
+    /// What a string column's views are into, or none.
+    pub(crate) fn bytes(&self) -> Option<&Buffer> {
+        self.view.header().bytes.as_ref()
+    }
+
     /// The word of row `row`, a row of a batch.
     #[inline]
     pub(crate) fn word(&self, row: u32) -> i64 {

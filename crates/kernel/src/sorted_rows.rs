@@ -15,6 +15,7 @@ use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
 use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
+use crate::selection::Kept;
 
 /// A column to sort by, and its direction.
 #[derive(Clone, Copy)]
@@ -315,7 +316,7 @@ impl SortedRows {
             }
             Ok(ColumnView::new(context, data_type, values, nulls.then_some(validity))?)
         };
-        self.rows.gather(context, out, rows, at, &mut { given })
+        self.rows.gather(context, out, (rows, Kept::Prefix), at, &mut { given })
     }
 
     /// Copies the columns `RowStore::scatter` can into the order, once

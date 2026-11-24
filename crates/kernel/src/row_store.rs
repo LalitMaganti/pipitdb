@@ -12,7 +12,9 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
+use core::mem::MaybeUninit;
 use core::ops::Range;
+use core::ptr;
 
 /// The bits of a row's place that say which row of its batch it is.
 const ROW_BITS: u32 = 11;
@@ -231,16 +233,17 @@ impl RowStore {
     }
 
     /// Fills `out` with up to a batch's worth of `rows`, in that order and
-    /// repeats included, returning how many. Rows held one after another in
-    /// one batch are viewed where they are held; any others are copied into
-    /// buffers from `context`. `at` is where `rows` start in the order
-    /// `scatter` was given, if it was. `given(context, column)` makes a
-    /// dropped column's values.
+    /// repeats included, returning how many. Only the rows `kept` keeps are
+    /// read and written, but a string not kept is empty. Rows held one
+    /// after another in one batch are viewed where they are held; any
+    /// others are copied into buffers from `context`. `at` is where `rows`
+    /// start in the order `scatter` was given, if it was.
+    /// `given(context, column)` makes a dropped column's values.
     pub(crate) fn gather(
         &mut self,
         context: &mut Context,
         out: &mut RowBatch,
-        rows: &[u32],
+        (rows, kept): (&[u32], Kept),
         at: u32,
         given: &mut dyn FnMut(&mut Context, u32) -> Result<ColumnView, Error>,
     ) -> Result<u32, Error> {
@@ -250,21 +253,39 @@ impl RowStore {
         out.reset(count);
         let Some(&first) = rows.first() else { return Ok(0) };
         self.flush(context)?;
-        // Found once for every column: a row held whole is its own place.
+        // The rows kept, by their place in `rows`.
+        let mut every = [MaybeUninit::<u16>::uninit(); BATCH_ROWS_MAX as usize];
+        let kept = match kept {
+            Kept::Prefix => {
+                let every = at_mut!(every, ..count as usize);
+                for (r, slot) in (0..).zip(every.iter_mut()) {
+                    slot.write(r);
+                }
+                // SAFETY: each was just written.
+                unsafe { &*(ptr::from_ref(every) as *const [u16]) }
+            }
+            Kept::None => &[],
+            Kept::Select(kept) => kept,
+        };
+        check!(kept.last().is_none_or(|&r| u32::from(r) < count));
+        // Found once for every column, by row: a row held whole is its own
+        // place.
         let mut found = [0_u32; BATCH_ROWS_MAX as usize];
         let places = if self.places.is_empty() {
             rows
         } else {
-            for (found, &row) in found.iter_mut().zip(rows) {
-                *found = self.place(row);
+            for &r in kept {
+                *at_mut!(found, usize::from(r)) = self.place(*at!(rows, usize::from(r)));
             }
             at!(found, ..count as usize)
         };
-        let first_place = *at!(places, 0);
+        // A run's first, or any held, as rows not kept may be of none.
+        let first_place = kept.first().map_or(0, |&r| *at!(places, usize::from(r)));
         let (held, start) = self.find(first_place);
         let scattered = |c: usize| self.copied(c, at, count);
-        // Rows from `start` on in one batch, not running past its last.
-        let run = start + count <= 1 << ROW_BITS
+        // Every row, from `start` on in one batch, not running past its last.
+        let run = kept.len() == count as usize
+            && start + count <= 1 << ROW_BITS
             && (0..count)
                 .zip(rows.iter().zip(places))
                 .all(|(r, (&row, &place))| row == first + r && place == first_place + r);
@@ -290,7 +311,9 @@ impl RowStore {
                 None => {
                     let nullable = self.nullable >> c.min(63) & 1 != 0;
                     let data_type = at!(held, c).view().data_type();
-                    gather(context, data_type, (&self.held, width, c), places, nullable)?
+                    let source = (&*self.held, width, c);
+                    let one = self.batches == 1;
+                    gather(context, data_type, source, (places, kept), (nullable, one))?
                 }
             };
             let Ok(()) = out.push_column(column) else { failed!() };
@@ -305,7 +328,7 @@ impl RowStore {
         &mut self,
         context: &mut Context,
         out: &mut RowBatch,
-        rows: &[u32],
+        rows: (&[u32], Kept),
     ) -> Result<u32, Error> {
         self.gather(context, out, rows, 0, &mut |_, _| failed!())
     }
@@ -644,20 +667,26 @@ fn view(start: usize, len: usize) -> Result<[u32; 2], Error> {
     Ok([start, len])
 }
 
-/// A flat column of `data_type` holding, for each of `places`, that row of
-/// its batch's column in `held`: the store's columns, how many each batch
-/// has, and which column. `nullable` is whether any has nulls.
+/// A flat column of `data_type` holding, for each row `kept`, the row at
+/// its place in `places` of its batch's column in `held`: the store's
+/// columns, how many each batch has, and which column. `kept` increase,
+/// the last below `places`' length. Other rows are unspecified, but a
+/// string's is empty. `nullable` is whether any has nulls, and `one`
+/// whether there's one batch held, whose strings' bytes are then shared
+/// rather than copied.
 fn gather(
     context: &mut Context,
     data_type: DataType,
     (held, width, column): (&[GatherSource], usize, usize),
-    places: &[u32],
-    nullable: bool,
+    (places, kept): (&[u32], &[u16]),
+    (nullable, one): (bool, bool),
 ) -> Result<ColumnView, Error> {
     let rows = places.len();
     // This column of every batch held is every `width`th from here.
     let held = at!(held, column..);
-    let found = |place: u32| {
+    let found = |r: u16| {
+        // SAFETY: as `kept` says.
+        let place = *unsafe { places.get_unchecked(usize::from(r)) };
         let at = (place >> ROW_BITS) as usize * width;
         // SAFETY: a place is of a batch held, each with `width` sources.
         (unsafe { held.get_unchecked(at) }, place & ROW_MASK)
@@ -669,34 +698,45 @@ fn gather(
         let bits = buffer.as_mut_slice::<u8>();
         bits.fill(0);
         let mut nulls = false;
-        for (r, &place) in places.iter().enumerate() {
-            let (source, row) = found(place);
+        for &r in kept {
+            let (source, row) = found(r);
             let valid = source.is_valid(row);
-            BitSlice::of_mut(&mut *bits).set_if(r, valid);
+            BitSlice::of_mut(&mut *bits).set_if(usize::from(r), valid);
             nulls |= !valid;
         }
         validity = nulls.then_some(buffer);
     }
+    let words = at_mut!(values.as_mut_slice::<i64>(), ..rows);
+    if kept.len() < rows && data_type.has_bytes() {
+        words.fill(0);
+    }
     // A string's word is its view.
-    for (out, &place) in values.as_mut_slice::<i64>().iter_mut().zip(places) {
-        let (source, row) = found(place);
-        *out = source.word(row);
+    for &r in kept {
+        let (source, row) = found(r);
+        // SAFETY: as `kept` says.
+        *unsafe { words.get_unchecked_mut(usize::from(r)) } = source.word(row);
     }
     if !data_type.has_bytes() {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
+    if let (true, Some(bytes)) = (one, at!(held, 0).bytes()) {
+        return Ok(ColumnView::strings(context, values, bytes.clone(), validity)?);
+    }
     let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
-    let total = views.iter().map(|&[_, len]| len as usize).sum();
-    let mut bytes = context.bytes_buffer(total)?;
+    let total: u64 = views.iter().map(|&[_, len]| u64::from(len)).sum();
+    // So no view's start or length is past 32 bits.
+    let Ok(total) = u32::try_from(total) else { return Err(Error::OutOfMemory) };
+    let mut bytes = context.bytes_buffer(total as usize)?;
     let out = bytes.as_mut_slice::<u8>();
     let mut start = 0;
-    for (out_view, &place) in views.iter_mut().zip(places) {
-        let (source, _) = found(place);
+    for &r in kept {
+        let (source, _) = found(r);
+        let out_view = at_mut!(views, usize::from(r));
         let [from, len] = *out_view;
         let string = source.string(from, len);
-        at_mut!(out, start..start + string.len()).copy_from_slice(string);
-        *out_view = view(start, string.len())?;
-        start += string.len();
+        at_mut!(out, start as usize..(start + len) as usize).copy_from_slice(string);
+        *out_view = [start, len];
+        start += len;
     }
     Ok(ColumnView::strings(context, values, bytes, validity)?)
 }
@@ -815,8 +855,9 @@ mod tests {
         let mut got = Vec::new();
         for chunk in all.chunks(BATCH_ROWS_MAX as usize) {
             assert_eq!(
-                store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap()
-                    as usize,
+                store
+                    .gather(&mut context, &mut out, (chunk, Kept::Prefix), 0, &mut |_, _| failed!())
+                    .unwrap() as usize,
                 chunk.len()
             );
             if chunk[0] == 0 {
@@ -830,7 +871,9 @@ mod tests {
         let backwards: Vec<u32> = (0..store.len()).rev().step_by(3).collect();
         let mut got = Vec::new();
         for chunk in backwards.chunks(BATCH_ROWS_MAX as usize) {
-            store.gather(&mut context, &mut out, chunk, 0, &mut |_, _| failed!()).unwrap();
+            store
+                .gather(&mut context, &mut out, (chunk, Kept::Prefix), 0, &mut |_, _| failed!())
+                .unwrap();
             got.extend(read(&out));
         }
         let expected: Vec<_> = backwards.iter().map(|&r| expected[r as usize].clone()).collect();
@@ -850,11 +893,37 @@ mod tests {
         let last = BATCH_ROWS_MAX * 2 - 1;
         let rows = [last, 3, BATCH_ROWS_MAX, 0];
         let mut out = RowBatch::new();
-        store.gather(&mut context, &mut out, &rows, 0, &mut |_, _| failed!()).unwrap();
+        store
+            .gather(&mut context, &mut out, (&rows, Kept::Prefix), 0, &mut |_, _| failed!())
+            .unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let null = (None, b"v0".to_vec());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
         assert_eq!(read(&out), [int(newest), null, int(10_000), int(0)]);
+    }
+
+    #[test]
+    fn gathers_only_the_rows_kept() {
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        let mut store = RowStore::new(env).unwrap();
+        // Half the rows, shared: row `i` held is the batch's `2 * i`.
+        let one = batch(&mut context, 0, |row| row % 2 == 0);
+        store.append(&mut context, &one).unwrap();
+        // Rows 0 and 2 aren't kept, and their rows held aren't any.
+        let rows = [u32::MAX, 4, u32::MAX, 2];
+        let mut out = RowBatch::new();
+        let kept = (&rows[..], Kept::Select(&[1, 3]));
+        store.gather(&mut context, &mut out, kept, 0, &mut |_, _| failed!()).unwrap();
+        // One batch held: its strings' bytes are shared.
+        assert!(core::ptr::eq(
+            out.column(1).string_values().get(1).as_ptr(),
+            one.column(1).string_values().get(8).as_ptr()
+        ));
+        let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
+        let got = read(&out);
+        assert_eq!([&got[1], &got[3]], [&int(8), &int(4)]);
+        assert_eq!(got[0].1, b"");
     }
 
     #[test]
@@ -898,7 +967,9 @@ mod tests {
         for (chunk, at) in
             rows.chunks(BATCH_ROWS_MAX as usize).zip((0..).step_by(BATCH_ROWS_MAX as usize))
         {
-            store.gather(&mut context, &mut out, chunk, at, &mut |_, _| failed!()).unwrap();
+            store
+                .gather(&mut context, &mut out, (chunk, Kept::Prefix), at, &mut |_, _| failed!())
+                .unwrap();
             for (r, &row) in chunk.iter().enumerate() {
                 assert_eq!(out.column(0).int64s()[r], value(row));
                 assert_eq!(out.column(2).int64s()[r], value(row) * 10 + 1);
