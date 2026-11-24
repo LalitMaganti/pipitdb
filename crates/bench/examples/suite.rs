@@ -135,8 +135,14 @@ fn main() -> Result<(), String> {
             continue;
         }
         let repeat = std::env::var("REPEAT").ok().and_then(|n| n.parse().ok()).unwrap_or(1);
-        for _ in 1..repeat {
-            run(&open_tables(&codecs, &sources, false)?, query, pipitdb_bench::env())?;
+        // A query that fails is reported as the timed run reports it, and the
+        // rest still run.
+        let warm = (1..repeat).try_for_each(|_| {
+            run(&open_tables(&codecs, &sources, false)?, query, pipitdb_bench::env()).map(drop)
+        });
+        if let Err(error) = warm {
+            eprintln!("Q{number}: {error}");
+            continue;
         }
         // Counts what the query holds at its peak, for the report.
         let env = Env::new(Memory::new(Heap, usize::MAX)).map_err(|e| format!("{e:?}"))?;
