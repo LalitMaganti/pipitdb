@@ -291,8 +291,7 @@ mod tests {
 
     #[test]
     fn allocation_past_the_budget_fails() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let env = unsafe { Env::new(Heap, 1000) }.unwrap();
+        let env = Env::new(crate::env::Memory::new(Heap, 1000)).unwrap();
         assert_eq!(Buffer::allocate(&env, 1000).err(), Some(AllocError));
     }
 

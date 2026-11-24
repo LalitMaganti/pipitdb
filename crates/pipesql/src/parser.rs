@@ -871,8 +871,7 @@ mod tests {
     #[test]
     fn running_out_of_memory_comes_before_later_errors() {
         // The first block and the slot table, but not a second block.
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let env = unsafe { Env::new(Heap, 2 * BLOCK_BYTES) }.unwrap();
+        let env = Env::new(pipit_kernel::env::Memory::new(Heap, 2 * BLOCK_BYTES)).unwrap();
         let source = format!("{}+)", "1+".repeat(BLOCK_BYTES / 8));
         let error = parse_expression(&env, source.as_bytes()).err().unwrap();
         assert_eq!(error.code, ErrorCode::OutOfMemory);

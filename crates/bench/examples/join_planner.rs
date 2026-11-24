@@ -22,7 +22,7 @@ use std::fmt::Debug;
 use std::time::{Duration, Instant};
 
 use pipit_kernel::allocator::Heap;
-use pipit_kernel::env::Env;
+use pipit_kernel::env::{Env, Memory};
 use pipit_kernel::join_planner::{QueryGraph, RelationSet};
 use pipitdb_bench::join_planner::{
     EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name, plan,
@@ -51,8 +51,7 @@ struct Outcome {
 }
 
 fn run(planner: Enumerator, graph: &QueryGraph) -> Result<Outcome, String> {
-    // SAFETY: the tree, all planning keeps, is dropped before it.
-    let env = unsafe { Env::new(Heap, usize::MAX) }.map_err(fail)?;
+    let env = Env::new(Memory::new(Heap, usize::MAX)).map_err(fail)?;
     let tree = planner(&env, graph).map_err(fail)?;
     let costed = cost(graph, &tree)?;
     drop(tree);

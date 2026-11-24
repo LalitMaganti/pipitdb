@@ -450,8 +450,7 @@ mod tests {
 
     #[test]
     fn fails_past_its_allocator() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let limited = unsafe { Env::new(Heap, BLOCK_BYTES + (1 << 20)) }.unwrap();
+        let limited = Env::new(crate::env::Memory::new(Heap, BLOCK_BYTES + (1 << 20))).unwrap();
         let mut pool = StringPool::new(&limited).unwrap();
         let long = alloc::vec![b'y'; LARGE_STRING_BYTES_MIN - 2];
         let ids: Vec<_> = (0..4_u8)
