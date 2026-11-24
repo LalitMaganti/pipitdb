@@ -266,42 +266,6 @@ impl Selection {
         self.len = total as u32;
     }
 
-    /// Keeps the rows `keep` says to, and moves the others to `dropped`,
-    /// replacing what it kept, in one pass.
-    #[expect(clippy::cast_possible_truncation, reason = "rows are below `BATCH_ROWS_MAX`")]
-    pub fn partition(&mut self, dropped: &mut Selection, mut keep: impl FnMut(u16) -> bool) {
-        let len = self.len as usize;
-        check!(len <= self.indices.len());
-        let indices = self.indices.as_mut_ptr().cast::<u16>();
-        let others = dropped.indices.as_mut_ptr().cast::<u16>();
-        let (mut kept, mut out) = (0, 0);
-        // As in `retain`: two loops, so neither checks `prefix` for each row, and
-        // `kept` and `out` never pass `i`, below `len`.
-        let mut put = |row: u16| {
-            let keeps = keep(row);
-            // SAFETY: see above.
-            unsafe {
-                indices.add(kept).write(row);
-                others.add(out).write(row);
-            }
-            kept += usize::from(keeps);
-            out += usize::from(!keeps);
-        };
-        if self.prefix {
-            (0..len).for_each(|i| put(i as u16));
-        } else {
-            // SAFETY: see above; the first `len` indices were written.
-            (0..len).for_each(|i| put(unsafe { indices.add(i).read() }));
-        }
-        // Either side is a prefix if it got every row of one.
-        let prefix = self.prefix;
-        self.prefix = prefix && kept == len;
-        self.len = kept as u32;
-        dropped.prefix = prefix && out == len;
-        dropped.len = out as u32;
-        dropped.rows = self.rows;
-    }
-
     /// All of `rows` rows, at `selection`, in place: the indices aren't
     /// written.
     ///
@@ -390,8 +354,9 @@ mod tests {
         odd.retain(|row| row % 2 == 1);
         assert_eq!(rows(&odd), [1, 3]);
         let mut kept = prefix(4);
-        let mut dropped = Selection::all(0);
-        kept.partition(&mut dropped, |row| row > 9);
+        let mut dropped = prefix(4);
+        kept.retain(|row| row > 9);
+        dropped.subtract(&kept);
         assert_eq!((kept.kept(), dropped.kept(), dropped.len()), (Kept::None, Kept::Prefix, 4));
         kept.union(&dropped);
         assert_eq!((kept.kept(), kept.len()), (Kept::Prefix, 4));
@@ -410,20 +375,6 @@ mod tests {
         even.retain(|row| row % 2 == 0);
         even.keep_range(2, 2);
         assert_eq!(rows(&even), [4, 6]);
-    }
-
-    #[test]
-    fn partitions_in_one_pass() {
-        let mut kept = Selection::all(10);
-        let mut dropped = Selection::all(0);
-        kept.partition(&mut dropped, |row| row % 3 == 0);
-        assert_eq!((rows(&kept), rows(&dropped)), ([0, 3, 6, 9].into(), [1, 2, 4, 5, 7, 8].into()));
-        kept.partition(&mut dropped, |row| row > 3);
-        assert_eq!((rows(&kept), rows(&dropped)), ([6, 9].into(), [0, 3].into()));
-
-        let mut none = Selection::all(10);
-        none.partition(&mut dropped, |_| false);
-        assert_eq!((none.kept(), dropped.kept()), (Kept::None, Kept::Prefix));
     }
 
     #[test]

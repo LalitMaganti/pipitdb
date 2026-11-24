@@ -12,7 +12,7 @@ use crate::containers::{Array, BitSlice};
 use core::cmp::Ordering;
 
 use crate::allocator::AllocError;
-use crate::column::{ColumnView, DataType, Form, Forms, Values};
+use crate::column::{ColumnView, DataType, Form, Forms, Validity, Values};
 use crate::eight;
 use crate::env::Env;
 use crate::flat_hash_map::{FlatHashMap, Key};
@@ -224,8 +224,7 @@ pub fn is_in(
         let listed = |cell: i64| {
             set.find_by(murmur_hash::mix(cell.cast_unsigned()), |held| held.value == cell).is_some()
         };
-        let valid = valid_rows(column);
-        retain(selection, None, |row| valid(row) && listed(at(row)) == want);
+        retain_valid(column, selection, None, |row| listed(at(row)) == want);
     } else {
         // Each row is compared with all of a list of fixed length at once:
         // 4 values, or 16, padded with copies of the first.
@@ -255,14 +254,7 @@ fn scan<const N: usize>(
         let cell = unsafe { cell(cells, row) };
         crate::listed::listed(&list, cell) == want
     };
-    match column.validity() {
-        None => retain(selection, None, listed),
-        Some(validity) => retain(selection, None, |row| {
-            // SAFETY: as for `cell`.
-            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-            valid & listed(row)
-        }),
-    }
+    retain_valid(column, selection, None, listed);
 }
 
 /// Narrows `selection` to the rows of `column`, a string column that isn't a
@@ -310,17 +302,16 @@ pub fn compare_string(
     check!(column.data_type() == DataType::String);
     let strings = column.values().strings();
     check!(strings.len() >= selection.rows() as usize);
-    let valid = valid_rows(column);
     // Equality needn't order: most cells differ in length, so aren't read.
     // One test for both `=` and `<>`, so the loop isn't copied.
     let equal = comparison == Comparison::Equal;
     let len = string.len();
-    retain(selection, dropped, |row| {
+    retain_valid(column, selection, dropped, |row| {
         let at = usize::from(row);
         // SAFETY: every kept row is below `rows()`, which `strings` covers.
         let same = unsafe { strings.len_of_unchecked(at) } == len
             && (len == 0 || strings.get(at) == string);
-        valid(row) && same == equal
+        same == equal
     });
 }
 
@@ -365,18 +356,7 @@ fn keep_strings(
         // see `FilterOp::accepts`. Sequences are integers.
         Form::Dictionary(_) | Form::Sequence(_) => failed!(),
     }
-    let valid = valid_rows(column);
-    retain(selection, dropped, |row| valid(row) && holds(strings.get(usize::from(row))));
-}
-
-/// Whether each row of `column` isn't null. A null row's view isn't read: it
-/// may not point at bytes.
-fn valid_rows(column: &ColumnView) -> impl Fn(u16) -> bool + '_ {
-    let validity = column.validity();
-    move |row: u16| {
-        // SAFETY: `check_covers` checked every row is a row of `column`.
-        validity.is_none_or(|validity| unsafe { validity.is_valid_unchecked(u32::from(row)) })
-    }
+    retain_valid(column, selection, dropped, |row| holds(strings.get(usize::from(row))));
 }
 
 /// Sets the bit of each of a dictionary's entries, `values`, where
@@ -576,12 +556,11 @@ pub fn is_null(
         // No row is null.
         None if nulls => drop_all(selection, dropped),
         None => keep_all(selection, dropped),
-        Some(validity) => retain(selection, dropped, move |row| {
-            // SAFETY: `check_covers` checked every row is a row of `column`.
-            // SAFETY: as for `cell`.
-            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-            valid != nulls
-        }),
+        Some(validity) => {
+            let dropped = before(selection, dropped);
+            keep_valid(validity, nulls, selection);
+            after(selection, dropped);
+        }
     }
 }
 
@@ -660,23 +639,48 @@ fn float_key(value: f64) -> i64 {
     ordered((value + 0.0).to_bits().cast_signed())
 }
 
-/// As `retain`, but also drops the null rows of `column`, with a loop that
-/// skips checking for nulls when `column` has none. `test` still runs on
-/// null rows, whose values are there to read, so the loop doesn't branch.
+/// As `retain`, but first drops the null rows of `column`, in one loop
+/// every test shares, so `test` reads only rows that aren't null.
 fn retain_valid(
     column: &ColumnView,
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
-    test: impl Fn(u16) -> bool + Copy,
+    test: impl FnMut(u16) -> bool,
 ) {
-    match column.validity() {
-        None => retain(selection, dropped, test),
-        Some(validity) => retain(selection, dropped, move |row| {
-            // SAFETY: callers check with `check_covers` first.
-            // SAFETY: as for `cell`.
-            let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
-            valid & test(row)
-        }),
+    let dropped = before(selection, dropped);
+    if let Some(validity) = column.validity() {
+        keep_valid(validity, false, selection);
+    }
+    keep(selection, test);
+    after(selection, dropped);
+}
+
+/// Narrows `selection` to the rows `validity` says are null if `nulls`, or
+/// else to the others. One loop for every test that drops null rows.
+#[inline(never)]
+fn keep_valid(validity: Validity<'_>, nulls: bool, selection: &mut Selection) {
+    selection.retain(|row| {
+        // SAFETY: callers check with `check_covers` first.
+        let valid = unsafe { validity.is_valid_unchecked(u32::from(row)) };
+        valid != nulls
+    });
+}
+
+/// Starts narrowing `selection`, writing the rows it drops to `dropped`, if
+/// given: which holds them all until `after` takes those kept.
+fn before<'d>(
+    selection: &Selection,
+    dropped: Option<&'d mut Selection>,
+) -> Option<&'d mut Selection> {
+    let dropped = dropped?;
+    dropped.clone_from(selection);
+    Some(dropped)
+}
+
+/// Ends narrowing `selection`: `dropped`, from `before`, loses the rows kept.
+fn after(selection: &Selection, dropped: Option<&mut Selection>) {
+    if let Some(dropped) = dropped {
+        dropped.subtract(selection);
     }
 }
 
@@ -702,19 +706,24 @@ fn never(_: u16) -> bool {
 }
 
 /// Narrows `selection` to the rows `test` is true for, writing the rows it
-/// drops to `dropped`, if given. Never inlined, so each test's loop is in a
-/// small function of its own, where it's aligned: inlined into a large one,
-/// it looks cold, and isn't.
-#[inline(never)]
+/// drops to `dropped`, if given: found from those kept, so each test has
+/// one loop.
 fn retain(
     selection: &mut Selection,
     dropped: Option<&mut Selection>,
     test: impl FnMut(u16) -> bool,
 ) {
-    match dropped {
-        None => selection.retain(test),
-        Some(dropped) => selection.partition(dropped, test),
-    }
+    let dropped = before(selection, dropped);
+    keep(selection, test);
+    after(selection, dropped);
+}
+
+/// Narrows `selection` to the rows `test` is true for. Never inlined, so
+/// each test's loop is in a small function of its own, where it's aligned:
+/// inlined into a large one, it looks cold, and isn't.
+#[inline(never)]
+fn keep(selection: &mut Selection, test: impl FnMut(u16) -> bool) {
+    selection.retain(test);
 }
 
 /// Checks every row `selection` may keep is a row of `column`, so the rows
