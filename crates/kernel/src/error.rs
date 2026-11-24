@@ -59,6 +59,12 @@ pub enum TypeError {
     Arguments,
     /// A column of a type the operation reading it doesn't take.
     Read,
+    /// A double, not an integer, as the condition of a filter or a join.
+    DoubleCondition,
+    /// A key rows are grouped by that isn't an integer or a string.
+    GroupKey,
+    /// A column of a type an aggregate doesn't read.
+    Aggregated,
 }
 
 impl From<AllocError> for Error {

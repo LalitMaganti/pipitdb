@@ -15,8 +15,8 @@ use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::{Error, TypeError};
 use crate::expression::{
-    ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, PRESENT,
-    check_expr_type, expr_can_be_null,
+    ComputeItem, ComputeOp, Expr as PlanExpr, ExprBuilder, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX,
+    PRESENT, check_expr_type, expr_can_be_null,
 };
 use crate::function::DynFunction;
 pub use crate::join::JoinKind;
@@ -44,6 +44,32 @@ pub struct Builder<'e> {
     nodes: ExprBuilder,
 }
 
+/// An expression, built, and the type of value it computes, which one
+/// operation takes.
+pub struct Expr {
+    /// Where its nodes start among the plan's.
+    start: u32,
+    /// Which of its nodes is its root: at most `EXPR_NODES_MAX`.
+    root: u16,
+    /// The type of value it computes.
+    data_type: DataType,
+}
+
+impl Expr {
+    /// It, as the plan holds it.
+    fn plan_expr(&self) -> PlanExpr {
+        PlanExpr { start: self.start, root: u32::from(self.root) }
+    }
+}
+
+impl Expr {
+    /// The type of value it computes.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        self.data_type
+    }
+}
+
 /// A value of the expression being built: one of its nodes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Value(u32);
@@ -64,6 +90,16 @@ pub enum Binary {
     GreaterEqual,
     And,
     Or,
+}
+
+/// Checks a condition of type `data_type` is an integer, true where it
+/// isn't 0, as a comparison is.
+fn check_condition(data_type: DataType) -> Result<(), Error> {
+    match data_type {
+        DataType::Int64 => Ok(()),
+        DataType::String => Err(Error::WrongType(TypeError::Condition)),
+        DataType::Float64 => Err(Error::WrongType(TypeError::DoubleCondition)),
+    }
 }
 
 /// The step computing each `Binary`, by its order.
@@ -152,18 +188,6 @@ pub struct Grouping {
     keys: SmallVec<ColumnId>,
     /// The aggregates, in turn.
     aggregates: SmallVec<Aggregate>,
-}
-
-impl Grouping {
-    /// Groups by `column` too.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::OutOfMemory`] if there are more keys than the grouping was
-    /// made for.
-    pub fn by(&mut self, column: Column) -> Result<(), Error> {
-        Ok(self.keys.push(column.0)?)
-    }
 }
 
 /// Rows being sorted, by keys added one at a time.
@@ -271,9 +295,12 @@ impl<'e> Builder<'e> {
     ///
     /// # Errors
     ///
+    /// [`Error::WrongType`] if `condition` isn't an integer, and
     /// [`Error::OutOfMemory`] if `env` has too little left.
+    #[expect(clippy::needless_pass_by_value, reason = "an expression is taken once")]
     pub fn filter(&mut self, relation: Relation, condition: Expr) -> Result<Relation, Error> {
-        let filter = FilterOp::new(self.env, &self.plan.exprs, condition)?;
+        check_condition(condition.data_type)?;
+        let filter = FilterOp::new(self.env, &self.plan.exprs, condition.plan_expr())?;
         self.add(DynOp::new(self.env, filter)?, relation)
     }
 
@@ -307,12 +334,16 @@ impl<'e> Builder<'e> {
     ///
     /// # Errors
     ///
+    /// [`Error::WrongType`] if `condition` isn't an integer, and
     /// [`Error::OutOfMemory`] if `env` has too little left.
     pub fn joined(&mut self, joining: Joining, condition: Option<Expr>) -> Result<Relation, Error> {
         let env = self.env;
         let Joining { kind, children, columns } = joining;
         let conjuncts = match condition {
-            Some(condition) => conjuncts_of(env, &self.plan.exprs, condition)?,
+            Some(condition) => {
+                check_condition(condition.data_type)?;
+                conjuncts_of(env, &self.plan.exprs, condition.plan_expr())?
+            }
             None => SmallVec::fixed(env, 0)?,
         };
         let op = JoinOp::new(env, kind, conjuncts, columns)?;
@@ -329,18 +360,14 @@ impl<'e> Builder<'e> {
         Ok(Extension { relation, items: SmallVec::fixed(self.env, len)? })
     }
 
-    /// A column of `extension`, of `expr`, of type `data_type`, computed
-    /// for each row.
+    /// A column of `extension`, of `expr`, computed for each row.
     ///
     /// # Errors
     ///
     /// [`Error::OutOfMemory`] if `env` has too little left.
-    pub fn compute(
-        &mut self,
-        extension: &mut Extension,
-        expr: Expr,
-        data_type: DataType,
-    ) -> Result<Column, Error> {
+    #[expect(clippy::needless_pass_by_value, reason = "an expression is taken once")]
+    pub fn compute(&mut self, extension: &mut Extension, expr: Expr) -> Result<Column, Error> {
+        let (data_type, expr) = (expr.data_type, expr.plan_expr());
         let (columns, nodes) = (&self.plan.columns, self.plan.exprs.nodes(expr));
         let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
         let column = self.plan.add_unnamed_column(data_type, nullable)?;
@@ -361,7 +388,21 @@ impl<'e> Builder<'e> {
         self.add(DynOp::new(self.env, ComputeOp { items })?, relation)
     }
 
-    /// A grouping by up to `keys` keys, which [`Grouping::by`] adds, into up
+    /// Groups `grouping` by `column` too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] if `column` isn't of integers or strings, and
+    /// [`Error::OutOfMemory`] if there are more keys than the grouping was
+    /// made for.
+    pub fn group_by(&mut self, grouping: &mut Grouping, column: Column) -> Result<(), Error> {
+        if !matches!(self.column_type(column), DataType::Int64 | DataType::String) {
+            return Err(Error::WrongType(TypeError::GroupKey));
+        }
+        Ok(grouping.keys.push(column.0)?)
+    }
+
+    /// A grouping by up to `keys` keys, which [`Builder::group_by`] adds, into up
     /// to `aggregates` aggregates, which [`Builder::aggregate`] adds.
     ///
     /// # Errors
@@ -378,6 +419,7 @@ impl<'e> Builder<'e> {
     ///
     /// # Errors
     ///
+    /// [`Error::WrongType`] if `function` doesn't read `input`'s type, and
     /// [`Error::OutOfMemory`] if `env` has too little left.
     pub fn aggregate(
         &mut self,
@@ -389,6 +431,9 @@ impl<'e> Builder<'e> {
         let input = input.map(|column| column.0);
         let input_type =
             input.map_or(DataType::Int64, |id| at!(self.plan.columns, id as usize).data_type);
+        if input.is_some() && !function.reads(input_type) {
+            return Err(Error::WrongType(TypeError::Aggregated));
+        }
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
         let output_type = function.output_type(input_type);
@@ -447,20 +492,22 @@ impl<'e> Builder<'e> {
     // Expressions.
 
     /// Takes the expression being built, whose root is the last node built,
-    /// and the type it computes.
+    /// typed.
     ///
     /// # Errors
     ///
     /// [`Error::WrongType`] if its values aren't of the types they're used
     /// as.
-    pub fn expr(&mut self) -> Result<(Expr, DataType), Error> {
+    pub fn expr(&mut self) -> Result<Expr, Error> {
         let columns = &self.plan.columns;
         let type_of = |column: ColumnId| at!(columns, column as usize).data_type;
         let typed = check_expr_type(self.env, self.nodes.nodes(), &type_of);
         let expr = self.plan.exprs.add(self.nodes.nodes());
         self.nodes.clear();
-        let data_type = typed?;
-        Ok((expr?, data_type))
+        let (data_type, expr) = (typed?, expr?);
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let root = expr.root as u16;
+        Ok(Expr { start: expr.start, root, data_type })
     }
 
     /// The value of `column` in each row.
@@ -689,16 +736,16 @@ mod tests {
         // dividing by a column may.
         let (value, sixty) = (builder.column_value(a).unwrap(), builder.int(60).unwrap());
         builder.binary(Binary::Divide, value, sixty).unwrap();
-        let (expr, data_type) = builder.expr().unwrap();
-        let x = builder.compute(&mut extension, expr, data_type).unwrap();
+        let expr = builder.expr().unwrap();
+        let x = builder.compute(&mut extension, expr).unwrap();
         let (value, by) = (builder.column_value(a).unwrap(), builder.column_value(b).unwrap());
         builder.binary(Binary::Divide, value, by).unwrap();
-        let (expr, data_type) = builder.expr().unwrap();
-        let y = builder.compute(&mut extension, expr, data_type).unwrap();
+        let expr = builder.expr().unwrap();
+        let y = builder.compute(&mut extension, expr).unwrap();
         let rows = builder.extended(extension).unwrap();
         // A count is never null, but a sum of no values is.
         let mut grouping = builder.group(1, 2).unwrap();
-        grouping.by(x).unwrap();
+        builder.group_by(&mut grouping, x).unwrap();
         let count = builder.aggregate(&mut grouping, Function::CountStar, None, false).unwrap();
         let total = builder.aggregate(&mut grouping, Function::Sum, Some(b), false).unwrap();
         builder.grouped(rows, grouping).unwrap();

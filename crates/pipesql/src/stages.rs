@@ -2,13 +2,11 @@
 //! API as any extension.
 
 use pipit_kernel::aggregate::Function;
-use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
-use pipit_kernel::expression::Expr;
 use pipit_kernel::join::JoinKind;
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::PLAN_COLUMNS_MAX;
-use pipit_kernel::query::{Binary, Extension, Order};
+use pipit_kernel::query::{Binary, Expr, Extension, Order};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::{Compiler, Named};
@@ -187,24 +185,17 @@ fn alias_or(compiler: &Compiler<'_, '_>, alias: Node, table: Node) -> Result<Nod
     if alias.child_count() == 0 { Ok(table) } else { only(compiler, alias) }
 }
 
-/// The condition `node`, `ON`'s or `WHERE`'s: an integer, true where it
-/// isn't 0, as a comparison is.
-fn condition_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, Error> {
-    let (condition, data_type) = compile_expr(compiler, node)?;
-    match data_type {
-        DataType::Int64 => Ok(condition),
-        DataType::String => Err(Error::new(ErrorCode::NumberCondition, compiler.span(node))),
-        DataType::Float64 => {
-            Err(Error::unsupported(Unsupported::DoubleCondition, compiler.span(node)))
-        }
-    }
+/// The kernel's `error`, about `node`.
+fn at(compiler: &Compiler<'_, '_>, error: pipit_kernel::error::Error, node: Node) -> Error {
+    Error::from(error).at(compiler.span(node))
 }
 
 /// `WHERE c`: keeps the rows condition `c` is true for.
 fn compile_where(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let condition = condition_expr(compiler, compiler.node(stage.first_child()))?;
+    let node = compiler.node(stage.first_child());
+    let condition = compile_expr(compiler, node)?;
     let rows = compiler.rows();
-    let rows = compiler.builder.filter(rows, condition)?;
+    let rows = compiler.builder.filter(rows, condition).map_err(|e| at(compiler, e, node))?;
     compiler.set_rows(rows);
     Ok(())
 }
@@ -255,7 +246,8 @@ fn join(
     let probe = (probe, compiler.scope.iter().map(|named| named.column));
     let build_columns = build.columns.iter().map(|named| named.column);
     let joining = compiler.builder.join(kind, probe, (build.rows, build_columns))?;
-    let condition = match condition {
+    // The condition, and the node it's of, which a type error is about.
+    let (condition, node) = match condition {
         Some((on, using)) if on.child_count() == 0 && using.child_count() == 0 => {
             return Err(Error::new(ErrorCode::ExpectedWord, compiler.span(table)));
         }
@@ -263,18 +255,19 @@ fn join(
             return Err(Error::new(ErrorCode::UnexpectedToken, compiler.span(using)));
         }
         Some((_, using)) if using.child_count() != 0 => {
-            Some(using_columns(compiler, &build.columns, using)?)
+            (Some(using_columns(compiler, &build.columns, using)?), using)
         }
         Some((on, _)) => {
             compiler.scope.extend_from_slice(&build.columns)?;
-            Some(condition_expr(compiler, only(compiler, on)?)?)
+            let on = only(compiler, on)?;
+            (Some(compile_expr(compiler, on)?), on)
         }
         None => {
             compiler.scope.extend_from_slice(&build.columns)?;
-            None
+            (None, table)
         }
     };
-    let joined = compiler.builder.joined(joining, condition)?;
+    let joined = compiler.builder.joined(joining, condition).map_err(|e| at(compiler, e, node))?;
     compiler.set_rows(joined);
     Ok(())
 }
@@ -319,7 +312,7 @@ fn using_columns(
             scope.push(*column)?;
         }
     }
-    let (expr, _) = finish_expr(compiler, using)?;
+    let expr = finish_expr(compiler, using)?;
     compiler.scope = scope;
     Ok(expr)
 }
@@ -501,8 +494,8 @@ fn value_of(
     let Some(name) = name else {
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
-    let (expr, data_type) = compile_expr(compiler, value)?;
-    let column = compiler.builder.compute(extension, expr, data_type)?;
+    let expr = compile_expr(compiler, value)?;
+    let column = compiler.builder.compute(extension, expr)?;
     Ok(Named { name, column: (column) })
 }
 
@@ -571,11 +564,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         let column = input_column(compiler, key, alias, &mut extension)?;
-        let data_type = compiler.builder.column_type(column.column);
-        if !matches!(data_type, DataType::Int64 | DataType::String) {
-            return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
-        }
-        grouping.by(column.column)?;
+        let grouped = compiler.builder.group_by(&mut grouping, column.column);
+        grouped.map_err(|e| at(compiler, e, key))?;
         scope.push(named(compiler, column, alias)?)?;
     }
     for i in 0..list.child_count() {
@@ -600,11 +590,6 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             Tag::Star => return Err(unsupported),
             _ => (function, Some(input_column(compiler, argument, alias, &mut extension)?.column)),
         };
-        let input_type =
-            input.map_or(DataType::Int64, |column| compiler.builder.column_type(column));
-        if input.is_some() && !function.reads(input_type) {
-            return Err(Error::unsupported(Unsupported::AggregateType, span));
-        }
         let name = if let Some(alias) = alias {
             compiler.add_name(alias.span())?
         } else {
@@ -612,7 +597,8 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
             let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
             aggregate_name(compiler, function_name, distinct, argument)?
         };
-        let column = compiler.builder.aggregate(&mut grouping, function, input, distinct)?;
+        let column = compiler.builder.aggregate(&mut grouping, function, input, distinct);
+        let column = column.map_err(|error| Error::from(error).at(span))?;
         scope.push(Named { name, column: (column) })?;
     }
     let rows = compiler.builder.extended(extension)?;

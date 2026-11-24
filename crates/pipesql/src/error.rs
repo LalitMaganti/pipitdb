@@ -168,6 +168,13 @@ impl From<pipit_kernel::error::Error> for Error {
                 TypeError::DoubleIn | TypeError::Read => {
                     return Error::unsupported(Unsupported::SelectExpression, UNPLACED);
                 }
+                TypeError::DoubleCondition => {
+                    return Error::unsupported(Unsupported::DoubleCondition, UNPLACED);
+                }
+                TypeError::GroupKey => return Error::unsupported(Unsupported::GroupKey, UNPLACED),
+                TypeError::Aggregated => {
+                    return Error::unsupported(Unsupported::AggregateType, UNPLACED);
+                }
             },
             _ => failed!(),
         };

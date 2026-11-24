@@ -3,9 +3,8 @@
 
 use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
-use pipit_kernel::expression::Expr;
 use pipit_kernel::function::DynFunction;
-use pipit_kernel::query::{Binary, Unary, Value};
+use pipit_kernel::query::{Binary, Expr, Unary, Value};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
@@ -14,19 +13,14 @@ use crate::keywords::same_word;
 use crate::parser::NESTING_MAX;
 use crate::stages::aggregate;
 
-/// Compiles the expression `node` against the columns in scope, and the type
-/// it computes.
-pub fn compile_expr(
-    compiler: &mut Compiler<'_, '_>,
-    node: Node,
-) -> Result<(Expr, DataType), Error> {
+/// Compiles the expression `node` against the columns in scope.
+pub fn compile_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, Error> {
     compile(compiler, node, 0)?;
     finish_expr(compiler, node)
 }
 
-/// Takes the expression built, compiled from `node`, and the type it
-/// computes.
-pub fn finish_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<(Expr, DataType), Error> {
+/// Takes the expression built, compiled from `node`.
+pub fn finish_expr(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<Expr, Error> {
     compiler.builder.expr().map_err(|error| Error::from(error).at(compiler.span(node)))
 }
 
