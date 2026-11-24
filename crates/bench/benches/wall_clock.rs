@@ -52,26 +52,12 @@ fn small(c: &mut Criterion) {
     group.finish();
 }
 
-/// What the pipeline costs per batch, with steps that do nothing.
-fn pipeline(c: &mut Criterion) {
-    let batches = 10_000;
-    let mut group = c.benchmark_group("pipeline");
-    group.throughput(Throughput::Elements(u64::from(batches)));
-    for (name, steps, operators) in
-        [("source", 0, false), ("transforms", 4, false), ("operators", 4, true)]
-    {
-        let pipeline = pipitdb_bench::pass_pipeline(batches, steps, operators);
-        group.bench_function(name, |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
-    }
-    group.finish();
-}
-
 /// Scanning a table's row groups.
 fn scan(c: &mut Criterion) {
-    let pipeline = pipitdb_bench::scan_pipeline(pipitdb_bench::table(1000));
+    let mut plan = pipitdb_bench::scan_plan(1000);
     let mut group = c.benchmark_group("scan");
     group.throughput(Throughput::Elements(100 * 20_480));
-    group.bench_function("table", |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
+    group.bench_function("table", |b| b.iter(|| black_box(&mut plan).run()));
     group.finish();
 }
 
@@ -120,43 +106,6 @@ fn slices(c: &mut Criterion) {
     group.finish();
 }
 
-/// Filtering 1,000 batches of 2,048 rows.
-fn filter(c: &mut Criterion) {
-    let plain = pipitdb_bench::filter_column(false);
-    let nullable = pipitdb_bench::filter_column(true);
-    let mut group = c.benchmark_group("filter");
-    group.throughput(Throughput::Elements(1000 * 2048));
-    let strings = pipitdb_bench::string_column();
-    let cases: [(&str, &_, fn(&_, &mut _)); 3] = [
-        ("greater", &plain, pipitdb_bench::greater),
-        ("greater_nulls", &nullable, pipitdb_bench::greater),
-        ("string_equal", &strings, pipitdb_bench::string_equal),
-    ];
-    for (name, column, filter) in cases {
-        group.bench_function(name, |b| {
-            b.iter(|| pipitdb_bench::run_filter(black_box(column), 1000, filter));
-        });
-    }
-    for shape in ["and", "or", "not"] {
-        let predicate = pipitdb_bench::predicate(shape);
-        group.bench_function(shape, |b| {
-            b.iter(|| pipitdb_bench::run_predicate(black_box(&predicate), None, &plain, 1000));
-        });
-    }
-    // A string filter over flat strings, and over a dictionary each batch
-    // shares, as a chunk's do: its eight entries are tested once.
-    let (ipad, literals) = pipitdb_bench::ipad_predicate();
-    let dictionary = pipitdb_bench::string_dictionary();
-    for (name, column) in [("string_flat", &strings), ("string_dictionary", &dictionary)] {
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                pipitdb_bench::run_predicate(black_box(&ipad), Some(&literals), column, 1000)
-            });
-        });
-    }
-    group.finish();
-}
-
 /// Perfetto's `filter_benchmark.cc`, on the same 2^20 rows: a scan of `id`
 /// and the filtered column, filtered.
 fn perfetto_filter(c: &mut Criterion) {
@@ -169,32 +118,6 @@ fn perfetto_filter(c: &mut Criterion) {
     group.finish();
 }
 
-/// Perfetto's `expression_benchmark.cc`: 512 batches of 2,048 rows.
-fn perfetto_expression(c: &mut Criterion) {
-    let mut group = c.benchmark_group("perfetto_expression");
-    group.throughput(Throughput::Elements(512 * 2048));
-    for (i, (name, ..)) in pipitdb_bench::PERFETTO_EXPRESSIONS.iter().enumerate() {
-        let pipeline = pipitdb_bench::perfetto_expression(i, 512);
-        group.bench_function(*name, |b| b.iter(|| pipitdb_bench::run(black_box(&pipeline))));
-    }
-    group.finish();
-}
-
-/// Interning 100,000 strings, and getting them back.
-fn string_pool(c: &mut Criterion) {
-    let mut group = c.benchmark_group("string_pool");
-    group.throughput(Throughput::Elements(100_000));
-    for (name, distinct) in [("intern_repeats", 1000), ("intern_distinct", 100_000)] {
-        let strings = pipitdb_bench::strings(100_000, distinct);
-        group.bench_function(name, |b| {
-            b.iter(|| pipitdb_bench::intern_strings(black_box(&strings)));
-        });
-    }
-    let (pool, ids) = pipitdb_bench::intern_strings(&pipitdb_bench::strings(100_000, 100_000));
-    group.bench_function("get", |b| b.iter(|| pipitdb_bench::get_strings(&pool, black_box(&ids))));
-    group.finish();
-}
-
 // Each iteration takes well under a millisecond, so short runs still give
 // thousands of samples.
 criterion_group! {
@@ -202,6 +125,6 @@ criterion_group! {
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(2));
-    targets = lexer, parser, query, small, pipeline, scan, join, slices, filter, perfetto_filter, perfetto_expression, string_pool
+    targets = lexer, parser, query, small, scan, join, slices, perfetto_filter
 }
 criterion_main!(benches);
