@@ -1,10 +1,11 @@
 //! `OrderByOp`: its child's rows sorted by keys, as `ORDER BY` does.
 
 use crate::containers::SmallVec;
+use crate::error::Error;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arranged, DeriveContext, InputNeeds, OutputProperties};
-use crate::plan::{ColumnId, Op, PlanNode, SortKey};
+use crate::plan::{ColumnId, Op, PlanNode, Scope, SortKey};
 
 /// Outputs its child's rows, with the same columns, sorted stably by `keys`,
 /// the first first. It needs its input sorted, which planning does only if
@@ -19,6 +20,15 @@ impl<'c> Op<'c> for OrderByOp {
     /// which rows pass.
     fn moves_condition(&self, _: ColumnId) -> Option<u32> {
         Some(0)
+    }
+
+    /// Its input's columns.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for key in self.keys.iter() {
+            scope.read(0, key.column)?;
+        }
+        scope.pass(0);
+        Ok(())
     }
 
     /// Makes no columns, and needs its keys.

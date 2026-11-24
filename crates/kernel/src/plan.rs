@@ -12,9 +12,10 @@ use core::ptr::NonNull;
 use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
-use crate::containers::{Box, ErasedBox, InlineVec, SmallVec};
+use crate::containers::{BitSlice, Bitmap, Box, ErasedBox, InlineVec, SmallVec};
 use crate::env::Env;
 use crate::erase::{value_mut_of, value_of};
+use crate::error::Error;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::{
     Compute, EXPR_NODES_MAX, Expr, ExprOp, Exprs, columns_of, conjuncts, mark_expr_columns,
@@ -73,6 +74,16 @@ pub trait Op<'c> {
     /// Marks the columns whose values this reads. By default, all of them.
     fn reads(&self, reads: &mut Needed) {
         reads.need_all();
+    }
+
+    /// Checks each column this reads is among its inputs', in `scope`, and
+    /// adds the columns its rows have to it. By default, it reads none, and
+    /// its rows have all of its inputs' columns.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for input in 0..scope.inputs.len() {
+            scope.pass(input);
+        }
+        Ok(())
     }
 
     /// Of the columns this reads, the forms it takes `column` in. By default,
@@ -279,6 +290,7 @@ pub struct DynOp<'c> {
 struct OpFunctions<'c> {
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
+    scope: unsafe fn(NonNull<()>, &mut Scope<'_>) -> Result<(), Error>,
     accepts: unsafe fn(NonNull<()>, &Exprs, ColumnId) -> Forms,
     passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
@@ -315,6 +327,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
         // SAFETY: only called with this op.
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
+        // SAFETY: as for `reads`.
+        scope: |op, scope| unsafe { value_of::<T>(op).scope(scope) },
         // SAFETY: as for `reads`.
         accepts: |op, exprs, column| unsafe { value_of::<T>(op).accepts(exprs, column) },
         // SAFETY: as for `reads`.
@@ -373,6 +387,11 @@ impl<'c> DynOp<'c> {
     pub(crate) fn reads(&self, reads: &mut Needed) {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
+    }
+
+    pub(crate) fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.scope)(self.op.as_ptr(), scope) }
     }
 
     pub(crate) fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
@@ -519,6 +538,78 @@ pub const CHILDREN_MAX: usize = 2;
 /// The nodes a node reads, in order.
 pub type Children = InlineVec<PlanNodeId, CHILDREN_MAX>;
 
+/// The columns of a node's inputs' rows, and of its own, as its op says
+/// while a plan's scopes are checked.
+pub struct Scope<'s> {
+    /// The plan's expressions, whose columns ops read.
+    exprs: &'s Exprs,
+    /// Each input's columns, a bit for each of the plan's.
+    inputs: &'s [&'s BitSlice],
+    /// The node's columns.
+    out: &'s mut BitSlice,
+}
+
+impl Scope<'_> {
+    /// Checks `column` is among input `input`'s columns.
+    pub fn read(&self, input: usize, column: ColumnId) -> Result<(), Error> {
+        let has = self.inputs.get(input).is_some_and(|columns| columns.get(column as usize));
+        if has { Ok(()) } else { Err(Error::NotInScope) }
+    }
+
+    /// Checks each column `expr` reads is among any input's columns.
+    pub fn read_expr(&self, expr: Expr) -> Result<(), Error> {
+        for step in self.exprs.nodes(expr).iter().filter(|step| step.op == ExprOp::Column) {
+            if !self.inputs.iter().any(|columns| columns.get(step.a as usize)) {
+                return Err(Error::NotInScope);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives the node's rows each of input `input`'s columns.
+    pub fn pass(&mut self, input: usize) {
+        self.out.or_with(at!(self.inputs, input));
+    }
+
+    /// Gives the node's rows `column`.
+    pub fn make(&mut self, column: ColumnId) {
+        self.out.set(column as usize);
+    }
+}
+
+/// Checks each op of `plan` reads only columns its inputs have, and the
+/// plan's output only its root's.
+///
+/// # Errors
+///
+/// [`Error::NotInScope`] if one doesn't, and [`Error::OutOfMemory`] if `env`
+/// has too little left.
+#[inline(never)]
+pub(crate) fn check_scopes(env: &Env, plan: &LogicalPlan<'_>) -> Result<(), Error> {
+    // Each node's columns, in words of their own, the nodes in order.
+    let words = BitSlice::<u64>::words_for(plan.columns.len());
+    let mut scopes = Bitmap::new(env, plan.nodes.len() * words * 64)?;
+    let all = scopes.words_mut();
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let (before, rest) = all.split_at_mut(id * words);
+        let mut inputs: [&BitSlice; CHILDREN_MAX] = [BitSlice::of(&[]); CHILDREN_MAX];
+        for (input, &child) in inputs.iter_mut().zip(node.children.iter()) {
+            let at = child as usize * words;
+            *input = BitSlice::of(at!(before, at..at + words));
+        }
+        let inputs = at!(inputs, ..node.children.len());
+        let out = BitSlice::of_mut(at_mut!(rest, ..words));
+        node.op.scope(&mut Scope { exprs: &plan.exprs, inputs, out })?;
+    }
+    let root = plan.root as usize * words;
+    let root = BitSlice::of(at!(scopes.words(), root..root + words));
+    if plan.output.iter().all(|named| root.get(named.column.0 as usize)) {
+        Ok(())
+    } else {
+        Err(Error::NotInScope)
+    }
+}
+
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
     /// The columns' names.
@@ -652,6 +743,14 @@ pub struct ScanColumn {
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
+    /// Makes the columns it binds.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for column in self.columns.iter() {
+            scope.make(column.binding);
+        }
+        Ok(())
+    }
+
     /// Keeps the needed columns, and at least one: a batch with no columns
     /// has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
@@ -894,6 +993,14 @@ impl<'c> Op<'c> for FilterOp {
         for &conjunct in self.conjuncts.iter() {
             mark_expr_columns(conjunct, reads);
         }
+    }
+
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &conjunct in self.conjuncts.iter() {
+            scope.read_expr(conjunct)?;
+        }
+        scope.pass(0);
+        Ok(())
     }
 
     /// Constants, which it tests once; dictionaries of columns it only

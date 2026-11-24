@@ -16,7 +16,7 @@ use crate::filter::{Comparison, Entries};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Column, DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Op, PlanNode};
+use crate::plan::{ColumnId, Op, PlanNode, Scope};
 use crate::predicate::{Leaf, Predicate, Set};
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Selection;
@@ -1581,6 +1581,16 @@ impl<'c> Op<'c> for ComputeOp {
         for item in self.items.iter() {
             mark_expr_columns(item.expr, reads);
         }
+    }
+
+    /// Its input's columns, then its items'.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        scope.pass(0);
+        for item in self.items.iter() {
+            scope.read_expr(item.expr)?;
+            scope.make(item.output);
+        }
+        Ok(())
     }
 
     /// Its input's, with each item's column after them.

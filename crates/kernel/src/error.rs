@@ -27,6 +27,9 @@ pub enum Error {
     TooDeep,
     /// A query, or one of its expressions, is bigger than a plan can hold.
     TooLarge,
+    /// A query reads a column where it isn't: not among the columns of the
+    /// rows an operation reads.
+    NotInScope,
 }
 
 /// How a query's values aren't of the types they're used as.

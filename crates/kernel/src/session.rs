@@ -55,6 +55,7 @@ use crate::error::Error;
 pub use crate::lower::OutputColumn;
 use crate::lower::PhysicalPlan;
 use crate::pipeline::Execution;
+use crate::plan::check_scopes;
 use crate::query::Query;
 use crate::row_batch::RowBatch;
 
@@ -85,10 +86,12 @@ impl<'e> Session<'e> {
     ///
     /// # Errors
     ///
-    /// [`Error::TooManyColumns`], [`Error::WrongType`] or [`Error::TooDeep`]
-    /// if the query can't be computed as built, and [`Error::OutOfMemory`]
+    /// [`Error::NotInScope`] if an operation reads a column the rows it
+    /// reads don't have; [`Error::TooManyColumns`], [`Error::WrongType`] or
+    /// [`Error::TooDeep`] if the query can't be computed as built, and [`Error::OutOfMemory`]
     /// if preparing it takes more memory than the session's `Env` has left.
     pub fn prepare(&self, mut query: Query<'e>) -> Result<Prepared<'e>, Error> {
+        check_scopes(self.env, &query.plan)?;
         let plan = PhysicalPlan::from_logical(self.env, &mut query.plan)?;
         Ok(Prepared { plan, session: self.id })
     }

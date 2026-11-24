@@ -6,6 +6,7 @@ use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
+use crate::error::Error;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
 use crate::group_table::KEYS_MAX;
@@ -13,7 +14,7 @@ use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, DynOp, Op, PlanNode};
+use crate::plan::{ColumnId, DynOp, Op, PlanNode, Scope};
 use crate::scannable::Key;
 use crate::step::DynSource;
 use crate::values::Values;
@@ -98,6 +99,21 @@ impl<'c> Op<'c> for AggregateOp {
         });
         self.reads(needed);
         Pruned::Keep
+    }
+
+    /// Its keys, then its aggregates.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &key in self.keys.iter() {
+            scope.read(0, key)?;
+            scope.make(key);
+        }
+        for aggregate in self.aggregates.iter() {
+            if let Some(input) = aggregate.input {
+                scope.read(0, input)?;
+            }
+            scope.make(aggregate.binding);
+        }
+        Ok(())
     }
 
     fn reads(&self, reads: &mut Needed) {

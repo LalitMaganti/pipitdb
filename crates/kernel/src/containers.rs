@@ -1161,6 +1161,15 @@ impl BitSlice<u8> {
     }
 }
 
+impl BitSlice {
+    /// Sets each bit `other` sets.
+    pub fn or_with(&mut self, other: &BitSlice) {
+        for (word, &other) in self.0.iter_mut().zip(other.words()) {
+            *word |= other;
+        }
+    }
+}
+
 /// Bits of its own, a `u64` at a time.
 pub struct Bitmap {
     words: Array<u64>,
@@ -1175,6 +1184,11 @@ impl Bitmap {
     /// Clears every bit.
     pub fn clear_all(&mut self) {
         self.words.fill(0);
+    }
+
+    /// The words the bits are in, to change them.
+    pub fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.words
     }
 }
 

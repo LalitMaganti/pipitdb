@@ -24,7 +24,7 @@ use crate::group_table::{GroupTable, NONE};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode};
+use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode, Scope};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
 use crate::env::Env;
@@ -222,6 +222,20 @@ impl<'c> Op<'c> for JoinOp {
     }
 
     /// Its condition's columns, and the build columns, which it copies.
+    /// Each side's columns it lists.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &condition in self.conjuncts.iter() {
+            scope.read_expr(condition)?;
+        }
+        for (side, columns) in self.columns.iter().enumerate() {
+            for &column in columns.iter() {
+                scope.read(side, column)?;
+                scope.make(column);
+            }
+        }
+        Ok(())
+    }
+
     fn reads(&self, reads: &mut Needed) {
         for &condition in self.conjuncts.iter() {
             mark_expr_columns(condition, reads);

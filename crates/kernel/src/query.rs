@@ -772,4 +772,27 @@ mod tests {
         assert!(!nullable(a) && !nullable(x) && !nullable(count));
         assert!(nullable(y) && nullable(total));
     }
+
+    #[test]
+    fn prepares_only_queries_that_read_columns_in_scope() {
+        let env = Env::current();
+        let columns = [("a", DataType::Int64), ("b", DataType::Int64)];
+        let table = Table::new(env, &columns, &[&[int64s(&[1, 2]), int64s(&[10, 20])]]).unwrap();
+        let table = DynScannable::new(env, table).unwrap();
+        let session = crate::session::Session::new(env);
+        let mut builder = Builder::new(env).unwrap();
+        let (rows, columns) = builder.scan(&table).unwrap();
+        let [a, b] = columns.iter().collect::<Vec<_>>()[..] else { panic!() };
+        // Above an aggregate, only its keys and aggregates.
+        let mut grouping = builder.group(1, 0).unwrap();
+        builder.group_by(&mut grouping, a).unwrap();
+        let rows = builder.grouped(rows, grouping).unwrap();
+        let mut sorting = builder.sort(rows, 1).unwrap();
+        sorting.by(b, Order::Ascending).unwrap();
+        let rows = builder.sorted(sorting).unwrap();
+        let name = builder.names_mut().add("a").unwrap();
+        let output = SmallVec::fixed_from(env, [Named { name, column: a }].into_iter()).unwrap();
+        let query = builder.finish(rows, output).unwrap();
+        assert_eq!(session.prepare(query).err(), Some(Error::NotInScope));
+    }
 }
