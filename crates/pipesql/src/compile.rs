@@ -6,6 +6,7 @@
 
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
+use pipit_kernel::ops::Scan;
 pub use pipit_kernel::query::Named;
 use pipit_kernel::query::{Builder, Query, Relation};
 use pipit_kernel::query::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
@@ -254,7 +255,7 @@ pub fn compile<'e>(
         ast: &ast,
         catalog,
         registry,
-        builder: Builder::new(env)?,
+        builder: Builder::unchecked(env)?,
         rows: None,
         scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
         aliases: SpillVec::new(env, ALIASES_MAX),

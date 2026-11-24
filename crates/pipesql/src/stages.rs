@@ -3,7 +3,10 @@
 
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::names::Name;
-use pipit_kernel::query::{Binary, Expr, Extension, Function, JoinKind, Order, PLAN_COLUMNS_MAX};
+use pipit_kernel::ops::{
+    Aggregate, Compute, Extension, Filter, Function, Join, JoinKind, Limit, Order, Sort,
+};
+use pipit_kernel::query::{Binary, Expr, PLAN_COLUMNS_MAX};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::{Compiler, Named};

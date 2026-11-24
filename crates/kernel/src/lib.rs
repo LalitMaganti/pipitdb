@@ -36,6 +36,7 @@ mod listed;
 pub(crate) mod lower;
 mod murmur_hash;
 pub mod names;
+pub mod ops;
 pub(crate) mod optimize;
 pub(crate) mod order_by;
 mod ordered;

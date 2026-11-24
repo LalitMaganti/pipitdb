@@ -549,17 +549,25 @@ pub struct Scope<'s> {
     out: &'s mut BitSlice,
 }
 
-impl Scope<'_> {
+impl<'s> Scope<'s> {
+    pub(crate) fn new(
+        exprs: &'s Exprs,
+        inputs: &'s [&'s BitSlice],
+        out: &'s mut BitSlice,
+    ) -> Scope<'s> {
+        Scope { exprs, inputs, out }
+    }
+
     /// Checks `column` is among input `input`'s columns.
     pub fn read(&self, input: usize, column: ColumnId) -> Result<(), Error> {
-        let has = self.inputs.get(input).is_some_and(|columns| columns.get(column as usize));
+        let has = self.inputs.get(input).is_some_and(|columns| has(columns, column));
         if has { Ok(()) } else { Err(Error::NotInScope) }
     }
 
     /// Checks each column `expr` reads is among any input's columns.
     pub fn read_expr(&self, expr: Expr) -> Result<(), Error> {
         for step in self.exprs.nodes(expr).iter().filter(|step| step.op == ExprOp::Column) {
-            if !self.inputs.iter().any(|columns| columns.get(step.a as usize)) {
+            if !self.inputs.iter().any(|columns| has(columns, step.a)) {
                 return Err(Error::NotInScope);
             }
         }
@@ -575,6 +583,13 @@ impl Scope<'_> {
     pub fn make(&mut self, column: ColumnId) {
         self.out.set(column as usize);
     }
+}
+
+/// Whether `columns` has `column`, which may be past their bits: a column
+/// added after they were.
+pub(crate) fn has(columns: &BitSlice, column: ColumnId) -> bool {
+    let column = column as usize;
+    columns.words().get(column / 64).is_some_and(|word| word >> (column % 64) & 1 != 0)
 }
 
 /// Checks each op of `plan` reads only columns its inputs have, and the
