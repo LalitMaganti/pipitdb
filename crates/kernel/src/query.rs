@@ -4,12 +4,15 @@
 //! operation takes the relation it reads and returns a new one, whose
 //! columns the next operations read.
 
-use crate::column::Forms;
+pub use crate::aggregate::Function;
+use crate::aggregate::{Aggregate, AggregateOp};
+use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
-use crate::expression::Expr;
+use crate::expression::{ComputeItem, ComputeOp, Expr, expr_can_be_null};
 use crate::limit::LimitOp;
+use crate::names::Name;
 use crate::order_by::OrderByOp;
 use crate::plan::{
     ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey,
@@ -50,6 +53,34 @@ pub struct Column(ColumnId);
 pub struct Columns {
     first: ColumnId,
     count: u32,
+}
+
+/// Rows being extended, by computed columns added one at a time.
+pub struct Extension {
+    /// The rows extended.
+    relation: Relation,
+    /// The columns, each with what computes it.
+    items: SmallVec<ComputeItem>,
+}
+
+/// Rows being grouped, by keys and into aggregates added one at a time.
+pub struct Grouping {
+    /// The keys, in turn.
+    keys: SmallVec<ColumnId>,
+    /// The aggregates, in turn.
+    aggregates: SmallVec<Aggregate>,
+}
+
+impl Grouping {
+    /// Groups by `column` too.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if there are more keys than the grouping was
+    /// made for.
+    pub fn by(&mut self, column: Column) -> Result<(), Error> {
+        Ok(self.keys.push(column.0)?)
+    }
 }
 
 /// Rows being sorted, by keys added one at a time.
@@ -133,6 +164,99 @@ impl<'e> Builder<'e> {
     pub fn filter(&mut self, relation: Relation, condition: Expr) -> Result<Relation, Error> {
         let filter = FilterOp::new(self.env, &self.plan.exprs, condition)?;
         self.add(DynOp::new(self.env, filter)?, relation)
+    }
+
+    /// The rows of `relation`, to be extended by up to `len` columns, which
+    /// [`Builder::compute`] adds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn extend(&mut self, relation: Relation, len: usize) -> Result<Extension, Error> {
+        Ok(Extension { relation, items: SmallVec::fixed(self.env, len)? })
+    }
+
+    /// A column of `extension`, named `name`, of `expr`, of type
+    /// `data_type`, computed for each row.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn compute(
+        &mut self,
+        extension: &mut Extension,
+        name: Name,
+        expr: Expr,
+        data_type: DataType,
+    ) -> Result<Column, Error> {
+        let (columns, nodes) = (&self.plan.columns, self.plan.exprs.nodes(expr));
+        let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
+        let column = self.plan.add_named_column(name, data_type, nullable)?;
+        extension.items.push(ComputeItem { output: column.id, expr })?;
+        Ok(Column(column.id))
+    }
+
+    /// The rows of `extension`, with its columns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn extended(&mut self, extension: Extension) -> Result<Relation, Error> {
+        let Extension { relation, items } = extension;
+        if items.is_empty() {
+            return Ok(relation);
+        }
+        self.add(DynOp::new(self.env, ComputeOp { items })?, relation)
+    }
+
+    /// A grouping by up to `keys` keys, which [`Grouping::by`] adds, into up
+    /// to `aggregates` aggregates, which [`Builder::aggregate`] adds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn group(&mut self, keys: usize, aggregates: usize) -> Result<Grouping, Error> {
+        let keys = SmallVec::fixed(self.env, keys)?;
+        Ok(Grouping { keys, aggregates: SmallVec::fixed(self.env, aggregates)? })
+    }
+
+    /// A column of `grouping`, named `name`: `function` of each group's
+    /// values of `input`, of each distinct one if `distinct`, or of its rows
+    /// if there's no input.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn aggregate(
+        &mut self,
+        grouping: &mut Grouping,
+        name: Name,
+        function: Function,
+        input: Option<Column>,
+        distinct: bool,
+    ) -> Result<Column, Error> {
+        let input = input.map(|column| column.0);
+        let input_type =
+            input.map_or(DataType::Int64, |id| at!(self.plan.columns, id as usize).data_type);
+        // A count is 0 for a group of nulls, where the others are null.
+        let nullable = !matches!(function, Function::CountStar | Function::Count);
+        let output_type = function.output_type(input_type);
+        let binding = self.plan.add_named_column(name, output_type, nullable)?;
+        // The least or greatest of the distinct values is that of them all.
+        let distinct = distinct && !matches!(function, Function::Min | Function::Max);
+        grouping.aggregates.push(Aggregate { function, input, distinct, binding })?;
+        Ok(Column(binding.id))
+    }
+
+    /// The rows of `relation`, grouped by `grouping`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
+    pub fn grouped(&mut self, relation: Relation, grouping: Grouping) -> Result<Relation, Error> {
+        let Grouping { keys, aggregates } = grouping;
+        let aggregate = AggregateOp { keys, aggregates, answer: None };
+        self.add(DynOp::new(self.env, aggregate)?, relation)
     }
 
     /// The rows of `relation`, to be sorted by up to `len` keys, which
