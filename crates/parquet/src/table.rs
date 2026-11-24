@@ -235,6 +235,42 @@ impl<'a> Source for Pruned<'a> {
 }
 
 impl<'a> ParquetTable<'a> {
+    /// What `make` makes of the scan `scan_within` makes, or `None` if it
+    /// would skip nothing.
+    fn pruned<'s, T>(
+        &'s self,
+        env: &Env,
+        columns: &[(u32, Forms)],
+        conditions: &[Condition],
+        cutoff: Option<Cutoff>,
+        make: impl FnOnce(Pruned<'s>) -> Result<T, AllocError>,
+    ) -> Result<Option<T>, AllocError> {
+        let may_keep = |file: &File, group: usize| {
+            conditions.iter().all(|condition| {
+                let c = condition.column() as usize;
+                let chunk = file.footer.chunk(group, c);
+                let bounds = bounds::of_chunk(*at!(file.footer.columns(), c), chunk);
+                bounds.is_none_or(|bounds| condition.may_keep(bounds))
+            })
+        };
+        let mut groups = SmallVec::new(env, ROW_GROUPS_MAX)?;
+        let mut skipped = false;
+        for (f, file) in self.files.iter().enumerate() {
+            for group in 0..file.footer.row_groups() {
+                if may_keep(file, group) {
+                    groups.push((f, group))?;
+                } else {
+                    skipped = true;
+                }
+            }
+        }
+        if !skipped && cutoff.is_none() {
+            return Ok(None);
+        }
+        let columns = SmallVec::fixed_from(env, columns.iter().copied())?;
+        Ok(Some(make(Pruned { table: self, columns, groups, cutoff })?))
+    }
+
     /// The files in `sources`, which must have the same columns, in the same
     /// order, of types the kernel has. Their pages are decompressed with
     /// `codecs`.
@@ -478,30 +514,7 @@ impl<'a> Scannable for ParquetTable<'a> {
         conditions: &[Condition],
         cutoff: Option<Cutoff>,
     ) -> Result<Option<DynSource<'s>>, AllocError> {
-        let may_keep = |file: &File, group: usize| {
-            conditions.iter().all(|condition| {
-                let c = condition.column() as usize;
-                let chunk = file.footer.chunk(group, c);
-                let bounds = bounds::of_chunk(*at!(file.footer.columns(), c), chunk);
-                bounds.is_none_or(|bounds| condition.may_keep(bounds))
-            })
-        };
-        let mut groups = SmallVec::new(env, ROW_GROUPS_MAX)?;
-        let mut skipped = false;
-        for (f, file) in self.files.iter().enumerate() {
-            for group in 0..file.footer.row_groups() {
-                if may_keep(file, group) {
-                    groups.push((f, group))?;
-                } else {
-                    skipped = true;
-                }
-            }
-        }
-        if !skipped && cutoff.is_none() {
-            return Ok(None);
-        }
-        let columns = SmallVec::fixed_from(env, columns.iter().copied())?;
-        Ok(Some(DynSource::new(env, Pruned { table: self, columns, groups, cutoff })?))
+        self.pruned(env, columns, conditions, cutoff, |pruned| DynSource::new(env, pruned))
     }
 }
 
@@ -514,9 +527,7 @@ mod tests {
 
     use pipit_kernel::env::Env;
     use pipit_kernel::filter::{Comparison, Value};
-    use pipit_kernel::pipeline::Pipeline;
     use pipit_kernel::predicate::{Leaf, Node, Predicate};
-    use pipit_kernel::scannable::DynScannable;
 
     use super::*;
     use crate::Uncompressed;
@@ -685,87 +696,58 @@ mod tests {
         Predicate::new(env, SmallVec::fixed_from(env, nodes.into_iter()).unwrap()).unwrap()
     }
 
+    /// The `id`s `pruned` keeps, as the first column it reads. After each
+    /// batch, `after` is given the context and how many rows were read.
+    fn kept(pruned: &Pruned<'_>, mut after: impl FnMut(&mut Context, usize)) -> Vec<i64> {
+        let mut context = Context::new(Env::current(), None);
+        let mut state = pruned.new_state(&mut context).unwrap();
+        let (mut batch, mut ids, mut read) = (RowBatch::new(), Vec::new(), 0);
+        while pruned.next(&mut context, &mut state, &mut batch).unwrap() {
+            let (selection, column) = (batch.selection(), batch.column(0));
+            let rows = (0..selection.len()).map(|i| selection.kept().row(i) as usize);
+            ids.extend(rows.map(|row| column.int64s()[row]));
+            read += batch.row_count() as usize;
+            after(&mut context, read);
+        }
+        ids
+    }
+
     #[test]
     fn skips_row_groups_statistics_rule_out() {
         let env = Env::current();
         let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-        let table = DynScannable::new(env, table).unwrap();
         // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
         // to 4999.
         let ids = |min, max| {
             // Not exact: it only skips.
             let conditions = [Condition::new(0, &between(min, max))];
-            let source =
-                table.scan(env, [(0, Forms::FLAT)].into_iter(), &conditions, None).unwrap();
-            let pipeline = Pipeline::new(source, SmallVec::fixed(env, 0).unwrap());
-            let query = Env::current();
-            let mut execution = pipeline.start(query, None).unwrap();
-            let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
-            while execution.next(&mut batch).unwrap() {
-                let column = batch.column(0);
-                ids.extend((0..column.row_count()).map(|row| column.int64s()[row as usize]));
-            }
-            ids
+            let pruned = table.pruned(env, &[(0, Forms::FLAT)], &conditions, None, Ok).unwrap();
+            pruned.map(|pruned| kept(&pruned, |_, _| {}))
         };
         let middle: Vec<i64> = (2048..4096).collect();
-        assert_eq!(ids(3000, 3000), [&middle[..], &middle[..]].concat());
-        assert_eq!(ids(5000, i64::MAX), []);
-        assert_eq!(ids(0, 4999).len(), 10000);
-    }
-
-    /// Counts the rows each batch keeps into its cell.
-    struct Rows<'c>(&'c core::cell::Cell<u32>);
-
-    impl pipit_kernel::step::Transform for Rows<'_> {
-        type State = ();
-
-        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
-            Ok(())
-        }
-
-        fn process(&self, _: &mut Context, (): &mut (), batch: &mut RowBatch) -> Result<(), Error> {
-            self.0.set(self.0.get() + batch.selection().len());
-            Ok(())
-        }
+        assert_eq!(ids(3000, 3000), Some([&middle[..], &middle[..]].concat()));
+        assert_eq!(ids(5000, i64::MAX), Some(Vec::new()));
+        assert_eq!(ids(0, 4999), None);
     }
 
     #[test]
-    fn keeps_only_rows_before_a_top_k_cutoff() {
+    fn skips_rows_after_a_cutoff() {
         let env = Env::current();
-        // The first 3 by `id` of two files whose row groups each hold `id`s 0
-        // to 2047, 2048 to 4095 and 4096 to 4999, and how many rows the scan
-        // keeps. Once the `TopK` holds the first two groups, its cutoff is 2:
-        // the third is skipped, and of the second file only 0, 1 and 2 kept.
-        let first = |publish: Option<u32>| {
-            use pipit_kernel::pipeline::{Sinks, served};
-            use pipit_kernel::step::{DynTransform, Step};
-            let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
-            let table = DynScannable::new(env, table).unwrap();
-            let cutoff = publish.map(|slot| Cutoff { slot, column: 0, descending: false });
-            let source = table.scan(env, [(0, Forms::FLAT)].into_iter(), &[], cutoff).unwrap();
-            let keys = [pipit_kernel::sort::SortKey { column: 0, descending: false }];
-            let keys = SmallVec::fixed_from(env, keys.into_iter()).unwrap();
-            let kept = core::cell::Cell::new(0);
-            let steps = [Step::Transform(DynTransform::new(env, Rows(&kept)).unwrap())];
-            let steps = SmallVec::fixed_from(env, steps.into_iter()).unwrap();
-            let mut sinks = Sinks::new(env).unwrap();
-            let top_k = pipit_kernel::top_k::top_k(keys, 3, publish);
-            let top_k = sinks.add(env, Pipeline::new(source, steps), top_k).unwrap();
-            let after = SmallVec::fixed(env, 0).unwrap();
-            let pipeline = Pipeline::new(served(env, top_k).unwrap(), after);
-            let query = Env::current();
-            let mut execution = pipeline.start_with_sinks(query, None, &sinks, None).unwrap();
-            let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
-            while execution.next(&mut batch).unwrap() {
-                let (selection, column) = (batch.selection(), batch.column(0));
-                let rows = (0..selection.len()).map(|i| selection.kept().row(i) as usize);
-                ids.extend(rows.map(|row| column.int64s()[row]));
+        let table = ParquetTable::open(env, &Uncompressed, &[&SMALL, &SMALL]).unwrap();
+        // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
+        // to 4999. Once the first two are read, a `TopK` of the first 3 by
+        // `id` publishes 2: the third is skipped, and of the second file
+        // only 0, 1 and 2 kept.
+        let cutoff = Cutoff { slot: 0, column: 0, descending: false };
+        let pruned =
+            table.pruned(env, &[(0, Forms::FLAT)], &[], Some(cutoff), Ok).unwrap().unwrap();
+        let ids = kept(&pruned, |context, read| {
+            if read >= 4096 {
+                context.reserve_cutoff(0).unwrap();
+                context.set_cutoff(0, Some(2));
             }
-            drop(execution);
-            (ids, kept.get())
-        };
-        assert_eq!(first(None), ([0, 0, 1].into(), 10000));
-        assert_eq!(first(Some(2)), ([0, 0, 1].into(), 4096 + 3));
+        });
+        assert_eq!(ids, (0..4096).chain(0..3).collect::<Vec<i64>>());
     }
 
     #[test]
