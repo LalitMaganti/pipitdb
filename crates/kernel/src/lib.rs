@@ -29,6 +29,7 @@ mod group_table;
 mod hash_aggregate;
 pub mod join;
 pub mod join_planner;
+mod key_set;
 pub mod like;
 pub mod limit;
 mod listed;

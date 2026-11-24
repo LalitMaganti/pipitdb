@@ -3,12 +3,13 @@
 
 use crate::allocator::AllocError;
 use crate::column::{ColumnView, Form, Forms};
-use crate::containers::{Array, RankBitmap};
+use crate::containers::Array;
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
 use crate::filter::{self, Range};
 use crate::group_table::NONE;
+use crate::key_set::KeySet;
 use crate::row_batch::RowBatch;
 
 /// How far apart the keys can be for `Direct` to find build rows by them:
@@ -18,85 +19,65 @@ const KEYS_PER_ROW: u64 = 256;
 /// Finds the build row of a key by its value, as a perfect hash does: by
 /// how far it is above the smallest key.
 pub(super) struct Direct {
-    /// The smallest key.
-    min: i64,
-    /// How far above `min` the largest key is.
-    span: u64,
-    /// Which keys have a build row, and which. None if each key's build row
-    /// is its number above `min`, as a table's ids' are.
-    keyed: Option<Keyed>,
-}
-
-/// The build rows in order of key, and which keys have one, by their number
-/// above the smallest, so a key's row is at its rank, as in DuckDB's perfect
-/// hash join. With no gaps between the keys, a key's rank is its number, so
-/// there's no bitmap.
-struct Keyed {
-    keys: Option<RankBitmap>,
-    rows: Array<u32>,
+    /// The keys that have a build row.
+    keys: KeySet,
+    /// The build rows in order of key, each at its key's place among them,
+    /// as in DuckDB's perfect hash join. None if each key's build row is its
+    /// number above the smallest, as a table's ids' are.
+    rows: Option<Array<u32>>,
 }
 
 impl Direct {
     /// For `count` build rows whose keys are each their number above the
     /// first, `min`, as a table's ids are.
     pub(super) fn sequence(min: i64, count: u32) -> Direct {
-        Direct { min, span: u64::from(count - 1), keyed: None }
+        let keys = KeySet::all(Range { lo: min, span: u64::from(count - 1) });
+        Direct { keys, rows: None }
     }
 
     /// For build rows of keys `keys`, one integer each, if they're close
     /// enough and none repeats.
     pub(super) fn of(env: &Env, keys: &[i64]) -> Result<Option<Direct>, AllocError> {
-        let bounds = |(min, max): (i64, i64), &key: &i64| (key.min(min), key.max(max));
-        let (min, max) = keys.iter().fold((i64::MAX, i64::MIN), bounds);
-        let span = max.wrapping_sub(min).cast_unsigned();
         let len = keys.len() as u64;
-        if len == 0 || span > (len * KEYS_PER_ROW).min(u32::MAX.into()) {
-            return Ok(None);
-        }
-        #[expect(clippy::cast_possible_truncation, reason = "at most `span`, in 32 bits")]
-        let above = |key: i64| key.wrapping_sub(min).cast_unsigned() as usize;
+        // Keys that repeat are found below, so taken not to.
+        let Some(set) = KeySet::of(env, keys, len * KEYS_PER_ROW, true)? else { return Ok(None) };
         // Each build row its key's number above the first.
-        if keys.iter().enumerate().all(|(row, &key)| row == above(key)) {
-            return Ok(Some(Direct { min, span, keyed: None }));
+        if keys.iter().enumerate().all(|(row, &key)| row == set.above(key) as usize) {
+            return Ok(Some(Direct { keys: set, rows: None }));
         }
-        #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
-        let bits = (span + 1 > len)
-            .then(|| RankBitmap::new(env, span as usize + 1, keys.iter().map(|&key| above(key))))
-            .transpose()?;
         let mut rows = Array::zeroed(env, keys.len())?;
         rows.fill(NONE);
         for (row, &key) in (0..).zip(keys) {
-            let at = bits.as_ref().map_or(above(key), |bits| bits.rank(above(key)) as usize);
-            let found = at_mut!(rows, at);
+            let found = at_mut!(rows, set.rank(set.above(key)) as usize);
             // A key that repeats.
             if *found != NONE {
                 return Ok(None);
             }
             *found = row;
         }
-        Ok(Some(Direct { min, span, keyed: Some(Keyed { keys: bits, rows }) }))
+        Ok(Some(Direct { keys: set, rows: Some(rows) }))
     }
 
     /// Narrows `pairs` to its rows whose key, at `key`, has a build row,
-    /// writing each one's to `paired`, of the `count` build rows. Every row
-    /// is gathered, so one without a build row takes the first's.
+    /// writing each one's to `paired`.
     pub(super) fn pair(
         &self,
         context: &mut Context,
         key: u32,
-        count: u32,
         paired: &mut [u32],
         pairs: &mut RowBatch,
     ) -> Result<(), Error> {
         let mut key = pairs.column(key).clone();
         key.make_in(context, Forms::FLAT)?;
-        let (min, span) = (self.min, self.span);
-        filter::keep_within(&key, Range { lo: min, span }, pairs.selection_mut(), None);
-        // A bound of 32 bits, so the loop works in 32 bits.
+        let Range { lo, span } = self.keys.range();
+        filter::keep_within(&key, self.keys.range(), pairs.selection_mut(), None);
+        // Each row's place above the smallest key, in one loop that
+        // vectorizes: 0 for one outside the range, which isn't kept. A bound
+        // of 32 bits, so the loop works in 32 bits.
         #[expect(clippy::cast_possible_truncation, reason = "a span in 32 bits")]
         let keys = span as u32 + 1;
         let above_of = |value: i64| {
-            let above = value.wrapping_sub(min).cast_unsigned();
+            let above = value.wrapping_sub(lo).cast_unsigned();
             #[expect(clippy::cast_possible_truncation, reason = "below `keys`")]
             let above = if above < u64::from(keys) { above as u32 } else { 0 };
             above
@@ -104,9 +85,9 @@ impl Direct {
         for (paired, &value) in paired.iter_mut().zip(key.int64s()) {
             *paired = above_of(value);
         }
-        let Some(Keyed { keys, rows }) = &self.keyed else { return Ok(()) };
-        let Some(keys) = keys else {
-            // Every key within the bounds has a build row.
+        let Some(rows) = self.rows.as_deref() else { return Ok(()) };
+        let Some(present) = self.keys.present() else {
+            // Every key within the range has a build row, at its place.
             for paired in paired.iter_mut() {
                 *paired = *at!(rows, *paired as usize);
             }
@@ -114,14 +95,11 @@ impl Direct {
         };
         // Most rows often have no build row, so those go before the rest's
         // rows are found.
-        pairs.selection_mut().retain(|row| keys.get(*at!(paired, usize::from(row)) as usize));
+        pairs.selection_mut().retain(|row| present.get(*at!(paired, usize::from(row)) as usize));
         let selection = pairs.selection();
         for i in 0..selection.len() {
             let paired = at_mut!(paired, selection.kept().row(i) as usize);
-            *paired = *at!(rows, keys.rank(*paired as usize) as usize);
-        }
-        for paired in paired.iter_mut() {
-            *paired = (*paired).min(count - 1);
+            *paired = *at!(rows, present.rank(*paired as usize) as usize);
         }
         Ok(())
     }

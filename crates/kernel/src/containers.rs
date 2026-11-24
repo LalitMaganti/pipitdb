@@ -1227,6 +1227,12 @@ impl RankBitmap {
         self.bits.get(at)
     }
 
+    /// How many bits are set.
+    pub fn count(&self) -> u32 {
+        let last = self.before.len().checked_sub(1);
+        last.map_or(0, |last| *at!(self.before, last) + at!(self.bits.words(), last).count_ones())
+    }
+
     /// How many bits are set before bit `at`.
     #[inline]
     pub fn rank(&self, at: usize) -> u32 {
