@@ -22,7 +22,7 @@ use crate::erase::{drop_state, state_of, value_of, write_state};
 use crate::error::Error;
 use crate::row_batch::{BATCH_COLUMNS_MAX, RowBatch};
 use crate::selection::Selection;
-use crate::step::{DynSource, DynTransform, SourceNext, StepFunctions, TransformProcess};
+use crate::step::{DynSource, DynTransform, Name, SourceNext, StepFunctions, TransformProcess};
 
 /// Named, typed columns, read into batches. Where a read is lives in
 /// `State`, which each run opens, as for a step.
@@ -243,6 +243,7 @@ impl<'a, T: Scannable + 'a> Functions<'a, T> {
             orders
         },
         scan: StepFunctions {
+            name: Name::new("Scan"),
             state_layout: Layout::new::<T::State<'a>>(),
             // SAFETY: only called with a `Scan` of this scannable and its
             // state, as is each below. The state borrows the scan's
@@ -264,6 +265,7 @@ impl<'a, T: Scannable + 'a> Functions<'a, T> {
             },
         },
         materialize: StepFunctions {
+            name: Name::new("Materialize"),
             state_layout: Layout::new::<T::Loader>(),
             // SAFETY: only called with a `Materialize` of this scannable and
             // its loader, as is each below.
@@ -374,7 +376,7 @@ impl<'a> DynScannable<'a> {
         let step = Box::new(env, scan)?.erase();
         // SAFETY: the functions take a `Scan` of this scannable, which the
         // `Scan` borrows for as long as the source lives.
-        let source = unsafe { DynSource::from_parts(step, &self.functions.scan, "Scan") };
+        let source = unsafe { DynSource::from_parts(step, &self.functions.scan) };
         Ok(source)
     }
 
@@ -393,7 +395,7 @@ impl<'a> DynScannable<'a> {
         let functions = &self.functions.materialize;
         // SAFETY: the functions take a `Materialize` of this scannable, which
         // the `Materialize` borrows for as long as the transform lives.
-        Ok(unsafe { DynTransform::from_parts(step, functions, "Materialize") })
+        Ok(unsafe { DynTransform::from_parts(step, functions) })
     }
 }
 
@@ -636,6 +638,7 @@ mod tests {
     struct KeepOdd;
 
     impl Transform for KeepOdd {
+        const NAME: &'static str = "KeepOdd";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {

@@ -16,7 +16,7 @@ pipitdb-kernel = { path = "../kernel" }
 
 [dev-dependencies]
 # Tests use each thread's `Global`.
-pipitdb-kernel = { path = "../kernel", features = ["std"] }
+pipitdb-kernel = { path = "../kernel", features = ["explain", "std"] }
 pipitdb-operators = { path = "../operators" }
 
 [features]

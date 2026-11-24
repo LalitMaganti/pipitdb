@@ -71,12 +71,6 @@ impl<'c> PhysicalPlan<'c> {
         lower(env, plan, &planned)
     }
 
-    /// Its pipelines' steps, as `Sinks::describe` prints them.
-    #[cfg(test)]
-    pub(crate) fn describe(&self) -> alloc::string::String {
-        self.sinks.describe(&self.pipeline)
-    }
-
     /// Starts a run of its statement, in `memory`, which the run grows if
     /// it's too small.
     pub(crate) fn start<'r>(
@@ -85,6 +79,12 @@ impl<'c> PhysicalPlan<'c> {
         memory: &'r mut Array<u8>,
     ) -> Result<Execution<'r>, Error> {
         self.pipeline.start_with_sinks(env, Some(&self.statement), &self.sinks, Some(memory))
+    }
+
+    /// Writes its pipelines' steps, as `Sinks::explain` does.
+    #[cfg(any(test, feature = "explain"))]
+    pub(crate) fn explain(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        self.sinks.explain(out, &self.pipeline)
     }
 
     pub fn columns(&self) -> &[OutputColumn] {
@@ -351,6 +351,13 @@ mod tests {
     use crate::selection::{Kept, Selection};
     use crate::step::DynSource;
 
+    /// How `plan` runs, as it explains it.
+    fn explained(plan: &PhysicalPlan<'_>) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        plan.explain(&mut out).unwrap();
+        out
+    }
+
     /// Plans `plan`, then lowers it.
     fn lower_planned<'c>(plan: &mut LogicalPlan<'c>) -> Result<PhysicalPlan<'c>, LowerError> {
         let env = Env::current();
@@ -599,7 +606,7 @@ mod tests {
             plan.add_node(limit, &[ordered]).unwrap();
         }
         assert!(plan.output.push(bindings[keys.first().map_or(0, |key| key.0)]).is_ok());
-        lower_planned(&mut plan).unwrap().describe()
+        explained(&lower_planned(&mut plan).unwrap())
     }
 
     #[test]
@@ -655,7 +662,7 @@ mod tests {
             node = plan.add_node(order_by, &children).unwrap();
         }
         assert!(plan.output.push(ids[0]).is_ok());
-        assert_eq!(lower_planned(&mut plan).unwrap().describe(), "Scan | Sort / Served");
+        assert_eq!(explained(&lower_planned(&mut plan).unwrap()), "Scan | Sort / Served");
     }
 
     /// `Ab` scanned with `output` as the plan's output, and pruned.
@@ -1039,7 +1046,7 @@ mod tests {
                 kept.push(columns.map(|column| column.int64s()[usize::from(row)]).collect());
             }
         }
-        (kept, rows, physical.describe())
+        (kept, rows, explained(&physical))
     }
 
     #[test]
@@ -1341,7 +1348,7 @@ mod tests {
         if execution.next(&mut batch).unwrap() {
             row = physical.columns().iter().map(|c| batch.column(c.position).int64s()[0]).collect();
         }
-        (physical.describe(), row)
+        (explained(&physical), row)
     }
 
     #[test]

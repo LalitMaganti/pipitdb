@@ -21,6 +21,7 @@ pub struct Sort {
 }
 
 impl Breaker for Sort {
+    const NAME: &'static str = "Sort";
     type State = SortedRows;
 
     fn new_state(&self, context: &mut Context) -> Result<SortedRows, Error> {
@@ -106,6 +107,7 @@ mod tests {
     }
 
     impl Source for Rows {
+        const NAME: &'static str = "Rows";
         type State = usize;
 
         fn new_state(&self, _: &mut Context) -> Result<usize, Error> {
