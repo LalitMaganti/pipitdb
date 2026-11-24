@@ -4,10 +4,13 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::string::String;
+use std::vec::Vec;
+use std::{format, vec};
 
-use pipit_kernel::env::Env;
-use pipit_kernel::error::Error;
-use pipit_kernel::join_planner::{
+use crate::env::Env;
+use crate::error::Error;
+use crate::join_planner::{
     BUILD_COST, EquivalenceSet, Estimator, JoinEdge, JoinKind, JoinNode, JoinTree, QueryGraph,
     ROWS_MAX, Relation, RelationSet,
 };
@@ -110,7 +113,7 @@ fn round(rows: f64) -> u64 {
 }
 
 fn relation_set(relations: impl IntoIterator<Item = u32>) -> Result<RelationSet, String> {
-    let mut set = RelationSet::new(crate::env()).map_err(fail)?;
+    let mut set = RelationSet::new(Env::current()).map_err(fail)?;
     for relation in relations {
         set.insert(relation).map_err(fail)?;
     }
@@ -244,7 +247,7 @@ pub fn generate(shape: Shape, count: usize, mixed: bool) -> Result<QueryGraph, S
         }
     }
 
-    let mut graph = QueryGraph::new(crate::env()).map_err(fail)?;
+    let mut graph = QueryGraph::new(Env::current()).map_err(fail)?;
     for relation in relations {
         graph.relations.push(relation).map_err(fail)?;
     }
@@ -415,7 +418,7 @@ pub fn cost(graph: &QueryGraph, tree: &JoinTree) -> Result<Costed, String> {
     // Each node's relations and rows.
     let mut sets: Vec<Option<RelationSet>> = (0..order.len()).map(|_| None).collect();
     let mut rows = vec![0.0; order.len()];
-    let mut seen = RelationSet::new(crate::env()).map_err(fail)?;
+    let mut seen = RelationSet::new(Env::current()).map_err(fail)?;
     let (mut total, mut valid) = (0.0_f64, Ok(()));
     for node in order {
         let (set, node_rows) = match tree.nodes.get(node).map(|node| node.kind) {
@@ -489,7 +492,7 @@ pub fn as_written(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
 
 /// The planner's tree for `graph`, or the written order where it keeps that.
 pub fn plan(env: &Env, graph: &QueryGraph) -> Result<JoinTree, Error> {
-    pipit_kernel::join_planner::plan(env, graph)?.map_or_else(|| as_written(env, graph), Ok)
+    crate::join_planner::plan(env, graph)?.map_or_else(|| as_written(env, graph), Ok)
 }
 
 /// The cheapest valid tree of `graph`, of at most `EXHAUSTIVE_MAX`
@@ -565,7 +568,7 @@ pub fn exhaustive(graph: &QueryGraph) -> Result<(JoinTree, f64), String> {
     if best[all].is_infinite() {
         return Err("no valid tree".into());
     }
-    let mut tree = JoinTree::new(crate::env(), count).map_err(fail)?;
+    let mut tree = JoinTree::new(Env::current(), count).map_err(fail)?;
     build(&mut tree, &split, &rows, all)?;
     Ok((tree, best[all]))
 }
@@ -588,7 +591,7 @@ mod tests {
     /// A fact of 1000 rows, joined to a dimension of 10 on its key, and
     /// left joined to another of 100, which then joins the first dimension.
     fn star() -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::env()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for rows in [1000, 10, 100] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
         }
@@ -610,7 +613,7 @@ mod tests {
 
     /// A tree joining `first` and `second`, then that to `third`.
     fn left_deep([first, second, third]: [u32; 3]) -> JoinTree {
-        let mut tree = JoinTree::new(crate::env(), 3).unwrap();
+        let mut tree = JoinTree::new(Env::current(), 3).unwrap();
         let (a, b) = (tree.relation(first, 0.0).unwrap(), tree.relation(second, 0.0).unwrap());
         let joined = tree.join(a, b, 0.0).unwrap();
         let c = tree.relation(third, 0.0).unwrap();
@@ -621,7 +624,7 @@ mod tests {
     #[test]
     fn costs_and_checks_trees() {
         let graph = star();
-        let written = as_written(crate::env(), &graph).unwrap();
+        let written = as_written(Env::current(), &graph).unwrap();
         // 1000 * 10 / 10, then a left join keeping all 1000, each building
         // its smaller side's 10, then 100, rows at `BUILD_COST` each.
         let cost_of = 2000.0 + BUILD_COST * 110.0;
@@ -641,7 +644,7 @@ mod tests {
     /// Each relation left joined to all those before it: a long graph with
     /// few connected sets, so it's planned exactly.
     fn left_chain(count: u32) -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::env()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for relation in 0..count {
             let rows = 10 + u64::from(relation * 7919 % 1000);
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
@@ -657,11 +660,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn small_graphs_are_planned_optimally() {
         for shape in SHAPES {
             for (count, mixed) in [(2, false), (3, true), (7, false), (10, true)] {
                 let graph = generate(shape, count, mixed).unwrap();
-                let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
+                let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
                 let (_, optimum) = exhaustive(&graph).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= optimum * (1.0 + 1e-9));
             }
@@ -669,38 +673,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn larger_graphs_get_valid_plans() {
         for shape in SHAPES {
             for (count, mixed) in [(20, true), (70, false), (70, true)] {
                 let graph = generate(shape, count, mixed).unwrap();
-                let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
-                let written = cost(&graph, &as_written(crate::env(), &graph).unwrap()).unwrap();
+                let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
+                let written = cost(&graph, &as_written(Env::current(), &graph).unwrap()).unwrap();
                 assert!(planned.valid.is_ok() && planned.cost <= written.cost);
             }
         }
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn disconnected_graphs_take_cross_products() {
         for count in [5, 70] {
             let mut graph = generate(Shape::Chain, count, true).unwrap();
             graph.relations.push(Relation { rows: 3, unfiltered_rows: 3, max_rows: 3 }).unwrap();
-            assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
+            assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
         }
     }
 
     #[test]
     fn long_graphs_with_few_connected_sets_are_planned_exactly() {
         let graph = left_chain(50);
-        let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
-        let written = cost(&graph, &as_written(crate::env(), &graph).unwrap()).unwrap();
+        let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
+        let written = cost(&graph, &as_written(Env::current(), &graph).unwrap()).unwrap();
         assert_eq!(planned, written);
     }
 
     /// A fact of 1000 rows with dimensions of 10 and 20 on its keys, and a
     /// relation of one row: joined to the fact if `connected`, or to nothing.
     fn one_row_star(connected: bool) -> QueryGraph {
-        let mut graph = QueryGraph::new(crate::env()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for (rows, max_rows) in [(1000, 1000), (10, 10), (20, 20), (1, 1)] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
         }
@@ -720,7 +726,7 @@ mod tests {
         for connected in [true, false] {
             let graph = one_row_star(connected);
             // The one-row relation joins a dimension, with no edge between.
-            let mut tree = JoinTree::new(crate::env(), 4).unwrap();
+            let mut tree = JoinTree::new(Env::current(), 4).unwrap();
             let (dimension, one) =
                 (tree.relation(1, 10.0).unwrap(), tree.relation(3, 1.0).unwrap());
             let crossed = tree.join(dimension, one, 10.0).unwrap();
@@ -733,16 +739,17 @@ mod tests {
             assert_eq!(cost(&graph, &tree).unwrap(), Costed { cost: optimum, valid: Ok(()) });
             // A disconnected graph may take any cross product, which exact
             // search doesn't try, so only its validity is checked.
-            let planned = cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap();
+            let planned = cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap();
             assert!(planned.valid.is_ok());
             assert!(!connected || planned.cost <= optimum * (1.0 + 1e-9));
         }
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "too slow under Miri")]
     fn plans_keep_to_joins_that_can_run() {
         // A chain of 3, whose first two relations can't be joined directly.
-        let mut graph = QueryGraph::new(crate::env()).unwrap();
+        let mut graph = QueryGraph::new(Env::current()).unwrap();
         for rows in [10, 20, 30] {
             graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows: rows }).unwrap();
             graph.equivalences.push(EquivalenceSet { domain: 10 }).unwrap();
@@ -752,14 +759,14 @@ mod tests {
             graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence }).unwrap();
         }
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
-        let written = as_written(crate::env(), &graph).unwrap();
+        let written = as_written(Env::current(), &graph).unwrap();
         assert_eq!(cost(&graph, &written).unwrap().valid, Err(Invalid::Executable));
         let (tree, _) = exhaustive(&graph).unwrap();
         assert!(cost(&graph, &tree).unwrap().valid.is_ok());
-        assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
+        assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
         // Too big for exact search, so planned greedily, then by windows.
         let mut graph = generate(Shape::Chain, 70, false).unwrap();
         graph.executable = Some(|_, left, right| (left[0] | right[0]) != 0b11);
-        assert!(cost(&graph, &plan(crate::env(), &graph).unwrap()).unwrap().valid.is_ok());
+        assert!(cost(&graph, &plan(Env::current(), &graph).unwrap()).unwrap().valid.is_ok());
     }
 }

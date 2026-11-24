@@ -3,30 +3,32 @@
 //! against the optimum, or for graphs too big to search, against the best
 //! plan any run has found.
 //!
-//! Usage: `cargo run --release -p pipitdb-bench --example join_planner -- [OPTION]...`
+//! Usage: `cargo test --release -p pipitdb-kernel join_planner::report -- --ignored --nocapture`,
+//! with options in the environment:
 //!
-//! - `--planner NAME`: runs this one, as many times as given; all by default.
-//! - `--shapes chain,star,...`: of chain, star, snowflake, cycle, clique, random.
-//! - `--sizes 5,10,...`: relations per graph; 5, 10, 15, 20, 50, 100, 500 by default.
-//! - `--joins inner|mixed|both`: inner joins only, about 20% LEFT, SEMI and
+//! - `PIPIT_PLANNERS=plan,...`: runs these; all by default.
+//! - `PIPIT_SHAPES=chain,star,...`: of chain, star, snowflake, cycle, clique, random.
+//! - `PIPIT_SIZES=5,10,...`: relations per graph; 5, 10, 15, 20, 50, 100, 500 by default.
+//! - `PIPIT_JOINS=inner|mixed|both`: inner joins only, about 20% LEFT, SEMI and
 //!   ANTI joins, or both, the default.
-//! - `--exhaustive N`: finds the optimum of graphs of up to N relations, 15 by
-//!   default.
-//! - `--best FILE`: the best known costs, read and updated.
-//! - `--graph NAME`: prints a graph, such as `star-10-mixed`, and runs nothing.
-
-#![allow(unsafe_code)]
+//! - `PIPIT_EXHAUSTIVE=N`: finds the optimum of graphs of up to N relations, 15
+//!   by default.
+//! - `PIPIT_BEST=FILE`: the best known costs, read and updated.
+//! - `PIPIT_GRAPH=NAME`: prints a graph, such as `star-10-mixed`, and runs nothing.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::string::{String, ToString};
 use std::time::{Duration, Instant};
+use std::vec::Vec;
+use std::{format, println, vec};
 
-use pipit_kernel::allocator::Heap;
-use pipit_kernel::env::{Env, Memory};
-use pipit_kernel::join_planner::{QueryGraph, RelationSet};
-use pipitdb_bench::join_planner::{
+use super::harness::{
     EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name, plan,
 };
+use crate::allocator::Heap;
+use crate::env::{Env, Memory};
+use crate::join_planner::{QueryGraph, RelationSet};
 
 /// The planners competing, by name. Add one here.
 const PLANNERS: &[(&str, Enumerator)] = &[("as_written", as_written), ("plan", plan)];
@@ -61,7 +63,7 @@ fn run(planner: Enumerator, graph: &QueryGraph) -> Result<Outcome, String> {
     let started = Instant::now();
     while times.len() < 3 || (started.elapsed() < TIMING && times.len() < 101) {
         let start = Instant::now();
-        let tree = planner(pipitdb_bench::env(), graph).map_err(fail)?;
+        let tree = planner(Env::current(), graph).map_err(fail)?;
         times.push(start.elapsed());
         drop(tree);
         if times.len() == 1 && started.elapsed() > TIMING * 5 {
@@ -134,44 +136,35 @@ fn options() -> Result<Options, String> {
         best: None,
         graph: None,
     };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
-        match arg.as_str() {
-            "--planner" => {
-                let name = value()?;
-                let found = PLANNERS.iter().find(|(n, _)| *n == name);
-                options.planners.push(*found.ok_or(format!("no planner {name}"))?);
-            }
-            "--shapes" => {
-                options.shapes = value()?
-                    .split(',')
-                    .map(|name| {
-                        SHAPES.into_iter().find(|s| s.name() == name).ok_or(format!("no {name}"))
-                    })
-                    .collect::<Result<_, _>>()?;
-            }
-            "--sizes" => {
-                options.sizes =
-                    value()?.split(',').map(str::parse).collect::<Result<_, _>>().map_err(fail)?;
-            }
-            "--joins" => {
-                options.mixed = match value()?.as_str() {
-                    "inner" => vec![false],
-                    "mixed" => vec![true],
-                    "both" => vec![false, true],
-                    other => return Err(format!("no joins {other}")),
-                };
-            }
-            "--exhaustive" => {
-                options.exhaustive = value()?.parse().map_err(fail)?;
-                options.exhaustive = options.exhaustive.min(EXHAUSTIVE_MAX);
-            }
-            "--best" => options.best = Some(value()?),
-            "--graph" => options.graph = Some(value()?),
-            _ => return Err(format!("unknown option {arg}")),
+    let var = |name: &str| std::env::var(name).ok();
+    if let Some(names) = var("PIPIT_PLANNERS") {
+        for name in names.split(',') {
+            let found = PLANNERS.iter().find(|(n, _)| *n == name);
+            options.planners.push(*found.ok_or(format!("no planner {name}"))?);
         }
     }
+    if let Some(names) = var("PIPIT_SHAPES") {
+        options.shapes = names
+            .split(',')
+            .map(|name| SHAPES.into_iter().find(|s| s.name() == name).ok_or(format!("no {name}")))
+            .collect::<Result<_, _>>()?;
+    }
+    if let Some(sizes) = var("PIPIT_SIZES") {
+        options.sizes = sizes.split(',').map(str::parse).collect::<Result<_, _>>().map_err(fail)?;
+    }
+    if let Some(joins) = var("PIPIT_JOINS") {
+        options.mixed = match joins.as_str() {
+            "inner" => vec![false],
+            "mixed" => vec![true],
+            "both" => vec![false, true],
+            other => return Err(format!("no joins {other}")),
+        };
+    }
+    if let Some(exhaustive) = var("PIPIT_EXHAUSTIVE") {
+        options.exhaustive = exhaustive.parse::<usize>().map_err(fail)?.min(EXHAUSTIVE_MAX);
+    }
+    options.best = var("PIPIT_BEST");
+    options.graph = var("PIPIT_GRAPH");
     if options.planners.is_empty() {
         options.planners = PLANNERS.to_vec();
     }
@@ -195,8 +188,10 @@ struct Summary {
     slowest: Duration,
 }
 
+#[test]
+#[ignore = "a report, run on demand"]
 #[expect(clippy::too_many_lines, reason = "the report, in one place")]
-fn main() -> Result<(), String> {
+fn report() -> Result<(), String> {
     let options = options()?;
     if let Some(graph) = &options.graph {
         let parts: Vec<&str> = graph.split('-').collect();

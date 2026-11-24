@@ -5,7 +5,11 @@ mod estimate;
 mod exact;
 mod graph;
 mod greedy;
+#[cfg(test)]
+mod harness;
 mod region;
+#[cfg(test)]
+mod report;
 mod tree;
 mod windows;
 

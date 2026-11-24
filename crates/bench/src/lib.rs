@@ -2,8 +2,6 @@
 
 #![allow(unsafe_code)]
 
-pub mod join_planner;
-
 use pipit_kernel::buffer::Buffer;
 use pipit_kernel::column::{ColumnView, DataType, Forms};
 use pipit_kernel::containers::BitSlice;
