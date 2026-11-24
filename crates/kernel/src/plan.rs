@@ -12,21 +12,23 @@ use core::ptr::NonNull;
 use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::condition::{CONDITIONS_MAX, Condition, Cutoff};
-use crate::containers::{Box, ErasedBox, InlineVec, SmallVec};
+use crate::containers::{BitSlice, Bitmap, Box, ErasedBox, InlineVec, SmallVec};
 use crate::env::Env;
 use crate::erase::{value_mut_of, value_of};
+use crate::error::Error;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::{
-    Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, Exprs, columns_of, conjuncts,
-    mark_expr_columns, type_expr,
+    Compute, EXPR_NODES_MAX, Expr, ExprOp, Exprs, columns_of, conjuncts, mark_expr_columns,
+    type_expr,
 };
 use crate::function::DynFunction;
 use crate::join::JoinOp;
 use crate::lower::{LowerError, Lowering};
-use crate::names::{Name, Names};
+use crate::names::Names;
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate, compared_with};
+use crate::query::Named;
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
 use crate::statement::Statement;
@@ -53,19 +55,10 @@ pub struct SortKey {
 }
 
 pub struct ColumnSchema {
-    /// What queries call it.
-    pub name: Name,
     /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,
-}
-
-/// A name in a scope or result. Several names can refer to one column.
-#[derive(Clone, Copy)]
-pub struct NamedColumn {
-    pub name: Name,
-    pub id: ColumnId,
 }
 
 /// An operation in a plan that reads what it borrows for `'c`, and knows how
@@ -81,6 +74,16 @@ pub trait Op<'c> {
     /// Marks the columns whose values this reads. By default, all of them.
     fn reads(&self, reads: &mut Needed) {
         reads.need_all();
+    }
+
+    /// Checks each column this reads is among its inputs', in `scope`, and
+    /// adds the columns its rows have to it. By default, it reads none, and
+    /// its rows have all of its inputs' columns.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for input in 0..scope.inputs.len() {
+            scope.pass(input);
+        }
+        Ok(())
     }
 
     /// Of the columns this reads, the forms it takes `column` in. By default,
@@ -287,6 +290,7 @@ pub struct DynOp<'c> {
 struct OpFunctions<'c> {
     prune: unsafe fn(NonNull<()>, &mut Needed) -> Pruned,
     reads: unsafe fn(NonNull<()>, &mut Needed),
+    scope: unsafe fn(NonNull<()>, &mut Scope<'_>) -> Result<(), Error>,
     accepts: unsafe fn(NonNull<()>, &Exprs, ColumnId) -> Forms,
     passes_through: unsafe fn(NonNull<()>, ColumnId) -> bool,
     allow: unsafe fn(NonNull<()>, ColumnId, Forms) -> Forms,
@@ -323,6 +327,8 @@ impl<'c, T: Op<'c> + 'c> Functions<'c, T> {
         prune: |op, needed| unsafe { value_mut_of::<T>(op).prune(needed) },
         // SAFETY: only called with this op.
         reads: |op, reads| unsafe { value_of::<T>(op).reads(reads) },
+        // SAFETY: as for `reads`.
+        scope: |op, scope| unsafe { value_of::<T>(op).scope(scope) },
         // SAFETY: as for `reads`.
         accepts: |op, exprs, column| unsafe { value_of::<T>(op).accepts(exprs, column) },
         // SAFETY: as for `reads`.
@@ -381,6 +387,11 @@ impl<'c> DynOp<'c> {
     pub(crate) fn reads(&self, reads: &mut Needed) {
         // SAFETY: the function matches the op's type.
         unsafe { (self.functions.reads)(self.op.as_ptr(), reads) }
+    }
+
+    pub(crate) fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        // SAFETY: the function matches the op's type.
+        unsafe { (self.functions.scope)(self.op.as_ptr(), scope) }
     }
 
     pub(crate) fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
@@ -527,6 +538,93 @@ pub const CHILDREN_MAX: usize = 2;
 /// The nodes a node reads, in order.
 pub type Children = InlineVec<PlanNodeId, CHILDREN_MAX>;
 
+/// The columns of a node's inputs' rows, and of its own, as its op says
+/// while a plan's scopes are checked.
+pub struct Scope<'s> {
+    /// The plan's expressions, whose columns ops read.
+    exprs: &'s Exprs,
+    /// Each input's columns, a bit for each of the plan's.
+    inputs: &'s [&'s BitSlice],
+    /// The node's columns.
+    out: &'s mut BitSlice,
+}
+
+impl<'s> Scope<'s> {
+    pub(crate) fn new(
+        exprs: &'s Exprs,
+        inputs: &'s [&'s BitSlice],
+        out: &'s mut BitSlice,
+    ) -> Scope<'s> {
+        Scope { exprs, inputs, out }
+    }
+
+    /// Checks `column` is among input `input`'s columns.
+    pub fn read(&self, input: usize, column: ColumnId) -> Result<(), Error> {
+        let has = self.inputs.get(input).is_some_and(|columns| has(columns, column));
+        if has { Ok(()) } else { Err(Error::NotInScope) }
+    }
+
+    /// Checks each column `expr` reads is among any input's columns.
+    pub fn read_expr(&self, expr: Expr) -> Result<(), Error> {
+        for step in self.exprs.nodes(expr).iter().filter(|step| step.op == ExprOp::Column) {
+            if !self.inputs.iter().any(|columns| has(columns, step.a)) {
+                return Err(Error::NotInScope);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives the node's rows each of input `input`'s columns.
+    pub fn pass(&mut self, input: usize) {
+        self.out.or_with(at!(self.inputs, input));
+    }
+
+    /// Gives the node's rows `column`.
+    pub fn make(&mut self, column: ColumnId) {
+        self.out.set(column as usize);
+    }
+}
+
+/// Whether `columns` has `column`, which may be past their bits: a column
+/// added after they were.
+pub(crate) fn has(columns: &BitSlice, column: ColumnId) -> bool {
+    let column = column as usize;
+    columns.words().get(column / 64).is_some_and(|word| word >> (column % 64) & 1 != 0)
+}
+
+/// Checks each op of `plan` reads only columns its inputs have, and the
+/// plan's output only its root's.
+///
+/// # Errors
+///
+/// [`Error::NotInScope`] if one doesn't, and [`Error::OutOfMemory`] if `env`
+/// has too little left.
+#[inline(never)]
+pub(crate) fn check_scopes(env: &Env, plan: &LogicalPlan<'_>) -> Result<(), Error> {
+    // Each node's columns, in words of their own, the nodes in order.
+    let words = BitSlice::<u64>::words_for(plan.columns.len());
+    let mut scopes = Bitmap::new(env, plan.nodes.len() * words * 64)?;
+    let all = scopes.words_mut();
+    for (id, node) in plan.nodes.iter().enumerate() {
+        let (before, rest) = all.split_at_mut(id * words);
+        let mut inputs: [&BitSlice; CHILDREN_MAX] = [BitSlice::of(&[]); CHILDREN_MAX];
+        for (input, &child) in inputs.iter_mut().zip(node.children.iter()) {
+            let at = child as usize * words;
+            *input = BitSlice::of(at!(before, at..at + words));
+        }
+        let inputs = at!(inputs, ..node.children.len());
+        let out = BitSlice::of_mut(at_mut!(rest, ..words));
+        node.op.scope(&mut Scope { exprs: &plan.exprs, inputs, out })?;
+    }
+    let root = plan.root as usize * words;
+    let root = BitSlice::of(at!(scopes.words(), root..root + words));
+    if plan.output.iter().all(|named| root.get(named.column.0 as usize)) {
+        Ok(())
+    } else {
+        Err(Error::NotInScope)
+    }
+}
+
 /// Borrows what it reads, such as a catalog's tables, for `'c`.
 pub struct LogicalPlan<'c> {
     /// The columns' names.
@@ -538,7 +636,7 @@ pub struct LogicalPlan<'c> {
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
     /// The columns of the result, in order.
-    pub output: SmallVec<NamedColumn>,
+    pub output: SmallVec<Named>,
     /// The nodes of its expressions.
     pub exprs: Exprs,
     /// What its runs read through their context, such as its literals.
@@ -564,13 +662,6 @@ impl<'c> LogicalPlan<'c> {
         self.statement.add_literal(env, literal)
     }
 
-    /// The literal whose id is `id`.
-    pub fn literal(&self, id: Id) -> &[u8] {
-        let literal = self.statement.literals().and_then(|literals| literals.get(id));
-        let Some(literal) = literal else { failed!() };
-        literal
-    }
-
     /// Binds `function` to it, allocating from `env`, which must
     /// outlive the plan, and returns its id, or `None` if it has the most it
     /// can.
@@ -587,28 +678,29 @@ impl<'c> LogicalPlan<'c> {
         core::mem::take(&mut self.statement)
     }
 
-    /// A new column, with a copy of `name`.
+    /// A new column, and a copy of `name`, which it can be output as.
+    #[cfg(test)]
     pub fn add_column(
         &mut self,
         name: &str,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<NamedColumn, AllocError> {
+    ) -> Result<Named, AllocError> {
         let name = self.names.add(name)?;
-        self.add_named_column(name, data_type, nullable)
+        let column = crate::query::Column(self.add_unnamed_column(data_type, nullable)?);
+        Ok(Named { name, column })
     }
 
-    /// As `add_column`, for a name already in `names`.
+    /// A new column, which has a name only if it's output.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
-    pub fn add_named_column(
+    pub fn add_unnamed_column(
         &mut self,
-        name: Name,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<NamedColumn, AllocError> {
+    ) -> Result<ColumnId, AllocError> {
         let id = self.columns.len() as ColumnId;
-        self.columns.push(ColumnSchema { name, data_type, nullable })?;
-        Ok(NamedColumn { name, id })
+        self.columns.push(ColumnSchema { data_type, nullable })?;
+        Ok(id)
     }
 
     /// Adds a node and makes it the root, which holds while a plan is built
@@ -660,19 +752,27 @@ pub struct ScanColumn {
     /// Which of the scannable's columns.
     pub column: u32,
     /// What it's bound to.
-    pub binding: NamedColumn,
+    pub binding: ColumnId,
     /// The forms it's read in, which the plan chooses.
     pub forms: Forms,
 }
 
 impl<'c> Op<'c> for ScanOp<'c> {
+    /// Makes the columns it binds.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for column in self.columns.iter() {
+            scope.make(column.binding);
+        }
+        Ok(())
+    }
+
     /// Keeps the needed columns, and at least one: a batch with no columns
     /// has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
+        let any = self.columns.iter().any(|column| needed.is_needed(column.binding));
         let mut i = 0;
         self.columns.retain(|column| {
-            let keep = needed.is_needed(column.binding.id) || (!any && i == 0);
+            let keep = needed.is_needed(column.binding) || (!any && i == 0);
             i += 1;
             keep
         });
@@ -683,7 +783,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn reads(&self, _: &mut Needed) {}
 
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
-        let found = self.columns.iter_mut().find(|c| c.binding.id == column);
+        let found = self.columns.iter_mut().find(|c| c.binding == column);
         // Chosen once: a column chosen already is loaded already.
         let Some(scanned) = found.filter(|scanned| scanned.forms == Forms::FLAT) else {
             return Forms::FLAT;
@@ -694,7 +794,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     /// Those on its columns.
     fn takes_condition(&self, column: ColumnId) -> bool {
-        self.columns.iter().any(|scanned| scanned.binding.id == column)
+        self.columns.iter().any(|scanned| scanned.binding == column)
     }
 
     fn take_condition(
@@ -704,7 +804,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
-        let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
+        let Some(scanned) = self.columns.iter().find(|c| c.binding == column) else {
             failed!();
         };
         let data_type = self.scannable.column_type(scanned.column);
@@ -749,7 +849,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Its scannable's.
     fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
         let scanned = match column {
-            Some(column) => Some(self.columns.iter().find(|c| c.binding.id == column)?.column),
+            Some(column) => Some(self.columns.iter().find(|c| c.binding == column)?.column),
             None => None,
         };
         self.scannable.summary(scanned)
@@ -764,10 +864,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let rows = summary.and_then(|summary| u64::try_from(summary.rows).ok());
         let mut out = Estimate::of(rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly));
         for scanned in self.columns.iter() {
-            out.add_key(scanned.binding.id, self.scannable.column_key(scanned.column));
+            out.add_key(scanned.binding, self.scannable.column_key(scanned.column));
             let summary = self.scannable.summary(Some(scanned.column));
             if let Some(bounds) = summary.and_then(|summary| summary.bounds) {
-                out.add_bounds(scanned.binding.id, bounds);
+                out.add_bounds(scanned.binding, bounds);
             }
         }
         if self.conditions.as_ref().is_some_and(|conditions| !conditions.is_empty()) {
@@ -782,12 +882,12 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(c.column_of(column.binding.id))?;
+            out.push_column(c.column_of(column.binding))?;
         }
         out.scan = Some(c.node());
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);
-            read.map(|read| SortKey { column: read.binding.id, descending })
+            read.map(|read| SortKey { column: read.binding, descending })
         };
         for order in self.scannable.sorted_by() {
             let mut sorted = [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX];
@@ -810,7 +910,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
         let cutoff = lowering.query_cutoff(node).map(|(key, slot)| {
-            let Some(scanned) = self.columns.iter().find(|c| c.binding.id == key.column) else {
+            let Some(scanned) = self.columns.iter().find(|c| c.binding == key.column) else {
                 failed!()
             };
             Cutoff { slot, column: scanned.column, descending: key.descending }
@@ -908,6 +1008,14 @@ impl<'c> Op<'c> for FilterOp {
         for &conjunct in self.conjuncts.iter() {
             mark_expr_columns(conjunct, reads);
         }
+    }
+
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &conjunct in self.conjuncts.iter() {
+            scope.read_expr(conjunct)?;
+        }
+        scope.pass(0);
+        Ok(())
     }
 
     /// Constants, which it tests once; dictionaries of columns it only
@@ -1080,7 +1188,7 @@ impl<'c> Op<'c> for FilterOp {
                 let nodes = exprs.nodes(part);
                 let program = match type_expr(env, rows, nodes, values.clone(), true) {
                     Ok(program) => program,
-                    Err(ExprError::OutOfMemory) => return Err(LowerError::OutOfMemory),
+                    Err(crate::error::Error::OutOfMemory) => return Err(LowerError::OutOfMemory),
                     // Named by the first column it reads.
                     Err(_) => {
                         let mut first = None;

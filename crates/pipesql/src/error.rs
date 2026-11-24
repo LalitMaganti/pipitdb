@@ -143,6 +143,45 @@ pub struct Error {
     pub span: Span,
 }
 
+/// Where an error goes until it's placed: one from the kernel, placed by
+/// what's compiling the part of the query it's about.
+const UNPLACED: Span = Span { start: u32::MAX, len: 0 };
+
+/// The kernel's error, not yet placed.
+impl From<pipit_kernel::error::Error> for Error {
+    fn from(error: pipit_kernel::error::Error) -> Error {
+        use pipit_kernel::error::{Error as Kernel, TypeError};
+        let code = match error {
+            Kernel::OutOfMemory => ErrorCode::OutOfMemory,
+            Kernel::TooLarge => ErrorCode::ExpressionTooLarge,
+            Kernel::WrongType(wrong) => match wrong {
+                TypeError::Numbers => ErrorCode::ExpectedNumber,
+                TypeError::Integers => ErrorCode::ExpectedInteger,
+                TypeError::Kinds => ErrorCode::ExpectedOneKind,
+                TypeError::Types => ErrorCode::ExpectedOneType,
+                TypeError::Strings => ErrorCode::ExpectedString,
+                TypeError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
+                TypeError::Condition => ErrorCode::NumberCondition,
+                TypeError::Choices => ErrorCode::ChoicesOfOneType,
+                TypeError::Arguments => ErrorCode::ArgumentType,
+                TypeError::Inexact => return Error::unsupported(Unsupported::NumberType, UNPLACED),
+                TypeError::DoubleIn | TypeError::Read => {
+                    return Error::unsupported(Unsupported::SelectExpression, UNPLACED);
+                }
+                TypeError::DoubleCondition => {
+                    return Error::unsupported(Unsupported::DoubleCondition, UNPLACED);
+                }
+                TypeError::GroupKey => return Error::unsupported(Unsupported::GroupKey, UNPLACED),
+                TypeError::Aggregated => {
+                    return Error::unsupported(Unsupported::AggregateType, UNPLACED);
+                }
+            },
+            _ => failed!(),
+        };
+        Error::new(code, UNPLACED)
+    }
+}
+
 /// Running out of memory, which isn't about any one part of the query, so
 /// points at its start.
 impl From<AllocError> for Error {
@@ -175,6 +214,11 @@ impl Error {
     /// `Unsupported`, for what isn't.
     pub fn unsupported(what: Unsupported, span: Span) -> Error {
         Error { code: ErrorCode::Unsupported, detail: what as u16, span }
+    }
+
+    /// It, at `span` if it isn't placed yet.
+    pub fn at(self, span: Span) -> Error {
+        if self.span == UNPLACED { Error { span, ..self } } else { self }
     }
 
     /// `ExpectedToken`, where `kind` was expected.

@@ -409,3 +409,35 @@ impl Catalog for One {
         (name == "t").then_some(self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pipit_kernel::bytes::ByteSource;
+    use pipit_parquet::Uncompressed;
+    use pipit_parquet::table::ParquetTable;
+
+    use super::*;
+
+    /// A Parquet file of 5,000 rows of `id`, `quarter` and `name`.
+    static NULLS: &[u8] = include_bytes!("../../parquet/tests/data/nulls.parquet");
+
+    /// Table `t`, a Parquet file, whose columns can be read lazily.
+    struct Lazy(DynScannable<'static>);
+
+    impl Catalog for Lazy {
+        fn find(&self, name: &str) -> Option<&DynScannable<'_>> {
+            (name == "t").then_some(&self.0)
+        }
+    }
+
+    #[test]
+    fn sorts_by_columns_it_then_drops() {
+        let sources: &'static [&dyn ByteSource] = Box::leak(Box::new([&NULLS as &dyn ByteSource]));
+        let table = ParquetTable::open(env(), &Uncompressed, sources).unwrap();
+        let catalog = Box::leak(Box::new(Lazy(DynScannable::new(env(), table).unwrap())));
+        // A sort's columns are loaded before it, even ones only above it
+        // reads: a top-k can't carry lazy columns through.
+        let query = "FROM t |> WHERE id > 10 |> ORDER BY quarter, id |> SELECT name |> LIMIT 3";
+        assert_eq!(plan_and_run(catalog, query), 3);
+    }
+}

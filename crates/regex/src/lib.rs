@@ -9,7 +9,7 @@ use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::validity_of;
+use pipit_kernel::function::validity_of;
 use pipit_kernel::function::{DynFunction, Function};
 use pipit_pipesql::ast::Node;
 use pipit_pipesql::compile::Compiler;
@@ -19,9 +19,7 @@ use pipit_pipesql::registry::FunctionRule;
 
 pub const REGEX_FUNCTIONS: &[FunctionRule] = &[FunctionRule {
     name: "regexp_replace",
-    compile: |compiler, node, depth, nodes| {
-        call_bound(compiler, (node, depth), nodes, STRINGS, bind as Bind)
-    },
+    compile: |compiler, node, depth| call_bound(compiler, (node, depth), STRINGS, bind as Bind),
 }];
 
 /// Three strings, and a string result.
@@ -46,16 +44,14 @@ fn bind(compiler: &mut Compiler<'_, '_>, node: Node) -> Result<DynFunction, Comp
         CompileError::new(ErrorCode::InvalidArgument, compiler.span(argument(compiler, i)))
     };
     let pattern = compiler.string_literal(argument(compiler, 2))?;
-    let Some(pattern) = pattern.and_then(engine::compile) else {
+    let Some(pattern) = pattern.as_deref().and_then(engine::compile) else {
         return Err(invalid(compiler, 2));
     };
     let env = compiler.env();
-    let Some(text) = compiler.string_literal(argument(compiler, 3))? else {
+    let Some(replacement) = compiler.string_literal(argument(compiler, 3))? else {
         return Err(invalid(compiler, 3));
     };
-    let groups = text.contains(&b'\\');
-    let mut replacement = SmallVec::fixed(env, text.len())?;
-    replacement.extend_from_slice(text)?;
+    let groups = replacement.contains(&b'\\');
     Ok(DynFunction::new(env, Replace { pattern, replacement, groups })?)
 }
 

@@ -286,16 +286,6 @@ impl Types {
         len: 0,
     };
 
-    /// Adds that `column` must hold `data_type`, unless that's known.
-    pub fn push(&mut self, column: ColumnId, data_type: DataType) {
-        let need = Type { column, data_type };
-        if self.known().iter().any(|known| known.column == column && known.data_type == data_type) {
-            return;
-        }
-        *at_mut!(self.list, self.len) = need;
-        self.len += 1;
-    }
-
     fn known(&self) -> &[Type] {
         at!(self.list, ..self.len)
     }
@@ -576,14 +566,5 @@ mod tests {
         // Two keys on one column group by it once, not by two columns.
         rows.arrangements.push(&[], &[key(0), key(0)]);
         assert!(!rows.is_arranged(&[0, 1], &[]));
-    }
-
-    #[test]
-    fn needs_each_type_of_a_column_once() {
-        let mut types = Types::NONE;
-        for _ in 0..2 * BATCH_COLUMNS_MAX {
-            types.push(0, DataType::Int64);
-        }
-        assert_eq!(types.known().len(), 1);
     }
 }

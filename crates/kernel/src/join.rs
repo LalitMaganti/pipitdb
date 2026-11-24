@@ -24,7 +24,7 @@ use crate::group_table::{GroupTable, NONE};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode};
+use crate::plan::{ColumnId, Conjuncts, Given, Op, PlanNode, Scope};
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 
 use crate::env::Env;
@@ -222,6 +222,20 @@ impl<'c> Op<'c> for JoinOp {
     }
 
     /// Its condition's columns, and the build columns, which it copies.
+    /// Each side's columns it lists.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &condition in self.conjuncts.iter() {
+            scope.read_expr(condition)?;
+        }
+        for (side, columns) in self.columns.iter().enumerate() {
+            for &column in columns.iter() {
+                scope.read(side, column)?;
+                scope.make(column);
+            }
+        }
+        Ok(())
+    }
+
     fn reads(&self, reads: &mut Needed) {
         for &condition in self.conjuncts.iter() {
             mark_expr_columns(condition, reads);
@@ -1189,16 +1203,20 @@ mod tests {
     use super::*;
 
     use crate::estimate::RowEstimate;
-    use crate::expression::ExprBuilder;
+    use crate::expression::ExprStep;
+
+    /// The steps of `a = b`, of columns `a` and `b`.
+    fn equal(a: ColumnId, b: ColumnId) -> [ExprStep; 3] {
+        let column = |id| ExprStep::new(ExprOp::Column, id, 0, 0);
+        [column(a), column(b), ExprStep::new(ExprOp::Eq, 0, 1, 0)]
+    }
 
     /// The child a join of `kind` on `a = b` builds, given its children's
     /// rows and keys.
     fn built(kind: JoinKind, first: (u64, Key), second: (u64, Key)) -> u32 {
         let mut exprs = Exprs::new(Env::current()).unwrap();
-        let mut nodes = ExprBuilder::new(Env::current()).unwrap();
-        let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
-        nodes.node(ExprOp::Eq, a, b).unwrap();
-        let condition = Some(exprs.add(nodes.nodes()).unwrap());
+        let nodes = equal(0, 1);
+        let condition = Some(exprs.add(&nodes).unwrap());
         let estimate = |(rows, key): (u64, Key), column| {
             let mut estimate = Estimate::of(RowEstimate::exactly(rows));
             estimate.add_key(column, key);
@@ -1216,10 +1234,8 @@ mod tests {
         // Joined on 0 = 1, of which only 2 and 3 are read above: pruned,
         // the join still knows its first side's key is an id.
         let mut exprs = Exprs::new(Env::current()).unwrap();
-        let mut nodes = ExprBuilder::new(Env::current()).unwrap();
-        let (a, b) = (nodes.column(0).unwrap(), nodes.column(1).unwrap());
-        nodes.node(ExprOp::Eq, a, b).unwrap();
-        let condition = exprs.add(nodes.nodes()).unwrap();
+        let nodes = equal(0, 1);
+        let condition = exprs.add(&nodes).unwrap();
         let conjuncts = SmallVec::fixed_from(Env::current(), [condition].into_iter()).unwrap();
         let two = |a, b| SmallVec::fixed_from(Env::current(), [a, b].into_iter()).unwrap();
         let mut join =

@@ -4,7 +4,7 @@
 //! Rules come in sets, and a `Registry` composes sets. Built as a `static`, a
 //! registry's mistakes, such as two rules with one keyword, are build errors.
 
-use pipit_kernel::expression::ExprBuilder;
+use pipit_kernel::query::Value;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
@@ -85,11 +85,10 @@ pub struct Rule {
 pub struct FunctionRule {
     /// What queries call it, matched ignoring case.
     pub name: &'static str,
-    /// Appends the expression nodes computing the `Call` node passed,
-    /// `depth` deep, its result last: steps the kernel has, as `iif`'s
-    /// `CASE`, or a call of a function bound to the statement, which
-    /// `call_bound` appends.
-    pub compile: fn(&mut Compiler<'_, '_>, Node, usize, &mut ExprBuilder) -> Result<(), Error>,
+    /// Builds the `Call` node passed, `depth` deep, and returns its value:
+    /// of what the kernel has, as `iif`'s `CASE`, or a call of a function
+    /// bound to the statement, which `call_bound` builds.
+    pub compile: fn(&mut Compiler<'_, '_>, Node, usize) -> Result<Value, Error>,
 }
 
 /// Rules, found by keyword, and functions, found by name. A rule's id is

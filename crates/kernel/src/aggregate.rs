@@ -6,6 +6,7 @@ use crate::allocator::AllocError;
 use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
+use crate::error::Error;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
 use crate::group_table::KEYS_MAX;
@@ -13,7 +14,7 @@ use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{DeriveContext, OutputProperties};
-use crate::plan::{ColumnId, DynOp, NamedColumn, Op, PlanNode};
+use crate::plan::{ColumnId, DynOp, Op, PlanNode, Scope};
 use crate::scannable::Key;
 use crate::step::DynSource;
 use crate::values::Values;
@@ -68,7 +69,7 @@ pub struct Aggregate {
     pub function: Function,
     pub input: Option<ColumnId>,
     pub distinct: bool,
-    pub binding: NamedColumn,
+    pub binding: ColumnId,
 }
 
 /// Outputs a row for each group: its keys, then its aggregates, in the order
@@ -88,16 +89,31 @@ impl<'c> Op<'c> for AggregateOp {
     /// Drops the aggregates nothing reads, keeping one if there are no keys:
     /// a batch with no columns has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding.id));
+        let any = self.aggregates.iter().any(|aggregate| needed.is_needed(aggregate.binding));
         let keep_first = !any && self.keys.is_empty();
         let mut first = true;
         self.aggregates.retain(|aggregate| {
-            let keep = needed.is_needed(aggregate.binding.id) || (keep_first && first);
+            let keep = needed.is_needed(aggregate.binding) || (keep_first && first);
             first = false;
             keep
         });
         self.reads(needed);
         Pruned::Keep
+    }
+
+    /// Its keys, then its aggregates.
+    fn scope(&self, scope: &mut Scope<'_>) -> Result<(), Error> {
+        for &key in self.keys.iter() {
+            scope.read(0, key)?;
+            scope.make(key);
+        }
+        for aggregate in self.aggregates.iter() {
+            if let Some(input) = aggregate.input {
+                scope.read(0, input)?;
+            }
+            scope.make(aggregate.binding);
+        }
+        Ok(())
     }
 
     fn reads(&self, reads: &mut Needed) {
@@ -194,7 +210,7 @@ impl<'c> Op<'c> for AggregateOp {
             out.push_column(c.column_of(key))?;
         }
         for aggregate in self.aggregates.iter() {
-            out.push_column(c.column_of(aggregate.binding.id))?;
+            out.push_column(c.column_of(aggregate.binding))?;
         }
         if self.answer.is_none() {
             let sorted = c.input(0).sorted_by(&self.keys);

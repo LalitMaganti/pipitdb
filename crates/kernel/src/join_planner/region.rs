@@ -325,7 +325,7 @@ mod tests {
     use super::*;
     use crate::column::{Bounds, DataType, Forms};
     use crate::context::Context;
-    use crate::expression::{ExprBuilder, ExprOp};
+    use crate::expression::{ExprOp, ExprStep};
     use crate::plan::{ScanColumn, ScanOp, conjuncts_of};
     use crate::row_batch::RowBatch;
     use crate::scannable::{DynScannable, Scannable, Summary};
@@ -383,7 +383,7 @@ mod tests {
             let b = plan.add_column("b", DataType::Int64, false).unwrap();
             let scanned = [a, b].into_iter().zip(0..2).map(|(binding, column)| ScanColumn {
                 column,
-                binding,
+                binding: binding.column.0,
                 forms: Forms::FLAT,
             });
             let columns = SmallVec::fixed_from(env, scanned).unwrap();
@@ -391,24 +391,26 @@ mod tests {
             let scan = plan.add_node(scan, &[]).unwrap();
             plan.output.push(a).unwrap();
             let Some((left, left_columns)) = root.take() else {
-                root = Some((scan, SmallVec::fixed_from(env, [a.id, b.id].into_iter()).unwrap()));
-                previous = b.id;
+                root = Some((
+                    scan,
+                    SmallVec::fixed_from(env, [a.column.0, b.column.0].into_iter()).unwrap(),
+                ));
+                previous = b.column.0;
                 continue;
             };
-            let mut nodes = ExprBuilder::new(env).unwrap();
-            let (x, y) = (nodes.column(previous).unwrap(), nodes.column(a.id).unwrap());
-            nodes.node(ExprOp::Eq, x, y).unwrap();
-            let condition = plan.exprs.add(nodes.nodes()).unwrap();
+            let column = |id| ExprStep::new(ExprOp::Column, id, 0, 0);
+            let nodes = [column(previous), column(a.column.0), ExprStep::new(ExprOp::Eq, 0, 1, 0)];
+            let condition = plan.exprs.add(&nodes).unwrap();
             let conjuncts = conjuncts_of(env, &plan.exprs, condition).unwrap();
             let mut all = SmallVec::new(env, PLAN_COLUMNS_MAX).unwrap();
-            for &column in left_columns.iter().chain(&[a.id, b.id]) {
+            for &column in left_columns.iter().chain(&[a.column.0, b.column.0]) {
                 all.push(column).unwrap();
             }
-            let right = SmallVec::fixed_from(env, [a.id, b.id].into_iter()).unwrap();
+            let right = SmallVec::fixed_from(env, [a.column.0, b.column.0].into_iter()).unwrap();
             let join = JoinOp::new(env, Kind::Inner, conjuncts, [left_columns, right]).unwrap();
             let join = plan.add_node(DynOp::new(env, join).unwrap(), &[left, scan]).unwrap();
             root = Some((join, all));
-            previous = b.id;
+            previous = b.column.0;
         }
         crate::optimize::optimize(env, &mut plan).unwrap();
         shape(&plan, plan.root)

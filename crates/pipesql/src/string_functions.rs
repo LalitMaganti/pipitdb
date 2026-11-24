@@ -3,7 +3,7 @@
 use pipit_kernel::column::{ColumnView, DataType};
 use pipit_kernel::context::Context;
 use pipit_kernel::error::Error;
-use pipit_kernel::expression::validity_of;
+use pipit_kernel::function::validity_of;
 use pipit_kernel::function::{DynFunction, Function};
 
 use crate::expression::{Bind, call_bound};
@@ -12,16 +12,16 @@ use crate::registry::FunctionRule;
 pub const STRING_FUNCTIONS: &[FunctionRule] = &[
     FunctionRule {
         name: "length",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Length { bytes: false })?);
-            call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
+            call_bound(compiler, (node, depth), STRING_TO_INT, bind)
         },
     },
     FunctionRule {
         name: "octet_length",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Length { bytes: true })?);
-            call_bound(compiler, (node, depth), nodes, STRING_TO_INT, bind)
+            call_bound(compiler, (node, depth), STRING_TO_INT, bind)
         },
     },
 ];

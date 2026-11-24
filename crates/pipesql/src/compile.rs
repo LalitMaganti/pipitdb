@@ -4,15 +4,13 @@
 
 #![allow(unsafe_code)]
 
-use pipit_kernel::column::Forms;
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{
-    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId, ScanColumn,
-    ScanOp,
-};
+use pipit_kernel::ops::Scan;
+pub use pipit_kernel::query::Named;
+use pipit_kernel::query::{Builder, Query, Relation};
+use pipit_kernel::query::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
 use pipit_kernel::scannable::Catalog;
-use pipit_kernel::session::Query;
 
 use crate::ast::{Ast, Node, Tag};
 use crate::error::{Error, ErrorCode, Span};
@@ -21,11 +19,11 @@ use crate::parser::parse_query;
 use crate::registry::Registry;
 use pipit_kernel::env::Env;
 
-/// What a query reads rows from, compiled: its plan node, and its columns, by
+/// What a query reads rows from, compiled: its rows, and its columns, by
 /// name.
-pub struct Relation {
-    pub node: PlanNodeId,
-    pub columns: SmallVec<NamedColumn>,
+pub struct Scanned {
+    pub rows: Relation,
+    pub columns: SmallVec<Named>,
 }
 
 /// A table alias, as `GoogleSQL`'s: a name for the columns a table had when
@@ -60,17 +58,30 @@ pub struct Compiler<'q, 'c> {
     registry: &'q Registry,
     /// What the plan's memory comes from.
     env: &'q Env,
-    /// The plan so far.
-    pub plan: LogicalPlan<'c>,
+    /// What builds the query.
+    pub builder: Builder<'c>,
+    /// The rows the stages so far make, once `FROM` has made some.
+    rows: Option<Relation>,
     /// The columns the stages so far make, by name.
-    pub scope: SmallVec<NamedColumn>,
+    pub scope: SmallVec<Named>,
     /// The aliases `t.x` can name columns by.
     aliases: SpillVec<'q, TableAlias, ALIASES_INLINE>,
     /// The columns of `aliases`, each alias's after the one before's.
-    alias_columns: SmallVec<NamedColumn>,
+    alias_columns: SmallVec<Named>,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
+    /// The rows the stages so far make, which the next stage reads.
+    pub fn rows(&mut self) -> Relation {
+        let Some(rows) = self.rows.take() else { failed!() };
+        rows
+    }
+
+    /// Makes `rows` those the stages so far make.
+    pub fn set_rows(&mut self, rows: Relation) {
+        self.rows = Some(rows);
+    }
+
     pub fn node(&self, index: u32) -> Node {
         self.ast.node(index)
     }
@@ -91,18 +102,23 @@ impl<'q, 'c> Compiler<'q, 'c> {
         at!(self.source, start..start + span.len as usize)
     }
 
+    /// Adds the name `span` to the query's names.
+    pub fn add_name(&mut self, span: Span) -> Result<Name, Error> {
+        let text = self.text(span);
+        Ok(self.builder.names_mut().add(text)?)
+    }
+
     pub fn catalog(&self) -> &'c dyn Catalog {
         self.catalog
     }
 
-    /// The bytes of `node`, if it's a string literal, which it adds to the
-    /// statement's literals: as a function's binding reads a pattern.
-    pub fn string_literal(&mut self, node: Node) -> Result<Option<&[u8]>, Error> {
+    /// The bytes of `node`, if it's a string literal: as a function's
+    /// binding reads a pattern.
+    pub fn string_literal(&self, node: Node) -> Result<Option<SmallVec<u8>>, Error> {
         if node.tag() != Tag::String {
             return Ok(None);
         }
-        let id = crate::expression::string(self, node)?;
-        Ok(Some(self.plan.literal(id)))
+        Ok(Some(crate::expression::unquoted(self, node)?))
     }
 
     /// The stages and functions queries can use.
@@ -118,8 +134,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// Whether two of `columns` have one name, ignoring case: a relation's
     /// columns must each have their own, as in Perfetto.
     #[inline(never)]
-    fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
-        let name = |i: usize| self.plan.names.get(at!(columns, i).name);
+    fn repeats_a_name(&self, columns: &[Named]) -> bool {
+        let name = |i: usize| self.builder.names().get(at!(columns, i).name);
         (1..columns.len())
             .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
     }
@@ -128,7 +144,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// case, as SQL does. Two columns may share a name, as after `SELECT a,
     /// a`, but then the name can't be used, as in Perfetto.
     #[inline(never)]
-    pub fn find_column(&self, name: Node) -> Result<NamedColumn, Error> {
+    pub fn find_column(&self, name: Node) -> Result<Named, Error> {
         let text = self.text(name.span()).as_bytes();
         let Some(dot) = text.iter().position(|&byte| byte == b'.') else {
             return self.find_named(&self.scope, text, name.span());
@@ -137,7 +153,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         let mut found = self
             .aliases
             .iter()
-            .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
+            .filter(|a| same_word(self.builder.names().get(a.name).as_bytes(), wanted));
         let Some(alias) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
@@ -149,19 +165,14 @@ impl<'q, 'c> Compiler<'q, 'c> {
     }
 
     /// The one column of `columns` that `name` names, ignoring case.
-    pub fn find_in(&self, columns: &[NamedColumn], name: Node) -> Result<NamedColumn, Error> {
+    pub fn find_in(&self, columns: &[Named], name: Node) -> Result<Named, Error> {
         self.find_named(columns, self.text(name.span()).as_bytes(), name.span())
     }
 
     /// The one column of `columns` named `text`, ignoring case, for `span`.
-    fn find_named(
-        &self,
-        columns: &[NamedColumn],
-        text: &[u8],
-        span: Span,
-    ) -> Result<NamedColumn, Error> {
+    fn find_named(&self, columns: &[Named], text: &[u8], span: Span) -> Result<Named, Error> {
         let named =
-            |column: &&NamedColumn| same_word(self.plan.names.get(column.name).as_bytes(), text);
+            |column: &&Named| same_word(self.builder.names().get(column.name).as_bytes(), text);
         let mut found = columns.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, span));
@@ -176,31 +187,28 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// scanned. Every source of rows is compiled through this, so a query
     /// read by another can be one more kind of relation.
     #[inline]
-    pub fn compile_relation(&mut self, name: Node) -> Result<Relation, Error> {
+    pub fn compile_relation(&mut self, name: Node) -> Result<Scanned, Error> {
         let span = name.span();
         let Some(table) = self.catalog.find(self.text(span)) else {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
-        let count = table.column_count();
-        let mut reads = SmallVec::fixed(self.env, count as usize)?;
+        let (relation, made) = self.builder.scan(table)?;
         let mut columns = SmallVec::new(self.env, PLAN_COLUMNS_MAX)?;
-        for i in 0..count {
-            let (name, data_type) = (table.column_name(i), table.column_type(i));
-            let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
-            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
-            columns.push(binding)?;
+        for (i, column) in (0..).zip(made.iter()) {
+            columns.push(Named {
+                name: self.builder.names_mut().add(table.column_name(i))?,
+                column,
+            })?;
         }
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let op = DynOp::new(self.env, ScanOp::new(table, reads))?;
-        let node = self.plan.add_node(op, &[])?;
-        Ok(Relation { node, columns })
+        Ok(Scanned { rows: relation, columns })
     }
 
     /// Adds the alias `name`, a name, for `columns`.
-    pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
-        let name = self.plan.names.add(self.text(name.span()))?;
+    pub fn add_alias(&mut self, name: Node, columns: &[Named]) -> Result<(), Error> {
+        let name = self.add_name(name.span())?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
         let start = self.alias_columns.len() as u32;
         self.alias_columns.extend_from_slice(columns)?;
@@ -241,28 +249,27 @@ pub fn compile<'e>(
     catalog: &'e dyn Catalog,
     source: &[u8],
 ) -> Result<Query<'e>, Error> {
-    Query::new(env, |env| {
-        let ast = parse_query(env, registry, source)?;
-        let mut compiler = Compiler {
-            source,
-            ast: &ast,
-            catalog,
-            registry,
-            plan: LogicalPlan::new(env)?,
-            scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
-            aliases: SpillVec::new(env, ALIASES_MAX),
-            alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
-            env,
-        };
-        let query = ast.node(ast.root());
-        for i in 0..query.child_count() {
-            let stage = ast.node(query.first_child() + i);
-            (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
-        }
-        let Compiler { mut plan, scope, .. } = compiler;
-        plan.output = scope;
-        Ok(plan)
-    })
+    let ast = parse_query(env, registry, source)?;
+    let mut compiler = Compiler {
+        source,
+        ast: &ast,
+        catalog,
+        registry,
+        builder: Builder::unchecked(env)?,
+        rows: None,
+        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+        aliases: SpillVec::new(env, ALIASES_MAX),
+        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+        env,
+    };
+    let query = ast.node(ast.root());
+    for i in 0..query.child_count() {
+        let stage = ast.node(query.first_child() + i);
+        (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
+    }
+    let rows = compiler.rows();
+    let Compiler { builder, scope, .. } = compiler;
+    Ok(builder.finish(rows, scope)?)
 }
 
 #[cfg(test)]
@@ -282,7 +289,7 @@ mod tests {
     use pipit_kernel::table::Table;
 
     use super::*;
-    use pipit_kernel::expression::validity_of;
+    use pipit_kernel::function::validity_of;
     use pipit_kernel::function::{DynFunction, Function};
 
     use crate::choices::CHOICES;
@@ -305,10 +312,10 @@ mod tests {
     /// `half(x)`, as a crate would add a function.
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Half)?);
             let signature = (&[DataType::Float64][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
@@ -333,10 +340,10 @@ mod tests {
     /// `total(x1, ..., x20)`: more arguments than a call holds in place.
     const TOTAL: &[FunctionRule] = &[FunctionRule {
         name: "total",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Total)?);
             let signature = (&[DataType::Float64; 20][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
@@ -752,22 +759,6 @@ mod tests {
         // Renames happen at once, and values are set from the scope before.
         assert_eq!(kept("FROM t |> RENAME a AS b, b AS a |> SELECT a"), [10.0, 20.0]);
         assert_eq!(kept("FROM t |> SET a = b, b = a |> SELECT b"), [1.0, 2.0]);
-    }
-
-    #[test]
-    fn knows_which_columns_can_be_null() {
-        let catalog = catalog();
-        let query = b"FROM t |> EXTEND a / 60 % 60 AS x, a / b AS y |> AGGREGATE count(*) AS c, sum(b) AS total GROUP BY x, y";
-        let query = compile(Env::current(), &REGISTRY, &catalog, query).unwrap();
-        let plan = query.plan();
-        let nullable = |name: &str| {
-            let column = plan.columns.iter().find(|column| plan.names.get(column.name) == name);
-            column.unwrap().nullable
-        };
-        // The table has no nulls; dividing by a column may make one, and a
-        // sum of none is one, but dividing by a constant that isn't zero can't.
-        assert!(!nullable("a") && !nullable("x") && !nullable("c"));
-        assert!(nullable("y") && nullable("total"));
     }
 
     #[test]

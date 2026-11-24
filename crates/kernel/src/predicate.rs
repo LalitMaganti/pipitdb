@@ -804,29 +804,27 @@ mod tests {
     /// condition.
     fn kernel(exprs: &mut Exprs, expr: &Expr) -> crate::expression::Expr {
         fn add(expr: &Expr, nodes: &mut ExprBuilder) -> u32 {
-            let added = match *expr {
+            let mut push = |op, a, b, value| nodes.push(ExprStep::new(op, a, b, value)).unwrap();
+            match *expr {
                 Expr::Greater(column, value) => {
-                    let (column, value) = (nodes.column(column), nodes.int(value));
-                    nodes.node(ExprOp::Gt, column.unwrap(), value.unwrap())
+                    let column = push(ExprOp::Column, column, 0, 0);
+                    let value = push(ExprOp::Constant, 0, 0, value);
+                    push(ExprOp::Gt, column, value, 0)
                 }
                 Expr::IsNull(column) => {
-                    let column = nodes.column(column).unwrap();
-                    nodes.node(ExprOp::IsNull, column, 0)
+                    let column = push(ExprOp::Column, column, 0, 0);
+                    push(ExprOp::IsNull, column, 0, 0)
                 }
-                Expr::And(a, b) => {
+                Expr::And(a, b) | Expr::Or(a, b) => {
                     let (a, b) = (add(a, nodes), add(b, nodes));
-                    nodes.node(ExprOp::And, a, b)
-                }
-                Expr::Or(a, b) => {
-                    let (a, b) = (add(a, nodes), add(b, nodes));
-                    nodes.node(ExprOp::Or, a, b)
+                    let op = if matches!(expr, Expr::And(..)) { ExprOp::And } else { ExprOp::Or };
+                    nodes.push(ExprStep::new(op, a, b, 0)).unwrap()
                 }
                 Expr::Not(a) => {
                     let a = add(a, nodes);
-                    nodes.node(ExprOp::Not, a, 0)
+                    nodes.push(ExprStep::new(ExprOp::Not, a, 0, 0)).unwrap()
                 }
-            };
-            added.unwrap()
+            }
         }
         let mut nodes = ExprBuilder::new(Env::current()).unwrap();
         add(expr, &mut nodes);
