@@ -25,8 +25,7 @@ use crate::limit::LimitOp;
 use crate::names::{Name, Names};
 use crate::order_by::OrderByOp;
 use crate::plan::{
-    ColumnId, DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp, SortKey,
-    conjuncts_of,
+    ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey, conjuncts_of,
 };
 use crate::scannable::DynScannable;
 
@@ -112,7 +111,15 @@ pub struct Relation(PlanNodeId);
 
 /// A column of a relation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Column(ColumnId);
+pub struct Column(pub(crate) ColumnId);
+
+/// A column, and what it's called: in a front end's scope, or in a query's
+/// output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Named {
+    pub name: Name,
+    pub column: Column,
+}
 
 /// Columns made together, as a scan's are.
 #[derive(Clone, Copy, Debug)]
@@ -214,11 +221,9 @@ impl<'e> Builder<'e> {
     pub fn finish(
         mut self,
         relation: Relation,
-        output: impl Iterator<Item = (Column, Name)>,
+        output: SmallVec<Named>,
     ) -> Result<Query<'e>, Error> {
-        for (column, name) in output {
-            self.plan.output.push(NamedColumn { name, id: column.0 })?;
-        }
+        self.plan.output = output;
         self.plan.root = relation.0;
         Ok(Query { plan: self.plan })
     }

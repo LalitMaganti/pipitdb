@@ -84,7 +84,7 @@ pub enum Pruned {
 pub fn prune_columns(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocError> {
     let mut needed = Needed::none(env, plan.columns.len(), &plan.exprs)?;
     for column in plan.output.iter() {
-        needed.need(column.id);
+        needed.need(column.column.0);
     }
     // Nodes left to prune, and where each is referred to from: its parent's
     // children, or the root if `None`.
@@ -399,7 +399,7 @@ pub fn choose_forms(env: &Env, plan: &mut LogicalPlan<'_>) -> Result<(), AllocEr
     }
     let mut output = Needed::none(env, columns, &plan.exprs)?;
     for column in plan.output.iter() {
-        output.need(column.id);
+        output.need(column.column.0);
     }
     // Each column made lazy: what made it, and where it's loaded.
     let mut lazy = SmallVec::new(env, PLAN_COLUMNS_MAX)?;

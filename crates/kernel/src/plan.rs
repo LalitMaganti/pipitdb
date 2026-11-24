@@ -23,10 +23,11 @@ use crate::expression::{
 use crate::function::DynFunction;
 use crate::join::JoinOp;
 use crate::lower::{LowerError, Lowering};
-use crate::names::{Name, Names};
+use crate::names::Names;
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
 use crate::predicate::{Filter, Predicate, compared_with};
+use crate::query::{Column, Named};
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
 use crate::statement::Statement;
@@ -57,13 +58,6 @@ pub struct ColumnSchema {
     pub data_type: DataType,
     /// Whether it can hold a null.
     pub nullable: bool,
-}
-
-/// A name in a scope or result. Several names can refer to one column.
-#[derive(Clone, Copy)]
-pub struct NamedColumn {
-    pub name: Name,
-    pub id: ColumnId,
 }
 
 /// An operation in a plan that reads what it borrows for `'c`, and knows how
@@ -536,7 +530,7 @@ pub struct LogicalPlan<'c> {
     /// The node whose rows are the plan's rows.
     pub root: PlanNodeId,
     /// The columns of the result, in order.
-    pub output: SmallVec<NamedColumn>,
+    pub output: SmallVec<Named>,
     /// The nodes of its expressions.
     pub exprs: Exprs,
     /// What its runs read through their context, such as its literals.
@@ -591,9 +585,9 @@ impl<'c> LogicalPlan<'c> {
         name: &str,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<NamedColumn, AllocError> {
+    ) -> Result<Named, AllocError> {
         let name = self.names.add(name)?;
-        Ok(NamedColumn { name, id: self.add_unnamed_column(data_type, nullable)? })
+        Ok(Named { name, column: Column(self.add_unnamed_column(data_type, nullable)?) })
     }
 
     /// A new column, which has a name only if it's output.

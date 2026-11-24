@@ -7,7 +7,8 @@
 use pipit_kernel::containers::{SmallVec, SpillVec};
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
-use pipit_kernel::query::{Builder, Column, Query, Relation};
+pub use pipit_kernel::query::Named;
+use pipit_kernel::query::{Builder, Query, Relation};
 use pipit_kernel::scannable::Catalog;
 
 use crate::ast::{Ast, Node, Tag};
@@ -16,13 +17,6 @@ use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
 use pipit_kernel::env::Env;
-
-/// A column in scope, and what it's called there.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Named {
-    pub name: Name,
-    pub column: Column,
-}
 
 /// What a query reads rows from, compiled: its rows, and its columns, by
 /// name.
@@ -274,7 +268,7 @@ pub fn compile<'e>(
     }
     let rows = compiler.rows();
     let Compiler { builder, scope, .. } = compiler;
-    Ok(builder.finish(rows, scope.iter().map(|named| (named.column, named.name)))?)
+    Ok(builder.finish(rows, scope)?)
 }
 
 #[cfg(test)]
