@@ -3,14 +3,22 @@
 //! A [`Builder`] builds a [`Query`] from tables, a relation at a time: each
 //! operation takes the relation it reads and returns a new one, whose
 //! columns the next operations read.
+//!
+//! An expression is built a node at a time, each a [`Value`] the next ones
+//! can read, and is every node built since an operation last took one:
+//! [`Builder::expr`] takes it, typed.
 
 pub use crate::aggregate::Function;
 use crate::aggregate::{Aggregate, AggregateOp};
 use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
-use crate::error::Error;
-use crate::expression::{ComputeItem, ComputeOp, Expr, expr_can_be_null};
+use crate::error::{Error, TypeError};
+use crate::expression::{
+    ComputeItem, ComputeOp, Expr, ExprBuilder, ExprOp, ExprStep, PLAN_EXPR_VALUES_MAX, PRESENT,
+    check_expr_type, expr_can_be_null,
+};
+use crate::function::DynFunction;
 pub use crate::join::JoinKind;
 use crate::join::JoinOp;
 use crate::limit::LimitOp;
@@ -40,6 +48,69 @@ pub struct Builder<'e> {
     /// The plan built so far.
     #[doc(hidden)]
     pub plan: LogicalPlan<'e>,
+    /// The nodes of the expression being built.
+    nodes: ExprBuilder,
+}
+
+/// A value of the expression being built: one of its nodes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Value(u32);
+
+/// An operation of two values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Binary {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
+}
+
+/// The step computing each `Binary`, by its order.
+static BINARY: [ExprOp; 13] = [
+    ExprOp::Add,
+    ExprOp::Sub,
+    ExprOp::Mul,
+    ExprOp::Div,
+    ExprOp::Mod,
+    ExprOp::Eq,
+    ExprOp::Ne,
+    ExprOp::Lt,
+    ExprOp::Le,
+    ExprOp::Gt,
+    ExprOp::Ge,
+    ExprOp::And,
+    ExprOp::Or,
+];
+
+/// An operation of one value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unary {
+    Not,
+    IsNull,
+    IsNotNull,
+}
+
+/// The step computing each `Unary`, by its order.
+static UNARY: [ExprOp; 3] = [ExprOp::Not, ExprOp::IsNull, ExprOp::IsNotNull];
+
+/// A list of integers or of strings being built, which a value is tested
+/// for being in.
+pub struct InList {
+    /// The value tested.
+    value: Value,
+    /// Where its values start among the plan's.
+    start: u32,
+    /// The type of its values, once it has one.
+    data_type: Option<DataType>,
 }
 
 /// Rows an operation makes, which one other operation reads.
@@ -137,7 +208,7 @@ impl<'e> Builder<'e> {
     ///
     /// [`Error::OutOfMemory`] if `env` has too little left.
     pub fn new(env: &'e Env) -> Result<Builder<'e>, Error> {
-        Ok(Builder { env, plan: LogicalPlan::new(env)? })
+        Ok(Builder { env, plan: LogicalPlan::new(env)?, nodes: ExprBuilder::new(env)? })
     }
 
     /// The query whose rows are those of `relation`.
@@ -345,6 +416,211 @@ impl<'e> Builder<'e> {
         offset: u64,
     ) -> Result<Relation, Error> {
         self.add(DynOp::new(self.env, LimitOp { count, offset })?, relation)
+    }
+
+    // Expressions.
+
+    /// Takes the expression being built, whose root is the last node built,
+    /// and the type it computes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] if its values aren't of the types they're used
+    /// as.
+    pub fn expr(&mut self) -> Result<(Expr, DataType), Error> {
+        let columns = &self.plan.columns;
+        let type_of = |column: ColumnId| at!(columns, column as usize).data_type;
+        let typed = check_expr_type(self.env, self.nodes.nodes(), &type_of);
+        let expr = self.plan.exprs.add(self.nodes.nodes());
+        self.nodes.clear();
+        let data_type = typed?;
+        Ok((expr?, data_type))
+    }
+
+    /// The value of `column` in each row.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn column_value(&mut self, column: Column) -> Result<Value, Error> {
+        self.push(ExprStep::new(ExprOp::Column, column.0, 0, 0))
+    }
+
+    /// The integer `value`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn int(&mut self, value: i64) -> Result<Value, Error> {
+        self.push(ExprStep::new(ExprOp::Constant, 0, 0, value))
+    }
+
+    /// The string `value`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn string(&mut self, value: &[u8]) -> Result<Value, Error> {
+        let id = self.plan.add_literal(self.env, value)?;
+        let mut constant = ExprStep::new(ExprOp::Constant, id.raw_id(), 0, 0);
+        constant.data_type = DataType::String;
+        self.push(constant)
+    }
+
+    /// A null, of whatever type it's used as.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn null(&mut self) -> Result<Value, Error> {
+        self.push(ExprStep::new(ExprOp::Null, 0, 0, 0))
+    }
+
+    /// `a op b`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn binary(&mut self, op: Binary, a: Value, b: Value) -> Result<Value, Error> {
+        self.push(ExprStep::new(*at!(BINARY, op as usize), a.0, b.0, 0))
+    }
+
+    /// `op a`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn unary(&mut self, op: Unary, a: Value) -> Result<Value, Error> {
+        self.push(ExprStep::new(*at!(UNARY, op as usize), a.0, 0, 0))
+    }
+
+    /// Whether `a` matches `pattern`, in which `%` is any bytes and `_` any
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn like(&mut self, a: Value, pattern: &[u8]) -> Result<Value, Error> {
+        let pattern = self.plan.add_literal(self.env, pattern)?;
+        self.push(ExprStep::new(ExprOp::Like, a.0, pattern.raw_id(), 0))
+    }
+
+    /// A test of whether `value` is in a list, which [`Builder::list_int`]
+    /// and [`Builder::list_string`] add to, and [`Builder::listed`] ends.
+    #[must_use]
+    pub fn in_list(&self, value: Value) -> InList {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
+        let start = self.plan.exprs.values().len() as u32;
+        InList { value, start, data_type: None }
+    }
+
+    /// Adds `value` to `list`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] if the list has strings, and [`Error::TooLarge`]
+    /// if the plan has the most values it can.
+    pub fn list_int(&mut self, list: &mut InList, value: i64) -> Result<(), Error> {
+        self.list(list, value, DataType::Int64)
+    }
+
+    /// Adds `value` to `list`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] if the list has integers, and
+    /// [`Error::TooLarge`] if the plan has the most values it can.
+    pub fn list_string(&mut self, list: &mut InList, value: &[u8]) -> Result<(), Error> {
+        let id = self.plan.add_literal(self.env, value)?;
+        self.list(list, i64::from(id.raw_id()), DataType::String)
+    }
+
+    /// Adds `value`, of type `data_type`, to `list`.
+    fn list(&mut self, list: &mut InList, value: i64, data_type: DataType) -> Result<(), Error> {
+        if list.data_type.is_some_and(|listed| listed != data_type) {
+            return Err(Error::WrongType(TypeError::Kinds));
+        }
+        if self.plan.exprs.values().len() == PLAN_EXPR_VALUES_MAX {
+            return Err(Error::TooLarge);
+        }
+        list.data_type = Some(data_type);
+        self.plan.exprs.add_value(value)?;
+        Ok(())
+    }
+
+    /// Whether `list`'s value is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    #[expect(clippy::needless_pass_by_value, reason = "a list is ended once")]
+    pub fn listed(&mut self, list: InList) -> Result<Value, Error> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_EXPR_VALUES_MAX`")]
+        let len = self.plan.exprs.values().len() as u32 - list.start;
+        let mut test = ExprStep::new(ExprOp::In, list.value.0, list.start, 0);
+        (test.c, test.data_type) = (len, list.data_type.unwrap_or(DataType::Int64));
+        self.push(test)
+    }
+
+    /// The value of the first of `branches` whose condition is true, or
+    /// without one, whose value isn't null; or else `otherwise`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can.
+    pub fn case(
+        &mut self,
+        branches: &[(Option<Value>, Value)],
+        otherwise: Value,
+    ) -> Result<Value, Error> {
+        let mut first = None;
+        for &(condition, value) in branches {
+            let condition = condition.map_or(PRESENT, |condition| condition.0);
+            let when = self.push(ExprStep::new(ExprOp::When, condition, value.0, 0))?;
+            first.get_or_insert(when.0);
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let mut case = ExprStep::new(ExprOp::Case, first.unwrap_or(0), branches.len() as u32, 0);
+        case.c = otherwise.0;
+        self.push(case)
+    }
+
+    /// A call of `function` with `arguments`, each converted to its type,
+    /// giving a value of type `result`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] if the expression has the most nodes it can, or
+    /// the plan the most functions.
+    pub fn call(
+        &mut self,
+        function: DynFunction,
+        arguments: &[(Value, DataType)],
+        result: DataType,
+    ) -> Result<Value, Error> {
+        let Some(id) = self.plan.add_function(self.env, function)? else {
+            return Err(Error::TooLarge);
+        };
+        let mut first = None;
+        for &(value, data_type) in arguments {
+            let mut argument = ExprStep::new(ExprOp::Argument, value.0, 0, 0);
+            argument.data_type = data_type;
+            first.get_or_insert(self.push(argument)?.0);
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most `EXPR_NODES_MAX`")]
+        let mut call = ExprStep::new(ExprOp::Call, first.unwrap_or(0), arguments.len() as u32, 0);
+        call.data_type = result;
+        call.c = id;
+        self.push(call)
+    }
+
+    /// Adds `step` to the expression being built.
+    #[inline(never)]
+    fn push(&mut self, step: ExprStep) -> Result<Value, Error> {
+        if self.nodes.is_full() {
+            return Err(Error::TooLarge);
+        }
+        Ok(Value(self.nodes.push(step)?))
     }
 
     /// Adds `op`, reading `relation`.

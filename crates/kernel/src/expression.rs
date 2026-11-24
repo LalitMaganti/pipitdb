@@ -10,7 +10,7 @@ use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
 use crate::context::Context;
 use crate::env::Env;
-use crate::error::Error;
+use crate::error::{Error, TypeError};
 use crate::estimate::Estimate;
 use crate::filter::{Comparison, Entries};
 use crate::lower::{LowerError, Lowering};
@@ -953,6 +953,11 @@ impl ExprBuilder {
         self.nodes.len() == EXPR_NODES_MAX
     }
 
+    /// Takes every node off.
+    pub fn clear(&mut self) {
+        self.nodes.truncate(0);
+    }
+
     /// Takes the last node off.
     pub fn pop(&mut self) -> Option<ExprStep> {
         self.nodes.pop()
@@ -1011,49 +1016,11 @@ impl Exprs {
     }
 }
 
-/// Why an expression can't be computed: what it needed instead, or memory.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ExprError {
-    /// Numbers, not strings, in arithmetic.
-    Numbers,
-    /// Integers on both sides of `%`.
-    Integers,
-    /// Values of one kind, numbers or strings, on both sides of a comparison.
-    Kinds,
-    /// Values of one type on both sides of a comparison, unless one is an
-    /// integer literal compared with a double.
-    Types,
-    /// An integer literal compared with a double which can hold it exactly.
-    Inexact,
-    /// A double in a list of integers, as `IN`'s.
-    DoubleIn,
-    /// A string, not a number, on the left of `LIKE`.
-    Strings,
-    /// Integer arithmetic in an argument of `coalesce`, or a branch of
-    /// `CASE`, which only some rows use, which could overflow on the others.
-    SomeRows,
-    /// A number, not a string, as a condition of `CASE`, or an integer as
-    /// an operand of `AND`, `OR` or `NOT`.
-    Condition,
-    /// Arguments of `coalesce`, or values of `CASE`, of one type.
-    Choices,
-    /// An argument of the type its function takes.
-    Arguments,
-    /// An allocation failed.
-    OutOfMemory,
-}
-
-impl From<AllocError> for ExprError {
-    fn from(_: AllocError) -> ExprError {
-        ExprError::OutOfMemory
-    }
-}
-
 /// How an op whose operands are typed alike is typed.
 #[derive(Clone, Copy)]
 struct Rule {
     /// The error if an operand is a string, then if one is a double.
-    errors: [Option<ExprError>; 2],
+    errors: [Option<TypeError>; 2],
     /// Whether a NULL operand makes it NULL.
     null_is_null: bool,
     /// Whether it's an integer, rather than of its operands' type.
@@ -1067,8 +1034,8 @@ static RULES: [Option<Rule>; OP_COUNT] = rules();
 
 const fn rules() -> [Option<Rule>; OP_COUNT] {
     let arithmetic =
-        Rule { errors: [Some(ExprError::Numbers), None], null_is_null: true, integer: false };
-    let condition = Some(ExprError::Condition);
+        Rule { errors: [Some(TypeError::Numbers), None], null_is_null: true, integer: false };
+    let condition = Some(TypeError::Condition);
     let logic = Rule { errors: [condition, condition], null_is_null: false, integer: true };
     let test = Rule { errors: [None, None], null_is_null: false, integer: true };
     let mut rules = [None; OP_COUNT];
@@ -1077,7 +1044,7 @@ const fn rules() -> [Option<Rule>; OP_COUNT] {
     rules[ExprOp::Mul as usize] = Some(arithmetic);
     rules[ExprOp::Div as usize] = Some(arithmetic);
     rules[ExprOp::Mod as usize] =
-        Some(Rule { errors: [Some(ExprError::Numbers), Some(ExprError::Integers)], ..arithmetic });
+        Some(Rule { errors: [Some(TypeError::Numbers), Some(TypeError::Integers)], ..arithmetic });
     rules[ExprOp::And as usize] = Some(logic);
     rules[ExprOp::Or as usize] = Some(logic);
     rules[ExprOp::Not as usize] = Some(logic);
@@ -1115,7 +1082,7 @@ type Typed = (Option<DataType>, u32, bool);
 impl Typer<'_> {
     /// The type of the expression's result.
     #[inline(never)]
-    fn run(&mut self, nodes: &[ExprStep]) -> Result<Option<DataType>, ExprError> {
+    fn run(&mut self, nodes: &[ExprStep]) -> Result<Option<DataType>, Error> {
         check!(!nodes.is_empty() && nodes.len() <= EXPR_NODES_MAX);
         // Only what the root reads: the nodes before it can be others'.
         mark_reached(nodes, self.nodes);
@@ -1131,7 +1098,7 @@ impl Typer<'_> {
 
     /// The register holding node `i` as `data_type`: a null of that type for
     /// a bare NULL, an integer widened for a double.
-    fn materialize(&mut self, i: u32, data_type: DataType) -> Result<u32, ExprError> {
+    fn materialize(&mut self, i: u32, data_type: DataType) -> Result<u32, Error> {
         let (node_type, register, _) = *at!(self.nodes, i as usize);
         match node_type {
             None => self.add(step(ExprOp::Null, data_type, 0, 0)),
@@ -1143,7 +1110,7 @@ impl Typer<'_> {
     }
 
     /// Appends `step`, if building, and returns its register.
-    fn add(&mut self, step: ExprStep) -> Result<u32, ExprError> {
+    fn add(&mut self, step: ExprStep) -> Result<u32, Error> {
         let Some((_, steps)) = &mut self.build else { return Ok(0) };
         steps.push(step)?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `4 * EXPR_NODES_MAX`")]
@@ -1155,7 +1122,7 @@ impl Typer<'_> {
         &mut self,
         nodes: &[ExprStep],
         node: &ExprStep,
-    ) -> Result<(Option<DataType>, u32), ExprError> {
+    ) -> Result<(Option<DataType>, u32), Error> {
         match node.op {
             ExprOp::Column => {
                 let data_type = (self.type_of)(node.a);
@@ -1183,7 +1150,7 @@ impl Typer<'_> {
                         let like = step(ExprOp::Like, DataType::Int64, a, node.b);
                         Ok((Some(DataType::Int64), self.add(like)?))
                     }
-                    Some(_) => Err(ExprError::Strings),
+                    Some(_) => Err(Error::WrongType(TypeError::Strings)),
                 }
             }
             ExprOp::Case => self.type_case(nodes, node),
@@ -1203,7 +1170,7 @@ impl Typer<'_> {
 
     /// Types `node` by its op's `Rule`: its operands, which are of one
     /// type, a double where any is, or an integer if all are NULL.
-    fn type_by_rule(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+    fn type_by_rule(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), Error> {
         let Some(rule) = *at!(RULES, node.op as usize) else { failed!() };
         let [(a, _), (b, b_len)] = node.operands();
         let both = [a, b];
@@ -1221,7 +1188,7 @@ impl Typer<'_> {
             if types >> data_type as u8 & 1 != 0
                 && let Some(error) = error
             {
-                return Err(error);
+                return Err(Error::WrongType(error));
             }
         }
         if null && rule.null_is_null {
@@ -1243,7 +1210,7 @@ impl Typer<'_> {
 
     /// Types `node`, an `In`, whose operand must be of its list's kind:
     /// integers, or strings.
-    fn type_in(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+    fn type_in(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), Error> {
         let (a_type, a, _) = *at!(self.nodes, node.a as usize);
         match a_type {
             // `NULL IN (...)` is NULL.
@@ -1254,9 +1221,9 @@ impl Typer<'_> {
                 Ok((Some(DataType::Int64), self.add(test)?))
             }
             Some(DataType::Float64) if node.data_type == DataType::Int64 => {
-                Err(ExprError::DoubleIn)
+                Err(Error::WrongType(TypeError::DoubleIn))
             }
-            Some(_) => Err(ExprError::Kinds),
+            Some(_) => Err(Error::WrongType(TypeError::Kinds)),
         }
     }
 
@@ -1291,21 +1258,21 @@ impl Typer<'_> {
         &mut self,
         nodes: &[ExprStep],
         node: &ExprStep,
-    ) -> Result<(Option<DataType>, u32), ExprError> {
+    ) -> Result<(Option<DataType>, u32), Error> {
         let whens = at!(nodes, node.a as usize..(node.a + node.b) as usize);
         check!(!whens.is_empty() && whens.iter().all(|when| when.op == ExprOp::When));
         let at = |i: u32| *at!(self.nodes, i as usize);
         for (k, when) in whens.iter().enumerate() {
             let tested = if when.a == PRESENT { when.b } else { when.a };
             if (k > 0 && at(tested).2) || (tested != when.b && at(when.b).2) {
-                return Err(ExprError::SomeRows);
+                return Err(Error::WrongType(TypeError::SomeRows));
             }
             if when.a != PRESENT && at(when.a).0 == Some(DataType::String) {
-                return Err(ExprError::Condition);
+                return Err(Error::WrongType(TypeError::Condition));
             }
         }
         if at(node.c).2 {
-            return Err(ExprError::SomeRows);
+            return Err(Error::WrongType(TypeError::SomeRows));
         }
         let types = whens.iter().map(|when| at(when.b).0).chain([at(node.c).0]);
         let Some(data_type) = one_type(types)? else { return Ok((None, 0)) };
@@ -1330,13 +1297,15 @@ impl Typer<'_> {
     /// Types `node`, an `Argument`, which must be of the type its function
     /// takes, or an integer for a double, or `NULL`; or a `Call` of the
     /// `Argument`s from node `a`, which it adds the steps of together.
-    fn type_call(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), ExprError> {
+    fn type_call(&mut self, node: &ExprStep) -> Result<(Option<DataType>, u32), Error> {
         let (a, b) = (node.a as usize, node.b as usize);
         if node.op == ExprOp::Argument {
             let takes = |data_type| data_type == node.data_type;
             match at!(self.nodes, a).0 {
                 Some(DataType::Int64) if takes(DataType::Float64) => {}
-                Some(data_type) if !takes(data_type) => return Err(ExprError::Arguments),
+                Some(data_type) if !takes(data_type) => {
+                    return Err(Error::WrongType(TypeError::Arguments));
+                }
                 _ => {}
             }
             return Ok((Some(node.data_type), self.materialize(node.a, node.data_type)?));
@@ -1353,7 +1322,7 @@ impl Typer<'_> {
 
     /// The register holding node `i` as an Int64 condition: a double is true
     /// unless it's zero.
-    fn condition(&mut self, i: u32) -> Result<u32, ExprError> {
+    fn condition(&mut self, i: u32) -> Result<u32, Error> {
         let (data_type, register, _) = *at!(self.nodes, i as usize);
         if data_type != Some(DataType::Float64) {
             return self.materialize(i, DataType::Int64);
@@ -1367,12 +1336,12 @@ impl Typer<'_> {
         &mut self,
         nodes: &[ExprStep],
         node: &ExprStep,
-    ) -> Result<(Option<DataType>, u32), ExprError> {
+    ) -> Result<(Option<DataType>, u32), Error> {
         let (a_type, b_type) =
             (at!(self.nodes, node.a as usize).0, at!(self.nodes, node.b as usize).0);
         let string = |data_type| data_type == Some(DataType::String);
         if a_type.is_some() && b_type.is_some() && string(a_type) != string(b_type) {
-            return Err(ExprError::Kinds);
+            return Err(Error::WrongType(TypeError::Kinds));
         }
         // A comparison with NULL is NULL.
         let (Some(a_type), Some(b_type)) = (a_type, b_type) else { return Ok((None, 0)) };
@@ -1389,13 +1358,13 @@ impl Typer<'_> {
             let (side, value) = match (a_type, literal(node.a), literal(node.b)) {
                 (DataType::Int64, Some(value), _) => (&mut a, value),
                 (DataType::Float64, _, Some(value)) => (&mut b, value),
-                _ => return Err(ExprError::Types),
+                _ => return Err(Error::WrongType(TypeError::Types)),
             };
             #[expect(clippy::cast_precision_loss, reason = "checked to be exact")]
             let double = value as f64;
             #[expect(clippy::cast_possible_truncation, reason = "a check, not a use")]
             if double as i128 != i128::from(value) {
-                return Err(ExprError::Inexact);
+                return Err(Error::WrongType(TypeError::Inexact));
             }
             let mut constant = step(ExprOp::Constant, DataType::Float64, 0, 0);
             constant.double_value = double;
@@ -1407,11 +1376,11 @@ impl Typer<'_> {
 
 /// The one type of `types`, `None` for NULL going with any: `None` if all are,
 /// and an error if two differ.
-fn one_type(types: impl Iterator<Item = Option<DataType>>) -> Result<Option<DataType>, ExprError> {
+fn one_type(types: impl Iterator<Item = Option<DataType>>) -> Result<Option<DataType>, Error> {
     let mut one = None;
     for data_type in types.flatten() {
         if one.is_some_and(|one| one != data_type) {
-            return Err(ExprError::Choices);
+            return Err(Error::WrongType(TypeError::Choices));
         }
         one = Some(data_type);
     }
@@ -1450,7 +1419,7 @@ fn type_nodes(
     build: Option<(&OutputProperties, &mut SmallVec<ExprStep>)>,
     nodes: &[ExprStep],
     condition: bool,
-) -> Result<(DataType, u32), ExprError> {
+) -> Result<(DataType, u32), Error> {
     let mut found = SpillVec::<Typed, EXPR_NODES_INLINE>::filled(
         env,
         EXPR_NODES_MAX,
@@ -1475,7 +1444,7 @@ pub fn check_expr_type(
     env: &Env,
     nodes: &[ExprStep],
     type_of: &dyn Fn(ColumnId) -> DataType,
-) -> Result<DataType, ExprError> {
+) -> Result<DataType, Error> {
     Ok(type_nodes(env, type_of, None, nodes, false)?.0)
 }
 
@@ -1577,7 +1546,7 @@ pub fn type_expr(
     nodes: &[ExprStep],
     values: Option<Buffer>,
     condition: bool,
-) -> Result<ExprProgram, ExprError> {
+) -> Result<ExprProgram, Error> {
     // Each node takes at most three steps, and a NULL result one more.
     let mut steps = SmallVec::new(env, 4 * EXPR_NODES_MAX)?;
     let type_of = |column| rows.type_of(column);
@@ -1604,20 +1573,10 @@ pub struct ComputeOp {
 }
 
 /// An error typing the expression of `column`, as lowering reports it.
-fn lower_error(error: ExprError, column: ColumnId) -> LowerError {
+fn lower_error(error: Error, column: ColumnId) -> LowerError {
     match error {
-        ExprError::OutOfMemory => LowerError::OutOfMemory,
-        ExprError::Numbers
-        | ExprError::Integers
-        | ExprError::Kinds
-        | ExprError::Types
-        | ExprError::Inexact
-        | ExprError::DoubleIn
-        | ExprError::Strings
-        | ExprError::SomeRows
-        | ExprError::Condition
-        | ExprError::Choices
-        | ExprError::Arguments => LowerError::WrongType(column),
+        Error::OutOfMemory => LowerError::OutOfMemory,
+        _ => LowerError::WrongType(column),
     }
 }
 

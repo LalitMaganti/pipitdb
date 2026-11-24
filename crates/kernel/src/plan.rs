@@ -17,8 +17,8 @@ use crate::env::Env;
 use crate::erase::{value_mut_of, value_of};
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::{
-    Compute, EXPR_NODES_MAX, Expr, ExprError, ExprOp, Exprs, columns_of, conjuncts,
-    mark_expr_columns, type_expr,
+    Compute, EXPR_NODES_MAX, Expr, ExprOp, Exprs, columns_of, conjuncts, mark_expr_columns,
+    type_expr,
 };
 use crate::function::DynFunction;
 use crate::join::JoinOp;
@@ -1080,7 +1080,7 @@ impl<'c> Op<'c> for FilterOp {
                 let nodes = exprs.nodes(part);
                 let program = match type_expr(env, rows, nodes, values.clone(), true) {
                     Ok(program) => program,
-                    Err(ExprError::OutOfMemory) => return Err(LowerError::OutOfMemory),
+                    Err(crate::error::Error::OutOfMemory) => return Err(LowerError::OutOfMemory),
                     // Named by the first column it reads.
                     Err(_) => {
                         let mut first = None;

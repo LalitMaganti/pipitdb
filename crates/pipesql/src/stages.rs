@@ -4,16 +4,16 @@
 use pipit_kernel::aggregate::Function;
 use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
-use pipit_kernel::expression::{Expr, ExprBuilder, ExprOp};
+use pipit_kernel::expression::Expr;
 use pipit_kernel::join::JoinKind;
 use pipit_kernel::names::Name;
 use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX};
-use pipit_kernel::query::{Builder, Extension, Order};
+use pipit_kernel::query::{Binary, Builder, Extension, Order};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
 use crate::error::{Error, ErrorCode, Unsupported};
-use crate::expression::{add_expr, compile_expr, is_null};
+use crate::expression::{compile_expr, finish_expr, is_null};
 use crate::keywords::same_word;
 use crate::registry::{Item, Point, Rule, Shared};
 
@@ -288,19 +288,20 @@ fn using_columns(
     using: Node,
 ) -> Result<Expr, Error> {
     let env = compiler.env();
-    let mut nodes = ExprBuilder::new(env)?;
     let mut scope = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
+    let mut before = None;
     // Each build column joined on, one for each name in the list.
     let mut joined = SmallVec::new(env, PLAN_COLUMNS_MAX)?;
     for i in 0..using.child_count() {
         let name = listed_once(compiler, using, i, 0)?;
         let (left, right) = (compiler.find_column(name)?, compiler.find_in(build, name)?);
-        let before = (i > 0).then(|| nodes.last());
-        let (a, b) = (nodes.column(left.id)?, nodes.column(right.id)?);
-        let equal = nodes.node(ExprOp::Eq, a, b)?;
+        let a = compiler.builder.column_value(Builder::column(left.id))?;
+        let b = compiler.builder.column_value(Builder::column(right.id))?;
+        let mut equal = compiler.builder.binary(Binary::Equal, a, b)?;
         if let Some(before) = before {
-            nodes.node(ExprOp::And, before, equal)?;
+            equal = compiler.builder.binary(Binary::And, before, equal)?;
         }
+        before = Some(equal);
         scope.push(left)?;
         joined.push(right.id)?;
     }
@@ -318,7 +319,7 @@ fn using_columns(
             scope.push(*column)?;
         }
     }
-    let (expr, _) = add_expr(compiler, &nodes, using)?;
+    let (expr, _) = finish_expr(compiler, using)?;
     compiler.scope = scope;
     Ok(expr)
 }

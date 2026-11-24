@@ -104,14 +104,13 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.catalog
     }
 
-    /// The bytes of `node`, if it's a string literal, which it adds to the
-    /// statement's literals: as a function's binding reads a pattern.
-    pub fn string_literal(&mut self, node: Node) -> Result<Option<&[u8]>, Error> {
+    /// The bytes of `node`, if it's a string literal: as a function's
+    /// binding reads a pattern.
+    pub fn string_literal(&self, node: Node) -> Result<Option<SmallVec<u8>>, Error> {
         if node.tag() != Tag::String {
             return Ok(None);
         }
-        let id = crate::expression::string(self, node)?;
-        Ok(Some(self.builder.plan.literal(id)))
+        Ok(Some(crate::expression::unquoted(self, node)?))
     }
 
     /// The stages and functions queries can use.
@@ -311,10 +310,10 @@ mod tests {
     /// `half(x)`, as a crate would add a function.
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Half)?);
             let signature = (&[DataType::Float64][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
@@ -339,10 +338,10 @@ mod tests {
     /// `total(x1, ..., x20)`: more arguments than a call holds in place.
     const TOTAL: &[FunctionRule] = &[FunctionRule {
         name: "total",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Total)?);
             let signature = (&[DataType::Float64; 20][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
