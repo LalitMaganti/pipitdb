@@ -13,9 +13,9 @@ use pipit_kernel::query::{PLAN_COLUMNS_MAX, PLAN_NODES_MAX};
 use pipit_kernel::scannable::Catalog;
 
 use crate::ast::{Ast, Node, Tag};
-use crate::error::{Error, ErrorCode, Span};
+use crate::error::{Error, ErrorCode, Span, Unsupported};
 use crate::keywords::same_word;
-use crate::parser::parse_query;
+use crate::parser::{QUERIES_NESTED_MAX, parse_query};
 use crate::registry::Registry;
 use pipit_kernel::env::Env;
 
@@ -68,6 +68,19 @@ pub struct Compiler<'q, 'c> {
     aliases: SpillVec<'q, TableAlias, ALIASES_INLINE>,
     /// The columns of `aliases`, each alias's after the one before's.
     alias_columns: SmallVec<Named>,
+    /// The first of `aliases` the query being compiled has: those before are
+    /// the queries' it's within, which it can't name.
+    aliases_start: usize,
+    /// The queries `WITH` names, as a `List` of `Named`s, if any.
+    named: Option<Node>,
+    /// How many of `named` a name can be: those before the one being
+    /// compiled, so none reads itself.
+    named_visible: u32,
+    /// A bit for each of the first 64 of `named` that's been read. A query
+    /// can name no more than that.
+    named_read: u64,
+    /// How many queries are being compiled, each within the last.
+    depth: usize,
 }
 
 impl<'q, 'c> Compiler<'q, 'c> {
@@ -150,8 +163,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return self.find_named(&self.scope, text, name.span());
         };
         let (wanted, column) = (at!(text, ..dot).trim_ascii(), at!(text, dot + 1..).trim_ascii());
-        let mut found = self
-            .aliases
+        let mut found = at!(self.aliases, self.aliases_start..)
             .iter()
             .filter(|a| same_word(self.builder.names().get(a.name).as_bytes(), wanted));
         let Some(alias) = found.next() else {
@@ -183,12 +195,27 @@ impl<'q, 'c> Compiler<'q, 'c> {
         Ok(column)
     }
 
-    /// The relation `name`, a `Name` node, names: a table in the catalog,
-    /// scanned. Every source of rows is compiled through this, so a query
-    /// read by another can be one more kind of relation.
+    /// The relation `source` reads: a query in parentheses, compiled; or a
+    /// name, of a query `WITH` named, compiled where it's read, or else of a
+    /// table in the catalog, scanned. Every source of rows is compiled
+    /// through this, as Perfetto's pipe sources are.
     #[inline]
-    pub fn compile_relation(&mut self, name: Node) -> Result<Scanned, Error> {
-        let span = name.span();
+    pub fn compile_relation(&mut self, source: Node) -> Result<Scanned, Error> {
+        if source.tag() == Tag::Query {
+            return self.compile_subquery(source);
+        }
+        let span = source.span();
+        if let Some((at, query)) = self.named_query(span) {
+            if self.named_read >> at & 1 != 0 {
+                return Err(Error::unsupported(Unsupported::ReadTwice, span));
+            }
+            self.named_read |= 1 << at;
+            // It reads only the queries named before it.
+            let visible = core::mem::replace(&mut self.named_visible, at);
+            let relation = self.compile_subquery(query);
+            self.named_visible = visible;
+            return relation;
+        }
         let Some(table) = self.catalog.find(self.text(span)) else {
             return Err(Error::new(ErrorCode::UnknownTable, span));
         };
@@ -206,6 +233,54 @@ impl<'q, 'c> Compiler<'q, 'c> {
         Ok(Scanned { rows: relation, columns })
     }
 
+    /// The query `WITH` named as `span`'s text, ignoring case, if one before
+    /// the one being compiled is: its place among them, and its `Query`.
+    fn named_query(&self, span: Span) -> Option<(u32, Node)> {
+        let named = self.named?;
+        let text = self.text(span).as_bytes();
+        (0..self.named_visible).find_map(|at| {
+            let named = self.node(named.first_child() + at);
+            let [query, name] = [0, 1].map(|i| self.node(named.first_child() + i));
+            same_word(self.text(name.span()).as_bytes(), text).then_some((at, query))
+        })
+    }
+
+    /// The query `query`, a `Query`, compiled into the plan in a scope of its
+    /// own, as Perfetto's `CompileSubpipeline` does: its root and its columns.
+    #[inline(never)]
+    fn compile_subquery(&mut self, query: Node) -> Result<Scanned, Error> {
+        if self.depth == QUERIES_NESTED_MAX {
+            return Err(Error::new(ErrorCode::NestingTooDeep, self.span(query)));
+        }
+        let rows = self.rows.take();
+        let scope = core::mem::replace(&mut self.scope, SmallVec::new(self.env, PLAN_COLUMNS_MAX)?);
+        // Its aliases go after the ones in scope, which it can't see, and
+        // are dropped once it's compiled.
+        let start = core::mem::replace(&mut self.aliases_start, self.aliases.len());
+        self.depth += 1;
+        let compiled = self.compile_query(query);
+        self.depth -= 1;
+        self.clear_aliases();
+        self.aliases_start = start;
+        let columns = core::mem::replace(&mut self.scope, scope);
+        let made = core::mem::replace(&mut self.rows, rows);
+        compiled?;
+        if self.repeats_a_name(&columns) {
+            return Err(Error::new(ErrorCode::DuplicateColumn, self.span(query)));
+        }
+        let Some(made) = made else { failed!() };
+        Ok(Scanned { rows: made, columns })
+    }
+
+    /// Compiles each stage of `query`, a `Query`, by its rule.
+    fn compile_query(&mut self, query: Node) -> Result<(), Error> {
+        for i in 0..query.child_count() {
+            let stage = self.node(query.first_child() + i);
+            (self.registry.rule(stage.rule()).compile)(self, stage)?;
+        }
+        Ok(())
+    }
+
     /// Adds the alias `name`, a name, for `columns`.
     pub fn add_alias(&mut self, name: Node, columns: &[Named]) -> Result<(), Error> {
         let name = self.add_name(name.span())?;
@@ -217,10 +292,15 @@ impl<'q, 'c> Compiler<'q, 'c> {
         Ok(self.aliases.push(TableAlias { name, start, end })?)
     }
 
-    /// Drops every alias, as a stage that makes a new scope does.
+    /// Drops every alias of the query being compiled, as a stage that makes a
+    /// new scope does.
     pub fn clear_aliases(&mut self) {
-        self.aliases.truncate(0);
-        self.alias_columns.retain(|_| false);
+        let columns = self
+            .aliases
+            .get(self.aliases_start)
+            .map_or(self.alias_columns.len(), |a| a.start as usize);
+        self.aliases.truncate(self.aliases_start);
+        self.alias_columns.truncate(columns);
     }
 
     /// The value of `node`, an `Integer`.
@@ -250,6 +330,16 @@ pub fn compile<'e>(
     source: &[u8],
 ) -> Result<Query<'e>, Error> {
     let ast = parse_query(env, registry, source)?;
+    let root = ast.node(ast.root());
+    let (named, query) = match root.tag() {
+        Tag::With => (Some(ast.node(root.first_child())), ast.node(root.first_child() + 1)),
+        _ => (None, root),
+    };
+    // One bit each for whether it's been read.
+    if let Some(named) = named.filter(|named| named.child_count() > 64) {
+        let past = ast.node(named.first_child() + 64);
+        return Err(Error::new(ErrorCode::ListTooLong, ast.node(past.first_child() + 1).span()));
+    }
     let mut compiler = Compiler {
         source,
         ast: &ast,
@@ -260,13 +350,14 @@ pub fn compile<'e>(
         scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
         aliases: SpillVec::new(env, ALIASES_MAX),
         alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+        aliases_start: 0,
+        named,
+        named_visible: named.map_or(0, Node::child_count),
+        named_read: 0,
+        depth: 0,
         env,
     };
-    let query = ast.node(ast.root());
-    for i in 0..query.child_count() {
-        let stage = ast.node(query.first_child() + i);
-        (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
-    }
+    compiler.compile_query(query)?;
     let rows = compiler.rows();
     let Compiler { builder, scope, .. } = compiler;
     Ok(builder.finish(rows, scope)?)
@@ -600,6 +691,54 @@ mod tests {
         assert_eq!(
             kept("FROM t |> RENAME b AS id, a AS v |> JOIN ids USING (v, id) |> SELECT v"),
             [1.0]
+        );
+    }
+
+    #[test]
+    fn reads_queries_as_sources() {
+        // A query in parentheses is read as a table is, by `FROM` or a join.
+        assert_eq!(kept("FROM (FROM t |> WHERE a = 2) |> SELECT b"), [20.0]);
+        let counted = "FROM (FROM t |> AGGREGATE count(*) AS n GROUP BY b) AS c";
+        assert_eq!(
+            kept(&format!("FROM ids |> JOIN {} ON id = c.b |> SELECT v", &counted[5..])),
+            [1.0]
+        );
+        // Its aliases stay in it, and it has one only if given one.
+        assert_eq!(error("FROM (FROM t AS x) |> SELECT x.a").0, ErrorCode::UnknownColumn);
+        assert_eq!(kept("FROM (FROM t AS x |> SELECT x.a) AS y |> SELECT y.a"), [1.0, 2.0]);
+        // As a table's, its columns must each have their own name.
+        assert_eq!(error("FROM (FROM t |> SELECT a, a)"), (ErrorCode::DuplicateColumn, 11));
+        let deep =
+            format!("{}t{}", "FROM (".repeat(QUERIES_NESTED_MAX), ")".repeat(QUERIES_NESTED_MAX));
+        assert_eq!(error(&deep).0, ErrorCode::NestingTooDeep);
+    }
+
+    #[test]
+    fn reads_queries_with_names() {
+        let small = "WITH small AS (FROM t |> WHERE a = 1)";
+        assert_eq!(kept(&format!("{small} FROM small |> SELECT b")), [10.0]);
+        // A query reads those named before it, not itself or those after.
+        assert_eq!(
+            kept("WITH x AS (FROM t), y AS (FROM x |> WHERE a = 2) FROM y |> SELECT a"),
+            [2.0]
+        );
+        assert_eq!(
+            error("WITH x AS (FROM y), y AS (FROM t) FROM x"),
+            (ErrorCode::UnknownTable, 16)
+        );
+        assert_eq!(error("WITH x AS (FROM x) FROM x"), (ErrorCode::UnknownTable, 16));
+        assert_eq!(error("WITH x (FROM t) FROM x").0, ErrorCode::ExpectedAs);
+        let many: StdVec<_> = (0..65).map(|i| format!("q{i} AS (FROM t)")).collect();
+        assert_eq!(error(&format!("WITH {} FROM q0", many.join(", "))).0, ErrorCode::ListTooLong);
+        // Each is read at most once, by the query or another named one, until
+        // one read twice can be built once for every read.
+        let joined = "FROM small |> JOIN small AS other ON small.b = other.b";
+        assert_eq!(error(&format!("{small} {joined}")), (ErrorCode::Unsupported, 57));
+        let shared =
+            "WITH x AS (FROM t), y AS (FROM x |> WHERE a = 1), z AS (FROM x |> WHERE a = 2)";
+        assert_eq!(
+            error(&format!("{shared} FROM y |> CROSS JOIN z")),
+            (ErrorCode::Unsupported, 61)
         );
     }
 

@@ -18,7 +18,7 @@ use crate::registry::{Item, Point, Rule, Shared};
 pub const FROM: Rule = Rule {
     keyword: "from",
     point: Point::Source,
-    items: &[Item::One(Shared::Name), Item::Clause(&["as"], Shared::Name)],
+    items: &[Item::One(Shared::Source), Item::Clause(&["as"], Shared::Name)],
     compile: compile_from,
 };
 
@@ -96,7 +96,7 @@ pub const JOIN: Rule = Rule {
     keyword: "join",
     point: Point::Stage,
     items: &[
-        Item::One(Shared::Name),
+        Item::One(Shared::Source),
         Item::Clause(&["as"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
@@ -108,7 +108,7 @@ pub const INNER_JOIN: Rule = Rule {
     keyword: "inner",
     point: Point::Stage,
     items: &[
-        Item::After(&["join"], Shared::Name),
+        Item::After(&["join"], Shared::Source),
         Item::Clause(&["as"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
@@ -121,7 +121,7 @@ pub const LEFT_JOIN: Rule = Rule {
     point: Point::Stage,
     items: &[
         Item::Optional("outer"),
-        Item::After(&["join"], Shared::Name),
+        Item::After(&["join"], Shared::Source),
         Item::Clause(&["as"], Shared::Name),
         Item::Clause(&["on"], Shared::Expr),
         Item::Parenthesized(&["using"], Shared::Name),
@@ -132,7 +132,7 @@ pub const LEFT_JOIN: Rule = Rule {
 pub const CROSS_JOIN: Rule = Rule {
     keyword: "cross",
     point: Point::Stage,
-    items: &[Item::After(&["join"], Shared::Name), Item::Clause(&["as"], Shared::Name)],
+    items: &[Item::After(&["join"], Shared::Source), Item::Clause(&["as"], Shared::Name)],
     compile: compile_cross_join,
 };
 
@@ -160,13 +160,14 @@ pub(crate) fn aggregate(name: &[u8]) -> Option<(&'static str, Function)> {
     FUNCTIONS.iter().find(|(f, _)| same_word(f.as_bytes(), name)).copied()
 }
 
-/// `FROM t [AS a]`: scans the table `t`, whose columns are then in scope,
-/// and named by alias `a`, or else `t`.
+/// `FROM t [AS a]`: reads source `t`, a table or a query, whose columns are
+/// then in scope, and named by alias `a`, or else by `t` if it's a name.
 fn compile_from(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error> {
-    let table = compiler.node(stage.first_child());
-    let relation = compiler.compile_relation(table)?;
-    let alias = alias_or(compiler, compiler.node(stage.first_child() + 1), table)?;
-    compiler.add_alias(alias, &relation.columns)?;
+    let source = compiler.node(stage.first_child());
+    let relation = compiler.compile_relation(source)?;
+    if let Some(alias) = alias_of(compiler, compiler.node(stage.first_child() + 1), source)? {
+        compiler.add_alias(alias, &relation.columns)?;
+    }
     compiler.scope = relation.columns;
     compiler.set_rows(relation.rows);
     Ok(())
@@ -180,9 +181,13 @@ fn compile_as(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Error>
     compiler.add_alias(compiler.node(stage.first_child()), &scope)
 }
 
-/// The alias in the list `alias`, `AS`'s, or `table` if it's empty.
-fn alias_or(compiler: &Compiler<'_, '_>, alias: Node, table: Node) -> Result<Node, Error> {
-    if alias.child_count() == 0 { Ok(table) } else { only(compiler, alias) }
+/// The alias in the list `alias`, `AS`'s, or if it's empty, `source` if it's
+/// a name; a query in parentheses has none.
+fn alias_of(compiler: &Compiler<'_, '_>, alias: Node, source: Node) -> Result<Option<Node>, Error> {
+    if alias.child_count() != 0 {
+        return only(compiler, alias).map(Some);
+    }
+    Ok((source.tag() == Tag::Name).then_some(source))
 }
 
 /// The kernel's `error`, about `node`.
@@ -225,8 +230,9 @@ fn compile_cross_join(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<()
     join(compiler, compiler.node(first), compiler.node(first + 1), JoinKind::Inner, None)
 }
 
-/// Joins the rows so far to table `table`, a name or a list of one, named by
-/// the alias in the list `alias` or else its own name, of `kind`, on a
+/// Joins the rows so far to source `table`, a table or a query, or a list
+/// of one, named by the alias in the list `alias` or else its own name, if
+/// it's a table's, of `kind`, on a
 /// condition given as the lists of an `ON` and a `USING`, one of them
 /// empty, or on none. The scope is `USING`'s columns, then the rest of both
 /// sides', so another name in both is ambiguous.
@@ -241,7 +247,9 @@ fn join(
         table = only(compiler, table)?;
     }
     let build = compiler.compile_relation(table)?;
-    compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
+    if let Some(alias) = alias_of(compiler, alias, table)? {
+        compiler.add_alias(alias, &build.columns)?;
+    }
     let probe = compiler.rows();
     let probe = (probe, compiler.scope.iter().map(|named| named.column));
     let build_columns = build.columns.iter().map(|named| named.column);
