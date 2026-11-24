@@ -501,6 +501,15 @@ mod tests {
     }
 
     #[test]
+    fn explains_how_a_query_runs() {
+        let (catalog, session) = (catalog(), Session::new(Env::current()));
+        let prepared = prepare(&session, &catalog, b"FROM t |> ORDER BY a |> LIMIT 1");
+        let mut explained = std::string::String::new();
+        prepared.explain(&mut explained).unwrap();
+        assert_eq!(explained, "Scan | TopK / Served");
+    }
+
+    #[test]
     fn runs_from_and_select() {
         let a = (b"a".to_vec(), [1.0, 2.0].to_vec());
         let b = (b"b".to_vec(), [10.0, 20.0].to_vec());

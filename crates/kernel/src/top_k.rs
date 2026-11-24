@@ -66,6 +66,7 @@ fn compare_string(values: Values, row: u32, theirs: Option<&[u8]>, descending: b
 }
 
 impl Breaker for TopK {
+    const NAME: &'static str = "TopK";
     type State = Kept;
 
     fn new_state(&self, context: &mut Context) -> Result<Kept, Error> {

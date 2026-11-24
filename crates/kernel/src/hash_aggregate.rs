@@ -210,6 +210,7 @@ impl<'b, 'r> Flat<'b, 'r> {
 }
 
 impl Breaker for HashAggregate {
+    const NAME: &'static str = "HashAggregate";
     type State = State;
 
     fn new_state(&self, context: &mut Context) -> Result<State, Error> {
@@ -398,6 +399,7 @@ mod tests {
     }
 
     impl Source for Rows {
+        const NAME: &'static str = "Rows";
         type State = usize;
 
         fn new_state(&self, _: &mut Context) -> Result<usize, Error> {
@@ -448,6 +450,7 @@ mod tests {
     struct StringKeys(Rows, Vec<ColumnView>);
 
     impl Source for StringKeys {
+        const NAME: &'static str = "StringKeys";
         type State = usize;
 
         fn new_state(&self, context: &mut Context) -> Result<usize, Error> {

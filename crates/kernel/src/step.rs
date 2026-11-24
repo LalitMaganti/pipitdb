@@ -25,6 +25,9 @@ use crate::row_batch::RowBatch;
 
 /// Produces the batches a pipeline runs over.
 pub trait Source {
+    /// What a query's explanation calls it, such as `Filter`.
+    const NAME: &'static str;
+
     type State;
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
@@ -42,6 +45,9 @@ pub trait Source {
 
 /// Changes each batch in place, such as by keeping some of its columns.
 pub trait Transform {
+    /// What a query's explanation calls it, such as `Filter`.
+    const NAME: &'static str;
+
     type State;
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
@@ -57,6 +63,9 @@ pub trait Transform {
 /// Turns input batches into output batches, for steps that hold rows back or
 /// output more than one batch for an input.
 pub trait Operator {
+    /// What a query's explanation calls it, such as `Filter`.
+    const NAME: &'static str;
+
     type State;
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
@@ -84,6 +93,9 @@ pub trait Operator {
 /// as a sort or an aggregation: the sink of the pipeline it consumes, which
 /// it finalizes once that ends, and served by the source of the next.
 pub trait Breaker {
+    /// What a query's explanation calls it, such as `Filter`.
+    const NAME: &'static str;
+
     type State;
 
     fn new_state(&self, context: &mut Context) -> Result<Self::State, Error>;
@@ -112,6 +124,7 @@ pub trait Breaker {
 /// merging runs' comes with the executor that runs more than one. A
 /// `Served` source serves it, as the next pipeline's.
 impl<B: Breaker> Sink for B {
+    const NAME: &'static str = B::NAME;
     type State = Option<B::State>;
     type Local = Option<B::State>;
 
@@ -155,6 +168,9 @@ impl<B: Breaker> Sink for B {
 /// of its build side. Each run of the pipeline consumes into a local state
 /// of its own, combined into the shared one when that run ends.
 pub trait Sink {
+    /// What a query's explanation calls it, such as `Filter`.
+    const NAME: &'static str;
+
     /// What it builds, which what reads it gets once it's finalized.
     type State;
     /// What a run of its pipeline builds, until it's combined.
@@ -246,17 +262,35 @@ impl Step<'_> {
 pub struct Erased<'a, F: 'static> {
     step: ErasedBox,
     pub(crate) functions: &'a StepFunctions<F>,
-    #[cfg(test)]
-    pub(crate) name: &'static str,
 }
 
 /// A step type's functions, and the layout of its state: one table for each
 /// type. `F` is what a pipeline calls for each batch.
 pub(crate) struct StepFunctions<F> {
+    #[cfg_attr(
+        not(any(test, feature = "explain")),
+        expect(dead_code, reason = "only `explain` reads it")
+    )]
+    pub(crate) name: Name,
     pub(crate) state_layout: Layout,
     pub(crate) new_state: NewState,
     pub(crate) drop_state: unsafe fn(NonNull<u8>),
     pub(crate) run: F,
+}
+
+/// A step type's name, which only builds that explain queries keep.
+#[derive(Clone, Copy)]
+pub(crate) struct Name(#[cfg(any(test, feature = "explain"))] pub(crate) &'static str);
+
+impl Name {
+    pub(crate) const fn new(name: &'static str) -> Name {
+        #[cfg(not(any(test, feature = "explain")))]
+        let _ = name;
+        Name(
+            #[cfg(any(test, feature = "explain"))]
+            name,
+        )
+    }
 }
 
 /// Makes a step's state at the given place, or fails without making it.
@@ -304,8 +338,7 @@ pub struct SinkFunctions {
 type Sunk = Result<(), Error>;
 
 impl<'a, F> Erased<'a, F> {
-    /// A step from a table of functions for its type, named `name` for tests
-    /// to print plans.
+    /// A step from a table of functions for its type.
     ///
     /// # Safety
     ///
@@ -313,16 +346,8 @@ impl<'a, F> Erased<'a, F> {
     pub(crate) unsafe fn from_parts(
         step: ErasedBox,
         functions: &'a StepFunctions<F>,
-        name: &'static str,
     ) -> Erased<'a, F> {
-        #[cfg(not(test))]
-        let _ = name;
-        Erased {
-            step,
-            functions,
-            #[cfg(test)]
-            name,
-        }
+        Erased { step, functions }
     }
 }
 
@@ -331,6 +356,7 @@ struct Functions<'a, T>(PhantomData<(&'a (), T)>);
 
 impl<'a, T: Source + 'a> Functions<'a, T> {
     const SOURCE: StepFunctions<SourceNext> = StepFunctions {
+        name: Name::new(T::NAME),
         state_layout: Layout::new::<T::State>(),
         // SAFETY: only called with this source and its state, as is each below.
         new_state: |source, context, state| unsafe {
@@ -350,6 +376,7 @@ impl<'a, T: Source + 'a> Functions<'a, T> {
 
 impl<'a, T: Transform + 'a> Functions<'a, T> {
     const TRANSFORM: StepFunctions<TransformProcess> = StepFunctions {
+        name: Name::new(T::NAME),
         state_layout: Layout::new::<T::State>(),
         // SAFETY: only called with this transform and its state, as is each below.
         new_state: |transform, context, state| unsafe {
@@ -367,6 +394,7 @@ impl<'a, T: Transform + 'a> Functions<'a, T> {
 
 impl<'a, T: Operator + 'a> Functions<'a, T> {
     const OPERATOR: StepFunctions<OperatorFunctions> = StepFunctions {
+        name: Name::new(T::NAME),
         state_layout: Layout::new::<T::State>(),
         // SAFETY: only called with this operator and its state, as is each below.
         new_state: |operator, context, state| unsafe {
@@ -391,6 +419,7 @@ impl<'a, T: Operator + 'a> Functions<'a, T> {
 
 impl<'a, T: Sink + 'a> Functions<'a, T> {
     const SINK: StepFunctions<SinkFunctions> = StepFunctions {
+        name: Name::new(T::NAME),
         state_layout: Layout::new::<T::State>(),
         // SAFETY: only called with this sink and its states, as is each below.
         new_state: |sink, context, state| unsafe {
@@ -430,12 +459,7 @@ impl<'a> DynSource<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         let step = Box::new(env, source)?.erase();
         let functions = &Functions::<'a, T>::SOURCE;
-        Ok(Erased {
-            step,
-            functions,
-            #[cfg(test)]
-            name: type_name::<T>(),
-        })
+        Ok(Erased { step, functions })
     }
 
     /// # Safety
@@ -459,12 +483,7 @@ impl<'a> DynTransform<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         let step = Box::new(env, transform)?.erase();
         let functions = &Functions::<'a, T>::TRANSFORM;
-        Ok(Erased {
-            step,
-            functions,
-            #[cfg(test)]
-            name: type_name::<T>(),
-        })
+        Ok(Erased { step, functions })
     }
 
     /// # Safety
@@ -486,12 +505,7 @@ impl<'a> DynOperator<'a> {
         const { assert!(align_of::<T::State>() <= BUFFER_ALIGNMENT_BYTES) };
         let step = Box::new(env, operator)?.erase();
         let functions = &Functions::<'a, T>::OPERATOR;
-        Ok(Erased {
-            step,
-            functions,
-            #[cfg(test)]
-            name: type_name::<T>(),
-        })
+        Ok(Erased { step, functions })
     }
 
     /// # Safety
@@ -530,12 +544,7 @@ impl<'a> DynSink<'a> {
         };
         let step = Box::new(env, sink)?.erase();
         let functions = &Functions::<'a, T>::SINK;
-        Ok(Erased {
-            step,
-            functions,
-            #[cfg(test)]
-            name: type_name::<T>(),
-        })
+        Ok(Erased { step, functions })
     }
 
     /// A new local state, for a run of its pipeline.
@@ -662,12 +671,4 @@ impl<F> Erased<'_, F> {
         // the rest.
         unsafe { (self.functions.new_state)(self.step.as_ptr(), context, state) }
     }
-}
-
-/// `T`'s name, without its path or parameters, for tests to print plans.
-#[cfg(test)]
-fn type_name<T>() -> &'static str {
-    let name = core::any::type_name::<T>();
-    let name = name.split('<').next().unwrap_or(name);
-    name.rsplit("::").next().unwrap_or(name)
 }

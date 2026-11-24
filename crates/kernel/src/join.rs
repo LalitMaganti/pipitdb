@@ -699,6 +699,7 @@ impl HashBuild {
 }
 
 impl Sink for HashBuild {
+    const NAME: &'static str = "HashBuild";
     type State = Option<Built>;
     type Local = Building;
 
@@ -968,6 +969,7 @@ impl Join {
 }
 
 impl Operator for Join {
+    const NAME: &'static str = "Join";
     type State = Probing;
 
     fn new_state(&self, context: &mut Context) -> Result<Probing, Error> {
