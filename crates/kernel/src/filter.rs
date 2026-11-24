@@ -480,6 +480,10 @@ pub fn keep_entries(
         let equal = |at| unsafe { eight::equal(indices, at, entries.only) };
         return selection.keep_prefix(equal, |row| *at!(indices, row) == entries.only);
     }
+    // Checked together, so each row's lookup needn't be.
+    let rows = at!(indices, ..selection.rows() as usize);
+    check!(rows.iter().fold(0, |max, &e| max.max(e)) < column.values().len());
+    let bits = BitSlice::of(bits);
     retain(selection, dropped, |row| {
         // SAFETY: `check_covers` checked every row is a row of `column`, one
         // index each.
@@ -489,8 +493,9 @@ pub fn keep_entries(
         if only {
             return e == entries.only;
         }
-        // An index past the entries fails the check, as when read anywhere.
-        BitSlice::of(bits).get(e as usize)
+        // SAFETY: every index is below the entries, checked above, and there
+        // is a bit for each entry.
+        unsafe { bits.get_unchecked(e as usize) }
     });
 }
 
