@@ -3,54 +3,46 @@
 //! them as the set `CHOICES`.
 
 use pipit_kernel::containers::SmallVec;
-use pipit_kernel::expression::{ExprBuilder, PRESENT};
+use pipit_kernel::query::Expr;
 
 use crate::ast::Node;
 use crate::compile::Compiler;
 use crate::error::Error;
-use crate::expression::{compile_arguments, push_case};
+use crate::expression::{case_of, compile_arguments};
 use crate::registry::FunctionRule;
 
 /// `iif(c, x, y)` is `CASE WHEN c THEN x ELSE y END`, and `coalesce(a, b,
 /// c)` is `CASE WHEN a IS NOT NULL THEN a WHEN b IS NOT NULL THEN b ELSE c
-/// END`, which `PRESENT` branches test. `ifnull` is `coalesce` of two.
+/// END`, whose branches test that their values aren't null. `ifnull` is
+/// `coalesce` of two.
 pub const CHOICES: &[FunctionRule] = &[
-    FunctionRule { name: "iif", compile: |c, node, depth, nodes| iif(c, (node, depth), nodes) },
-    FunctionRule {
-        name: "ifnull",
-        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, 2),
-    },
+    FunctionRule { name: "iif", compile: |c, node, depth| iif(c, (node, depth)) },
+    FunctionRule { name: "ifnull", compile: |c, node, depth| coalesce(c, (node, depth), 2) },
     FunctionRule {
         name: "coalesce",
-        compile: |c, node, depth, nodes| coalesce(c, (node, depth), nodes, u32::MAX),
+        compile: |c, node, depth| coalesce(c, (node, depth), u32::MAX),
     },
 ];
 
-/// Appends the nodes of the `iif` call `node`.
-fn iif(
-    compiler: &mut Compiler<'_, '_>,
-    (node, depth): (Node, usize),
-    nodes: &mut ExprBuilder,
-) -> Result<(), Error> {
-    let values = compile_arguments(compiler, (node, depth), nodes, 3, 3)?;
-    let branch = [(*at!(values, 0), *at!(values, 1))];
-    push_case(compiler, node, nodes, &branch, *at!(values, 2))
+/// The `iif` call `node`.
+fn iif(compiler: &mut Compiler<'_, '_>, (node, depth): (Node, usize)) -> Result<Expr, Error> {
+    let values = compile_arguments(compiler, (node, depth), 3, 3)?;
+    let branch = [(Some(*at!(values, 0)), *at!(values, 1))];
+    case_of(compiler, node, &branch, *at!(values, 2))
 }
 
-/// Appends the nodes of the `coalesce` call `node`, of at most `most`
-/// arguments.
+/// The `coalesce` call `node`, of at most `most` arguments.
 fn coalesce(
     compiler: &mut Compiler<'_, '_>,
     (node, depth): (Node, usize),
-    nodes: &mut ExprBuilder,
     most: u32,
-) -> Result<(), Error> {
-    let values = compile_arguments(compiler, (node, depth), nodes, 2, most)?;
+) -> Result<Expr, Error> {
+    let values = compile_arguments(compiler, (node, depth), 2, most)?;
     // At least two, as `compile_arguments` checked.
     let Some((otherwise, tested)) = values.split_last() else { pipit_kernel::failed!() };
     let mut branches = SmallVec::fixed(compiler.env(), tested.len())?;
     for &value in tested {
-        branches.push((PRESENT, value))?;
+        branches.push((None, value))?;
     }
-    push_case(compiler, node, nodes, &branches, *otherwise)
+    case_of(compiler, node, &branches, *otherwise)
 }

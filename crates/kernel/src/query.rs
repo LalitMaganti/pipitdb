@@ -47,8 +47,9 @@ use crate::column::{DataType, Forms};
 use crate::containers::SmallVec;
 use crate::env::Env;
 use crate::error::Error;
+pub use crate::error::TypeError;
 use crate::expression::{
-    self, ComputeItem, ComputeOp, EXPR_NODES_MAX, ExprError, ExprOp, ExprStep, PLAN_EXPR_NODES_MAX,
+    self, ComputeItem, ComputeOp, EXPR_NODES_MAX, ExprOp, ExprStep, PLAN_EXPR_NODES_MAX,
     PLAN_EXPR_VALUES_MAX, PRESENT, check_expr_type, columns_of, expr_can_be_null,
 };
 use crate::function::DynFunction;
@@ -109,6 +110,10 @@ struct State<'e> {
     columns: SmallVec<ColumnId>,
     /// Every expression's nodes, each reading only nodes before it.
     nodes: SmallVec<ExprStep>,
+    /// For each of `nodes`, the copy that last copied it, and where to.
+    copies: SmallVec<(u32, u32)>,
+    /// The last copy's number.
+    stamp: u32,
 }
 
 /// Rows an operation makes, which one other operation reads.
@@ -346,6 +351,15 @@ impl<'e> Builder<'e> {
         self.state().column_count(relation)
     }
 
+    /// The type of `expr`'s values.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongType`] if its parts' types don't fit together.
+    pub fn type_of(&self, expr: Expr) -> Result<DataType, Error> {
+        self.state().type_of_expr(expr)
+    }
+
     /// The type of `column`'s values.
     ///
     /// # Errors
@@ -491,6 +505,8 @@ impl<'e> State<'e> {
             relations: SmallVec::new(env, PLAN_NODES_MAX)?,
             columns: SmallVec::new(env, RELATION_COLUMNS_MAX)?,
             nodes: SmallVec::new(env, PLAN_EXPR_NODES_MAX)?,
+            copies: SmallVec::new(env, PLAN_EXPR_NODES_MAX)?,
+            stamp: 0,
         })
     }
 
@@ -621,7 +637,7 @@ impl<'e> State<'e> {
         for &key in keys {
             self.in_scope(&relation, key)?;
             if !matches!(self.type_of(key.id), DataType::Int64 | DataType::String) {
-                return Err(Error::WrongType);
+                return Err(Error::WrongType(TypeError::GroupKey));
             }
             key_ids.push(key.id)?;
         }
@@ -634,7 +650,7 @@ impl<'e> State<'e> {
             let input_type = input.map_or(DataType::Int64, |input| self.type_of(input.id));
             let counts_rows = function == Function::CountStar;
             if counts_rows != input.is_none() || input.is_some() && !function.reads(input_type) {
-                return Err(Error::WrongType);
+                return Err(Error::WrongType(TypeError::Aggregated));
             }
             let nullable = !matches!(function, Function::CountStar | Function::Count);
             let binding = self.plan.add_column(name, function.output_type(input_type), nullable)?;
@@ -902,7 +918,7 @@ impl<'e> State<'e> {
     fn condition(&mut self, expr: Expr, scope: &[(u32, u32)]) -> Result<expression::Expr, Error> {
         let (expr, data_type) = self.compile(expr, scope)?;
         if data_type != DataType::Int64 {
-            return Err(Error::WrongType);
+            return Err(Error::WrongType(TypeError::Condition));
         }
         Ok(expr)
     }
@@ -914,9 +930,7 @@ impl<'e> State<'e> {
         expr: Expr,
         scope: &[(u32, u32)],
     ) -> Result<(expression::Expr, DataType), Error> {
-        let root = self.node(expr)?;
-        let mut nodes = SmallVec::new(self.env, EXPR_NODES_MAX)?;
-        self.copy(root, 0, &mut nodes)?;
+        let (nodes, data_type) = self.flatten(expr)?;
         let mut outside = false;
         let columns = &self.columns;
         let inside = |column| {
@@ -929,76 +943,115 @@ impl<'e> State<'e> {
         if outside {
             return Err(Error::NotInScope);
         }
-        let columns = &self.plan.columns;
-        let type_of = |column: ColumnId| at!(columns, column as usize).data_type;
-        let data_type =
-            check_expr_type(self.env, &nodes, &type_of).map_err(|error| match error {
-                ExprError::OutOfMemory => Error::OutOfMemory,
-                _ => Error::WrongType,
-            })?;
         Ok((self.plan.exprs.add(&nodes)?, data_type))
     }
 
-    /// Appends to `out` the nodes `node` reads, then it, `depth` deep, and
-    /// returns where it is there. A `Case`'s `When`s and a `Call`'s
-    /// `Argument`s stay together, as they're read as a run.
-    fn copy(&self, node: u32, depth: usize, out: &mut SmallVec<ExprStep>) -> Result<u32, Error> {
-        let mut step = *at!(self.nodes, node as usize);
-        if !matches!(step.op, ExprOp::Case | ExprOp::Call) {
-            let step = self.copy_operands(step, depth, out)?;
-            return Self::push_to(out, step);
-        }
-        let mut run = SmallVec::fixed(self.env, step.b as usize)?;
-        for member in step.a..step.a + step.b {
-            run.push(self.copy_operands(*at!(self.nodes, member as usize), depth, out)?)?;
-        }
-        if step.op == ExprOp::Case {
-            step.c = self.copy(step.c, depth + 1, out)?;
-        }
-        step.a = u32::try_from(out.len()).map_err(|_| Error::TooLarge)?;
-        for &member in run.iter() {
-            Self::push_to(out, member)?;
-        }
-        Self::push_to(out, step)
+    fn type_of_expr(&mut self, expr: Expr) -> Result<DataType, Error> {
+        Ok(self.flatten(expr)?.1)
     }
 
-    /// `step`, reading what it reads once it's appended to `out`.
-    fn copy_operands(
-        &self,
-        mut step: ExprStep,
-        depth: usize,
-        out: &mut SmallVec<ExprStep>,
-    ) -> Result<ExprStep, Error> {
+    /// The nodes `expr` reads, then it, each once, and its type.
+    fn flatten(&mut self, expr: Expr) -> Result<(SmallVec<ExprStep>, DataType), Error> {
+        let root = self.node(expr)?;
+        while self.copies.len() < self.nodes.len() {
+            self.copies.push((0, 0))?;
+        }
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.copies.iter_mut().for_each(|copy| *copy = (0, 0));
+            self.stamp = 1;
+        }
+        let mut flat = Flattening {
+            env: self.env,
+            nodes: &self.nodes,
+            copies: &mut self.copies,
+            stamp: self.stamp,
+            out: SmallVec::new(self.env, EXPR_NODES_MAX)?,
+        };
+        flat.copy(root, 0)?;
+        let columns = &self.plan.columns;
+        let type_of = |column: ColumnId| at!(columns, column as usize).data_type;
+        let data_type = check_expr_type(self.env, &flat.out, &type_of)?;
+        Ok((flat.out, data_type))
+    }
+}
+
+/// An expression's nodes being copied out of a builder's, each once.
+struct Flattening<'a> {
+    env: &'a Env,
+    /// The builder's nodes.
+    nodes: &'a [ExprStep],
+    /// For each of `nodes`, the copy that last copied it, and where to.
+    copies: &'a mut [(u32, u32)],
+    /// Which copy this is.
+    stamp: u32,
+    /// The nodes copied, each reading only those before it.
+    out: SmallVec<ExprStep>,
+}
+
+impl Flattening<'_> {
+    /// Copies the nodes `node` reads, then it, `depth` deep, and returns
+    /// where it is in `out`. A `Case`'s `When`s and a `Call`'s `Argument`s
+    /// stay together, as they're read as a run.
+    fn copy(&mut self, node: u32, depth: usize) -> Result<u32, Error> {
+        let (stamp, at) = *at!(self.copies, node as usize);
+        if stamp == self.stamp {
+            return Ok(at);
+        }
+        let mut step = *at!(self.nodes, node as usize);
+        let at = if matches!(step.op, ExprOp::Case | ExprOp::Call) {
+            let mut run = SmallVec::fixed(self.env, step.b as usize)?;
+            for member in step.a..step.a + step.b {
+                run.push(self.copy_operands(*at!(self.nodes, member as usize), depth)?)?;
+            }
+            if step.op == ExprOp::Case {
+                step.c = self.copy(step.c, depth + 1)?;
+            }
+            step.a = u32::try_from(self.out.len()).map_err(|_| Error::TooLarge)?;
+            for &member in run.iter() {
+                self.push(member)?;
+            }
+            self.push(step)?
+        } else {
+            let step = self.copy_operands(step, depth)?;
+            self.push(step)?
+        };
+        *at_mut!(self.copies, node as usize) = (self.stamp, at);
+        Ok(at)
+    }
+
+    /// `step`, reading what it reads once that's copied.
+    fn copy_operands(&mut self, mut step: ExprStep, depth: usize) -> Result<ExprStep, Error> {
         if depth == PLAN_DEPTH_MAX {
             return Err(Error::TooDeep);
         }
         let depth = depth + 1;
         match step.op {
             ExprOp::Column | ExprOp::Constant | ExprOp::Null => {}
-            ExprOp::When if step.a == PRESENT => step.b = self.copy(step.b, depth, out)?,
+            ExprOp::When if step.a == PRESENT => step.b = self.copy(step.b, depth)?,
             ExprOp::ToDouble
             | ExprOp::Like
             | ExprOp::IsNull
             | ExprOp::IsNotNull
             | ExprOp::Not
             | ExprOp::In
-            | ExprOp::Argument => step.a = self.copy(step.a, depth, out)?,
+            | ExprOp::Argument => step.a = self.copy(step.a, depth)?,
             ExprOp::Case | ExprOp::Call => failed!(),
             _ => {
-                step.a = self.copy(step.a, depth, out)?;
-                step.b = self.copy(step.b, depth, out)?;
+                step.a = self.copy(step.a, depth)?;
+                step.b = self.copy(step.b, depth)?;
             }
         }
         Ok(step)
     }
 
-    /// Appends `step` to `out`, and returns where it is.
-    fn push_to(out: &mut SmallVec<ExprStep>, step: ExprStep) -> Result<u32, Error> {
-        if out.len() == EXPR_NODES_MAX {
+    /// Appends `step`, and returns where it is.
+    fn push(&mut self, step: ExprStep) -> Result<u32, Error> {
+        if self.out.len() == EXPR_NODES_MAX {
             return Err(Error::TooLarge);
         }
-        let at = u32::try_from(out.len()).map_err(|_| Error::TooLarge)?;
-        out.push(step)?;
+        let at = u32::try_from(self.out.len()).map_err(|_| Error::TooLarge)?;
+        self.out.push(step)?;
         Ok(at)
     }
 }
@@ -1100,7 +1153,7 @@ mod tests {
         let b_value = q.column_value(b).unwrap();
         assert_eq!(q.filter(left, b_value).err(), Some(Error::NotInScope));
         let text = q.string(b"x").unwrap();
-        assert_eq!(q.filter(right, text).err(), Some(Error::WrongType));
+        assert_eq!(q.filter(right, text).err(), Some(Error::WrongType(TypeError::Condition)));
         assert_eq!(q.scan(&table, &[2]).err(), Some(Error::NotInScope));
     }
 }

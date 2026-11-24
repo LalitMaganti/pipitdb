@@ -1,30 +1,36 @@
-//! `compile`: PipeSQL text to a `LogicalPlan`, finding tables in a `Catalog`.
+//! `compile`: PipeSQL text to a `Query`, finding tables in a `Catalog`.
 //! Each stage's rule compiles it, so a stage an extension adds compiles
 //! the same way.
 
 #![allow(unsafe_code)]
 
-use pipit_kernel::column::Forms;
 use pipit_kernel::containers::{SmallVec, SpillVec};
-use pipit_kernel::names::Name;
-use pipit_kernel::plan::{
-    DynOp, LogicalPlan, NamedColumn, PLAN_COLUMNS_MAX, PLAN_NODES_MAX, PlanNodeId, ScanColumn,
-    ScanOp,
-};
-use pipit_kernel::query::Query;
+use pipit_kernel::error::{Error as KernelError, TypeError};
+use pipit_kernel::names::{Name, Names};
+use pipit_kernel::plan::{PLAN_COLUMNS_MAX, PLAN_NAME_BYTES_MAX, PLAN_NODES_MAX};
+use pipit_kernel::query::{Builder, Column, Query, Relation as Rows};
 use pipit_kernel::scannable::Catalog;
 
 use crate::ast::{Ast, Node, Tag};
-use crate::error::{Error, ErrorCode, Span};
+use crate::error::{Error, ErrorCode, Span, Unsupported};
 use crate::keywords::same_word;
 use crate::parser::parse_query;
 use crate::registry::Registry;
 use pipit_kernel::env::Env;
 
-/// What a query reads rows from, compiled: its plan node, and its columns, by
+/// A column in scope, and the name it has there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NamedColumn {
+    /// Its name, in the compiler's `names`.
+    pub name: Name,
+    /// The builder's column.
+    pub column: Column,
+}
+
+/// What a query reads rows from, compiled: its rows, and its columns, by
 /// name.
 pub struct Relation {
-    pub node: PlanNodeId,
+    pub rows: Rows,
     pub columns: SmallVec<NamedColumn>,
 }
 
@@ -48,7 +54,7 @@ const ALIASES_INLINE: usize = 8;
 /// The most columns of all aliases at once.
 const ALIAS_COLUMNS_MAX: usize = ALIASES_MAX * PLAN_COLUMNS_MAX;
 
-/// A plan being compiled from a query, which each stage's rule adds to.
+/// A query being compiled, which each stage's rule adds to.
 pub struct Compiler<'q, 'c> {
     /// The query's text, which the tree's spans are into.
     source: &'q [u8],
@@ -58,10 +64,14 @@ pub struct Compiler<'q, 'c> {
     catalog: &'c dyn Catalog,
     /// The stages' rules and the functions calls can name.
     registry: &'q Registry,
-    /// What the plan's memory comes from.
+    /// What the query's memory comes from.
     env: &'q Env,
-    /// The plan so far.
-    pub plan: LogicalPlan<'c>,
+    /// The query so far.
+    pub builder: Builder<'c>,
+    /// The rows the stages so far make, once a source has made some.
+    rows: Option<Rows>,
+    /// The names of columns and aliases.
+    pub names: Names,
     /// The columns the stages so far make, by name.
     pub scope: SmallVec<NamedColumn>,
     /// The aliases `t.x` can name columns by.
@@ -95,14 +105,24 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.catalog
     }
 
-    /// The bytes of `node`, if it's a string literal, which it adds to the
-    /// statement's literals: as a function's binding reads a pattern.
-    pub fn string_literal(&mut self, node: Node) -> Result<Option<&[u8]>, Error> {
+    /// The bytes of `node`, if it's a string literal: as a function's
+    /// binding reads a pattern.
+    pub fn string_literal(&self, node: Node) -> Result<Option<SmallVec<u8>>, Error> {
         if node.tag() != Tag::String {
             return Ok(None);
         }
-        let id = crate::expression::string(self, node)?;
-        Ok(Some(self.plan.literal(id)))
+        Ok(Some(crate::expression::unquoted(self, node)?))
+    }
+
+    /// The rows the stages so far make, taken for a stage to read.
+    pub fn take_rows(&mut self) -> Rows {
+        let Some(rows) = self.rows.take() else { failed!() };
+        rows
+    }
+
+    /// Makes `rows` the rows the stages so far make.
+    pub fn set_rows(&mut self, rows: Rows) {
+        self.rows = Some(rows);
     }
 
     /// The stages and functions queries can use.
@@ -110,7 +130,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         self.registry
     }
 
-    /// What to make plan nodes with.
+    /// What the query's memory comes from.
     pub fn env(&self) -> &'q Env {
         self.env
     }
@@ -119,7 +139,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
     /// columns must each have their own, as in Perfetto.
     #[inline(never)]
     fn repeats_a_name(&self, columns: &[NamedColumn]) -> bool {
-        let name = |i: usize| self.plan.names.get(at!(columns, i).name);
+        let name = |i: usize| self.names.get(at!(columns, i).name);
         (1..columns.len())
             .any(|i| (0..i).any(|j| same_word(name(j).as_bytes(), name(i).as_bytes())))
     }
@@ -134,10 +154,8 @@ impl<'q, 'c> Compiler<'q, 'c> {
             return self.find_named(&self.scope, text, name.span());
         };
         let (wanted, column) = (at!(text, ..dot).trim_ascii(), at!(text, dot + 1..).trim_ascii());
-        let mut found = self
-            .aliases
-            .iter()
-            .filter(|a| same_word(self.plan.names.get(a.name).as_bytes(), wanted));
+        let mut found =
+            self.aliases.iter().filter(|a| same_word(self.names.get(a.name).as_bytes(), wanted));
         let Some(alias) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         };
@@ -160,8 +178,7 @@ impl<'q, 'c> Compiler<'q, 'c> {
         text: &[u8],
         span: Span,
     ) -> Result<NamedColumn, Error> {
-        let named =
-            |column: &&NamedColumn| same_word(self.plan.names.get(column.name).as_bytes(), text);
+        let named = |column: &&NamedColumn| same_word(self.names.get(column.name).as_bytes(), text);
         let mut found = columns.iter().filter(named);
         let Some(&column) = found.next() else {
             return Err(Error::new(ErrorCode::UnknownColumn, span));
@@ -183,24 +200,26 @@ impl<'q, 'c> Compiler<'q, 'c> {
         };
         let count = table.column_count();
         let mut reads = SmallVec::fixed(self.env, count as usize)?;
+        for i in 0..count {
+            reads.push(i)?;
+        }
+        let rows = self.builder.scan(table, &reads).map_err(|error| kernel_error(error, span))?;
         let mut columns = SmallVec::new(self.env, PLAN_COLUMNS_MAX)?;
         for i in 0..count {
-            let (name, data_type) = (table.column_name(i), table.column_type(i));
-            let binding = self.plan.add_column(name, data_type, table.column_nullable(i))?;
-            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT })?;
-            columns.push(binding)?;
+            let name = self.names.add(table.column_name(i))?;
+            let column =
+                self.builder.column(&rows, i as usize).map_err(|e| kernel_error(e, span))?;
+            columns.push(NamedColumn { name, column })?;
         }
         if self.repeats_a_name(&columns) {
             return Err(Error::new(ErrorCode::DuplicateColumn, span));
         }
-        let op = DynOp::new(self.env, ScanOp::new(table, reads))?;
-        let node = self.plan.add_node(op, &[])?;
-        Ok(Relation { node, columns })
+        Ok(Relation { rows, columns })
     }
 
     /// Adds the alias `name`, a name, for `columns`.
     pub fn add_alias(&mut self, name: Node, columns: &[NamedColumn]) -> Result<(), Error> {
-        let name = self.plan.names.add(self.text(name.span()))?;
+        let name = self.names.add(self.text(name.span()))?;
         #[expect(clippy::cast_possible_truncation, reason = "at most `ALIAS_COLUMNS_MAX`")]
         let start = self.alias_columns.len() as u32;
         self.alias_columns.extend_from_slice(columns)?;
@@ -241,28 +260,62 @@ pub fn compile<'e>(
     catalog: &'e dyn Catalog,
     source: &[u8],
 ) -> Result<Query<'e>, Error> {
-    Query::new(env, |env| {
-        let ast = parse_query(env, registry, source)?;
-        let mut compiler = Compiler {
-            source,
-            ast: &ast,
-            catalog,
-            registry,
-            plan: LogicalPlan::new(env)?,
-            scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
-            aliases: SpillVec::new(env, ALIASES_MAX),
-            alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
-            env,
-        };
-        let query = ast.node(ast.root());
-        for i in 0..query.child_count() {
-            let stage = ast.node(query.first_child() + i);
-            (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
-        }
-        let Compiler { mut plan, scope, .. } = compiler;
-        plan.output = scope;
-        Ok(plan)
-    })
+    let ast = parse_query(env, registry, source)?;
+    let start = Span { start: 0, len: 1 };
+    let mut compiler = Compiler {
+        source,
+        ast: &ast,
+        catalog,
+        registry,
+        builder: Builder::new(env).map_err(|error| kernel_error(error, start))?,
+        rows: None,
+        names: Names::new(env, PLAN_NAME_BYTES_MAX)?,
+        scope: SmallVec::new(env, PLAN_COLUMNS_MAX)?,
+        aliases: SpillVec::new(env, ALIASES_MAX),
+        alias_columns: SmallVec::new(env, ALIAS_COLUMNS_MAX)?,
+        env,
+    };
+    let query = ast.node(ast.root());
+    for i in 0..query.child_count() {
+        let stage = ast.node(query.first_child() + i);
+        (registry.rule(stage.rule()).compile)(&mut compiler, stage)?;
+    }
+    let rows = compiler.take_rows();
+    let mut output = SmallVec::fixed(env, compiler.scope.len())?;
+    for named in compiler.scope.iter() {
+        output.push((named.column, compiler.names.get(named.name)))?;
+    }
+    let query = compiler.builder.finish(rows, &output);
+    drop(output);
+    query.map_err(|error| kernel_error(error, start))
+}
+
+/// The kernel's `error`, about the part of the query at `span`.
+#[cold]
+#[inline(never)]
+pub fn kernel_error(error: KernelError, span: Span) -> Error {
+    let code = match error {
+        KernelError::WrongType(wrong) => match wrong {
+            TypeError::Numbers => ErrorCode::ExpectedNumber,
+            TypeError::Integers => ErrorCode::ExpectedInteger,
+            TypeError::Kinds => ErrorCode::ExpectedOneKind,
+            TypeError::Types => ErrorCode::ExpectedOneType,
+            TypeError::Strings => ErrorCode::ExpectedString,
+            TypeError::SomeRows => ErrorCode::ArithmeticOnSomeRows,
+            TypeError::Condition => ErrorCode::NumberCondition,
+            TypeError::Choices => ErrorCode::ChoicesOfOneType,
+            TypeError::Arguments => ErrorCode::ArgumentType,
+            TypeError::Inexact => return Error::unsupported(Unsupported::NumberType, span),
+            TypeError::DoubleIn => return Error::unsupported(Unsupported::SelectExpression, span),
+            TypeError::GroupKey => return Error::unsupported(Unsupported::GroupKey, span),
+            TypeError::Aggregated => return Error::unsupported(Unsupported::AggregateType, span),
+        },
+        KernelError::TooLarge | KernelError::TooManyColumns => ErrorCode::ExpressionTooLarge,
+        KernelError::TooDeep => ErrorCode::NestingTooDeep,
+        KernelError::NotInScope => ErrorCode::UnknownColumn,
+        _ => ErrorCode::OutOfMemory,
+    };
+    Error::new(code, span)
 }
 
 #[cfg(test)]
@@ -305,10 +358,10 @@ mod tests {
     /// `half(x)`, as a crate would add a function.
     const HALF: &[FunctionRule] = &[FunctionRule {
         name: "half",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Half)?);
             let signature = (&[DataType::Float64][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
@@ -333,10 +386,10 @@ mod tests {
     /// `total(x1, ..., x20)`: more arguments than a call holds in place.
     const TOTAL: &[FunctionRule] = &[FunctionRule {
         name: "total",
-        compile: |compiler, node, depth, nodes| {
+        compile: |compiler, node, depth| {
             let bind: Bind = |c, _| Ok(DynFunction::new(c.env(), Total)?);
             let signature = (&[DataType::Float64; 20][..], DataType::Float64);
-            call_bound(compiler, (node, depth), nodes, signature, bind)
+            call_bound(compiler, (node, depth), signature, bind)
         },
     }];
 
