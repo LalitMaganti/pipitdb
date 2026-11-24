@@ -1327,8 +1327,7 @@ mod tests {
         fn grows_from_its_allocator() {
             let live = Rc::new(Cell::new(0));
             let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let mut values = SmallVec::new(&env, 128).unwrap();
             for i in 0..100 {
                 assert!(values.push(i).is_ok());
@@ -1358,8 +1357,7 @@ mod tests {
             // four.
             let left = Rc::new(Cell::new(2));
             let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let mut values = SmallVec::new(&env, 128).unwrap();
             for i in 0..4 {
                 assert!(values.push(i).is_ok());
@@ -1372,8 +1370,7 @@ mod tests {
         fn stops_at_its_max() {
             let left = Rc::new(Cell::new(2));
             let allocator = Limited { left: left.clone(), live: Rc::new(Cell::new(0)) };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let mut values = SmallVec::fixed(&env, 3).unwrap();
             for i in 0..4 {
                 assert!(values.push(i).is_ok());
@@ -1403,8 +1400,8 @@ mod tests {
         #[test]
         fn asks_for_exact_sizes_and_pages_when_large() {
             let layouts = Rc::new(RefCell::new(StdVec::new()));
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(Layouts(layouts.clone()), usize::MAX) }.unwrap();
+            let env =
+                Env::new(crate::env::Memory::new(Layouts(layouts.clone()), usize::MAX)).unwrap();
             drop(SmallVec::<u64>::fixed(&env, 100).unwrap());
             drop(SmallVec::<u64>::fixed(&env, 1 << 15).unwrap());
             // After the `Env`'s own.
@@ -1417,8 +1414,7 @@ mod tests {
         fn empty_allocates_nothing() {
             let left = Rc::new(Cell::new(1));
             let allocator = Limited { left, live: Rc::new(Cell::new(0)) };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let values = SmallVec::<u64>::new(&env, 16).unwrap();
             assert!(values.is_empty());
         }
@@ -1434,8 +1430,7 @@ mod tests {
         fn frees_and_grows_again() {
             let live = Rc::new(Cell::new(0));
             let allocator = Limited { left: Rc::new(Cell::new(u32::MAX)), live: live.clone() };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let mut values = SmallVec::new(&env, 16).unwrap();
             assert!(values.extend_from_slice(&[1_u64, 2, 3]).is_ok());
             values.free();
@@ -1449,8 +1444,7 @@ mod tests {
             let left = Rc::new(Cell::new(u32::MAX));
             let live = Rc::new(Cell::new(0));
             let allocator = Limited { left: left.clone(), live };
-            // SAFETY: declared before what's allocated from it, so dropped after.
-            let env = unsafe { Env::new(allocator, usize::MAX) }.unwrap();
+            let env = Env::new(crate::env::Memory::new(allocator, usize::MAX)).unwrap();
             let mut values = SmallVec::new(&env, 16).unwrap();
             assert!(values.extend_from_slice(&[1, 2, 3, 4, 5]).is_ok());
             assert!(values.extend_from_slice(&[6]).is_ok());

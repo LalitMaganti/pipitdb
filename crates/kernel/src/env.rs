@@ -1,12 +1,11 @@
-//! `Env`: the environment a query runs in, which every part of it is
-//! passed: its memory and budget now, and what else they share later, such
-//! as its I/O.
+//! `Env`: the environment queries run in, which every part of them is
+//! passed: the resources they use, each a piece of its own, such as its
+//! `Memory`.
 //!
 //! What's allocated from an `Env` points back to it, without a lifetime,
-//! so an `Env` must outlive everything allocated from it. One that's
-//! `'static`, from `leak` or `current`, always does; one from `new` lives
-//! as long as its `OwnedEnv`, which whoever makes it promises is dropped
-//! last.
+//! so it must be dropped before its `Env`. Dropping an `Env` while
+//! something allocated from it is held is a bug, which fails a check before
+//! anything is freed, so nothing is left pointing to freed memory.
 
 #![allow(unsafe_code)]
 
@@ -28,16 +27,11 @@ use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BY
 pub struct Env {
     /// Where plans, states, lists and column data of no fixed size come
     /// from, and the slab allocators' slabs.
-    /// Where plans, states, lists and column data of no fixed size come
-    /// from, and the slab allocators' slabs.
     budget: Budget,
-    /// Slots for a batch's 8-byte values.
     /// Slots for a batch's 8-byte values.
     values: SlabAllocator<'static>,
     /// Slots for a batch's 4-byte values.
-    /// Slots for a batch's 4-byte values.
     indices: SlabAllocator<'static>,
-    /// Slots for the small things a batch's columns need.
     /// Slots for the small things a batch's columns need.
     small: SlabAllocator<'static>,
     /// Each of the allocators above, by `MemoryKind`, so finding one doesn't
@@ -54,7 +48,6 @@ pub struct Env {
 struct Budget {
     /// The allocator, in the same allocation as the `Env`.
     base: NonNull<dyn Allocator>,
-    /// The most bytes that can be allocated at once.
     /// The most bytes that can be allocated at once.
     limit: usize,
     /// The bytes allocated now.
@@ -79,6 +72,21 @@ pub enum MemoryKind {
 
 const KIND_COUNT: usize = MemoryKind::Small as usize + 1;
 
+/// An `Env`'s memory: the allocator it comes from, and the most bytes of
+/// it the `Env` takes, itself included.
+pub struct Memory<A> {
+    /// Where the memory comes from.
+    allocator: A,
+    /// The most bytes taken at once.
+    limit: usize,
+}
+
+impl<A: Allocator + 'static> Memory<A> {
+    pub fn new(allocator: A, limit: usize) -> Memory<A> {
+        Memory { allocator, limit }
+    }
+}
+
 /// An `Env` and the allocator it was made with, in one allocation from it.
 #[repr(C)]
 struct Allocation<A> {
@@ -87,18 +95,10 @@ struct Allocation<A> {
 }
 
 impl Env {
-    /// A query's memory, all of it from `base`, which it owns, at most
-    /// `limit` bytes of it.
-    ///
-    /// # Safety
-    ///
-    /// Everything allocated from it must be dropped before the
-    /// `OwnedEnv`.
+    /// An environment with `memory`, which it owns.
     #[expect(clippy::new_ret_no_self, reason = "it lives in memory it owns, held by the owner")]
-    pub unsafe fn new<A: Allocator + 'static>(
-        base: A,
-        limit: usize,
-    ) -> Result<OwnedEnv, AllocError> {
+    pub fn new<A: Allocator + 'static>(memory: Memory<A>) -> Result<OwnedEnv, AllocError> {
+        let Memory { allocator: base, limit } = memory;
         let layout = Layout::new::<Allocation<A>>();
         if layout.size() > limit {
             return Err(AllocError);
@@ -137,17 +137,6 @@ impl Env {
         Ok(OwnedEnv(allocation.cast()))
     }
 
-    /// As `new`, one that's never freed, so outlives everything: for one
-    /// kept for a whole program or thread.
-    pub fn leak<A: Allocator + 'static>(base: A, limit: usize) -> Result<&'static Env, AllocError> {
-        // SAFETY: it's never dropped.
-        let owned = unsafe { Env::new(base, limit) }?;
-        let env = owned.0;
-        core::mem::forget(owned);
-        // SAFETY: it's never freed.
-        Ok(unsafe { env.as_ref() })
-    }
-
     /// This thread's `Env`, from the system's heap, without a limit, made
     /// the first time it's asked for, and freed when the thread exits unless
     /// something allocated from it is still held: for tools, and tests.
@@ -165,14 +154,14 @@ impl Env {
     }
 
     /// The allocator memory of `kind` comes from.
-    pub fn allocator(&self, kind: MemoryKind) -> &dyn Allocator {
+    pub(crate) fn allocator(&self, kind: MemoryKind) -> &dyn Allocator {
         // SAFETY: each points into this `Env`, which outlives the borrow.
         unsafe { at!(self.allocators, kind as usize).as_ref() }
     }
 
     /// Whether nothing allocated from it is held: only its own allocation and
     /// its slab allocators' slabs are.
-    pub fn holds_nothing(&self) -> bool {
+    pub(crate) fn holds_nothing(&self) -> bool {
         let fixed = [&self.values, &self.indices, &self.small];
         let slabs: usize = fixed.iter().map(|fixed| fixed.slab_bytes()).sum();
         fixed.iter().all(|fixed| fixed.is_idle()) && self.used() == self.allocation_bytes + slabs
@@ -189,8 +178,8 @@ impl Env {
     }
 }
 
-/// Owns an `Env` from `Env::new`, and frees it when dropped, checking
-/// everything allocated from it was freed first.
+/// Owns an `Env` from `Env::new`, and frees it when dropped, checking first
+/// that nothing allocated from it is held.
 pub struct OwnedEnv(NonNull<Env>);
 
 impl Deref for OwnedEnv {
@@ -203,15 +192,30 @@ impl Deref for OwnedEnv {
 }
 
 impl Drop for OwnedEnv {
+    #[inline(never)]
     fn drop(&mut self) {
-        // SAFETY: `free` was made for this `Env`'s allocation, and whoever made
-        // it promised nothing allocated from it is left.
+        // Checked before anything is freed, so if it fails, what's still
+        // allocated from it points to memory that's still there.
+        check!(self.holds_nothing());
+        // SAFETY: `free` was made for this `Env`'s allocation, and nothing
+        // allocated from it is left.
         unsafe { (self.free)(self.0) }
     }
 }
 
-/// Holds an `Env` for a thread, and frees it as `OwnedEnv::release`
-/// does when the thread exits.
+impl OwnedEnv {
+    /// Frees the `Env` if nothing allocated from it is held, and keeps it
+    /// for good if something is, which can then still use it: for a
+    /// thread's `Env`, which may hold what's kept for the whole program.
+    fn release(self) {
+        if !self.holds_nothing() {
+            core::mem::forget(self);
+        }
+    }
+}
+
+/// Holds an `Env` for a thread, and frees it as `OwnedEnv::release` does
+/// when the thread exits.
 pub struct ThreadEnv(core::mem::ManuallyDrop<OwnedEnv>);
 
 impl ThreadEnv {
@@ -222,9 +226,8 @@ impl ThreadEnv {
     /// It must be kept in a thread-local, as `get` lends the `Env` for
     /// as long as the thread lives, under `Env::current`'s rule.
     pub unsafe fn new() -> ThreadEnv {
-        // SAFETY: it's released, not dropped, so it's freed only if nothing
-        // allocated from it is held.
-        let Ok(env) = (unsafe { Env::new(crate::allocator::Heap, usize::MAX) }) else { failed!() };
+        let memory = Memory::new(crate::allocator::Heap, usize::MAX);
+        let Ok(env) = Env::new(memory) else { failed!() };
         ThreadEnv(core::mem::ManuallyDrop::new(env))
     }
 
@@ -240,16 +243,6 @@ impl Drop for ThreadEnv {
     fn drop(&mut self) {
         // SAFETY: taken once, here.
         unsafe { core::mem::ManuallyDrop::take(&mut self.0) }.release();
-    }
-}
-
-impl OwnedEnv {
-    /// Frees the `Env` if nothing allocated from it is held, and keeps it
-    /// for good if something is, which can then still use it.
-    pub fn release(self) {
-        if !self.holds_nothing() {
-            core::mem::forget(self);
-        }
     }
 }
 
@@ -271,7 +264,6 @@ unsafe fn free<A: Allocator>(env: NonNull<Env>) {
         (&raw mut (*env).values).drop_in_place();
         (&raw mut (*env).indices).drop_in_place();
         (&raw mut (*env).small).drop_in_place();
-        check!((*allocation.as_ptr()).env.used() == size_of::<Allocation<A>>());
         let base = (&raw const (*allocation.as_ptr()).base).read();
         base.deallocate(allocation.cast(), Layout::new::<Allocation<A>>());
     }
@@ -345,8 +337,7 @@ mod tests {
 
     #[test]
     fn fails_past_its_limit_and_counts_the_peak() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let env = unsafe { Env::new(Heap, 2000) }.unwrap();
+        let env = Env::new(Memory::new(Heap, 2000)).unwrap();
         let empty = env.used();
         let first = Buffer::allocate(&env, 600).unwrap();
         // A buffer's header counts too.
@@ -366,8 +357,7 @@ mod tests {
 
     #[test]
     fn cannot_be_made_past_its_limit() {
-        // SAFETY: nothing is allocated from it.
-        assert!(unsafe { Env::new(Heap, 16) }.is_err());
+        assert!(Env::new(Memory::new(Heap, 16)).is_err());
     }
 
     /// A static block, which `Bump` hands out, so what's allocated from it
@@ -410,37 +400,35 @@ mod tests {
         unsafe fn deallocate(&self, _: NonNull<u8>, _: Layout) {}
     }
 
-    static OUTLIVED: Arena = Arena::new();
     static KEPT: Arena = Arena::new();
 
+    static OUTLIVED: Arena = Arena::new();
+
     #[test]
-    #[should_panic(expected = "used")]
+    #[should_panic(expected = "holds_nothing")]
     fn checks_nothing_outlives_it() {
-        // SAFETY: the buffer is forgotten, so never freed through it after
-        // the drop, whose check is what's tested.
-        let env = unsafe { Env::new(Bump(&OUTLIVED), usize::MAX) }.unwrap();
+        let env = Env::new(Memory::new(Bump(&OUTLIVED), usize::MAX)).unwrap();
+        // Forgotten, so never freed through the `Env` the check keeps.
         core::mem::forget(Buffer::allocate(&env, 8).unwrap());
         drop(env);
     }
 
     #[test]
-    fn released_once_nothing_is_held() {
-        // SAFETY: what's allocated from it is dropped before it's released.
-        let env = unsafe { Env::new(Heap, usize::MAX) }.unwrap();
+    fn freed_once_nothing_is_held() {
+        let env = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
         let empty = env.used();
         drop(Buffer::allocate_in(&env, MemoryKind::Small, 8).unwrap());
         assert!(env.holds_nothing());
         assert!(env.used() > empty);
-        env.release();
+        drop(env);
     }
 
     #[test]
     fn kept_while_something_is_held() {
-        // SAFETY: released, not dropped, so the buffer it keeps is never
-        // freed through a freed `Env`.
-        let env = unsafe { Env::new(Bump(&KEPT), usize::MAX) }.unwrap();
+        let env = Env::new(Memory::new(Bump(&KEPT), usize::MAX)).unwrap();
         let buffer = Buffer::allocate(&env, 8).unwrap();
         assert!(!env.holds_nothing());
+        // Kept for good, as the buffer still points to it.
         env.release();
         assert_eq!(buffer.as_slice::<u64>(), [0]);
         core::mem::forget(buffer);

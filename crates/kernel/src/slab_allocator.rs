@@ -223,8 +223,7 @@ mod tests {
 
     #[test]
     fn chunks_count_against_a_limit() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let env = unsafe { Env::new(Heap, 1000) }.unwrap();
+        let env = Env::new(crate::env::Memory::new(Heap, 1000)).unwrap();
         let before = env.used();
         assert!(Buffer::allocate_in(&env, MemoryKind::Small, 100).is_err());
         assert_eq!(env.used(), before);

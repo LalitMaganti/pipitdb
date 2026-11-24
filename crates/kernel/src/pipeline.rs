@@ -1281,8 +1281,7 @@ mod tests {
 
     #[test]
     fn operators_finish_without_their_last_input() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let live = unsafe { Env::new(Heap, usize::MAX) }.unwrap();
+        let live = Env::new(crate::env::Memory::new(Heap, usize::MAX)).unwrap();
         let empty = live.used();
         let released = Released { live: &live, empty };
         let pipeline = pipeline(Counted { live: &live }, [operator(released)]);

@@ -646,8 +646,7 @@ mod tests {
 
     #[test]
     fn fails_to_grow_past_its_allocator() {
-        // SAFETY: declared before what's allocated from it, so dropped after.
-        let limited = unsafe { Env::new(Heap, 4096) }.unwrap();
+        let limited = Env::new(crate::env::Memory::new(Heap, 4096)).unwrap();
         let mut map = FlatHashMap::<i64, ()>::new(&limited, 128).unwrap();
         assert!((0..1000).any(|key| map.insert(&limited, key, ()).is_err()));
         // What it held before is still there.
