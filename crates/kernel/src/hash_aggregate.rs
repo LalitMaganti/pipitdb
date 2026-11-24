@@ -519,7 +519,7 @@ mod tests {
         let input =
             Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
         let (sinks, pipeline) = after_breaker(input, hash_aggregate(spec), []);
-        let mut execution = pipeline.start_with_sinks(env, None, &sinks)?;
+        let mut execution = pipeline.start_with_sinks(env, None, &sinks, None)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {

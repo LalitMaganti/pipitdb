@@ -16,13 +16,13 @@ use pipit_kernel::expression::{
 };
 use pipit_kernel::filter::{self, Comparison, Value};
 use pipit_kernel::join::{JoinKind, JoinOp};
-use pipit_kernel::lower::PhysicalPlan;
 use pipit_kernel::pipeline::{Execution, Pipeline};
 use pipit_kernel::plan::{DynOp, LogicalPlan, ScanColumn, ScanOp};
 use pipit_kernel::predicate::{Leaf, Node, Predicate};
 use pipit_kernel::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Selection;
+use pipit_kernel::session::{Prepared, Query, Session};
 use pipit_kernel::step::{
     DynOperator, DynSource, DynTransform, Operator, Progress, Source, Step, Transform,
 };
@@ -320,11 +320,23 @@ pub fn run(pipeline: &Pipeline) -> u64 {
     count(execution)
 }
 
-/// Runs `plan`, returning the rows out.
-pub fn run_plan(plan: &PhysicalPlan) -> u64 {
-    let query = env();
-    let Ok(execution) = plan.start(query) else { return 0 };
-    count(execution)
+/// A query prepared in a session of its own, ready to run, as a
+/// benchmark's setup makes it.
+pub struct Ready {
+    session: Session<'static>,
+    prepared: Prepared<'static>,
+}
+
+impl Ready {
+    /// Runs it, returning the rows out.
+    pub fn run(&mut self) -> u64 {
+        let Ok(mut out) = self.prepared.run(&mut self.session) else { return 0 };
+        let mut rows = 0;
+        while let Ok(Some(batch)) = out.next() {
+            rows += u64::from(batch.selection().len());
+        }
+        rows
+    }
 }
 
 /// The rows `execution` puts out.
@@ -337,17 +349,26 @@ fn count(mut execution: Execution<'_>) -> u64 {
     rows
 }
 
-/// `query` over the tables in `catalog`, compiled, optimized and lowered,
-/// ready to run.
-pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<PhysicalPlan<'static>> {
-    let mut plan = compile(crate::env(), &REGISTRY, catalog, query.as_bytes()).ok()?;
-    PhysicalPlan::from_logical(crate::env(), &mut plan).ok()
+/// `query` over the tables in `catalog`, prepared in a session of its own.
+pub fn plan(catalog: &'static dyn Catalog, query: &str) -> Option<Ready> {
+    let session = Session::new(env());
+    let query = compile(env(), &REGISTRY, catalog, query.as_bytes()).ok()?;
+    let prepared = session.prepare(query).ok()?;
+    Some(Ready { session, prepared })
 }
 
-/// Plans and runs `query` over `catalog`, as an embedder would each query,
-/// returning the rows out.
+/// Plans and runs `query` over `catalog` in a session of its own, as an
+/// embedder would each query, returning the rows out.
 pub fn plan_and_run(catalog: &'static dyn Catalog, query: &str) -> u64 {
-    plan(catalog, query).map_or(0, |plan| run_plan(&plan))
+    let mut session = Session::new(env());
+    let Ok(query) = compile(env(), &REGISTRY, catalog, query.as_bytes()) else { return 0 };
+    let Ok(prepared) = session.prepare(query) else { return 0 };
+    let Ok(mut out) = prepared.run(&mut session) else { return 0 };
+    let mut rows = 0;
+    while let Ok(Some(batch)) = out.next() {
+        rows += u64::from(batch.selection().len());
+    }
+    rows
 }
 
 /// The table `t`.
@@ -386,7 +407,7 @@ pub fn small_table(rows: u32) -> &'static dyn Catalog {
 
 /// `query` over `small_table(rows)`, planned once.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn small_plan(rows: u32, query: &str) -> PhysicalPlan<'static> {
+pub fn small_plan(rows: u32, query: &str) -> Ready {
     plan(small_table(rows), query).expect("compiles")
 }
 
@@ -702,7 +723,7 @@ pub const PERFETTO_FILTERS: [(&str, &str); 4] = [
 
 /// `PERFETTO_FILTERS`' `i`th query over `perfetto_slices`, planned once.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn perfetto_filter_plan(i: usize) -> PhysicalPlan<'static> {
+pub fn perfetto_filter_plan(i: usize) -> Ready {
     plan(perfetto_slices(), PERFETTO_FILTERS[i].1).expect("compiles")
 }
 
@@ -773,7 +794,7 @@ impl Joined {
 /// slices' `utid`s, at random, are a thread's. Without a join, the slices'
 /// `dur` alone, to tell what the join costs. Kept for the rest of the run.
 #[expect(clippy::expect_used, reason = "a benchmark can't run without its input")]
-pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'static> {
+pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> Ready {
     let mut context = Context::new(env(), None);
     let int64s = int64_column;
     let groups = |rows: u32| {
@@ -818,27 +839,33 @@ pub fn join_plan(slices: u32, threads: u32, joined: Joined) -> PhysicalPlan<'sta
     let thread = table(&[("id", DataType::Int64), ("tid", DataType::Int64)], &thread_groups);
     let slice = table(&[("utid", DataType::Int64), ("dur", DataType::Int64)], &slice_groups);
 
-    let mut plan = LogicalPlan::new(crate::env()).expect("allocates");
-    let scan_of = |plan: &mut LogicalPlan<'static>, table, names: [&str; 2]| {
-        let mut reads = SmallVec::fixed(crate::env(), 2).expect("allocates");
-        let mut bound = [None; 2];
-        for (i, name) in (0..).zip(names) {
-            let binding = plan.add_column(name, DataType::Int64, false).expect("allocates");
-            reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).expect("fixed");
-            bound[i as usize] = Some(binding);
+    let query = Query::new(env(), |env| {
+        let mut plan = LogicalPlan::new(env)?;
+        let scan_of = |plan: &mut LogicalPlan<'static>, table, names: [&str; 2]| {
+            let mut reads = SmallVec::fixed(crate::env(), 2).expect("allocates");
+            let mut bound = [None; 2];
+            for (i, name) in (0..).zip(names) {
+                let binding = plan.add_column(name, DataType::Int64, false).expect("allocates");
+                reads.push(ScanColumn { column: i, binding, forms: Forms::FLAT }).expect("fixed");
+                bound[i as usize] = Some(binding);
+            }
+            let op = DynOp::new(crate::env(), ScanOp::new(table, reads)).expect("allocates");
+            let node = plan.add_node(op, &[]);
+            (node.expect("allocates"), bound.map(|b| b.expect("bound")))
+        };
+        let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
+        plan.output.push(dur)?;
+        if joined != Joined::No {
+            let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
+            let children = [probe, build];
+            let op = join_op(&mut plan.exprs, [utid.id, dur.id], [id.id, tid.id]);
+            plan.add_node(op, &children)?;
+            plan.output.push(tid)?;
         }
-        let op = DynOp::new(crate::env(), ScanOp::new(table, reads)).expect("allocates");
-        let node = plan.add_node(op, &[]);
-        (node.expect("allocates"), bound.map(|b| b.expect("bound")))
-    };
-    let (probe, [utid, dur]) = scan_of(&mut plan, slice, ["utid", "dur"]);
-    plan.output.push(dur).expect("allocates");
-    if joined != Joined::No {
-        let (build, [id, tid]) = scan_of(&mut plan, thread, ["id", "tid"]);
-        let children = [probe, build];
-        let op = join_op(&mut plan.exprs, [utid.id, dur.id], [id.id, tid.id]);
-        plan.add_node(op, &children).expect("allocates");
-        plan.output.push(tid).expect("allocates");
-    }
-    PhysicalPlan::from_logical(crate::env(), &mut plan).expect("lowers")
+        Ok::<_, pipit_kernel::allocator::AllocError>(plan)
+    });
+    let query = query.expect("allocates");
+    let session = Session::new(env());
+    let prepared = session.prepare(query).expect("lowers");
+    Ready { session, prepared }
 }

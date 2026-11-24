@@ -21,10 +21,9 @@ use pipit_kernel::allocator::Heap;
 use pipit_kernel::bytes::ByteSource;
 use pipit_kernel::column::{ColumnView, DataType, Form};
 use pipit_kernel::env::{Env, Memory};
-use pipit_kernel::lower::PhysicalPlan;
-use pipit_kernel::row_batch::RowBatch;
 use pipit_kernel::scannable::{Catalog, DynScannable};
 use pipit_kernel::selection::Kept;
+use pipit_kernel::session::Session;
 use pipit_parquet::Codec;
 use pipit_parquet::table::ParquetTable;
 use pipit_parquet_full::Codecs;
@@ -274,19 +273,18 @@ impl Output {
 /// The result of `query`: a column of its kept rows for each it outputs,
 /// built as each batch comes, as other engines build theirs.
 fn run(tables: &Tables, query: &str, env: &Env) -> Result<Vec<Output>, String> {
-    let mut plan =
-        compile(env, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
-    let physical = PhysicalPlan::from_logical(env, &mut plan).map_err(|e| format!("{e:?}"))?;
-    let mut execution = physical.start(env).map_err(|e| format!("{e:?}"))?;
-    let mut columns: Vec<Output> = physical.columns().iter().map(|_| Output::new()).collect();
-    let mut batch = RowBatch::new();
-    while execution.next(&mut batch).map_err(|e| format!("{e:?}"))? {
+    let mut session = Session::new(env);
+    let query = compile(env, &REGISTRY, tables, query.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    let prepared = session.prepare(query).map_err(|e| format!("{e:?}"))?;
+    let mut rows = prepared.run(&mut session).map_err(|e| format!("{e:?}"))?;
+    let mut columns: Vec<Output> = prepared.columns().iter().map(|_| Output::new()).collect();
+    while let Some(batch) = rows.next().map_err(|e| format!("{e:?}"))? {
         let kept: Vec<u32> = match batch.selection().kept() {
             Kept::Prefix => (0..batch.selection().len()).collect(),
             Kept::None => Vec::new(),
             Kept::Select(rows) => rows.iter().map(|&row| u32::from(row)).collect(),
         };
-        for (output, c) in columns.iter_mut().zip(physical.columns()) {
+        for (output, c) in columns.iter_mut().zip(prepared.columns()) {
             let column = batch.column(c.position);
             for &row in &kept {
                 output.push(column, row);

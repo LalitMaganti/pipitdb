@@ -754,7 +754,7 @@ mod tests {
             let after = SmallVec::fixed(env, 0).unwrap();
             let pipeline = Pipeline::new(served(env, top_k).unwrap(), after);
             let query = Env::current();
-            let mut execution = pipeline.start_with_sinks(query, None, &sinks).unwrap();
+            let mut execution = pipeline.start_with_sinks(query, None, &sinks, None).unwrap();
             let (mut batch, mut ids) = (RowBatch::new(), Vec::new());
             while execution.next(&mut batch).unwrap() {
                 let (selection, column) = (batch.selection(), batch.column(0));
