@@ -59,5 +59,6 @@ pub mod spill;
 pub(crate) mod statement;
 pub mod step;
 pub mod string_pool;
+pub mod table;
 pub(crate) mod top_k;
 pub(crate) mod values;
