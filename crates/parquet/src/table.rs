@@ -195,6 +195,7 @@ struct Pruned<'a> {
 }
 
 impl<'a> Source for Pruned<'a> {
+    const NAME: &'static str = "Pruned";
     /// How many of `groups` are started, and the rows of the last.
     type State = (usize, Rows<'a>);
 

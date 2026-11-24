@@ -192,6 +192,7 @@ enum Prepared {
 }
 
 impl Transform for Compute {
+    const NAME: &'static str = "Compute";
     type State = ComputeState;
 
     fn new_state(&self, context: &mut Context) -> Result<ComputeState, Error> {

@@ -33,7 +33,7 @@ use crate::plan::PLAN_NODES_MAX;
 use crate::row_batch::RowBatch;
 use crate::statement::Statement;
 use crate::step::{
-    Breaker, DynSink, DynSource, ErasedBatch, Progress, Sink, Source, SourceNext, Step,
+    Breaker, DynSink, DynSource, ErasedBatch, Name, Progress, Sink, Source, SourceNext, Step,
     StepFunctions,
 };
 
@@ -84,7 +84,7 @@ impl<'a> Pipeline<'a> {
     pub fn into_source(self, env: &Env) -> Result<DynSource<'a>, AllocError> {
         let pipeline = Box::new(env, self)?.erase();
         // SAFETY: each function takes a pipeline and a run of it.
-        Ok(unsafe { DynSource::from_parts(pipeline, &PIPELINE_SOURCE, "Pipeline") })
+        Ok(unsafe { DynSource::from_parts(pipeline, &PIPELINE_SOURCE) })
     }
 
     /// A `Segment` per segment, a `Slot` per step, the source's state, each
@@ -251,6 +251,7 @@ type Serve =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
 impl Source for Served {
+    const NAME: &'static str = "Served";
     /// Whether the breaker has served all it holds.
     type State = bool;
 
@@ -319,30 +320,39 @@ pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error
     Ok(built)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "explain"))]
 impl Sinks<'_> {
-    /// Each pipeline, then the sink it ends in, as `Pipeline::describe`
-    /// does, and `then` after: such as `Scan | Sort / Served`.
-    pub(crate) fn describe(&self, then: &Pipeline) -> alloc::string::String {
-        let mut out = alloc::string::String::new();
+    /// Writes each pipeline, then the sink it ends in, and `then` after,
+    /// such as `Scan | Sort / Served`.
+    pub(crate) fn explain(
+        &self,
+        out: &mut impl core::fmt::Write,
+        then: &Pipeline,
+    ) -> core::fmt::Result {
         for SinkPipeline { pipeline, sink } in self.pipelines.iter() {
-            out = out + &pipeline.describe() + " | " + sink.name + " / ";
+            pipeline.explain(out)?;
+            out.write_str(" | ")?;
+            out.write_str(sink.functions.name.0)?;
+            out.write_str(" / ")?;
         }
-        out + &then.describe()
+        then.explain(out)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "explain"))]
 impl Pipeline<'_> {
-    /// Its source's and steps' types, in order, such as `Scan | Filter`.
-    pub(crate) fn describe(&self) -> alloc::string::String {
-        let steps = self.steps.iter().map(|step| match step {
-            Step::Transform(transform) => transform.name,
-            Step::Operator(operator) => operator.name,
-        });
-        let names: alloc::vec::Vec<&str> =
-            core::iter::once(self.source.name).chain(steps).collect();
-        names.join(" | ")
+    /// Writes its source's and steps' names, in order, such as
+    /// `Scan | Filter`.
+    pub(crate) fn explain(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        out.write_str(self.source.functions.name.0)?;
+        for step in self.steps.iter() {
+            out.write_str(" | ")?;
+            out.write_str(match step {
+                Step::Transform(transform) => transform.functions.name.0,
+                Step::Operator(operator) => operator.functions.name.0,
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +439,7 @@ struct Run<'p> {
 
 /// A pipeline's functions as a source, whose state is a run of it.
 const PIPELINE_SOURCE: StepFunctions<SourceNext> = StepFunctions {
+    name: Name::new("Pipeline"),
     state_layout: Layout::new::<Run<'static>>(),
     new_state: new_run,
     drop_state: drop_state::<Run<'static>>,
@@ -780,6 +791,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::allocator::Heap;
 
+    /// How `plan` runs, as it explains it.
+    fn explained(plan: &Pipeline<'_>) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        plan.explain(&mut out).unwrap();
+        out
+    }
+
     use crate::column::{ColumnView, DataType};
     use crate::context::Context;
     use crate::env::Env;
@@ -815,6 +833,7 @@ pub(crate) mod tests {
     }
 
     impl Source for Numbers {
+        const NAME: &'static str = "Numbers";
         type State = i64;
 
         fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
@@ -837,6 +856,7 @@ pub(crate) mod tests {
     struct Reverse;
 
     impl Transform for Reverse {
+        const NAME: &'static str = "Reverse";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -861,6 +881,7 @@ pub(crate) mod tests {
     }
 
     impl Transform for Position {
+        const NAME: &'static str = "Position";
         type State = (i64, Rc<()>);
 
         fn new_state(&self, _: &mut Context) -> Result<(i64, Rc<()>), Error> {
@@ -884,6 +905,7 @@ pub(crate) mod tests {
     struct SkipOdd;
 
     impl Transform for SkipOdd {
+        const NAME: &'static str = "SkipOdd";
         type State = bool;
 
         fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
@@ -908,6 +930,7 @@ pub(crate) mod tests {
     struct KeepEven;
 
     impl Transform for KeepEven {
+        const NAME: &'static str = "KeepEven";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -925,6 +948,7 @@ pub(crate) mod tests {
     struct KeepNone;
 
     impl Transform for KeepNone {
+        const NAME: &'static str = "KeepNone";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -943,6 +967,7 @@ pub(crate) mod tests {
     }
 
     impl Source for Counted<'_> {
+        const NAME: &'static str = "Counted";
         type State = bool;
 
         fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
@@ -978,6 +1003,7 @@ pub(crate) mod tests {
     }
 
     impl Operator for Released<'_> {
+        const NAME: &'static str = "Released";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -1009,6 +1035,7 @@ pub(crate) mod tests {
     struct Split;
 
     impl Operator for Split {
+        const NAME: &'static str = "Split";
         type State = u32;
 
         fn new_state(&self, _: &mut Context) -> Result<u32, Error> {
@@ -1049,6 +1076,7 @@ pub(crate) mod tests {
     struct Sum;
 
     impl Operator for Sum {
+        const NAME: &'static str = "Sum";
         type State = i64;
 
         fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
@@ -1085,6 +1113,7 @@ pub(crate) mod tests {
     }
 
     impl Transform for Boxed {
+        const NAME: &'static str = "Boxed";
         type State = crate::containers::Box<i64>;
 
         fn new_state(&self, context: &mut Context) -> Result<Self::State, Error> {
@@ -1110,6 +1139,7 @@ pub(crate) mod tests {
     struct Backwards;
 
     impl Breaker for Backwards {
+        const NAME: &'static str = "Backwards";
         type State = Vec<i64>;
 
         fn new_state(&self, _: &mut Context) -> Result<Vec<i64>, Error> {
@@ -1158,6 +1188,7 @@ pub(crate) mod tests {
     struct FailSecond;
 
     impl Transform for FailSecond {
+        const NAME: &'static str = "FailSecond";
         type State = bool;
 
         fn new_state(&self, _: &mut Context) -> Result<bool, Error> {
@@ -1180,6 +1211,7 @@ pub(crate) mod tests {
     }
 
     impl Sink for Total<'_> {
+        const NAME: &'static str = "Total";
         type State = i64;
         type Local = i64;
 
@@ -1213,6 +1245,7 @@ pub(crate) mod tests {
     }
 
     impl Operator for WithTotal<'_> {
+        const NAME: &'static str = "WithTotal";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -1339,7 +1372,7 @@ pub(crate) mod tests {
     fn breakers_output_once_their_input_ends() {
         let input = pipeline(Numbers { batches: 3 }, []);
         let (sinks, pipeline) = after_breaker(input, Backwards, []);
-        assert_eq!(pipeline.describe(), "Served");
+        assert_eq!(explained(&pipeline), "Served");
         let query = Env::current();
         assert_eq!(
             batches(&mut pipeline.start_with_sinks(query, None, &sinks, None).unwrap()),
@@ -1434,6 +1467,7 @@ pub(crate) mod tests {
     }
 
     impl Transform for Interns {
+        const NAME: &'static str = "Interns";
         type State = ();
 
         fn new_state(&self, _: &mut Context) -> Result<(), Error> {
@@ -1459,7 +1493,7 @@ pub(crate) mod tests {
         let flat = pipeline(Numbers { batches: 2 }, [transform(Reverse), operator(Split)]);
         let inner = pipeline(Numbers { batches: 2 }, [transform(Reverse)]);
         let split = nested(inner, [operator(Split)]);
-        assert_eq!(split.describe(), "Pipeline | Split");
+        assert_eq!(explained(&split), "Pipeline | Split");
         let query = Env::current();
         let expected = batches(&mut flat.start(query, None).unwrap());
         assert_eq!(batches(&mut split.start(query, None).unwrap()), expected);

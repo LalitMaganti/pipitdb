@@ -666,6 +666,7 @@ pub struct FilterState {
 }
 
 impl Transform for Filter {
+    const NAME: &'static str = "Filter";
     type State = FilterState;
 
     fn new_state(&self, context: &mut Context) -> Result<FilterState, Error> {

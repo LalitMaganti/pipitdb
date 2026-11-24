@@ -150,6 +150,19 @@ impl Prepared<'_> {
     pub fn name(&self, column: OutputColumn) -> &str {
         self.plan.name(column)
     }
+
+    /// Writes how it runs to `out`, such as a `String`, for people to read:
+    /// each pipeline's steps, from the source that feeds it to the sink it
+    /// ends in, such as `Scan | TopK / Served | Limit`. The format may
+    /// change.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `out` fails with.
+    #[cfg(feature = "explain")]
+    pub fn explain(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+        self.plan.explain(out)
+    }
 }
 
 /// One run of a prepared query: its result, a batch at a time.

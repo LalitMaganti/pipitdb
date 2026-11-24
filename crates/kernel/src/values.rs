@@ -14,6 +14,7 @@ pub struct Values {
 }
 
 impl Source for Values {
+    const NAME: &'static str = "Values";
     /// Whether the row was output.
     type State = bool;
 

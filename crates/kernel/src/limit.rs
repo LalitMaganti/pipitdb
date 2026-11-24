@@ -77,6 +77,7 @@ struct Counted {
 }
 
 impl Operator for Limit {
+    const NAME: &'static str = "Limit";
     type State = Counted;
 
     fn new_state(&self, _: &mut Context) -> Result<Counted, Error> {
@@ -136,6 +137,7 @@ mod tests {
     }
 
     impl Source for Counting<'_> {
+        const NAME: &'static str = "Counting";
         type State = i64;
 
         fn new_state(&self, _: &mut Context) -> Result<i64, Error> {
