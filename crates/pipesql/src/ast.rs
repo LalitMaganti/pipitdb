@@ -53,6 +53,10 @@ pub enum Tag {
     Stage,
     /// A query: `child_count` stages from `first_child`.
     Query,
+    /// A query that names others first, with `WITH`: two children from
+    /// `first_child`, a `List` of `Named`s, each a `Query` and its name, then
+    /// the `Query` that can read them by name.
+    With,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,7 +185,7 @@ impl Node {
     }
 
     pub fn tag(self) -> Tag {
-        check!(self.tag <= Tag::Query as u8);
+        check!(self.tag <= Tag::With as u8);
         // SAFETY: `Tag` is a `u8` and the value is in range, checked above.
         unsafe { core::mem::transmute::<u8, Tag>(self.tag) }
     }
@@ -202,10 +206,10 @@ impl Node {
         self.payload
     }
 
-    /// For `Call`, `Case`, `List` and `Query`. A `Stage` has one child per
-    /// item of its rule.
+    /// For `Call`, `Case`, `List`, `Query` and `With`. A `Stage` has one
+    /// child per item of its rule.
     pub fn child_count(self) -> u32 {
-        check!(matches!(self.tag(), Tag::Call | Tag::Case | Tag::List | Tag::Query));
+        check!(matches!(self.tag(), Tag::Call | Tag::Case | Tag::List | Tag::Query | Tag::With));
         self.data_u24()
     }
 

@@ -131,6 +131,9 @@ pub enum Unsupported {
     Join = 10,
     /// A condition that's a double, not a comparison or an integer.
     DoubleCondition = 11,
+    /// A query `WITH` named, read a second time: each read would run it
+    /// again, where it should be built once and read by each.
+    ReadTwice = 12,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

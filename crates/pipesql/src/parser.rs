@@ -30,10 +30,22 @@ pub const LIST_MAX: usize = DATA_MAX as usize;
 /// more. A longer list's are gathered in memory from the `Env`.
 const LIST_INLINE: usize = 64;
 
-/// Parses `source` as a query, with the stages in `registry`.
-pub fn parse_query(env: &Env, registry: &Registry, source: &[u8]) -> Result<Ast, Error> {
+/// The most queries nested in one another, by parentheses or by `WITH`
+/// queries reading those before them. Parsing and compiling each takes a few
+/// kilobytes of stack.
+pub const QUERIES_NESTED_MAX: usize = 64;
+
+/// Parses `source` as a query, with the stages in `registry`: maybe after
+/// `WITH`, which names queries it can read.
+pub fn parse_query<'a>(
+    env: &'a Env,
+    registry: &'a Registry,
+    source: &'a [u8],
+) -> Result<Ast, Error> {
     let mut parser = Parser::new(env, source)?;
-    let root = parser.query(registry).and_then(|root| parser.end(root));
+    parser.registry = Some(registry);
+    let root = if parser.at_word("with") { parser.with() } else { parser.query() };
+    let root = root.and_then(|root| parser.end(root));
     parser.finish(root)
 }
 
@@ -57,6 +69,10 @@ pub(crate) struct Parser<'a> {
     nodes: Nodes,
     /// The first error found, once there is one.
     failed: Option<Error>,
+    /// The stages queries can have, if it parses queries.
+    registry: Option<&'a Registry>,
+    /// How many queries it's in, each within the last.
+    queries: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -65,7 +81,7 @@ impl<'a> Parser<'a> {
         let current = lexer.next_token()?;
         let nodes = Nodes::new(env)
             .map_err(|_| Error::new(ErrorCode::OutOfMemory, Span { start: 0, len: 1 }))?;
-        Ok(Parser { env, source, lexer, current, nodes, failed: None })
+        Ok(Parser { env, source, lexer, current, nodes, failed: None, registry: None, queries: 0 })
     }
 
     /// The token the parser is on.
@@ -651,11 +667,43 @@ fn leaf(token: Token) -> Result<Node, Error> {
 
 impl Parser<'_> {
     /// Parses a query, returning its root, which is not in the tree yet.
-    pub(crate) fn query(&mut self, registry: &Registry) -> Result<Node, Error> {
-        self.items(Tag::Query, TokenKind::Pipe, &mut |parser, first| {
+    pub(crate) fn query(&mut self) -> Result<Node, Error> {
+        let Some(registry) = self.registry else { pipit_kernel::failed!() };
+        if self.queries == QUERIES_NESTED_MAX {
+            return Err(Error::new(ErrorCode::NestingTooDeep, self.current().span));
+        }
+        self.queries += 1;
+        let query = self.items(Tag::Query, TokenKind::Pipe, &mut |parser, first| {
             let point = if first { Point::Source } else { Point::Stage };
             parser.stage(registry, point)
-        })
+        });
+        self.queries -= 1;
+        query
+    }
+
+    /// A query in parentheses.
+    fn subquery(&mut self) -> Result<Node, Error> {
+        self.expect(TokenKind::LeftParen)?;
+        let query = self.query()?;
+        self.expect(TokenKind::RightParen)?;
+        Ok(query)
+    }
+
+    /// `WITH a AS (query), b AS (query)`, then the query that reads them, as
+    /// a `With`.
+    fn with(&mut self) -> Result<Node, Error> {
+        self.advance()?;
+        let named = self.items(Tag::List, TokenKind::Comma, &mut |parser, _| {
+            let name = parser.shared(Shared::Name)?;
+            if !parser.at_word("as") {
+                return Err(Error::new(ErrorCode::ExpectedAs, parser.current().span));
+            }
+            parser.advance()?;
+            let query = parser.subquery()?;
+            Ok(Node::list(Tag::Named, 2, parser.write(&[query, name])))
+        })?;
+        let query = self.query()?;
+        Ok(Node::list(Tag::With, 2, self.write(&[named, query])))
     }
 
     fn stage(&mut self, registry: &Registry, point: Point) -> Result<Node, Error> {
@@ -705,6 +753,8 @@ impl Parser<'_> {
                 let token = self.expect(TokenKind::Identifier)?;
                 Ok(Node::leaf(Tag::Name, token.span))
             }
+            Shared::Source if self.current().kind == TokenKind::LeftParen => self.subquery(),
+            Shared::Source => self.shared(Shared::Name),
             Shared::Expr => self.expression(),
             Shared::Aliased | Shared::Renamed | Shared::Assigned => self.named(shared),
             Shared::Ordered => {

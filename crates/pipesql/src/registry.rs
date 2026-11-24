@@ -55,6 +55,9 @@ pub enum Item {
 pub enum Shared {
     /// A name, as a `Name`.
     Name,
+    /// What rows are read from: a table's or a `WITH` query's name, as a
+    /// `Name`, or a query in parentheses, as a `Query`.
+    Source,
     /// An expression.
     Expr,
     /// An expression, then maybe `AS` and its name: a `Named` if there is
