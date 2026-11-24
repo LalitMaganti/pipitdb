@@ -53,8 +53,6 @@ pub struct SortKey {
 }
 
 pub struct ColumnSchema {
-    /// What queries call it.
-    pub name: Name,
     /// What type its values are.
     pub data_type: DataType,
     /// Whether it can hold a null.
@@ -587,7 +585,7 @@ impl<'c> LogicalPlan<'c> {
         core::mem::take(&mut self.statement)
     }
 
-    /// A new column, with a copy of `name`.
+    /// A new column, and a copy of `name`, which it can be output as.
     pub fn add_column(
         &mut self,
         name: &str,
@@ -595,20 +593,19 @@ impl<'c> LogicalPlan<'c> {
         nullable: bool,
     ) -> Result<NamedColumn, AllocError> {
         let name = self.names.add(name)?;
-        self.add_named_column(name, data_type, nullable)
+        Ok(NamedColumn { name, id: self.add_unnamed_column(data_type, nullable)? })
     }
 
-    /// As `add_column`, for a name already in `names`.
+    /// A new column, which has a name only if it's output.
     #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
-    pub fn add_named_column(
+    pub fn add_unnamed_column(
         &mut self,
-        name: Name,
         data_type: DataType,
         nullable: bool,
-    ) -> Result<NamedColumn, AllocError> {
+    ) -> Result<ColumnId, AllocError> {
         let id = self.columns.len() as ColumnId;
-        self.columns.push(ColumnSchema { name, data_type, nullable })?;
-        Ok(NamedColumn { name, id })
+        self.columns.push(ColumnSchema { data_type, nullable })?;
+        Ok(id)
     }
 
     /// Adds a node and makes it the root, which holds while a plan is built
@@ -660,7 +657,7 @@ pub struct ScanColumn {
     /// Which of the scannable's columns.
     pub column: u32,
     /// What it's bound to.
-    pub binding: NamedColumn,
+    pub binding: ColumnId,
     /// The forms it's read in, which the plan chooses.
     pub forms: Forms,
 }
@@ -669,10 +666,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Keeps the needed columns, and at least one: a batch with no columns
     /// has no rows.
     fn prune(&mut self, needed: &mut Needed) -> Pruned {
-        let any = self.columns.iter().any(|column| needed.is_needed(column.binding.id));
+        let any = self.columns.iter().any(|column| needed.is_needed(column.binding));
         let mut i = 0;
         self.columns.retain(|column| {
-            let keep = needed.is_needed(column.binding.id) || (!any && i == 0);
+            let keep = needed.is_needed(column.binding) || (!any && i == 0);
             i += 1;
             keep
         });
@@ -683,7 +680,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn reads(&self, _: &mut Needed) {}
 
     fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
-        let found = self.columns.iter_mut().find(|c| c.binding.id == column);
+        let found = self.columns.iter_mut().find(|c| c.binding == column);
         // Chosen once: a column chosen already is loaded already.
         let Some(scanned) = found.filter(|scanned| scanned.forms == Forms::FLAT) else {
             return Forms::FLAT;
@@ -694,7 +691,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
 
     /// Those on its columns.
     fn takes_condition(&self, column: ColumnId) -> bool {
-        self.columns.iter().any(|scanned| scanned.binding.id == column)
+        self.columns.iter().any(|scanned| scanned.binding == column)
     }
 
     fn take_condition(
@@ -704,7 +701,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         column: ColumnId,
         condition: Conjuncts,
     ) -> Result<(), AllocError> {
-        let Some(scanned) = self.columns.iter().find(|c| c.binding.id == column) else {
+        let Some(scanned) = self.columns.iter().find(|c| c.binding == column) else {
             failed!();
         };
         let data_type = self.scannable.column_type(scanned.column);
@@ -749,7 +746,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
     /// Its scannable's.
     fn summary(&self, column: Option<ColumnId>) -> Option<Summary> {
         let scanned = match column {
-            Some(column) => Some(self.columns.iter().find(|c| c.binding.id == column)?.column),
+            Some(column) => Some(self.columns.iter().find(|c| c.binding == column)?.column),
             None => None,
         };
         self.scannable.summary(scanned)
@@ -764,10 +761,10 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let rows = summary.and_then(|summary| u64::try_from(summary.rows).ok());
         let mut out = Estimate::of(rows.map_or(RowEstimate::UNKNOWN, RowEstimate::exactly));
         for scanned in self.columns.iter() {
-            out.add_key(scanned.binding.id, self.scannable.column_key(scanned.column));
+            out.add_key(scanned.binding, self.scannable.column_key(scanned.column));
             let summary = self.scannable.summary(Some(scanned.column));
             if let Some(bounds) = summary.and_then(|summary| summary.bounds) {
-                out.add_bounds(scanned.binding.id, bounds);
+                out.add_bounds(scanned.binding, bounds);
             }
         }
         if self.conditions.as_ref().is_some_and(|conditions| !conditions.is_empty()) {
@@ -782,12 +779,12 @@ impl<'c> Op<'c> for ScanOp<'c> {
     fn derive(&self, c: &mut DeriveContext<'_, 'c>) -> Result<OutputProperties, LowerError> {
         let mut out = OutputProperties::NONE;
         for column in self.columns.iter() {
-            out.push_column(c.column_of(column.binding.id))?;
+            out.push_column(c.column_of(column.binding))?;
         }
         out.scan = Some(c.node());
         let read = |&(column, descending): &(u32, bool)| {
             let read = self.columns.iter().find(|read| read.column == column);
-            read.map(|read| SortKey { column: read.binding.id, descending })
+            read.map(|read| SortKey { column: read.binding, descending })
         };
         for order in self.scannable.sorted_by() {
             let mut sorted = [SortKey { column: 0, descending: false }; ARRANGEMENT_KEYS_MAX];
@@ -810,7 +807,7 @@ impl<'c> Op<'c> for ScanOp<'c> {
         let read = self.columns.iter().map(|column| (column.column, column.forms));
         let conditions = self.conditions.as_deref().unwrap_or(&[]);
         let cutoff = lowering.query_cutoff(node).map(|(key, slot)| {
-            let Some(scanned) = self.columns.iter().find(|c| c.binding.id == key.column) else {
+            let Some(scanned) = self.columns.iter().find(|c| c.binding == key.column) else {
                 failed!()
             };
             Cutoff { slot, column: scanned.column, descending: key.descending }

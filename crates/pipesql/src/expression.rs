@@ -5,7 +5,7 @@ use pipit_kernel::column::DataType;
 use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::Expr;
 use pipit_kernel::function::DynFunction;
-use pipit_kernel::query::{Binary, Builder, Unary, Value};
+use pipit_kernel::query::{Binary, Unary, Value};
 
 use crate::ast::{Node, Operator, Tag};
 use crate::compile::Compiler;
@@ -80,7 +80,7 @@ fn compile_node(compiler: &mut Compiler<'_, '_>, node: Node, depth: usize) -> Re
     let value = match node.tag() {
         Tag::Name if is_null(compiler, node) => compiler.builder.null()?,
         Tag::Name => {
-            let column = Builder::column(compiler.find_column(node)?.id);
+            let column = compiler.find_column(node)?.column;
             compiler.builder.column_value(column)?
         }
         Tag::Integer => {

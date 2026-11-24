@@ -7,11 +7,11 @@ use pipit_kernel::containers::SmallVec;
 use pipit_kernel::expression::Expr;
 use pipit_kernel::join::JoinKind;
 use pipit_kernel::names::Name;
-use pipit_kernel::plan::{NamedColumn, PLAN_COLUMNS_MAX};
-use pipit_kernel::query::{Binary, Builder, Extension, Order};
+use pipit_kernel::plan::PLAN_COLUMNS_MAX;
+use pipit_kernel::query::{Binary, Extension, Order};
 
 use crate::ast::{Node, Operator, Tag};
-use crate::compile::Compiler;
+use crate::compile::{Compiler, Named};
 use crate::error::{Error, ErrorCode, Unsupported};
 use crate::expression::{compile_expr, finish_expr, is_null};
 use crate::keywords::same_word;
@@ -252,8 +252,8 @@ fn join(
     let build = compiler.compile_relation(table)?;
     compiler.add_alias(alias_or(compiler, alias, table)?, &build.columns)?;
     let probe = compiler.rows();
-    let probe = (probe, compiler.scope.iter().map(|column| Builder::column(column.id)));
-    let build_columns = build.columns.iter().map(|column| Builder::column(column.id));
+    let probe = (probe, compiler.scope.iter().map(|named| named.column));
+    let build_columns = build.columns.iter().map(|named| named.column);
     let joining = compiler.builder.join(kind, probe, (build.rows, build_columns))?;
     let condition = match condition {
         Some((on, using)) if on.child_count() == 0 && using.child_count() == 0 => {
@@ -284,7 +284,7 @@ fn join(
 /// rest of `build`'s.
 fn using_columns(
     compiler: &mut Compiler<'_, '_>,
-    build: &[NamedColumn],
+    build: &[Named],
     using: Node,
 ) -> Result<Expr, Error> {
     let env = compiler.env();
@@ -295,27 +295,27 @@ fn using_columns(
     for i in 0..using.child_count() {
         let name = listed_once(compiler, using, i, 0)?;
         let (left, right) = (compiler.find_column(name)?, compiler.find_in(build, name)?);
-        let a = compiler.builder.column_value(Builder::column(left.id))?;
-        let b = compiler.builder.column_value(Builder::column(right.id))?;
+        let a = compiler.builder.column_value(left.column)?;
+        let b = compiler.builder.column_value(right.column)?;
         let mut equal = compiler.builder.binary(Binary::Equal, a, b)?;
         if let Some(before) = before {
             equal = compiler.builder.binary(Binary::And, before, equal)?;
         }
         before = Some(equal);
         scope.push(left)?;
-        joined.push(right.id)?;
+        joined.push(right.column)?;
     }
     // The rest of the rows so far's, even another name for a column joined
     // on, or a second copy of one.
     let joined_on = scope.len();
     for column in compiler.scope.iter() {
-        let named = |joined: &NamedColumn| (joined.name, joined.id) == (column.name, column.id);
+        let named = |joined: &Named| joined == column;
         if !at!(scope, ..joined_on).iter().any(named) {
             scope.push(*column)?;
         }
     }
     for column in build {
-        if !joined.contains(&column.id) {
+        if !joined.contains(&column.column) {
             scope.push(*column)?;
         }
     }
@@ -361,7 +361,7 @@ fn project(compiler: &mut Compiler<'_, '_>, stage: Node, extend: bool) -> Result
     for i in 0..list.child_count() {
         let (value, alias) = unalias(compiler, compiler.node(list.first_child() + i));
         let name = match alias {
-            Some(alias) => Some(compiler.builder.plan.names.add(compiler.text(alias.span()))?),
+            Some(alias) => Some(compiler.add_name(alias.span())?),
             None => None,
         };
         scope.push(value_of(compiler, value, name, &mut extension)?)?;
@@ -387,12 +387,12 @@ fn unalias(compiler: &Compiler<'_, '_>, item: Node) -> (Node, Option<Node>) {
 /// `column`, under the name `alias` if there is one.
 fn named(
     compiler: &mut Compiler<'_, '_>,
-    column: NamedColumn,
+    column: Named,
     alias: Option<Node>,
-) -> Result<NamedColumn, Error> {
+) -> Result<Named, Error> {
     let Some(alias) = alias else { return Ok(column) };
-    let name = compiler.builder.plan.names.add(compiler.text(alias.span()))?;
-    Ok(NamedColumn { name, id: column.id })
+    let name = compiler.add_name(alias.span())?;
+    Ok(Named { name, column: column.column })
 }
 
 /// `DROP a, b`: removes every column named `a` or `b`. One must be left.
@@ -403,9 +403,8 @@ fn compile_drop(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), Erro
     for i in 0..list.child_count() {
         let name = listed_once(compiler, list, i, 0)?;
         let text = compiler.text(name.span()).as_bytes();
-        let kept = |column: &NamedColumn| {
-            !same_word(compiler.builder.plan.names.get(column.name).as_bytes(), text)
-        };
+        let kept =
+            |column: &Named| !same_word(compiler.builder.names().get(column.name).as_bytes(), text);
         if scope.iter().all(kept) {
             return Err(Error::new(ErrorCode::UnknownColumn, name.span()));
         }
@@ -454,10 +453,10 @@ fn change_in_place(
         let column = at_mut!(scope, at);
         if renames {
             let alias = compiler.node(item.first_child() + 1);
-            column.name = compiler.builder.plan.names.add(compiler.text(alias.span()))?;
+            column.name = compiler.add_name(alias.span())?;
         } else {
             let value = compiler.node(item.first_child());
-            column.id = value_of(compiler, value, Some(found.name), &mut extension)?.id;
+            column.column = value_of(compiler, value, Some(found.name), &mut extension)?.column;
         }
     }
     let rows = compiler.builder.extended(extension)?;
@@ -494,17 +493,17 @@ fn value_of(
     value: Node,
     name: Option<Name>,
     extension: &mut Extension,
-) -> Result<NamedColumn, Error> {
+) -> Result<Named, Error> {
     if value.tag() == Tag::Name && !is_null(compiler, value) {
         let column = compiler.find_column(value)?;
-        return Ok(NamedColumn { name: name.unwrap_or(column.name), id: column.id });
+        return Ok(Named { name: name.unwrap_or(column.name), column: column.column });
     }
     let Some(name) = name else {
         return Err(Error::new(ErrorCode::ExpectedName, compiler.span(value)));
     };
     let (expr, data_type) = compile_expr(compiler, value)?;
-    let column = compiler.builder.compute(extension, name, expr, data_type)?;
-    Ok(NamedColumn { name, id: Builder::column_id(column) })
+    let column = compiler.builder.compute(extension, expr, data_type)?;
+    Ok(Named { name, column: (column) })
 }
 
 /// `ORDER BY a, b DESC`: the rows sorted by `a`, then `b` descending,
@@ -520,7 +519,7 @@ fn compile_order_by(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(), 
         if column.tag() != Tag::Name {
             return Err(unsupported);
         }
-        let column = Builder::column(compiler.find_column(column)?.id);
+        let column = compiler.find_column(column)?.column;
         sorting.by(column, if key.descending() { Order::Descending } else { Order::Ascending })?;
     }
     let rows = compiler.builder.sorted(sorting)?;
@@ -572,11 +571,11 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
     for i in 0..by.child_count() {
         let (key, alias) = unalias(compiler, compiler.node(by.first_child() + i));
         let column = input_column(compiler, key, alias, &mut extension)?;
-        let data_type = at!(compiler.builder.plan.columns, column.id as usize).data_type;
+        let data_type = compiler.builder.column_type(column.column);
         if !matches!(data_type, DataType::Int64 | DataType::String) {
             return Err(Error::unsupported(Unsupported::GroupKey, compiler.span(key)));
         }
-        grouping.by(Builder::column(column.id))?;
+        grouping.by(column.column)?;
         scope.push(named(compiler, column, alias)?)?;
     }
     for i in 0..list.child_count() {
@@ -599,24 +598,22 @@ fn compile_aggregate(compiler: &mut Compiler<'_, '_>, stage: Node) -> Result<(),
         let (function, input) = match argument.tag() {
             Tag::Star if function == Function::Count && !distinct => (Function::CountStar, None),
             Tag::Star => return Err(unsupported),
-            _ => (function, Some(input_column(compiler, argument, alias, &mut extension)?.id)),
+            _ => (function, Some(input_column(compiler, argument, alias, &mut extension)?.column)),
         };
-        let input_type = input.map_or(DataType::Int64, |id| {
-            at!(compiler.builder.plan.columns, id as usize).data_type
-        });
+        let input_type =
+            input.map_or(DataType::Int64, |column| compiler.builder.column_type(column));
         if input.is_some() && !function.reads(input_type) {
             return Err(Error::unsupported(Unsupported::AggregateType, span));
         }
         let name = if let Some(alias) = alias {
-            compiler.builder.plan.names.add(compiler.text(alias.span()))?
+            compiler.add_name(alias.span())?
         } else {
             // Unnamed, the argument is `*` or a column's name.
             let argument = if input.is_some() { compiler.text(argument.span()) } else { "*" };
             aggregate_name(compiler, function_name, distinct, argument)?
         };
-        let input = input.map(Builder::column);
-        let column = compiler.builder.aggregate(&mut grouping, name, function, input, distinct)?;
-        scope.push(NamedColumn { name, id: Builder::column_id(column) })?;
+        let column = compiler.builder.aggregate(&mut grouping, function, input, distinct)?;
+        scope.push(Named { name, column: (column) })?;
     }
     let rows = compiler.builder.extended(extension)?;
     let rows = compiler.builder.grouped(rows, grouping)?;
@@ -633,12 +630,12 @@ fn input_column(
     value: Node,
     alias: Option<Node>,
     extension: &mut Extension,
-) -> Result<NamedColumn, Error> {
+) -> Result<Named, Error> {
     if value.tag() == Tag::Name && !is_null(compiler, value) {
         return compiler.find_column(value);
     }
     let name = match alias {
-        Some(alias) => Some(compiler.builder.plan.names.add(compiler.text(alias.span()))?),
+        Some(alias) => Some(compiler.add_name(alias.span())?),
         None => None,
     };
     value_of(compiler, value, name, extension)
@@ -652,7 +649,7 @@ fn aggregate_name(
     argument: &str,
 ) -> Result<Name, Error> {
     let distinct = if distinct { "DISTINCT " } else { "" };
-    Ok(compiler.builder.plan.names.add_parts(&[function, "(", distinct, argument, ")"])?)
+    Ok(compiler.builder.names_mut().add_parts(&[function, "(", distinct, argument, ")"])?)
 }
 
 #[cfg(test)]

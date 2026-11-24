@@ -383,7 +383,7 @@ mod tests {
             let b = plan.add_column("b", DataType::Int64, false).unwrap();
             let scanned = [a, b].into_iter().zip(0..2).map(|(binding, column)| ScanColumn {
                 column,
-                binding,
+                binding: binding.id,
                 forms: Forms::FLAT,
             });
             let columns = SmallVec::fixed_from(env, scanned).unwrap();

@@ -445,8 +445,8 @@ mod tests {
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
         let b = plan.add_column("b", DataType::Int64, true).unwrap();
         let mut columns = SmallVec::fixed(env, 2).unwrap();
-        let a_column = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
-        let b_column = ScanColumn { column: 1, binding: b, forms: Forms::FLAT };
+        let a_column = ScanColumn { column: 0, binding: a.id, forms: Forms::FLAT };
+        let b_column = ScanColumn { column: 1, binding: b.id, forms: Forms::FLAT };
         assert!(columns.push(a_column).is_ok() && columns.push(b_column).is_ok());
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
         plan.add_node(scan, &[]).unwrap();
@@ -522,7 +522,11 @@ mod tests {
         let mut columns = SmallVec::fixed(env, read.len()).unwrap();
         for &column in read {
             let binding = bindings[column as usize];
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
@@ -575,7 +579,11 @@ mod tests {
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             bindings.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
@@ -583,8 +591,12 @@ mod tests {
         if let Some(groups) = groups {
             let binding = plan.add_column("n", DataType::Int64, true).unwrap();
             let function = crate::aggregate::Function::CountStar;
-            let aggregate =
-                crate::aggregate::Aggregate { function, input: None, distinct: false, binding };
+            let aggregate = crate::aggregate::Aggregate {
+                function,
+                input: None,
+                distinct: false,
+                binding: binding.id,
+            };
             let aggregate = crate::aggregate::AggregateOp {
                 keys: SmallVec::fixed_from(env, groups.iter().map(|&g| bindings[g].id)).unwrap(),
                 aggregates: SmallVec::fixed_from(env, [aggregate].into_iter()).unwrap(),
@@ -649,7 +661,11 @@ mod tests {
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             ids.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
@@ -674,7 +690,11 @@ mod tests {
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             bindings.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
@@ -782,7 +802,11 @@ mod tests {
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             bindings.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
@@ -857,7 +881,11 @@ mod tests {
             let mut columns = SmallVec::fixed(env, 70).unwrap();
             for column in 0..70 {
                 let binding = plan.add_column("c", DataType::Int64, true).unwrap();
-                assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+                assert!(
+                    columns
+                        .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                        .is_ok()
+                );
                 if (column as usize) < output {
                     assert!(plan.output.push(binding).is_ok());
                 }
@@ -1012,7 +1040,11 @@ mod tests {
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b"), (2, "c")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             bindings.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(table, columns)).unwrap();
@@ -1124,7 +1156,11 @@ mod tests {
         let mut ids = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             ids.push(binding.id);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
@@ -1144,7 +1180,7 @@ mod tests {
             let children = [node];
             node = plan.add_node(op, &children).unwrap();
         }
-        let a = NamedColumn { name: plan.columns[0].name, id: ids[0] };
+        let a = NamedColumn { name: plan.names.add("a").unwrap(), id: ids[0] };
         assert!(plan.output.push(a).is_ok());
         crate::optimize::optimize(env, &mut plan).unwrap();
         lower_planned(&mut plan).unwrap();
@@ -1245,7 +1281,7 @@ mod tests {
         let table = DynScannable::new(env, table).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
         let a = plan.add_column("a", DataType::Int64, false).unwrap();
-        let read = ScanColumn { column: 0, binding: a, forms: Forms::FLAT };
+        let read = ScanColumn { column: 0, binding: a.id, forms: Forms::FLAT };
         let columns = SmallVec::fixed_from(env, [read].into_iter()).unwrap();
         let scan = plan.add_node(DynOp::new(env, ScanOp::new(&table, columns)).unwrap(), &[]);
         let key = SortKey { column: a.id, descending: false };
@@ -1319,7 +1355,7 @@ mod tests {
         let table = DynScannable::new(env, Summarized { knows }).unwrap();
         let mut plan = LogicalPlan::new(env).unwrap();
         let a = plan.add_column("a", DataType::Int64, true).unwrap();
-        let columns = [ScanColumn { column: 0, binding: a, forms: Forms::FLAT }];
+        let columns = [ScanColumn { column: 0, binding: a.id, forms: Forms::FLAT }];
         let columns = SmallVec::fixed_from(env, columns.into_iter()).unwrap();
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();
         let scan = plan.add_node(scan, &[]).unwrap();
@@ -1328,7 +1364,7 @@ mod tests {
             [(Function::CountStar, None), (Function::Min, Some(a.id)), (Function::Max, Some(a.id))]
         {
             let binding = plan.add_column("x", DataType::Int64, true).unwrap();
-            aggregates.push(Aggregate { function, input, distinct: false, binding });
+            aggregates.push(Aggregate { function, input, distinct: false, binding: binding.id });
             assert!(plan.output.push(binding).is_ok());
         }
         let aggregate = AggregateOp {
@@ -1399,7 +1435,11 @@ mod tests {
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
             let binding = plan.add_column(name, DataType::Int64, true).unwrap();
-            assert!(columns.push(ScanColumn { column, binding, forms: Forms::FLAT }).is_ok());
+            assert!(
+                columns
+                    .push(ScanColumn { column, binding: binding.id, forms: Forms::FLAT })
+                    .is_ok()
+            );
             bindings.push(binding);
         }
         let scan = DynOp::new(env, ScanOp::new(&table, columns)).unwrap();

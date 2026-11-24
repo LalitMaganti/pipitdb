@@ -22,10 +22,11 @@ use crate::function::DynFunction;
 pub use crate::join::JoinKind;
 use crate::join::JoinOp;
 use crate::limit::LimitOp;
-use crate::names::Name;
+use crate::names::{Name, Names};
 use crate::order_by::OrderByOp;
 use crate::plan::{
-    ColumnId, DynOp, FilterOp, LogicalPlan, PlanNodeId, ScanColumn, ScanOp, SortKey, conjuncts_of,
+    ColumnId, DynOp, FilterOp, LogicalPlan, NamedColumn, PlanNodeId, ScanColumn, ScanOp, SortKey,
+    conjuncts_of,
 };
 use crate::scannable::DynScannable;
 
@@ -211,11 +212,41 @@ impl<'e> Builder<'e> {
         Ok(Builder { env, plan: LogicalPlan::new(env)?, nodes: ExprBuilder::new(env)? })
     }
 
-    /// The query whose rows are those of `relation`.
+    /// The query whose rows are those of `relation`, and whose columns are
+    /// `output`, each named.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::OutOfMemory`] if `env` has too little left.
     #[expect(clippy::needless_pass_by_value, reason = "a relation is read once")]
-    pub fn finish(mut self, relation: Relation) -> Query<'e> {
+    pub fn finish(
+        mut self,
+        relation: Relation,
+        output: impl Iterator<Item = (Column, Name)>,
+    ) -> Result<Query<'e>, Error> {
+        for (column, name) in output {
+            self.plan.output.push(NamedColumn { name, id: column.0 })?;
+        }
         self.plan.root = relation.0;
-        Query { plan: self.plan }
+        Ok(Query { plan: self.plan })
+    }
+
+    /// The query's names, which its output's are among, and a front end's,
+    /// such as of the columns in its scope.
+    #[must_use]
+    pub fn names(&self) -> &Names {
+        &self.plan.names
+    }
+
+    /// As [`Builder::names`], to add names to.
+    pub fn names_mut(&mut self) -> &mut Names {
+        &mut self.plan.names
+    }
+
+    /// The type of `column`'s values.
+    #[must_use]
+    pub fn column_type(&self, column: Column) -> DataType {
+        at!(self.plan.columns, column.0 as usize).data_type
     }
 
     /// The rows of `table`, of each of its columns, in order.
@@ -230,8 +261,8 @@ impl<'e> Builder<'e> {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_COLUMNS_MAX`")]
         let first = self.plan.columns.len() as ColumnId;
         for column in 0..count {
-            let (name, data_type) = (table.column_name(column), table.column_type(column));
-            let binding = self.plan.add_column(name, data_type, table.column_nullable(column))?;
+            let data_type = table.column_type(column);
+            let binding = self.plan.add_unnamed_column(data_type, table.column_nullable(column))?;
             reads.push(ScanColumn { column, binding, forms: Forms::FLAT })?;
         }
         let node = self.plan.add_node(DynOp::new(self.env, ScanOp::new(table, reads))?, &[])?;
@@ -301,8 +332,8 @@ impl<'e> Builder<'e> {
         Ok(Extension { relation, items: SmallVec::fixed(self.env, len)? })
     }
 
-    /// A column of `extension`, named `name`, of `expr`, of type
-    /// `data_type`, computed for each row.
+    /// A column of `extension`, of `expr`, of type `data_type`, computed
+    /// for each row.
     ///
     /// # Errors
     ///
@@ -310,15 +341,14 @@ impl<'e> Builder<'e> {
     pub fn compute(
         &mut self,
         extension: &mut Extension,
-        name: Name,
         expr: Expr,
         data_type: DataType,
     ) -> Result<Column, Error> {
         let (columns, nodes) = (&self.plan.columns, self.plan.exprs.nodes(expr));
         let nullable = expr_can_be_null(nodes, &|column| at!(columns, column as usize).nullable);
-        let column = self.plan.add_named_column(name, data_type, nullable)?;
-        extension.items.push(ComputeItem { output: column.id, expr })?;
-        Ok(Column(column.id))
+        let column = self.plan.add_unnamed_column(data_type, nullable)?;
+        extension.items.push(ComputeItem { output: column, expr })?;
+        Ok(Column(column))
     }
 
     /// The rows of `extension`, with its columns.
@@ -345,7 +375,7 @@ impl<'e> Builder<'e> {
         Ok(Grouping { keys, aggregates: SmallVec::fixed(self.env, aggregates)? })
     }
 
-    /// A column of `grouping`, named `name`: `function` of each group's
+    /// A column of `grouping`: `function` of each group's
     /// values of `input`, of each distinct one if `distinct`, or of its rows
     /// if there's no input.
     ///
@@ -355,7 +385,6 @@ impl<'e> Builder<'e> {
     pub fn aggregate(
         &mut self,
         grouping: &mut Grouping,
-        name: Name,
         function: Function,
         input: Option<Column>,
         distinct: bool,
@@ -366,11 +395,11 @@ impl<'e> Builder<'e> {
         // A count is 0 for a group of nulls, where the others are null.
         let nullable = !matches!(function, Function::CountStar | Function::Count);
         let output_type = function.output_type(input_type);
-        let binding = self.plan.add_named_column(name, output_type, nullable)?;
+        let binding = self.plan.add_unnamed_column(output_type, nullable)?;
         // The least or greatest of the distinct values is that of them all.
         let distinct = distinct && !matches!(function, Function::Min | Function::Max);
         grouping.aggregates.push(Aggregate { function, input, distinct, binding })?;
-        Ok(Column(binding.id))
+        Ok(Column(binding))
     }
 
     /// The rows of `relation`, grouped by `grouping`.
@@ -627,27 +656,5 @@ impl<'e> Builder<'e> {
     #[expect(clippy::needless_pass_by_value, reason = "a relation is read once")]
     fn add(&mut self, op: DynOp<'e>, relation: Relation) -> Result<Relation, Error> {
         Ok(Relation(self.plan.add_node(op, &[relation.0])?))
-    }
-
-    // What front ends not yet building through it reach the plan by.
-
-    #[doc(hidden)]
-    pub fn relation(node: PlanNodeId) -> Relation {
-        Relation(node)
-    }
-
-    #[doc(hidden)]
-    pub fn node(relation: &Relation) -> PlanNodeId {
-        relation.0
-    }
-
-    #[doc(hidden)]
-    pub fn column_id(column: Column) -> ColumnId {
-        column.0
-    }
-
-    #[doc(hidden)]
-    pub fn column(id: ColumnId) -> Column {
-        Column(id)
     }
 }
