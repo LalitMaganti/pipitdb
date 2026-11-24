@@ -2,7 +2,7 @@
 //! equivalence sets it joins on. `docs/join-planner.md` gives each rule's
 //! source.
 
-use super::graph::{EquivalenceSet, JoinEdge, JoinKind, QueryGraph, Relation, RelationSet};
+use super::graph::{EquivalenceSet, JoinEdge, QueryGraph, Relation, RelationSet};
 
 /// The most rows an estimate reaches.
 #[expect(clippy::cast_precision_loss, reason = "a limit, not a count")]
@@ -28,18 +28,6 @@ struct Pair {
     count: u32,
 }
 
-/// A non-inner edge that applies to the join being estimated.
-#[derive(Clone, Copy)]
-struct Kept {
-    /// Which rows it returns.
-    kind: JoinKind,
-    /// The rows of the side whose rows it keeps.
-    rows: f64,
-    /// The share of those rows that match: the other side's distinct key
-    /// values over the domain, at most 1.
-    matched: f64,
-}
-
 /// Estimates the rows of joins, with memory it's given and reuses from one
 /// join to the next. A join is estimated by `start`, then `apply` for each
 /// edge it applies, then `finish`.
@@ -61,12 +49,8 @@ pub struct Estimator<'a> {
     stamps: &'a mut [u64],
     /// The join being estimated, numbered from 1.
     stamp: u64,
-    /// The join's rows as an inner join, by the edges applied so far.
+    /// The join's rows by the edges applied so far.
     rows: f64,
-    /// The rows of its left and right sides.
-    sides: [f64; 2],
-    /// The non-inner edge that applies, if any.
-    kept: Option<Kept>,
 }
 
 impl<'a> Estimator<'a> {
@@ -80,22 +64,11 @@ impl<'a> Estimator<'a> {
     /// `Estimator::stamps` says.
     pub fn new(graph: &'a QueryGraph, stamps: &'a mut [u64]) -> Estimator<'a> {
         stamps.fill(0);
-        let (divided, stamp, rows, sides, kept) = (0, 0, 0.0, [0.0; 2], None);
+        let (divided, stamp, rows) = (0, 0, 0.0);
         let (equivalences, relations) = (&*graph.equivalences, &*graph.relations);
         let pair = Pair { relations: [0; 2], product: 1.0, largest: 0.0, count: 0 };
         let (pairs, pairs_len) = ([pair; PAIRS_MAX], 0);
-        Estimator {
-            equivalences,
-            relations,
-            pairs,
-            pairs_len,
-            divided,
-            stamps,
-            stamp,
-            rows,
-            sides,
-            kept,
-        }
+        Estimator { equivalences, relations, pairs, pairs_len, divided, stamps, stamp, rows }
     }
 
     /// Starts estimating a join of sides of `left_rows` and `right_rows`.
@@ -103,23 +76,14 @@ impl<'a> Estimator<'a> {
     #[inline(never)]
     pub fn start(&mut self, left_rows: f64, right_rows: f64) {
         (self.divided, self.stamp, self.pairs_len) = (0, self.stamp + 1, 0);
-        (self.rows, self.sides, self.kept) =
-            (left_rows * right_rows, [left_rows, right_rows], None);
+        self.rows = left_rows * right_rows;
     }
 
-    /// Applies `edge` to the join. `forward` is whether the edge's `left` is
-    /// on the join's left side.
-    pub fn apply(&mut self, edge: &JoinEdge, forward: bool) {
+    /// Applies `edge` to the join.
+    pub fn apply(&mut self, edge: &JoinEdge) {
         let domain = at!(self.equivalences, edge.equivalence as usize).domain;
         #[expect(clippy::cast_precision_loss, reason = "an estimate")]
         let domain = domain.max(1) as f64;
-        if edge.kind != JoinKind::Inner {
-            let [left, right] = self.sides;
-            let (rows, other) = if forward { (left, right) } else { (right, left) };
-            // The other side has at most as many distinct key values as rows.
-            let matched = other.min(domain) / domain;
-            self.kept = Some(Kept { kind: edge.kind, rows, matched });
-        }
         let set = edge.equivalence as usize;
         let fresh = if let Some(at) = set.checked_sub(64) {
             let stamp = at_mut!(self.stamps, at);
@@ -139,7 +103,8 @@ impl<'a> Estimator<'a> {
     /// two single relations.
     fn add_to_pair(&mut self, edge: &JoinEdge, domain: f64) {
         let single = |set: &RelationSet| {
-            (set.count() == 1 && set.word(0) != 0).then(|| set.word(0).trailing_zeros())
+            let alone = set.word(0).is_power_of_two() && (1..set.words()).all(|i| set.word(i) == 0);
+            alone.then(|| set.word(0).trailing_zeros())
         };
         let (Some(a), Some(b)) = (single(&edge.left), single(&edge.right)) else { return };
         let relations = [a.min(b), a.max(b)];
@@ -160,21 +125,15 @@ impl<'a> Estimator<'a> {
         // whose values aren't independent: they divide once, by the smaller
         // relation's rows, as DuckDB's `ApplyJoinPairCap` has it, unless that's
         // far more than any one of them could be.
-        let mut inner = self.rows;
+        let mut rows = self.rows;
         for pair in at!(self.pairs, ..self.pairs_len).iter().filter(|pair| pair.count > 1) {
-            let [a, b] = pair.relations.map(|r| at!(self.relations, r as usize).unfiltered_rows);
+            let [a, b] = pair.relations.map(|r| at!(self.relations, r as usize).max_rows);
             #[expect(clippy::cast_precision_loss, reason = "an estimate")]
             let cap = a.min(b).max(1) as f64;
             if cap <= pair.largest * CAP_RATIO_MAX {
-                inner = inner * pair.product / cap;
+                rows = rows * pair.product / cap;
             }
         }
-        let rows = match self.kept {
-            None => inner,
-            Some(Kept { kind: JoinKind::Left, rows, .. }) => inner.max(rows),
-            Some(Kept { kind: JoinKind::Semi, rows, matched }) => rows * matched,
-            Some(Kept { rows, matched, .. }) => rows * (1.0 - matched),
-        };
         rows.min(ROWS_MAX)
     }
 }
@@ -185,54 +144,39 @@ mod tests {
     use crate::env::Env;
     use crate::join_planner::{QueryGraph, RelationSet};
 
-    /// A graph with equivalence sets of domains 10 and 100, and an edge of
-    /// each kind on the first.
+    /// A graph with equivalence sets of domains 10 and 100, and an edge on
+    /// each.
     fn graph() -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for domain in [10, 100] {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
         }
-        for kind in [JoinKind::Inner, JoinKind::Left, JoinKind::Semi, JoinKind::Anti] {
+        for equivalence in [0, 1] {
             let (left, right) = (
                 RelationSet::new(Env::current()).unwrap(),
                 RelationSet::new(Env::current()).unwrap(),
             );
-            graph.edges.push(JoinEdge { left, right, kind, equivalence: 0 }).unwrap();
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
-        let (left, right) =
-            (RelationSet::new(Env::current()).unwrap(), RelationSet::new(Env::current()).unwrap());
-        graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence: 1 }).unwrap();
         graph
     }
 
     /// The rows of joining 1000 rows to 4, by edges `edges` of `graph()`.
-    fn rows(edges: &[usize], forward: bool) -> f64 {
+    fn rows(edges: &[usize]) -> f64 {
         let graph = graph();
         let mut estimator = Estimator::new(&graph, &mut []);
         estimator.start(1000.0, 4.0);
         for &edge in edges {
-            estimator.apply(at!(graph.edges, edge), forward);
+            estimator.apply(at!(graph.edges, edge));
         }
         estimator.finish()
     }
 
     #[test]
     fn inner_joins_divide_by_each_domain_once() {
-        assert!((rows(&[], true) - 4000.0).abs() < 1e-9);
-        assert!((rows(&[0, 0], true) - 400.0).abs() < 1e-9);
-        assert!((rows(&[0, 4], true) - 4.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn outer_semi_and_anti_joins_keep_a_side() {
-        // A left join keeps all 1000 left rows, more than the 400 that match.
-        assert!((rows(&[1], true) - 1000.0).abs() < 1e-9);
-        // The 4 right rows hold at most 4 of the 10 values: 40% match.
-        assert!((rows(&[2], true) - 400.0).abs() < 1e-9);
-        assert!((rows(&[3], true) - 600.0).abs() < 1e-9);
-        // Keeping the right side's 4 rows: the 1000 left rows hold every value.
-        assert!((rows(&[2], false) - 4.0).abs() < 1e-9);
-        assert!(rows(&[3], false).abs() < 1e-9);
+        assert!((rows(&[]) - 4000.0).abs() < 1e-9);
+        assert!((rows(&[0, 0]) - 400.0).abs() < 1e-9);
+        assert!((rows(&[0, 1]) - 4.0).abs() < 1e-9);
     }
 
     /// The rows of joining relations of 6000 and 800 rows on two keys, of
@@ -241,7 +185,7 @@ mod tests {
         let env = Env::current();
         let mut graph = QueryGraph::new(env).unwrap();
         for rows in [6000, 800] {
-            let relation = Relation { rows, unfiltered_rows: rows, max_rows: rows };
+            let relation = Relation { rows, max_rows: rows };
             graph.relations.push(relation).unwrap();
         }
         for (equivalence, domain) in (0..).zip(domains) {
@@ -250,12 +194,12 @@ mod tests {
                 (RelationSet::new(env).unwrap(), RelationSet::new(env).unwrap());
             left.insert(0).unwrap();
             right.insert(1).unwrap();
-            graph.edges.push(JoinEdge { left, right, kind: JoinKind::Inner, equivalence }).unwrap();
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
         let mut estimator = Estimator::new(&graph, &mut []);
         estimator.start(6000.0, 800.0);
         for edge in graph.edges.iter() {
-            estimator.apply(edge, true);
+            estimator.apply(edge);
         }
         estimator.finish()
     }

@@ -245,7 +245,7 @@ impl Greedy<'_, '_> {
                         continue;
                     }
                     self.estimator.start(self.rows(left), self.rows(right));
-                    self.estimator.apply(edge, true);
+                    self.estimator.apply(edge);
                     let (rows, mut i) = (self.estimator.finish(), TOP - 1);
                     if rows < at!(top, i).0 {
                         *at_mut!(top, i) = (rows, e);
@@ -343,7 +343,7 @@ impl Greedy<'_, '_> {
         for _ in 0..count {
             let [left, right] = self.trees(e);
             if left == a && right == b || left == b && right == a {
-                self.estimator.apply(at!(graph.edges, e), left == a);
+                self.estimator.apply(at!(graph.edges, e));
             }
             e = if e + 1 == graph.edges.len() { 0 } else { e + 1 };
         }
@@ -355,16 +355,14 @@ impl Greedy<'_, '_> {
 mod tests {
     use super::*;
     use crate::env::Env;
-    use crate::join_planner::{
-        EquivalenceSet, JoinEdge, JoinKind, JoinNode, Relation, RelationSet,
-    };
+    use crate::join_planner::{EquivalenceSet, JoinEdge, JoinNode, Relation, RelationSet};
 
     /// A graph of relations of `rows`, each a pair of rows and the most rows,
     /// and inner joins between pairs of relations on domains of `edges`.
     fn graph(rows: &[(u64, u64)], edges: &[(u32, u32, u64)]) -> QueryGraph {
         let mut graph = QueryGraph::new(Env::current()).unwrap();
         for &(rows, max_rows) in rows {
-            graph.relations.push(Relation { rows, unfiltered_rows: rows, max_rows }).unwrap();
+            graph.relations.push(Relation { rows, max_rows }).unwrap();
         }
         for (equivalence, &(left, right, domain)) in (0..).zip(edges) {
             graph.equivalences.push(EquivalenceSet { domain }).unwrap();
@@ -374,8 +372,8 @@ mod tests {
             );
             left_set.insert(left).unwrap();
             right_set.insert(right).unwrap();
-            let (left, right, kind) = (left_set, right_set, JoinKind::Inner);
-            graph.edges.push(JoinEdge { left, right, kind, equivalence }).unwrap();
+            let (left, right) = (left_set, right_set);
+            graph.edges.push(JoinEdge { left, right, equivalence }).unwrap();
         }
         graph
     }

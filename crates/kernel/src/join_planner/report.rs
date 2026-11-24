@@ -9,22 +9,21 @@
 //! - `PIPIT_PLANNERS=plan,...`: runs these; all by default.
 //! - `PIPIT_SHAPES=chain,star,...`: of chain, star, snowflake, cycle, clique, random.
 //! - `PIPIT_SIZES=5,10,...`: relations per graph; 5, 10, 15, 20, 50, 100, 500 by default.
-//! - `PIPIT_JOINS=inner|mixed|both`: inner joins only, about 20% LEFT, SEMI and
-//!   ANTI joins, or both, the default.
 //! - `PIPIT_EXHAUSTIVE=N`: finds the optimum of graphs of up to N relations, 15
 //!   by default.
 //! - `PIPIT_BEST=FILE`: the best known costs, read and updated.
-//! - `PIPIT_GRAPH=NAME`: prints a graph, such as `star-10-mixed`, and runs nothing.
+//! - `PIPIT_GRAPH=NAME`: prints a graph, such as `star-10`, and runs nothing.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::string::{String, ToString};
 use std::time::{Duration, Instant};
 use std::vec::Vec;
-use std::{format, println, vec};
+use std::{format, println};
 
 use super::harness::{
-    EXHAUSTIVE_MAX, Enumerator, SHAPES, Shape, as_written, cost, exhaustive, generate, name, plan,
+    EXHAUSTIVE_MAX, Enumerator, SHAPES, SetOps, Shape, as_written, cost, exhaustive, generate,
+    name, plan,
 };
 use crate::allocator::Heap;
 use crate::env::{Env, Memory};
@@ -96,7 +95,7 @@ fn format_ratio(ratio: f64) -> String {
 fn print_graph(name: &str, graph: &QueryGraph) {
     println!("{name}: {} relations", graph.relations.len());
     for (i, relation) in graph.relations.iter().enumerate() {
-        println!("  r{i}: {} of {} rows", relation.rows, relation.unfiltered_rows);
+        println!("  r{i}: {} of at most {} rows", relation.rows, relation.max_rows);
     }
     let relations = |set: &RelationSet| -> Vec<u32> {
         (0..u32::try_from(graph.relations.len()).unwrap_or(u32::MAX))
@@ -106,9 +105,8 @@ fn print_graph(name: &str, graph: &QueryGraph) {
     for edge in graph.edges.iter() {
         let domain = graph.equivalences.get(edge.equivalence as usize).map_or(0, |e| e.domain);
         println!(
-            "  {:?} {:?} {:?} on e{} (domain {domain})",
+            "  {:?} {:?} on e{} (domain {domain})",
             relations(&edge.left),
-            edge.kind,
             relations(&edge.right),
             edge.equivalence
         );
@@ -120,7 +118,6 @@ struct Options {
     planners: Vec<(&'static str, Enumerator)>,
     shapes: Vec<Shape>,
     sizes: Vec<usize>,
-    mixed: Vec<bool>,
     exhaustive: usize,
     best: Option<String>,
     graph: Option<String>,
@@ -131,7 +128,6 @@ fn options() -> Result<Options, String> {
         planners: Vec::new(),
         shapes: SHAPES.to_vec(),
         sizes: SIZES.to_vec(),
-        mixed: vec![false, true],
         exhaustive: 15,
         best: None,
         graph: None,
@@ -151,14 +147,6 @@ fn options() -> Result<Options, String> {
     }
     if let Some(sizes) = var("PIPIT_SIZES") {
         options.sizes = sizes.split(',').map(str::parse).collect::<Result<_, _>>().map_err(fail)?;
-    }
-    if let Some(joins) = var("PIPIT_JOINS") {
-        options.mixed = match joins.as_str() {
-            "inner" => vec![false],
-            "mixed" => vec![true],
-            "both" => vec![false, true],
-            other => return Err(format!("no joins {other}")),
-        };
     }
     if let Some(exhaustive) = var("PIPIT_EXHAUSTIVE") {
         options.exhaustive = exhaustive.parse::<usize>().map_err(fail)?.min(EXHAUSTIVE_MAX);
@@ -197,11 +185,10 @@ fn report() -> Result<(), String> {
         let parts: Vec<&str> = graph.split('-').collect();
         let shape = SHAPES.into_iter().find(|shape| parts.first() == Some(&shape.name()));
         let size = parts.get(1).and_then(|size| size.parse().ok());
-        let mixed = parts.get(2).map(|&joins| joins == "mixed");
-        let (Some(shape), Some(size @ 2..), Some(mixed)) = (shape, size, mixed) else {
+        let (Some(shape), Some(size @ 2..), 2) = (shape, size, parts.len()) else {
             return Err(format!("no graph {graph}"));
         };
-        print_graph(graph, &generate(shape, size, mixed)?);
+        print_graph(graph, &generate(shape, size)?);
         return Ok(());
     }
     let mut best: HashMap<String, f64> = HashMap::new();
@@ -224,78 +211,76 @@ fn report() -> Result<(), String> {
     );
     for &shape in &options.shapes {
         for &size in &options.sizes {
-            for &mixed in &options.mixed {
-                let name = name(shape, size, mixed);
-                let graph = generate(shape, size, mixed)?;
-                let mut reference = None;
-                if size <= options.exhaustive {
-                    let (tree, optimum) = exhaustive(&graph)?;
-                    let costed = cost(&graph, &tree)?;
-                    if (costed.cost - optimum).abs() > optimum * 1e-9 || costed.valid.is_err() {
-                        return Err(format!(
-                            "{name}: the exhaustive search's plan costs {optimum}, but costs {costed:?}"
-                        ));
+            let name = name(shape, size);
+            let graph = generate(shape, size)?;
+            let mut reference = None;
+            if size <= options.exhaustive {
+                let (tree, optimum) = exhaustive(&graph)?;
+                let costed = cost(&graph, &tree)?;
+                if (costed.cost - optimum).abs() > optimum * 1e-9 || costed.valid.is_err() {
+                    return Err(format!(
+                        "{name}: the exhaustive search's plan costs {optimum}, but costs {costed:?}"
+                    ));
+                }
+                reference = Some((optimum, "opt"));
+            }
+            let outcomes: Vec<Result<Outcome, String>> =
+                options.planners.iter().map(|&(_, p)| run(p, &graph)).collect();
+            let found = outcomes
+                .iter()
+                .filter_map(|o| o.as_ref().ok().filter(|o| o.valid.is_ok()).map(|o| o.cost))
+                .chain(best.get(&name).copied())
+                .reduce(f64::min);
+            if reference.is_none() {
+                reference = found.map(|cost| (cost, "best"));
+            }
+            if let Some(cost) = reference.map(|(cost, _)| cost) {
+                let known = best.entry(name.clone()).or_insert(cost);
+                *known = known.min(cost);
+            }
+            for ((&(planner, _), outcome), summary) in
+                options.planners.iter().zip(&outcomes).zip(&mut summaries)
+            {
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        summary.failed += 1;
+                        println!(
+                            "{name:<20} {:>5} {planner:<14} failed: {error}",
+                            graph.edges.len()
+                        );
+                        continue;
                     }
-                    reference = Some((optimum, "opt"));
+                };
+                let (reference_cost, of) = reference.unwrap_or((f64::NAN, "-"));
+                let ratio = outcome.cost / reference_cost;
+                summary.slowest = summary.slowest.max(outcome.time);
+                match &outcome.valid {
+                    Ok(()) if of == "opt" => {
+                        (summary.log_optimum, summary.optimum) =
+                            (summary.log_optimum + ratio.ln(), summary.optimum + 1);
+                        summary.worst = summary.worst.max(ratio);
+                    }
+                    Ok(()) => {
+                        (summary.log_best, summary.best) =
+                            (summary.log_best + ratio.ln(), summary.best + 1);
+                        summary.worst = summary.worst.max(ratio);
+                    }
+                    Err(_) => summary.invalid += 1,
                 }
-                let outcomes: Vec<Result<Outcome, String>> =
-                    options.planners.iter().map(|&(_, p)| run(p, &graph)).collect();
-                let found = outcomes
-                    .iter()
-                    .filter_map(|o| o.as_ref().ok().filter(|o| o.valid.is_ok()).map(|o| o.cost))
-                    .chain(best.get(&name).copied())
-                    .reduce(f64::min);
-                if reference.is_none() {
-                    reference = found.map(|cost| (cost, "best"));
-                }
-                if let Some(cost) = reference.map(|(cost, _)| cost) {
-                    let known = best.entry(name.clone()).or_insert(cost);
-                    *known = known.min(cost);
-                }
-                for ((&(planner, _), outcome), summary) in
-                    options.planners.iter().zip(&outcomes).zip(&mut summaries)
-                {
-                    let outcome = match outcome {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            summary.failed += 1;
-                            println!(
-                                "{name:<20} {:>5} {planner:<14} failed: {error}",
-                                graph.edges.len()
-                            );
-                            continue;
-                        }
-                    };
-                    let (reference_cost, of) = reference.unwrap_or((f64::NAN, "-"));
-                    let ratio = outcome.cost / reference_cost;
-                    summary.slowest = summary.slowest.max(outcome.time);
+                println!(
+                    "{name:<20} {:>5} {planner:<14} {:>11} {:>11} {of:>4} {:>9} {:>9} {:>10}  {}",
+                    graph.edges.len(),
+                    format_rows(outcome.cost),
+                    format_rows(reference_cost),
+                    format_ratio(ratio),
+                    format_time(outcome.time),
+                    outcome.peak,
                     match &outcome.valid {
-                        Ok(()) if of == "opt" => {
-                            (summary.log_optimum, summary.optimum) =
-                                (summary.log_optimum + ratio.ln(), summary.optimum + 1);
-                            summary.worst = summary.worst.max(ratio);
-                        }
-                        Ok(()) => {
-                            (summary.log_best, summary.best) =
-                                (summary.log_best + ratio.ln(), summary.best + 1);
-                            summary.worst = summary.worst.max(ratio);
-                        }
-                        Err(_) => summary.invalid += 1,
-                    }
-                    println!(
-                        "{name:<20} {:>5} {planner:<14} {:>11} {:>11} {of:>4} {:>9} {:>9} {:>10}  {}",
-                        graph.edges.len(),
-                        format_rows(outcome.cost),
-                        format_rows(reference_cost),
-                        format_ratio(ratio),
-                        format_time(outcome.time),
-                        outcome.peak,
-                        match &outcome.valid {
-                            Ok(()) => "yes".to_string(),
-                            Err(why) => format!("no: {why}"),
-                        },
-                    );
-                }
+                        Ok(()) => "yes".to_string(),
+                        Err(why) => format!("no: {why}"),
+                    },
+                );
             }
         }
     }
