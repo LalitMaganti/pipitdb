@@ -20,9 +20,9 @@ use pipit_kernel::table::Table;
 
 use crate::compile::compile;
 use crate::registry::Registry;
-use crate::stages::{JOINS, RELATIONAL};
+use crate::stages::{AGGREGATION, JOINS, RELATIONAL};
 
-static REGISTRY: Registry = Registry::new(&[RELATIONAL, JOINS]);
+static REGISTRY: Registry = Registry::new(&[RELATIONAL, JOINS, AGGREGATION]);
 
 fn int64s(values: &[Option<i64>]) -> ColumnView {
     let mut buffer = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
@@ -439,9 +439,15 @@ fn joined_expected(keys: &[Vec<Option<i64>>], edges: &[(usize, usize)]) -> Vec<V
     rows
 }
 
-/// A string column of `values`, flat.
+/// A string column of `values`, flat, an empty string null.
 fn strings(values: &[&str]) -> ColumnView {
     let context = &mut Context::new(Env::current(), None);
+    let mut valid =
+        Buffer::allocate(Env::current(), BitSlice::<u8>::words_for(values.len())).unwrap();
+    valid.as_mut_slice::<u8>().fill(0);
+    for (row, value) in values.iter().enumerate() {
+        BitSlice::of_mut(valid.as_mut_slice::<u8>()).set_if(row, !value.is_empty());
+    }
     let bytes: Vec<u8> = values.iter().flat_map(|value| value.bytes()).collect();
     let mut stored = Buffer::allocate(Env::current(), bytes.len()).unwrap();
     stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
@@ -452,60 +458,110 @@ fn strings(values: &[&str]) -> ColumnView {
         view.copy_from_slice(&[at, len]);
         at += len;
     }
-    ColumnView::strings(context, views, stored, None).unwrap()
+    let valid = values.iter().any(|value| value.is_empty()).then_some(valid);
+    ColumnView::strings(context, views, stored, valid).unwrap()
 }
 
 #[test]
 fn joins_on_strings_as_dictionaries_and_constants() {
     // The probe side's string key comes as a dictionary, then a constant;
-    // the build side's as flat strings.
+    // the build side's as flat strings, one null. A row's `pk` is its
+    // number mod 4, and its `pv` or `bv` its number.
     let context = &mut Context::new(Env::current(), None);
-    let dictionary = strings(&["a", "b", "c"]);
-    let rows = BATCH_ROWS_MAX as usize;
-    let mut indices = Buffer::allocate(Env::current(), rows * 4).unwrap();
+    let rows = BATCH_ROWS_MAX;
+    let mut indices = Buffer::allocate(Env::current(), rows as usize * 4).unwrap();
     for (row, index) in (0..).zip(indices.as_mut_slice::<u32>()) {
         *index = row % 3;
     }
-    let numbers = |first: i64, count: usize| -> Vec<Option<i64>> {
-        (first..).take(count).map(Some).collect()
+    let numbers = |rows: core::ops::Range<i64>| -> Vec<Option<i64>> { rows.map(Some).collect() };
+    let keys = |rows: core::ops::Range<i64>| -> Vec<Option<i64>> {
+        rows.map(|row| Some(row % 4)).collect()
     };
-    let keys =
-        |count: usize| -> Vec<Option<i64>> { (0..count as i64).map(|i| Some(i % 4)).collect() };
+    let all = 0..i64::from(rows);
     let probe = [
         [
-            int64s(&keys(rows)),
-            ColumnView::dictionary(context, &dictionary, indices).unwrap(),
-            int64s(&numbers(0, rows)),
+            int64s(&keys(all.clone())),
+            ColumnView::dictionary(context, &strings(&["a", "b", "c"]), indices).unwrap(),
+            int64s(&numbers(all)),
         ],
         [
-            int64s(&keys(10)),
+            int64s(&keys(0..10)),
             ColumnView::constant(context, &strings(&["b"]), 10).unwrap(),
-            int64s(&numbers(rows as i64, 10)),
+            int64s(&numbers(i64::from(rows)..i64::from(rows) + 10)),
         ],
     ];
-    let schema = [("pk", DataType::Int64), ("ps", DataType::String), ("pv", DataType::Int64)];
-    let groups: Vec<&[ColumnView]> = probe.iter().map(|group| &group[..]).collect();
-    let p =
+    let build_strings = ["a", "b", "", "d", "c", "b"];
+    let build = [[int64s(&keys(0..6)), strings(&build_strings), int64s(&numbers(0..6))]];
+    let table = |names: [&str; 3], groups: &[[ColumnView; 3]]| {
+        let groups: Vec<&[ColumnView]> = groups.iter().map(|group| &group[..]).collect();
+        let schema = [
+            (names[0], DataType::Int64),
+            (names[1], DataType::String),
+            (names[2], DataType::Int64),
+        ];
         DynScannable::new(Env::current(), Table::new(Env::current(), &schema, &groups).unwrap())
-            .unwrap();
-    let build_strings = ["a", "b", "b", "d", "c", "b"];
-    let build = [[int64s(&keys(6)), strings(&build_strings), int64s(&numbers(0, 6))]];
-    let schema = [("bk", DataType::Int64), ("bs", DataType::String), ("bv", DataType::Int64)];
-    let groups: Vec<&[ColumnView]> = build.iter().map(|group| &group[..]).collect();
-    let b =
-        DynScannable::new(Env::current(), Table::new(Env::current(), &schema, &groups).unwrap())
-            .unwrap();
+            .unwrap()
+    };
+    let (p, b) = (table(["pk", "ps", "pv"], &probe), table(["bk", "bs", "bv"], &build));
     let tables = Tables(Vec::from([(String::from("p"), &p), (String::from("b"), &b)]));
+    let probe_string = |p: i64| {
+        if p < i64::from(rows) { ["a", "b", "c"][usize::try_from(p % 3).unwrap()] } else { "b" }
+    };
+    let build_string = |b: i64| build_strings[usize::try_from(b).unwrap()];
+    let pairs = (0..i64::from(rows) + 10).flat_map(|p| (0..6).map(move |b| (p, b)));
+    let pairs = pairs.filter(|&(p, b)| p % 4 == b % 4);
     let got = run(&tables, "FROM p |> JOIN b ON pk = bk AND ps = bs |> SELECT pv, bv");
-    let probe_string = |row: usize| if row < rows { ["a", "b", "c"][row % 3] } else { "b" };
-    let mut expected = Vec::new();
-    for p in 0..rows + 10 {
-        for (b, &string) in build_strings.iter().enumerate() {
-            if p % 4 == b % 4 && probe_string(p) == string {
-                expected.push(Vec::from([Some(p as i64), Some(b as i64)]));
-            }
-        }
-    }
+    let mut expected: Vec<Vec<Option<i64>>> = pairs
+        .clone()
+        .filter(|&(p, b)| probe_string(p) == build_string(b) && !build_string(b).is_empty())
+        .map(|(p, b)| Vec::from([Some(p), Some(b)]))
+        .collect();
     expected.sort_unstable();
     assert_eq!(got, expected);
+    // The build side's strings, grouped by: they come out as a dictionary.
+    let query = "FROM p |> JOIN b ON pk = bk |> AGGREGATE count(*) AS n, sum(pv) AS s GROUP BY bs \
+                 |> SELECT n, s";
+    let mut expected: Vec<Vec<Option<i64>>> = ["a", "b", "c", "d", ""]
+        .iter()
+        .map(|&string| {
+            let matched = pairs.clone().filter(|&(_, b)| build_string(b) == string);
+            let (n, s) = matched.fold((0, 0), |(n, s), (p, _)| (n + 1, s + p));
+            Vec::from([Some(n), Some(s)])
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(run(&tables, query), expected);
+}
+
+#[test]
+fn groups_by_the_strings_of_more_build_rows_than_a_batch() {
+    // Every build row's strings make one column, longer than a batch.
+    let rows = i64::from(BATCH_ROWS_MAX) + 1;
+    let names: Vec<String> = (0..rows).map(|row| format!("s{}", row % 3)).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let keys: Vec<Option<i64>> = (0..rows).map(Some).collect();
+    let half = BATCH_ROWS_MAX as usize;
+    let p = [[int64s(&keys[..half])], [int64s(&keys[half..])]];
+    let b = [
+        [int64s(&keys[..half]), strings(&names[..half])],
+        [int64s(&keys[half..]), strings(&names[half..])],
+    ];
+    let table = |schema: &[(&str, DataType)], groups: &[&[ColumnView]]| {
+        DynScannable::new(Env::current(), Table::new(Env::current(), schema, groups).unwrap())
+            .unwrap()
+    };
+    let p = table(&[("pk", DataType::Int64)], &[&p[0], &p[1]]);
+    let b = table(&[("bk", DataType::Int64), ("bs", DataType::String)], &[&b[0], &b[1]]);
+    let tables = Tables(Vec::from([(String::from("p"), &p), (String::from("b"), &b)]));
+    let query = "FROM p |> JOIN b ON pk = bk |> AGGREGATE count(*) AS n, sum(pk) AS s GROUP BY bs \
+                 |> SELECT n, s";
+    let mut expected: Vec<Vec<Option<i64>>> = (0..3)
+        .map(|name| {
+            let matched = (0..rows).filter(|row| row % 3 == name);
+            let (n, s) = matched.fold((0, 0), |(n, s), row| (n + 1, s + row));
+            Vec::from([Some(n), Some(s)])
+        })
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(run(&tables, query), expected);
 }

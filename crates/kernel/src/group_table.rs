@@ -88,7 +88,7 @@ pub(crate) const NONE: u32 = u32::MAX;
 
 /// A string key's dictionary, and the words of its entries: kept while
 /// batches share it, as a chunk's do, so each entry is interned once.
-struct Interned {
+pub(crate) struct Interned {
     /// A column of the dictionary, kept so its values aren't freed, and
     /// their address reused, while the words are.
     dictionary: ColumnView,
@@ -479,7 +479,7 @@ impl GroupTable {
 /// the run's string pool. A dictionary's entries are each interned once, when
 /// a row with it is first found, and their words kept in `interned` while
 /// batches share the dictionary. A constant is interned once a batch.
-fn load_string_words(
+pub(crate) fn load_string_words(
     context: &mut Context,
     interned: &mut Option<Interned>,
     column: &ColumnView,
@@ -548,15 +548,19 @@ fn word(id: Id, number: u32) -> u64 {
 }
 
 /// The strings of `ids`, ids in the run's pool in their low halves, 0 for
-/// null, as a string column.
+/// null, as a string column: of more rows than a batch's, its buffers are
+/// bytes.
 #[inline(never)]
 pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
     let rows = ids.len();
+    let large = rows > BATCH_ROWS_MAX as usize;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);
     let mut validity = None;
     if (0..rows).any(|row| id(row).is_null()) {
-        let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
+        let size = BitSlice::<u8>::words_for(rows);
+        let mut bits =
+            if large { context.bytes_buffer(size)? } else { context.small_buffer(size)? };
         for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
             let row = start * 8;
             let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
@@ -564,7 +568,8 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         }
         validity = Some(bits);
     }
-    let mut views = context.values_buffer(rows * 8)?;
+    let mut views =
+        if large { context.bytes_buffer(rows * 8)? } else { context.values_buffer(rows * 8)? };
     let (views_out, _) = views.as_mut_slice::<u32>().as_chunks_mut::<2>();
     let pool = context.string_pool()?;
     let mut bytes = 0_u32;

@@ -20,7 +20,7 @@ use crate::expression::{
     mark_expr_columns, type_expr,
 };
 use crate::filter::{self, Comparison, Value};
-use crate::group_table::{GroupTable, NONE};
+use crate::group_table::{GroupTable, Interned, NONE, load_string_words, write_strings};
 use crate::lower::{LowerError, Lowering};
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{Arrangements, Column, DeriveContext, OutputProperties};
@@ -64,6 +64,10 @@ pub struct JoinOp {
     /// Only those it outputs need fit in a batch.
     columns: [SmallVec<ColumnId>; 2],
     outputs: [Bitmap; 2],
+    /// A bit for each build column it outputs, by its place among them,
+    /// that all that read it take as a dictionary: the first of strings it
+    /// outputs as a dictionary of every build row's.
+    dictionaries: u64,
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
     build: u32,
@@ -85,7 +89,7 @@ impl JoinOp {
             Ok::<_, AllocError>(outputs)
         };
         let outputs = [all(at!(columns, 0))?, all(at!(columns, 1))?];
-        Ok(JoinOp { kind, conjuncts, columns, outputs, build: 1 })
+        Ok(JoinOp { kind, conjuncts, columns, outputs, dictionaries: 0, build: 1 })
     }
 
     pub(crate) fn kind(&self) -> JoinKind {
@@ -261,6 +265,20 @@ impl<'c> Op<'c> for JoinOp {
         if key { forms } else { Forms::FLAT }
     }
 
+    /// Dictionaries of the build columns it outputs, where allowed.
+    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        let (columns, outputs) =
+            (at!(self.columns, self.build as usize), at!(self.outputs, self.build as usize));
+        let Some(i) = columns.iter().position(|&c| c == column) else { return Forms::FLAT };
+        let place = (0..i).filter(|&i| outputs.get(i)).count();
+        // A row store can't drop its last column.
+        if place >= 63 || !outputs.get(i) || !allowed.contains(Forms::DICTIONARY) {
+            return Forms::FLAT;
+        }
+        self.dictionaries |= 1 << place;
+        Forms::FLAT | Forms::DICTIONARY
+    }
+
     /// A condition on a child's column can be applied to that child, but
     /// for a left join's second: the join outputs each row of its first
     /// whatever rows of its second it has.
@@ -385,15 +403,23 @@ impl<'c> Op<'c> for JoinOp {
         }
         let mut build_types = [DataType::Int64; BATCH_COLUMNS_MAX as usize];
         let (outputs, count) = self.build_columns()?;
-        for (data_type, &column) in build_types.iter_mut().zip(at!(outputs, ..count)) {
+        let mut whole = None;
+        for (at, (data_type, &column)) in
+            (0..).zip(build_types.iter_mut().zip(at!(outputs, ..count)))
+        {
             *data_type = rows.type_of(column);
+            // Only strings are held whole.
+            let string = *data_type == DataType::String;
+            if string && self.dictionaries >> at & 1 != 0 && whole.is_none() {
+                whole = Some(at);
+            }
         }
         let (held, outputs) = (held.len(), count);
         let mut probe_types = SmallVec::fixed(env, probe.column_count() as usize)?;
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
-        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys })?;
+        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys, whole })?;
         let join = Join {
             kind: self.kind,
             build,
@@ -512,6 +538,9 @@ struct HashBuild {
     held: usize,
     /// The keys it hashes by, if any.
     keys: Option<Keys>,
+    /// The build column, by its place, of strings it holds whole, if any,
+    /// for the join to output as a dictionary.
+    whole: Option<u32>,
 }
 
 /// What a run of a `HashBuild`'s pipeline builds.
@@ -545,6 +574,52 @@ struct Built {
     /// With one integer key, while `sequence` is `Held`, each build row's
     /// key: hashed only if `direct` can't find their rows.
     keys: SmallVec<i64>,
+    /// The build column of strings held whole, rather than in `rows`.
+    whole: Option<Whole>,
+}
+
+/// A build column of strings held whole, as one flat column of every build
+/// row's: the join outputs it as a dictionary of them, so what reads it does
+/// each string's work once, rather than each row's.
+struct Whole {
+    /// Its place among the build columns.
+    at: u32,
+    /// Each row's string, as its word in the run's string pool, until built.
+    words: SmallVec<i64>,
+    /// The words of the dictionary the last batch's strings came in, if any.
+    interned: Option<Interned>,
+    /// Every row's string, once built.
+    column: Option<ColumnView>,
+}
+
+impl Whole {
+    /// Appends the rows `selection` keeps of `column`. Out of line, as it's
+    /// smaller.
+    #[inline(never)]
+    fn append(
+        &mut self,
+        context: &mut Context,
+        column: &ColumnView,
+        selection: &Selection,
+    ) -> Result<(), Error> {
+        let count = selection.len() as usize;
+        let words =
+            load_string_words(context, &mut self.interned, column, selected(selection), count)?;
+        self.words.extend_from_slice(at!(words.as_slice::<i64>(), ..count))?;
+        Ok(())
+    }
+
+    /// A dictionary of its strings, a row for each of `rows`, build rows: as
+    /// those of rows not kept may be past the last, each is taken as no more.
+    fn dictionary(&self, context: &mut Context, rows: &[u32]) -> Result<ColumnView, Error> {
+        let Some(column) = &self.column else { failed!() };
+        let last = column.row_count().saturating_sub(1);
+        let mut indices = context.indices_buffer(size_of_val(rows))?;
+        for (index, &row) in indices.as_mut_slice::<u32>().iter_mut().zip(rows) {
+            *index = row.min(last);
+        }
+        Ok(ColumnView::dictionary(context, column, indices)?)
+    }
 }
 
 /// What probing keeps, from one input batch to the next.
@@ -805,7 +880,7 @@ impl Sink for HashBuild {
             Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
             None => None,
         };
-        let built = Built {
+        let mut built = Built {
             rows: RowStore::new(env)?,
             count: 0,
             table,
@@ -814,7 +889,13 @@ impl Sink for HashBuild {
             direct: None,
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
             keys: SmallVec::new(env, 1 << 31)?,
+            whole: None,
         };
+        if let Some(at) = self.whole {
+            built.rows.drop_column(context, at)?;
+            let words = SmallVec::new(env, 1 << 31)?;
+            built.whole = Some(Whole { at, words, interned: None, column: None });
+        }
         let groups = context.indices_buffer(BATCH_ROWS_MAX as usize * size_of::<u32>())?;
         Ok(Building { built: Some(built), groups })
     }
@@ -853,6 +934,9 @@ impl Sink for HashBuild {
             }
         }
         columns.selection_mut().clone_from(selection);
+        if let Some(whole) = &mut built.whole {
+            whole.append(context, columns.column(whole.at), selection)?;
+        }
         built.rows.append(context, &columns)
     }
 
@@ -889,7 +973,31 @@ impl Sink for HashBuild {
         if let Some(table) = &mut built.table {
             table.freeze();
         }
+        if let Some(whole) = &mut built.whole {
+            whole.column = Some(write_strings(context, &whole.words)?);
+            whole.words.free();
+        }
         built.rows.flush(context)
+    }
+}
+
+impl Built {
+    /// The held build columns of `rows`, build rows, as `RowStore::gather`
+    /// gives them: that held whole as a dictionary. Out of line, as the
+    /// joins share it.
+    #[inline(never)]
+    fn gather(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+        (rows, kept): (&[u32], Kept),
+    ) -> Result<u32, Error> {
+        let whole = &self.whole;
+        let mut given = |context: &mut Context, _| {
+            let Some(whole) = whole else { failed!() };
+            whole.dictionary(context, rows)
+        };
+        self.rows.gather(context, out, (rows, kept), 0, &mut given)
     }
 }
 
@@ -1007,7 +1115,7 @@ impl Join {
         if self.held > 0 {
             let paired = at!(probing.paired, ..pairs.row_count() as usize);
             let mut gathered = RowBatch::new();
-            built.rows.gather_held(context, &mut gathered, (paired, pairs.selection().kept()))?;
+            built.gather(context, &mut gathered, (paired, pairs.selection().kept()))?;
             for c in 0..gathered.column_count() {
                 let Ok(()) = pairs.push_column(gathered.column(c).clone()) else { failed!() };
             }
@@ -1193,7 +1301,7 @@ impl Join {
         }
         let mut gathered = RowBatch::new();
         let paired = at!(probing.paired, ..count as usize);
-        built.rows.gather_held(context, &mut gathered, (paired, Kept::Prefix))?;
+        built.gather(context, &mut gathered, (paired, Kept::Prefix))?;
         for c in 0..self.outputs {
             #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
             let column = gathered.column(c as u32).clone();
