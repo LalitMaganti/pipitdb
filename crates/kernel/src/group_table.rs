@@ -253,13 +253,11 @@ impl GroupTable {
         let mut hashes = context.values_buffer(count * 8)?;
         let hashes = at_mut!(hashes.as_mut_slice(), ..count);
         hash_rows(hashes, keys, nulls);
-        if let ([keys], None) = (keys, nulls) {
-            return match self.first {
-                0 => self.find_values::<false>(hashes, keys, groups),
-                _ => self.find_values::<true>(hashes, keys, groups),
-            };
+        match (keys, nulls) {
+            (&[a], None) => self.find_values(hashes, [a], groups),
+            (&[a, b], None) => self.find_values(hashes, [a, b], groups),
+            _ => self.find_hashed(hashes, keys, nulls, groups),
         }
-        self.find_hashed(hashes, keys, nulls, groups)
     }
 
     /// As `find_or_create`, given each key as a word a row, and each row's
@@ -336,22 +334,26 @@ impl GroupTable {
     /// `number_groups` is `place`, and returns its number.
     fn add_numbered(&mut self, place: usize, word: i64) -> Result<u32, Error> {
         // A string key is never null, so there's no null word.
-        let group = push(&mut self.records, 0, word)?;
+        let group = push(&mut self.records, 0, [word])?;
         *at_mut!(self.number_groups, place) = group + 1;
         Ok(group)
     }
 
-    /// As `find_or_create`, for a single key with no nulls, given each row's
-    /// hash: compares the key values directly. Records start with a null word
-    /// if `NULL_WORD`: a constant, so the loop holds no check for it.
-    fn find_values<const NULL_WORD: bool>(
+    /// As `find_or_create`, for `N` keys with no nulls, given each row's
+    /// hash: compares the key values directly. `N` is a constant, so the
+    /// loop compares them in registers.
+    fn find_values<const N: usize>(
         &mut self,
         hashes: &[u64],
-        keys: &[i64],
+        keys: [&[i64]; N],
         groups: &mut [u32],
     ) -> Result<(), Error> {
-        let first = usize::from(NULL_WORD);
-        check!(self.first == first && self.stride > first);
+        let first = self.first;
+        check!(self.stride >= first + N);
+        // Masks a record's first word to its null bits, if it has them.
+        let nulls = if first == 0 { 0 } else { -1 };
+        let count = groups.len();
+        check!(hashes.len() == count && keys.iter().all(|keys| keys.len() >= count));
         // `prefetch` does nothing on other targets, so they don't look ahead.
         let ahead = cfg!(target_arch = "x86_64") && self.slots.len() > CACHED_SLOTS;
         let hash_of = |i: usize| hashes.get(i).copied();
@@ -360,7 +362,7 @@ impl GroupTable {
         let (slots, stride): (&mut [u64], usize) = (slots, *stride);
         // `grow` made room for every row, so no block moves while adding.
         let starts: *const [*mut i64] = records.starts();
-        for (i, ((&key, &hash), group)) in keys.iter().zip(hashes).zip(groups).enumerate() {
+        for (i, (&hash, group)) in hashes.iter().zip(groups).enumerate() {
             // SAFETY: as above.
             let starts = unsafe { &*starts };
             if ahead {
@@ -368,10 +370,12 @@ impl GroupTable {
             }
             // A stored group is its null bits, zero here, if it has them, then
             // its key.
-            // SAFETY: a group in a slot has a record, with its key.
+            // SAFETY: each key has a word for each row, checked above.
+            let key = keys.map(|keys| unsafe { *keys.get_unchecked(i) });
+            // SAFETY: a group in a slot has a record, with its keys.
             let equal = |group: usize| unsafe {
                 let stored = address(starts, stride, group).cast_const();
-                (first == 0 || *stored == 0) && *stored.add(first) == key
+                *stored & nulls == 0 && *stored.add(first).cast::<[i64; N]>() == key
             };
             *group = match probe(slots, hash, equal) {
                 Ok(group) => group,
@@ -629,15 +633,19 @@ fn load_key_words(
     Ok(())
 }
 
-/// Appends to `records` a group of a single key `key` that isn't null, at
-/// word `first`, and returns its number.
-fn push(records: &mut Blocks<i64>, first: usize, key: i64) -> Result<u32, Error> {
+/// Appends to `records` a group of keys `key` that aren't null, from word
+/// `first`, and returns its number.
+fn push<const N: usize>(
+    records: &mut Blocks<i64>,
+    first: usize,
+    key: [i64; N],
+) -> Result<u32, Error> {
     let group = records.len();
     if group == GROUPS_MAX {
         return Err(Error::OutOfMemory);
     }
-    // A record starts zeroed, so its null word says the key isn't null.
-    *at_mut!(records.push(), first) = key;
+    // A record starts zeroed, so its null word says the keys aren't null.
+    at_mut!(records.push(), first..first + N).copy_from_slice(&key);
     #[expect(clippy::cast_possible_truncation, reason = "below `GROUPS_MAX`")]
     Ok(group as u32)
 }
