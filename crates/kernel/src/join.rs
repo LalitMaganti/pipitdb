@@ -10,7 +10,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Form, Forms};
+use crate::column::{self, ColumnView, DataType, Form, Forms};
 use crate::containers::{Array, BitSlice, Bitmap, SmallVec};
 use crate::context::Context;
 use crate::error::Error;
@@ -64,6 +64,10 @@ pub struct JoinOp {
     /// Only those it outputs need fit in a batch.
     columns: [SmallVec<ColumnId>; 2],
     outputs: [Bitmap; 2],
+    /// A bit for each build column it outputs, by its place among them,
+    /// that all that read it take as a dictionary: the first of strings it
+    /// outputs as a dictionary of its distinct strings.
+    dictionaries: u64,
     /// Which child is the build side: the second, unless planning chooses
     /// the first.
     build: u32,
@@ -85,7 +89,7 @@ impl JoinOp {
             Ok::<_, AllocError>(outputs)
         };
         let outputs = [all(at!(columns, 0))?, all(at!(columns, 1))?];
-        Ok(JoinOp { kind, conjuncts, columns, outputs, build: 1 })
+        Ok(JoinOp { kind, conjuncts, columns, outputs, dictionaries: 0, build: 1 })
     }
 
     pub(crate) fn kind(&self) -> JoinKind {
@@ -252,13 +256,37 @@ impl<'c> Op<'c> for JoinOp {
     /// Sequences of what can be its keys, as a table's ids come: a build
     /// side's it holds no hash table for. Dictionaries and constants of them
     /// too: a string key's entries are each interned once, rather than each
-    /// row's.
+    /// row's. A build column's dictionaries and constants too, as one it
+    /// outputs as a dictionary interns each entry once.
     fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
         let key = self.conjuncts.iter().any(|&conjunct| {
             equality(exprs.nodes(conjunct)).is_some_and(|columns| columns.contains(&column))
         });
-        let forms = Forms::FLAT | Forms::SEQUENCE | Forms::DICTIONARY | Forms::CONSTANT;
-        if key { forms } else { Forms::FLAT }
+        let forms = Forms::FLAT | Forms::DICTIONARY | Forms::CONSTANT;
+        if key {
+            forms | Forms::SEQUENCE
+        } else if self.is_build_column(column) {
+            forms
+        } else {
+            Forms::FLAT
+        }
+    }
+
+    /// Dictionaries of the build columns it outputs, where allowed.
+    fn allow(&mut self, column: ColumnId, allowed: Forms) -> Forms {
+        let (columns, outputs) =
+            (at!(self.columns, self.build as usize), at!(self.outputs, self.build as usize));
+        if !allowed.contains(Forms::DICTIONARY) {
+            return Forms::FLAT;
+        }
+        let Some(i) = columns.iter().position(|&c| c == column) else { return Forms::FLAT };
+        let place = (0..i).filter(|&i| outputs.get(i)).count();
+        // A row store drops only its first 63 columns.
+        if place >= 63 || !outputs.get(i) {
+            return Forms::FLAT;
+        }
+        self.dictionaries |= 1 << place;
+        Forms::FLAT | Forms::DICTIONARY
     }
 
     /// A condition on a child's column can be applied to that child, but
@@ -385,15 +413,22 @@ impl<'c> Op<'c> for JoinOp {
         }
         let mut build_types = [DataType::Int64; BATCH_COLUMNS_MAX as usize];
         let (outputs, count) = self.build_columns()?;
-        for (data_type, &column) in build_types.iter_mut().zip(at!(outputs, ..count)) {
+        let mut strings = None;
+        for (at, (data_type, &column)) in
+            (0..).zip(build_types.iter_mut().zip(at!(outputs, ..count)))
+        {
             *data_type = rows.type_of(column);
+            let string = *data_type == DataType::String;
+            if string && self.dictionaries >> at & 1 != 0 && strings.is_none() {
+                strings = Some(at);
+            }
         }
         let (held, outputs) = (held.len(), count);
         let mut probe_types = SmallVec::fixed(env, probe.column_count() as usize)?;
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
-        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys })?;
+        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys, strings })?;
         let join = Join {
             kind: self.kind,
             build,
@@ -512,6 +547,9 @@ struct HashBuild {
     held: usize,
     /// The keys it hashes by, if any.
     keys: Option<Keys>,
+    /// The build column, by its place, of strings it holds as a dictionary,
+    /// if any, for the join to output as one.
+    strings: Option<u32>,
 }
 
 /// What a run of a `HashBuild`'s pipeline builds.
@@ -545,6 +583,69 @@ struct Built {
     /// With one integer key, while `sequence` is `Held`, each build row's
     /// key: hashed only if `direct` can't find their rows.
     keys: SmallVec<i64>,
+    /// The build column of strings held as a dictionary, rather than in
+    /// `rows`.
+    strings: Option<Strings>,
+}
+
+/// A build column of strings held as a dictionary of its distinct strings:
+/// the join outputs it as one, so what reads it does each string's work
+/// once, rather than each row's.
+struct Strings {
+    /// Its place among the build columns.
+    at: u32,
+    /// Numbers each distinct string, its entry.
+    table: GroupTable,
+    /// Each build row's entry.
+    entries: SmallVec<u32>,
+    /// A zeroed column of integers, a batch long, that the row store holds
+    /// in its place.
+    filler: ColumnView,
+    /// Its distinct strings, by entry, once built.
+    dictionary: Option<ColumnView>,
+}
+
+impl Strings {
+    /// Appends the rows `selection` keeps of `column`. Out of line, as it's
+    /// smaller.
+    #[inline(never)]
+    fn append(
+        &mut self,
+        context: &mut Context,
+        column: &ColumnView,
+        selection: &Selection,
+    ) -> Result<(), Error> {
+        let start = self.entries.len();
+        self.entries.extend_zeroed(selection.len() as usize)?;
+        let entries = at_mut!(self.entries, start..);
+        self.table.find_or_create(context, &[column], selected(selection), entries)
+    }
+
+    /// Its dictionary, a row for each of `rows`, build rows, of which those
+    /// `selection` keeps are read: the rest take the first entry, as they may
+    /// be past the last build row.
+    fn gather(
+        &self,
+        context: &mut Context,
+        rows: &[u32],
+        selection: &Selection,
+    ) -> Result<ColumnView, Error> {
+        let Some(dictionary) = &self.dictionary else { failed!() };
+        let mut indices = context.indices_buffer(size_of_val(rows))?;
+        let out = indices.as_mut_slice::<u32>();
+        let kept = selection.len() as usize;
+        if let Kept::Prefix = selection.kept() {
+            column::gather(at_mut!(out, ..kept), &self.entries, at!(rows, ..kept));
+            at_mut!(out, kept..).fill(0);
+        } else {
+            out.fill(0);
+            for &row in selected(selection) {
+                let row = usize::from(row);
+                *at_mut!(out, row) = *at!(self.entries, *at!(rows, row) as usize);
+            }
+        }
+        Ok(ColumnView::dictionary(context, dictionary, indices)?)
+    }
 }
 
 /// What probing keeps, from one input batch to the next.
@@ -805,7 +906,7 @@ impl Sink for HashBuild {
             Some(keys) => Some(GroupTable::new(env, keys.count, keys.strings, 0, 1)?),
             None => None,
         };
-        let built = Built {
+        let mut built = Built {
             rows: RowStore::new(env)?,
             count: 0,
             table,
@@ -814,7 +915,20 @@ impl Sink for HashBuild {
             direct: None,
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
             keys: SmallVec::new(env, 1 << 31)?,
+            strings: None,
         };
+        if let Some(at) = self.strings {
+            built.rows.drop_column(context, at)?;
+            let mut zeros = context.values_buffer(BATCH_ROWS_MAX as usize * 8)?;
+            zeros.as_mut_slice::<i64>().fill(0);
+            built.strings = Some(Strings {
+                at,
+                table: GroupTable::new(env, 1, 1, 0, 0)?,
+                entries: SmallVec::new(env, 1 << 31)?,
+                filler: ColumnView::new(context, DataType::Int64, zeros, None)?,
+                dictionary: None,
+            });
+        }
         let groups = context.indices_buffer(BATCH_ROWS_MAX as usize * size_of::<u32>())?;
         Ok(Building { built: Some(built), groups })
     }
@@ -840,14 +954,25 @@ impl Sink for HashBuild {
         if build_columns.is_empty() {
             return Ok(());
         }
+        // The row store holds a filler in place of the strings.
+        let (mut at, mut filler) = (usize::MAX, None);
+        if let Some(strings) = &mut built.strings {
+            at = strings.at as usize;
+            strings.append(context, batch.column(*at!(build_columns, at)), selection)?;
+            filler = Some(strings.filler.slice(0, batch.row_count()));
+        }
+        let column = |(i, &c): (usize, &u32)| match &filler {
+            Some(filler) if i == at => filler,
+            _ => batch.column(c),
+        };
         let mut columns = RowBatch::new();
         columns.reset(batch.row_count());
-        if build_columns.iter().all(|&c| matches!(batch.column(c).form(), Form::Flat)) {
-            columns.push_borrowed(build_columns.iter().map(|&c| batch.column(c)));
+        if build_columns.iter().enumerate().all(|c| matches!(column(c).form(), Form::Flat)) {
+            columns.push_borrowed(build_columns.iter().enumerate().map(column));
         } else {
             // A row store holds flat columns, and keys can come as sequences.
-            for &c in build_columns {
-                let mut column = batch.column(c).clone();
+            for c in build_columns.iter().enumerate() {
+                let mut column = column(c).clone();
                 column.make_in(context, Forms::FLAT)?;
                 let Ok(()) = columns.push_column(column) else { failed!() };
             }
@@ -889,7 +1014,32 @@ impl Sink for HashBuild {
         if let Some(table) = &mut built.table {
             table.freeze();
         }
+        if let Some(strings) = &mut built.strings {
+            let entries = strings.table.len();
+            strings.dictionary = Some(strings.table.write_keys(context, 0, 0..entries)?);
+        }
         built.rows.flush(context)
+    }
+}
+
+impl Built {
+    /// The held build columns of `rows`, build rows, as `RowStore::gather`
+    /// gives them: that of strings as a dictionary. Out of line, as the
+    /// joins share it.
+    #[inline(never)]
+    fn gather(
+        &mut self,
+        context: &mut Context,
+        out: &mut RowBatch,
+        rows: &[u32],
+        selection: &Selection,
+    ) -> Result<u32, Error> {
+        let strings = &self.strings;
+        let mut given = |context: &mut Context, _| {
+            let Some(strings) = strings else { failed!() };
+            strings.gather(context, rows, selection)
+        };
+        self.rows.gather(context, out, (rows, selection.kept()), 0, &mut given)
     }
 }
 
@@ -1007,7 +1157,7 @@ impl Join {
         if self.held > 0 {
             let paired = at!(probing.paired, ..pairs.row_count() as usize);
             let mut gathered = RowBatch::new();
-            built.rows.gather_held(context, &mut gathered, (paired, pairs.selection().kept()))?;
+            built.gather(context, &mut gathered, paired, pairs.selection())?;
             for c in 0..gathered.column_count() {
                 let Ok(()) = pairs.push_column(gathered.column(c).clone()) else { failed!() };
             }
@@ -1193,7 +1343,7 @@ impl Join {
         }
         let mut gathered = RowBatch::new();
         let paired = at!(probing.paired, ..count as usize);
-        built.rows.gather_held(context, &mut gathered, (paired, Kept::Prefix))?;
+        built.gather(context, &mut gathered, paired, &Selection::all(count))?;
         for c in 0..self.outputs {
             #[expect(clippy::cast_possible_truncation, reason = "at most a batch's columns")]
             let column = gathered.column(c as u32).clone();

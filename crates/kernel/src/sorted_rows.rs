@@ -122,7 +122,7 @@ impl SortedRows {
                 let data_type = at!(self.columns, k).data_type;
                 let decoded = self.decoded >> key.column.min(63) & 1 != 0;
                 if !data_type.has_bytes() && !decoded && key.column < 63 {
-                    self.rows.drop_column(context, key.column, data_type)?;
+                    self.rows.drop_column(context, key.column)?;
                     self.decoded |= 1 << key.column;
                 }
             }
