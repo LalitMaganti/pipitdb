@@ -8,7 +8,7 @@
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::DataType;
-use crate::column::{ColumnView, Form};
+use crate::column::{ColumnView, Form, Forms};
 use crate::containers::{SmallVec, SpillVec};
 use crate::context::Context;
 use crate::env::Env;
@@ -381,7 +381,16 @@ impl Leaf {
                 filter::keep_entries(column, entries, selection, dropped);
             }
             Leaf::IsNull { column } => {
-                filter::is_null(at!(inputs.columns, column as usize), want, selection, dropped);
+                let column = at!(inputs.columns, column as usize);
+                if !matches!(column.form(), Form::Dictionary(_)) {
+                    filter::is_null(column, want, selection, dropped);
+                    return Ok(());
+                }
+                let entries = at_mut!(inputs.entries, node as usize);
+                let entries = entries.find(inputs.env, column, want, &|values, bits| {
+                    filter::null_bits(values, want, bits);
+                })?;
+                filter::keep_entries(column, entries, selection, dropped);
             }
             Leaf::In { column, start, len } => {
                 let values = at!(inputs.values, start as usize..(start + len) as usize);
@@ -444,12 +453,14 @@ fn literal(literals: Option<&StringPool>, id: i64) -> &[u8] {
     string
 }
 
-/// What every test of `column` in a filter of `conjuncts` compares it with,
-/// if one kind: strings, or integers, which tests for null count as. Only
-/// those take a dictionary, or a sequence: see `FilterOp::accepts`.
-pub fn compared_with(exprs: &Exprs, conjuncts: &[Expr], column: ColumnId) -> Option<DataType> {
-    // `None` before any test, then the kind, if one.
+/// The forms a filter of `conjuncts` takes `column` in: dictionaries if it
+/// only compares the column with strings, whose entries it tests once each;
+/// sequences if only with integers, whose rows it keeps by their numbers; and
+/// any form if it only tests it for null, which reads neither.
+pub fn tested_forms(exprs: &Exprs, conjuncts: &[Expr], column: ColumnId) -> Forms {
+    // `None` before any test but for null, then the kind, if one.
     let mut found = None;
+    let mut nulls = false;
     let mut test = |tested| {
         found = Some(match found {
             Some(before) if before != tested => None,
@@ -474,11 +485,11 @@ pub fn compared_with(exprs: &Exprs, conjuncts: &[Expr], column: ColumnId) -> Opt
             for (first, count) in node.operands() {
                 for read in (first..first + count).filter(|&read| reads(read)) {
                     test(match node.op {
-                        ExprOp::And
-                        | ExprOp::Or
-                        | ExprOp::Not
-                        | ExprOp::IsNull
-                        | ExprOp::IsNotNull => Some(DataType::Int64),
+                        ExprOp::IsNull | ExprOp::IsNotNull => {
+                            nulls = true;
+                            continue;
+                        }
+                        ExprOp::And | ExprOp::Or | ExprOp::Not => Some(DataType::Int64),
                         ExprOp::Eq
                         | ExprOp::Ne
                         | ExprOp::Lt
@@ -493,7 +504,12 @@ pub fn compared_with(exprs: &Exprs, conjuncts: &[Expr], column: ColumnId) -> Opt
             }
         }
     }
-    found.flatten()
+    match found {
+        None if nulls => Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY | Forms::SEQUENCE,
+        Some(Some(DataType::String)) => Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY,
+        Some(Some(DataType::Int64)) => Forms::FLAT | Forms::CONSTANT | Forms::SEQUENCE,
+        _ => Forms::FLAT | Forms::CONSTANT,
+    }
 }
 
 impl Predicate {
@@ -1049,6 +1065,15 @@ mod tests {
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
             assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
         }
+        // `x IS NULL` keeps entry 1, and `x IS NOT NULL` the others.
+        for (not, expected) in [(false, rows_of(&[1])), (true, rows_of(&[0, 2, 3, 4]))] {
+            let nodes = [Node::Leaf(Leaf::IsNull { column: 0 }), Node::Not(0)];
+            let nodes = SmallVec::fixed_from(env, nodes[..=usize::from(not)].iter().copied());
+            let predicate = Predicate::new(env, nodes.unwrap()).unwrap();
+            let (mut entries, literals) = (predicate.new_entries(env).unwrap(), literals(&[]));
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &flat), expected);
+            assert_eq!(kept_of((&predicate, &literals), &mut entries, &dictionary), expected);
+        }
         // `x IN ('b', 'c')` keeps entries 0 and 3, and `NOT` that entries 2 and
         // 4, whether the list is scanned, or long enough for a set: 'b' and
         // 'c' then 20 strings of two bytes, and 'b' again.
@@ -1139,10 +1164,11 @@ mod tests {
         ];
         let mut exprs = Exprs::new(env).unwrap();
         let expr = exprs.add(&nodes).unwrap();
-        // A string column, an integer one, one also tested for nulls, and one
-        // it doesn't read.
-        let kinds: StdVec<_> =
-            (0..4).map(|column| compared_with(&exprs, &[expr], column)).collect();
-        assert!(kinds == [Some(string), Some(int), None, None]);
+        // A string column, an integer one, one also tested for nulls, which
+        // doesn't count, and one it doesn't read.
+        let forms: StdVec<_> = (0..4).map(|column| tested_forms(&exprs, &[expr], column)).collect();
+        let (strings, ints) = (Forms::DICTIONARY | Forms::CONSTANT, Forms::SEQUENCE);
+        assert!(forms.iter().map(|&forms| forms.contains(strings)).eq([true, false, true, false]));
+        assert!(forms.iter().map(|&forms| forms.contains(ints)).eq([false, true, false, false]));
     }
 }

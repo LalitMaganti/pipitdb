@@ -427,6 +427,14 @@ pub fn compare_string_bits(
     set(bits, values, |e| comparison.holds(strings.get(e as usize).cmp(string)));
 }
 
+/// Sets the bit of each of a dictionary's entries, `values`, that is null if
+/// `nulls`, or else isn't, as `is_null` keeps rows.
+pub fn null_bits(values: Values<'_>, nulls: bool, bits: &mut [u64]) {
+    for e in 0..values.len() {
+        BitSlice::of_mut(&mut *bits).set_if(e as usize, values.is_null(e) == nulls);
+    }
+}
+
 /// Sets bit `e` of `bits` for each entry `e` of `values` that isn't null and
 /// that `test` is true for: a null's value isn't read.
 fn set(bits: &mut [u64], values: Values<'_>, test: impl Fn(u32) -> bool) {
@@ -549,7 +557,7 @@ pub fn is_null(
         // A sequence has no nulls.
         Form::Sequence(_) if nulls => return drop_all(selection, dropped),
         Form::Sequence(_) => return keep_all(selection, dropped),
-        // Only string comparisons take dictionaries: see `FilterOp::accepts`.
+        // Tested by entry: see `filter::null_bits`.
         Form::Dictionary(_) => failed!(),
     }
     match column.validity() {
