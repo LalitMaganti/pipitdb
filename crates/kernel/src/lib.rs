@@ -24,6 +24,7 @@ pub(crate) mod estimate;
 pub(crate) mod expression;
 pub mod filter;
 pub(crate) mod flat_hash_map;
+mod flush;
 pub mod function;
 mod group_table;
 mod hash_aggregate;

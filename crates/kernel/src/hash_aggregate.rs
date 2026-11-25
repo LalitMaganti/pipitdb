@@ -382,8 +382,9 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::column::DataType;
     use crate::env::Env;
-    use crate::pipeline::Pipeline;
-    use crate::step::{DynSource, Source};
+    use crate::flush::flushed;
+    use crate::pipeline::{Execution, Pipeline};
+    use crate::step::{DynSource, Source, Step};
 
     /// An `Int64` column of `values`, null where `None`.
     fn column(values: &[Option<i64>]) -> ColumnView {
@@ -522,7 +523,20 @@ mod tests {
         let input =
             Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
         let (sinks, pipeline) = after_breaker(input, hash_aggregate(spec), []);
-        let mut execution = pipeline.start_with_sinks(env, None, &sinks, None)?;
+        rows_out(pipeline.start_with_sinks(env, None, &sinks, None)?)
+    }
+
+    /// As `run`, by the aggregate flushed as rows are grouped by the key at 0.
+    fn run_flushed(rows: Rows, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
+        let env = Env::current();
+        let flushed = flushed(env, hash_aggregate(spec), 0).unwrap();
+        let steps = SmallVec::fixed_from(env, [Step::Operator(flushed)].into_iter()).unwrap();
+        let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
+        rows_out(pipeline.start(env, None)?)
+    }
+
+    /// Each row `execution` outputs, as `run` returns them.
+    fn rows_out(mut execution: Execution<'_>) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {
@@ -545,6 +559,25 @@ mod tests {
         }
         out.sort();
         Ok(out)
+    }
+
+    #[test]
+    fn outputs_groups_as_no_more_rows_reach_them() {
+        // Grouped by the key, though not sorted. Row 1 of each batch is
+        // dropped, so the third batch starts with the key the second ends
+        // with.
+        let keys = [[1, 1, 2], [2, 2, 3], [3, 4, 4], [8, 8, 6]];
+        let rows = || Rows {
+            batches: keys
+                .iter()
+                .map(|keys| keys.iter().map(|&k| (Some(k), Some(k * 10))).collect())
+                .collect(),
+            dropped: alloc::vec![1],
+        };
+        let expected = run(rows(), spec(&[0])).unwrap();
+        let mut by_key = spec(&[0]);
+        by_key.nullable_keys = 0;
+        assert_eq!(run_flushed(rows(), by_key).unwrap(), expected);
     }
 
     #[test]
