@@ -273,7 +273,8 @@ impl<'a> ParquetTable<'a> {
     }
 
     /// The files in `sources`, which must have the same columns, in the same
-    /// order, of types the kernel has. Their pages are decompressed with
+    /// order. Columns of types the kernel doesn't have, and nested ones, are
+    /// left out. Their pages are decompressed with
     /// `codecs`.
     pub fn open(
         env: &Env,
@@ -285,8 +286,6 @@ impl<'a> ParquetTable<'a> {
             let footer = ParquetFile::open(env, source)?;
             if let Some(first) = files.first() {
                 check_same_columns(&first.footer, &footer)?;
-            } else if footer.columns().iter().any(|column| column.data_type().is_none()) {
-                return Err(Error::Unsupported);
             }
             files.push(File { source, footer }).map_err(|_| Error::OutOfMemory)?;
         }
@@ -674,6 +673,24 @@ mod tests {
             values.extend_from_slice(column.int64s());
         }
         assert!(values.iter().copied().eq((0..5000).map(|i| 4_000_000_000 + i)));
+    }
+
+    /// 100 rows: `id` the row, `flag` a boolean, `tags` a list, `pair` a
+    /// struct of two, `name` `name` and the row, and `n` three times the row.
+    const MIXED: &[u8] = include_bytes!("../tests/data/mixed.parquet");
+
+    #[test]
+    fn leaves_out_columns_it_cant_read() {
+        let env = Env::current();
+        let table = ParquetTable::open(env, &Uncompressed, &[&MIXED]).unwrap();
+        let names: Vec<_> = (0..table.column_count()).map(|c| table.column_name(c)).collect();
+        assert_eq!(names, ["id", "name", "n"]);
+        let mut context = Context::new(env, None);
+        let mut state = table.open(&mut context, &[(1, Forms::FLAT), (2, Forms::FLAT)]).unwrap();
+        let mut batch = RowBatch::new();
+        assert!(table.next(&mut context, &mut state, &mut batch).unwrap());
+        assert_eq!(cells(&mut context, batch.column(0))[7], "name7");
+        assert_eq!(cells(&mut context, batch.column(1))[7], "21");
     }
 
     #[test]
