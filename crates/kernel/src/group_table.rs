@@ -162,8 +162,8 @@ impl GroupTable {
 
     /// Writes the group of each row `select` keeps of `columns`, all if it's
     /// empty, to `groups`, with `columns` as the key. New keys get new
-    /// groups. Each column is flat, or a dictionary for a string key, of
-    /// strings for a string key, else of `Int64`s.
+    /// groups. Each column is flat, or a dictionary or a constant for a string
+    /// key, of strings for a string key, else of `Int64`s.
     pub(crate) fn find_or_create(
         &mut self,
         context: &mut Context,
@@ -474,11 +474,11 @@ impl GroupTable {
     }
 }
 
-/// Loads `count` rows that `select` keeps of string key column `column`, flat
-/// or a dictionary, all if `select` is empty, as their words in the run's
-/// string pool. A dictionary's entries are each interned once, when a row
-/// with it is first found, and their words kept in `interned` while batches
-/// share the dictionary.
+/// Loads `count` rows that `select` keeps of string key column `column`, flat,
+/// a dictionary or a constant, all if `select` is empty, as their words in
+/// the run's string pool. A dictionary's entries are each interned once, when
+/// a row with it is first found, and their words kept in `interned` while
+/// batches share the dictionary. A constant is interned once a batch.
 fn load_string_words(
     context: &mut Context,
     interned: &mut Option<Interned>,
@@ -527,7 +527,16 @@ fn load_string_words(
                 *out = *known;
             }
         }
-        Form::Constant | Form::Sequence(_) => failed!(),
+        Form::Constant => {
+            let known = if values.is_null(0) {
+                word(Id::NULL, NO_NUMBER)
+            } else {
+                let (id, number) = pool.intern_numbered(env, strings.get(0))?;
+                word(id, number)
+            };
+            at_mut!(out, ..count).fill(known);
+        }
+        Form::Sequence(_) => failed!(),
     }
     Ok(words)
 }

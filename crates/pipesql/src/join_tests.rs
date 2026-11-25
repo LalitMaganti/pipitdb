@@ -438,3 +438,75 @@ fn joined_expected(keys: &[Vec<Option<i64>>], edges: &[(usize, usize)]) -> Vec<V
     rows.sort_unstable();
     rows
 }
+
+/// A string column of `values`, flat.
+fn strings(values: &[&str]) -> ColumnView {
+    let context = &mut Context::new(Env::current(), None);
+    let bytes: Vec<u8> = values.iter().flat_map(|value| value.bytes()).collect();
+    let mut stored = Buffer::allocate(Env::current(), bytes.len()).unwrap();
+    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
+    let mut views = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
+    let mut at = 0;
+    for (view, value) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
+        let len = u32::try_from(value.len()).unwrap();
+        view.copy_from_slice(&[at, len]);
+        at += len;
+    }
+    ColumnView::strings(context, views, stored, None).unwrap()
+}
+
+#[test]
+#[expect(clippy::cast_possible_wrap, reason = "a few thousand rows")]
+fn joins_on_strings_as_dictionaries_and_constants() {
+    // The probe side's string key comes as a dictionary, then a constant;
+    // the build side's as flat strings.
+    let context = &mut Context::new(Env::current(), None);
+    let dictionary = strings(&["a", "b", "c"]);
+    let rows = BATCH_ROWS_MAX as usize;
+    let mut indices = Buffer::allocate(Env::current(), rows * 4).unwrap();
+    for (row, index) in (0..).zip(indices.as_mut_slice::<u32>()) {
+        *index = row % 3;
+    }
+    let numbers = |first: i64, count: usize| -> Vec<Option<i64>> {
+        (first..).take(count).map(Some).collect()
+    };
+    let keys =
+        |count: usize| -> Vec<Option<i64>> { (0..count as i64).map(|i| Some(i % 4)).collect() };
+    let probe = [
+        [
+            int64s(&keys(rows)),
+            ColumnView::dictionary(context, &dictionary, indices).unwrap(),
+            int64s(&numbers(0, rows)),
+        ],
+        [
+            int64s(&keys(10)),
+            ColumnView::constant(context, &strings(&["b"]), 10).unwrap(),
+            int64s(&numbers(rows as i64, 10)),
+        ],
+    ];
+    let schema = [("pk", DataType::Int64), ("ps", DataType::String), ("pv", DataType::Int64)];
+    let groups: Vec<&[ColumnView]> = probe.iter().map(|group| &group[..]).collect();
+    let p =
+        DynScannable::new(Env::current(), Table::new(Env::current(), &schema, &groups).unwrap())
+            .unwrap();
+    let build_strings = ["a", "b", "b", "d", "c", "b"];
+    let build = [[int64s(&keys(6)), strings(&build_strings), int64s(&numbers(0, 6))]];
+    let schema = [("bk", DataType::Int64), ("bs", DataType::String), ("bv", DataType::Int64)];
+    let groups: Vec<&[ColumnView]> = build.iter().map(|group| &group[..]).collect();
+    let b =
+        DynScannable::new(Env::current(), Table::new(Env::current(), &schema, &groups).unwrap())
+            .unwrap();
+    let tables = Tables(Vec::from([(String::from("p"), &p), (String::from("b"), &b)]));
+    let got = run(&tables, "FROM p |> JOIN b ON pk = bk AND ps = bs |> SELECT pv, bv");
+    let probe_string = |row: usize| if row < rows { ["a", "b", "c"][row % 3] } else { "b" };
+    let mut expected = Vec::new();
+    for p in 0..rows + 10 {
+        for (b, &string) in build_strings.iter().enumerate() {
+            if p % 4 == b % 4 && probe_string(p) == string {
+                expected.push(Vec::from([Some(p as i64), Some(b as i64)]));
+            }
+        }
+    }
+    expected.sort_unstable();
+    assert_eq!(got, expected);
+}

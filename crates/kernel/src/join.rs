@@ -250,12 +250,15 @@ impl<'c> Op<'c> for JoinOp {
     }
 
     /// Sequences of what can be its keys, as a table's ids come: a build
-    /// side's it holds no hash table for.
+    /// side's it holds no hash table for. Dictionaries and constants of them
+    /// too: a string key's entries are each interned once, rather than each
+    /// row's.
     fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
         let key = self.conjuncts.iter().any(|&conjunct| {
             equality(exprs.nodes(conjunct)).is_some_and(|columns| columns.contains(&column))
         });
-        if key { Forms::FLAT | Forms::SEQUENCE } else { Forms::FLAT }
+        let forms = Forms::FLAT | Forms::SEQUENCE | Forms::DICTIONARY | Forms::CONSTANT;
+        if key { forms } else { Forms::FLAT }
     }
 
     /// A condition on a child's column can be applied to that child, but
@@ -588,11 +591,14 @@ fn find_groups(
     positions: &[u32],
     groups: &mut [u32],
 ) -> Result<(), Error> {
-    // Flat, or a dictionary's, as a group table takes them.
+    // Flat, or a string's dictionary or constant, as a group table takes them.
     let mut copies = [const { None }; JOIN_KEYS_MAX];
     for (copy, &position) in copies.iter_mut().zip(positions) {
         let column = batch.column(position);
-        if !column.is_in(Forms::FLAT | Forms::DICTIONARY) {
+        let string = column.data_type() == DataType::String;
+        let forms =
+            if string { Forms::FLAT | Forms::DICTIONARY | Forms::CONSTANT } else { Forms::FLAT };
+        if !column.is_in(forms) {
             let mut flat = column.clone();
             flat.make_in(context, Forms::FLAT)?;
             *copy = Some(flat);
@@ -605,7 +611,7 @@ fn find_groups(
     let columns = at!(columns, ..positions.len());
     let selection = batch.selection();
     table.find_or_create(context, columns, selected(selection), groups)?;
-    if columns.iter().any(|column| column.validity().is_some()) {
+    if columns.iter().any(|column| column.values().validity().is_some()) {
         for (i, group) in groups.iter_mut().enumerate() {
             #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
             let row = selection.kept().row(i as u32);
