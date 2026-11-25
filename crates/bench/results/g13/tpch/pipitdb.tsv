@@ -1,0 +1,25 @@
+# pipitdb, build suite, one thread, best of 3, ms
+# x86_64, 16 cores, Linux-7.3.4-arch1-2-x86_64-with-glibc2.44, 2026-11-24, 8 files
+# load 3.36 before, 2.99 after
+1	202.9
+2	41.2
+3	118.6
+4	84.5
+5	135.6
+6	unwritten
+7	193.3
+8	199.7
+9	252.6
+10	203.7
+11	unwritten
+12	441.7
+13	148.4
+14	102.3
+15	unwritten
+16	34.0
+17	unwritten
+18	175.9
+19	129.4
+20	170.0
+21	779.4
+22	unwritten

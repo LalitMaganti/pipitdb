@@ -8,7 +8,7 @@ costs, as well as each one it does.
 groups of 10,000, so a footer describes 10 chunks of each column. Every
 tenth column is a string; the rest are integers.
 
-`run` times each query, best of RUNS, in ms, as clickbench/engines.py does:
+`run` times each query, best of RUNS, in ms:
 each run is a fresh process that runs every query once. Each engine first
 runs `SELECT 1`, which starts it without reading the file.
 pipitdb is its `suite` example, which needs building first with
