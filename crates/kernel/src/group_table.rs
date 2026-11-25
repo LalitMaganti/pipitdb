@@ -448,7 +448,11 @@ impl GroupTable {
         range: core::ops::Range<usize>,
     ) -> Result<ColumnView, Error> {
         let rows = range.len();
-        let mut values = context.values_buffer(rows * 8)?;
+        let mut values = if rows > BATCH_ROWS_MAX as usize {
+            context.bytes_buffer(rows * 8)?
+        } else {
+            context.values_buffer(rows * 8)?
+        };
         let out = values.as_mut_slice::<i64>().iter_mut();
         let mut nulls = false;
         for (out, group) in out.zip(range.clone()) {
@@ -548,15 +552,19 @@ fn word(id: Id, number: u32) -> u64 {
 }
 
 /// The strings of `ids`, ids in the run's pool in their low halves, 0 for
-/// null, as a string column.
+/// null, as a string column: of more rows than a batch's, its buffers are
+/// bytes.
 #[inline(never)]
 pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
     let rows = ids.len();
+    let large = rows > BATCH_ROWS_MAX as usize;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);
     let mut validity = None;
     if (0..rows).any(|row| id(row).is_null()) {
-        let mut bits = context.small_buffer(BitSlice::<u8>::words_for(rows))?;
+        let size = BitSlice::<u8>::words_for(rows);
+        let mut bits =
+            if large { context.bytes_buffer(size)? } else { context.small_buffer(size)? };
         for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
             let row = start * 8;
             let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
@@ -564,7 +572,8 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         }
         validity = Some(bits);
     }
-    let mut views = context.values_buffer(rows * 8)?;
+    let mut views =
+        if large { context.bytes_buffer(rows * 8)? } else { context.values_buffer(rows * 8)? };
     let (views_out, _) = views.as_mut_slice::<u32>().as_chunks_mut::<2>();
     let pool = context.string_pool()?;
     let mut bytes = 0_u32;

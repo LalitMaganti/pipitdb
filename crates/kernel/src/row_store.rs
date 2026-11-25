@@ -149,18 +149,13 @@ impl RowStore {
         Ok(())
     }
 
-    /// Stops holding column `column`, of `data_type`, of the rows appended
-    /// from now on, which must be all of them: gathering it needs its values
-    /// given.
-    pub(crate) fn drop_column(
-        &mut self,
-        context: &mut Context,
-        column: u32,
-        data_type: DataType,
-    ) -> Result<(), Error> {
+    /// Stops holding column `column` of the rows appended from now on, which
+    /// must be all of them: gathering it needs its values given.
+    pub(crate) fn drop_column(&mut self, context: &mut Context, column: u32) -> Result<(), Error> {
         check!(column < 63 && self.len() == 0 && self.dropped >> column & 1 == 0);
+        // Of any type, as it's never read.
         let nothing = context.values_buffer(BATCH_ROWS_MAX as usize * 8)?;
-        self.placeholders.push(ColumnView::new(context, data_type, nothing, None)?)?;
+        self.placeholders.push(ColumnView::new(context, DataType::Int64, nothing, None)?)?;
         self.dropped |= 1 << column;
         Ok(())
     }
@@ -319,18 +314,6 @@ impl RowStore {
             let Ok(()) = out.push_column(column) else { failed!() };
         }
         Ok(count)
-    }
-
-    /// As `gather`, of a store that dropped no column: one copy, which
-    /// the joins share.
-    #[inline(never)]
-    pub(crate) fn gather_held(
-        &mut self,
-        context: &mut Context,
-        out: &mut RowBatch,
-        rows: (&[u32], Kept),
-    ) -> Result<u32, Error> {
-        self.gather(context, out, rows, 0, &mut |_, _| failed!())
     }
 
     /// Column `column`'s `count` values from `at` in the order `scatter` was

@@ -598,16 +598,7 @@ impl ColumnView {
         let mut out = context.values_buffer(rows * 8)?;
         let gathered = at_mut!(out.as_mut_slice::<i64>(), ..rows);
         match form {
-            Form::Dictionary(indices) => {
-                let indices = at!(indices, ..rows);
-                // Checked together, so each row's gather needn't be.
-                let max = indices.iter().fold(0, |max, &i| max.max(i));
-                check!(rows == 0 || (max as usize) < words.len());
-                for (word, &i) in gathered.iter_mut().zip(indices) {
-                    // SAFETY: every index is below `words.len()`, checked above.
-                    *word = unsafe { *words.get_unchecked(i as usize) };
-                }
-            }
+            Form::Dictionary(indices) => gather(gathered, words, at!(indices, ..rows)),
             Form::Flat | Form::Constant | Form::Sequence(_) => gathered.fill(*at!(words, 0)),
         }
         if let Some(bytes) = &values.header.bytes {
@@ -698,6 +689,17 @@ impl Drop for ColumnView {
 /// Where the `Header` in `block` is: buffers are aligned for any.
 fn header_in(block: &Buffer) -> NonNull<Header> {
     block.as_non_null().cast()
+}
+
+/// Writes the values at `indices` to `out`: checked together, so each row's
+/// gather needn't be.
+pub(crate) fn gather<T: Copy>(out: &mut [T], values: &[T], indices: &[u32]) {
+    let max = indices.iter().fold(0, |max, &i| max.max(i));
+    check!(indices.is_empty() || (max as usize) < values.len());
+    for (out, &i) in out.iter_mut().zip(indices) {
+        // SAFETY: every index is below `values.len()`, checked above.
+        *out = unsafe { *values.get_unchecked(i as usize) };
+    }
 }
 
 impl<'a> Values<'a> {
