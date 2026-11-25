@@ -27,7 +27,7 @@ use crate::lower::{LowerError, Lowering};
 use crate::names::Names;
 use crate::optimize::{Needed, Pruned};
 use crate::output_properties::{ARRANGEMENT_KEYS_MAX, DeriveContext, InputNeeds, OutputProperties};
-use crate::predicate::{Filter, Predicate, compared_with};
+use crate::predicate::{Filter, Predicate, tested_forms};
 use crate::query::Named;
 use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::scannable::{DynScannable, Key, Summary};
@@ -1018,16 +1018,10 @@ impl<'c> Op<'c> for FilterOp {
         Ok(())
     }
 
-    /// Constants, which it tests once; dictionaries of columns it only
-    /// compares with strings, whose entries it tests once each; and
-    /// sequences of columns it only compares with integers, whose rows it
-    /// keeps by their numbers: see `Op::accepts`.
+    /// Constants, which it tests once, and dictionaries and sequences where
+    /// its tests gain from them: see `tested_forms` and `Op::accepts`.
     fn accepts(&self, exprs: &Exprs, column: ColumnId) -> Forms {
-        match compared_with(exprs, &self.conjuncts, column) {
-            Some(DataType::String) => Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY,
-            Some(DataType::Int64) => Forms::FLAT | Forms::CONSTANT | Forms::SEQUENCE,
-            _ => Forms::FLAT | Forms::CONSTANT,
-        }
+        tested_forms(exprs, &self.conjuncts, column)
     }
 
     /// Splits off the conjuncts that `below` can apply to an input instead:
