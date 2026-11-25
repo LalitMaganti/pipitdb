@@ -366,7 +366,7 @@ mod tests {
 
         fn summary(&self, column: Option<u32>) -> Option<Summary> {
             let bounds = column.and_then(|column| *at!(self.bounds, column as usize));
-            Some(Summary { rows: self.rows, bounds })
+            Some(Summary { rows: self.rows, bounds, follows_on: false })
         }
     }
 

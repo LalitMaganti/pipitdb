@@ -484,9 +484,10 @@ impl<'a> Scannable for ParquetTable<'a> {
     }
 
     /// From the footers: the rows' count, and a column's least and greatest
-    /// values, if every row group's statistics hold them exactly.
+    /// values, if every row group's statistics hold them exactly. Its row
+    /// groups follow on if each one's least is above the greatest before.
     fn summary(&self, column: Option<u32>) -> Option<Summary> {
-        let (mut rows, mut bounds) = (0, None::<Bounds>);
+        let (mut rows, mut bounds, mut follows_on) = (0, None::<Bounds>, true);
         for file in self.files.iter() {
             for group in 0..file.footer.row_groups() {
                 rows += i64::try_from(file.footer.group_rows(group)).ok()?;
@@ -496,13 +497,13 @@ impl<'a> Scannable for ParquetTable<'a> {
                     return None;
                 }
                 let next = bounds::of_chunk(*at!(file.footer.columns(), c as usize), chunk)?;
-                bounds = Some(bounds.map_or(next, |b| Bounds {
-                    min: b.min.min(next.min),
-                    max: b.max.max(next.max),
+                bounds = Some(bounds.map_or(next, |b| {
+                    follows_on &= b.max < next.min;
+                    Bounds { min: b.min.min(next.min), max: b.max.max(next.max) }
                 }));
             }
         }
-        Some(Summary { rows, bounds })
+        Some(Summary { rows, bounds, follows_on })
     }
 
     /// Skips the row groups whose footer statistics rule out a condition,
@@ -779,6 +780,19 @@ mod tests {
         assert_eq!(summary(Some(0)), Some((10000, Some((0, 4999)))));
         // `name` is a string, with no bounds.
         assert_eq!(summary(Some(2)), None);
+    }
+
+    #[test]
+    fn follows_on_where_row_groups_values_dont_overlap() {
+        let env = Env::current();
+        let follows_on = |files: &[&dyn ByteSource]| {
+            let table = ParquetTable::open(env, &Uncompressed, files).unwrap();
+            table.summary(Some(0)).unwrap().follows_on
+        };
+        // Each file's row groups have `id`s 0 to 2047, 2048 to 4095 and 4096
+        // to 4999, so a second file's overlap the first's.
+        assert!(follows_on(&[&SMALL]));
+        assert!(!follows_on(&[&SMALL, &SMALL]));
     }
 
     #[test]

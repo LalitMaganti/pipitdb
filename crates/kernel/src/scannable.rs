@@ -143,12 +143,15 @@ pub trait Scannable {
 }
 
 /// What's known of a scannable's rows without reading them: how many there
-/// are, and the least and greatest of a column's values, `None` if it has
-/// none that aren't null.
+/// are, the least and greatest of a column's values, `None` if it has none
+/// that aren't null, and whether its runs of rows, such as row groups,
+/// follow on in it: each run's values are above every value before it, and
+/// the bounds of any two batches of a run overlap.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Summary {
     pub rows: i64,
     pub bounds: Option<Bounds>,
+    pub follows_on: bool,
 }
 
 /// What kind of key a column is known to be, from least to most known, as
