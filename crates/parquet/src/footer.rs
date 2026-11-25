@@ -154,6 +154,9 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     ) else {
         return Some(Err(Error::OutOfMemory));
     };
+    let Ok(mut kept) = SmallVec::new(env, COLUMNS_MAX) else {
+        return Some(Err(Error::OutOfMemory));
+    };
     let mut c = Cursor::new(footer);
     // `FileMetaData`: its schema, then its row groups, each read where it
     // is, so no byte is passed over more than once. What comes after them
@@ -162,7 +165,7 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     loop {
         match c.field(&mut last)?? {
             (2, _) => {
-                if let Err(error) = schema(&mut c, &mut names, &mut columns)? {
+                if let Err(error) = schema(&mut c, &mut names, &mut columns, &mut kept)? {
                     return Some(Err(error));
                 }
             }
@@ -170,8 +173,11 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
             (_, kind) => c.skip(kind)?,
         }
     }
-    if columns.is_empty() {
+    if kept.is_empty() {
         return None;
+    }
+    if columns.is_empty() {
+        return Some(Err(Error::Unsupported));
     }
     let (_, len) = c.list()?;
     // `RowGroup`s: their column chunks, and rows.
@@ -180,11 +186,16 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
         while let Some((id, kind)) = c.field(&mut last)? {
             match id {
                 1 => {
-                    if c.list()?.1 != columns.len() {
+                    if c.list()?.1 != kept.len() {
                         return None;
                     }
-                    for column in columns.iter() {
-                        if chunks.push(column_chunk(&mut c, *column)?).is_err() {
+                    let mut next = columns.iter();
+                    for &kept in kept.iter() {
+                        if !kept {
+                            c.skip(STRUCT)?;
+                            continue;
+                        }
+                        if chunks.push(column_chunk(&mut c, *next.next()?)?).is_err() {
                             return Some(Err(Error::Unsupported));
                         }
                     }
@@ -200,21 +211,34 @@ fn parse(env: &Env, footer: &[u8]) -> Option<Result<ParquetFile, Error>> {
     Some(Ok(ParquetFile { names, columns, group_rows, chunks }))
 }
 
-/// Reads the schema at `c` into `names` and `columns`: `None` if it's
-/// damaged, and an error if it can't be read.
+/// Reads the schema at `c` into `names` and `columns`, and whether each of
+/// its leaves, in order, is one of `columns` into `kept`: `None` if it's
+/// damaged. Leaves this reader can't read are left out, so a file of some
+/// it can still be read.
 fn schema(
     c: &mut Cursor<'_>,
     names: &mut Names,
     columns: &mut SmallVec<Column>,
+    kept: &mut SmallVec<bool>,
 ) -> Option<Result<(), Error>> {
     let (_, len) = c.list()?;
     // `SchemaElement`s: its type, repetition, name, children's count, and
-    // converted and logical types. The first is the root; flat schemas have
-    // columns only under it.
+    // converted and logical types. The first is the root.
     let mut element = [Value::Missing; 6];
+    // How many elements below a nested one are still to be passed over.
+    let mut nested: usize = 0;
     for i in 0..len {
         c.fields(&[1, 3, 4, 5, 6, 10], &mut element)?;
+        let children = usize::try_from(element[3].int().unwrap_or(0)).ok()?;
         if i == 0 {
+            continue;
+        }
+        // Nested and repeated columns need repetition levels.
+        if nested > 0 || children > 0 {
+            nested = (nested + children).checked_sub(usize::from(nested > 0))?;
+            if children == 0 && kept.push(false).is_err() {
+                return Some(Err(Error::Unsupported));
+            }
             continue;
         }
         let physical = match element[0].int() {
@@ -226,18 +250,23 @@ fn schema(
             Some(5) => Physical::Double,
             Some(6) => Physical::ByteArray,
             Some(7) => Physical::FixedLenByteArray,
-            _ => return Some(Err(Error::Unsupported)),
+            _ => return None,
         };
-        // Nested and repeated columns need repetition levels.
-        if element[3].int().unwrap_or(0) != 0 || element[1].int() == Some(2) {
-            return Some(Err(Error::Unsupported));
-        }
         let optional = element[1].int() == Some(1);
         let logical = logical(c, element[4], element[5])?;
+        let name = Name::default();
+        let column = Column { name, physical, logical, optional };
+        let readable = column.data_type().is_some() && element[1].int() != Some(2);
+        if kept.push(readable).is_err() {
+            return Some(Err(Error::Unsupported));
+        }
+        if !readable {
+            continue;
+        }
         let Ok(name) = names.add(core::str::from_utf8(element[2].bytes()?).ok()?) else {
             return Some(Err(Error::OutOfMemory));
         };
-        if columns.push(Column { name, physical, logical, optional }).is_err() {
+        if columns.push(Column { name, ..column }).is_err() {
             return Some(Err(Error::Unsupported));
         }
     }
