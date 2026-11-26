@@ -326,6 +326,7 @@ impl Breaker for HashAggregate {
         // Output up to a full batch of groups.
         let first = state.emitted;
         let count = (groups - first).min(BATCH_ROWS_MAX as usize);
+        let count = state.groups.batch_from(first, count);
         #[expect(clippy::cast_possible_truncation, reason = "at most a batch's")]
         output.reset(count as u32);
         for k in 0..self.spec.key_columns.len() {
