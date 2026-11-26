@@ -18,7 +18,7 @@ use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
 use crate::step::Breaker;
-use crate::string_pool::CACHED_SLOTS;
+use crate::string_pool::{CACHED_SLOTS, StringPool};
 
 /// The breaker that aggregates by `spec`.
 pub fn hash_aggregate(spec: HashAggregateSpec) -> HashAggregate {
@@ -52,6 +52,8 @@ pub struct State {
     distinct: SmallVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
+    /// The strings string `MIN` and `MAX` keep, made with the first.
+    extremes: Option<StringPool>,
 }
 
 impl HashAggregate {
@@ -235,7 +237,7 @@ impl Breaker for HashAggregate {
             let set = if call.distinct { Some(FlatHashMap::for_len(env, 0)?) } else { None };
             distinct.push(set)?;
         }
-        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0 })
+        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0, extremes: None })
     }
 
     fn consume(
@@ -264,7 +266,7 @@ impl Breaker for HashAggregate {
             state.groups.find_or_create(context, keys, input.select(), groups)?;
         }
         let group_count = self.group_count(state);
-        let State { groups, total, seen, distinct, .. } = state;
+        let State { groups, total, seen, distinct, extremes, .. } = state;
         let total = [total.as_mut_ptr()];
         let base = self.state_base(groups, &total);
         let mut overflow = false;
@@ -275,7 +277,9 @@ impl Breaker for HashAggregate {
                 let states = Self::states(base, offset, None);
                 offset += StringExtreme::STATE_WORDS;
                 let column = input.column(call.column);
-                extreme.update(context, column, input.select(), rows, numbers, states)?;
+                let pool = StringPool::made(extremes, context.env())?;
+                let select = input.select();
+                extreme.update((context, pool), column, select, rows, numbers, states)?;
                 continue;
             }
             let function = make_aggregate_function(call.function, call.input_type);
@@ -338,7 +342,7 @@ impl Breaker for HashAggregate {
         for (number, group) in numbers.iter_mut().zip(first..) {
             *number = group as u32;
         }
-        let State { groups: table, total, seen, consumed, .. } = state;
+        let State { groups: table, total, seen, consumed, extremes, .. } = state;
         let total = [total.as_mut_ptr()];
         let base = self.state_base(table, &total);
         let mut offset = 0;
@@ -346,7 +350,8 @@ impl Breaker for HashAggregate {
             if string_extreme(*call).is_some() {
                 let states = Self::states(base, offset, None);
                 offset += StringExtreme::STATE_WORDS;
-                let column = StringExtreme::finalize(context, &states, numbers)?;
+                let pool = StringPool::made(extremes, context.env())?;
+                let column = StringExtreme::finalize(context, pool, &states, numbers)?;
                 let Ok(()) = output.push_column(column) else { failed!() };
                 continue;
             }
@@ -709,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn tables_sharing_a_pool_number_their_own_groups() {
+    fn tables_with_pools_of_their_own_number_their_own_groups() {
         let env = Env::current();
         let mut context = Context::new(env, None);
         let mut tables = [(); 2].map(|()| GroupTable::new(env, 1, 1, u64::MAX, 0).unwrap());
@@ -720,8 +725,8 @@ mod tests {
         let first = column(&[Some("a"), Some("b"), Some("c")]);
         tables[0].find_or_create(&mut context, &[&first], &[], &mut groups[..3]).unwrap();
         assert_eq!(groups[..3], [0, 1, 2]);
-        // The pool numbered "a" and "c" for the first table, and numbers "d"
-        // after them.
+        // The second table's pool hasn't seen "a" or "c", and numbers each
+        // key as it comes.
         let second = column(&[Some("c"), None, Some("a"), Some("c"), Some("d")]);
         tables[1].find_or_create(&mut context, &[&second], &[], &mut groups).unwrap();
         assert_eq!(groups, [0, 1, 2, 0, 3]);

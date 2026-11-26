@@ -1,6 +1,6 @@
 //! `GroupTable`: numbers rows by their keys, as Perfetto's does, for the
 //! operators that group rows. A string key is grouped by its id in the
-//! run's `StringPool`.
+//! table's own `StringPool`.
 
 #![allow(unsafe_code)]
 
@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::{SEED, combine};
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
+use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER, StringPool};
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -69,13 +69,16 @@ pub(crate) struct GroupTable {
     nullable: u64,
     /// How many keys there are.
     keys: usize,
-    /// Bit `k` set if key `k` is a string, stored as its word in the run's
-    /// pool: as in Perfetto, a null string is a key, not a null one.
+    /// Bit `k` set if key `k` is a string, stored as its word in `pool`: as
+    /// in Perfetto, a null string is a key, not a null one.
     string_keys: u64,
+    /// The strings its string keys are, made with the first: its own, so
+    /// they're freed with it.
+    pool: Option<StringPool>,
     /// For each key, the last dictionary it came in, if it's a string key.
     dictionaries: SmallVec<Option<Interned>>,
     /// With a single key, a string, each string's group plus one, 0 until it
-    /// has one, at its number in the run's pool plus one, and the null
+    /// has one, at its number in `pool` plus one, and the null
     /// string's at 0: so a row's group is found without hashing again.
     number_groups: SmallVec<u32>,
     /// Whether a key not found gets no group, `NONE`, rather than a new
@@ -121,6 +124,7 @@ impl GroupTable {
             nullable,
             keys,
             string_keys,
+            pool: None,
             dictionaries: SmallVec::fixed_from(env, (0..keys).map(|_| None))?,
             number_groups: SmallVec::new(env, 1 << 31)?,
             frozen: false,
@@ -176,7 +180,8 @@ impl GroupTable {
         if (self.keys, self.string_keys) == (1, 1) {
             self.records.reserve(context.env(), self.len() + count)?;
             let (interned, column) = (at_mut!(self.dictionaries, 0), at!(columns, 0));
-            let words = load_string_words(context, interned, column, select, count)?;
+            let pool = StringPool::made(&mut self.pool, context.env())?;
+            let words = load_string_words(context, pool, interned, column, select, count)?;
             return self.find_numbered(at!(words.as_slice(), ..count), groups);
         }
         // Each key as a word a row, 0 where null, and a word a row of which
@@ -186,7 +191,8 @@ impl GroupTable {
         for (k, (column, copy)) in columns.iter().zip(copies.iter_mut()).enumerate() {
             if self.string_keys >> k & 1 != 0 {
                 let interned = at_mut!(self.dictionaries, k);
-                *copy = Some(load_string_words(context, interned, column, select, count)?);
+                let pool = StringPool::made(&mut self.pool, context.env())?;
+                *copy = Some(load_string_words(context, pool, interned, column, select, count)?);
             } else {
                 let nulls = if self.nullable >> k & 1 != 0 { Some(&mut nulls) } else { None };
                 load_key_words(context, column, select, count, k, copy, nulls)?;
@@ -305,14 +311,14 @@ impl GroupTable {
     }
 
     /// As `find_or_create`, for a single key, a string, given each row's
-    /// word in the run's pool: a string's group is found by its number,
+    /// word in its pool: a string's group is found by its number,
     /// without hashing it again.
     #[inline(never)]
     fn find_numbered(&mut self, words: &[i64], groups: &mut [u32]) -> Result<(), Error> {
         // `NO_NUMBER` plus one wraps to 0, the null string's.
         let place = |word: i64| ((word.cast_unsigned() >> 32) as u32).wrapping_add(1) as usize;
         let most = words.iter().map(|&word| place(word)).max().unwrap_or(0);
-        // Other tables share the pool, so numbers can be skipped. Saturating,
+        // A number can be past every group's so far. Saturating,
         // as on 32-bit targets `most` can be `usize::MAX`: past the cap,
         // extending fails.
         let len = most.saturating_add(1);
@@ -446,7 +452,7 @@ impl GroupTable {
 
     /// Key `k` of the groups in `range`, as a column of its type.
     pub(crate) fn write_keys(
-        &self,
+        &mut self,
         context: &mut Context,
         k: usize,
         range: core::ops::Range<usize>,
@@ -465,7 +471,8 @@ impl GroupTable {
             nulls |= self.first == 1 && *at!(record, 0) >> k & 1 != 0;
         }
         if self.string_keys >> k & 1 != 0 {
-            return write_strings(context, at!(values.as_slice::<i64>(), ..rows));
+            let pool = StringPool::made(&mut self.pool, context.env())?;
+            return write_strings(context, pool, at!(values.as_slice::<i64>(), ..rows));
         }
         if !nulls {
             return Ok(ColumnView::new(context, DataType::Int64, values, None)?);
@@ -484,11 +491,12 @@ impl GroupTable {
 
 /// Loads `count` rows that `select` keeps of string key column `column`, flat,
 /// a dictionary or a constant, all if `select` is empty, as their words in
-/// the run's string pool. A dictionary's entries are each interned once, when
+/// `pool`. A dictionary's entries are each interned once, when
 /// a row with it is first found, and their words kept in `interned` while
 /// batches share the dictionary. A constant is interned once a batch.
 fn load_string_words(
     context: &mut Context,
+    pool: &mut StringPool,
     interned: &mut Option<Interned>,
     column: &ColumnView,
     select: &[u16],
@@ -499,7 +507,6 @@ fn load_string_words(
     let strings = values.strings();
     let mut words = context.values_buffer(count * 8)?;
     let env = context.env();
-    let pool = context.string_pool()?;
     let row_of = |i: usize| if select.is_empty() { i } else { usize::from(*at!(select, i)) };
     let out = words.as_mut_slice::<u64>();
     match column.form() {
@@ -549,17 +556,20 @@ fn load_string_words(
     Ok(words)
 }
 
-/// A string's word: its number in the run's pool above its id, so the word
+/// A string's word: its number in its pool above its id, so the word
 /// is a key on its own, and its low half is its id. Never 0.
 fn word(id: Id, number: u32) -> u64 {
     u64::from(id.raw_id()) | u64::from(number) << 32
 }
 
-/// The strings of `ids`, ids in the run's pool in their low halves, 0 for
-/// null, as a string column: of more rows than a batch's, its buffers are
-/// bytes.
+/// The strings of `ids`, ids in `pool` in their low halves, 0 for null, as
+/// a string column: of more rows than a batch's, its buffers are bytes.
 #[inline(never)]
-pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<ColumnView, Error> {
+pub(crate) fn write_strings(
+    context: &mut Context,
+    pool: &mut StringPool,
+    ids: &[i64],
+) -> Result<ColumnView, Error> {
     let rows = ids.len();
     let large = rows > BATCH_ROWS_MAX as usize;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
@@ -580,7 +590,6 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         if large { context.bytes_buffer(rows * 8)? } else { context.values_buffer(rows * 8)? };
     let words_out = words.as_mut_slice::<u64>();
     // An empty string first, which every null and empty string is.
-    let pool = context.string_pool()?;
     let mut bytes = 4_u32;
     for (row, word) in words_out.iter_mut().enumerate() {
         let len = pool.get(id(row)).map_or(0, <[u8]>::len);
@@ -590,7 +599,6 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         bytes = bytes.checked_add(taken).ok_or(Error::OutOfMemory)?;
     }
     let mut stored = context.bytes_buffer(bytes as usize)?;
-    let pool = context.string_pool()?;
     let out = stored.as_mut_slice::<u8>();
     at_mut!(out, ..4).fill(0);
     for (row, &word) in words_out.iter().enumerate() {

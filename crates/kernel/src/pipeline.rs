@@ -1474,19 +1474,18 @@ pub(crate) mod tests {
         assert_eq!(execution.next(&mut batch), Err(Error::Corrupt));
     }
 
-    /// Interns `string` in the run's string pool, checking it's numbered
-    /// `number`.
-    struct Interns {
-        string: &'static [u8],
-        number: u32,
+    /// Publishes `set` as the run's first cutoff, checking it was `was`.
+    struct Publishes {
+        was: Option<i64>,
+        set: i64,
     }
 
-    impl Transform for Interns {
-        const NAME: &'static str = "Interns";
+    impl Transform for Publishes {
+        const NAME: &'static str = "Publishes";
         type State = ();
 
-        fn new_state(&self, _: &mut Context) -> Result<(), Error> {
-            Ok(())
+        fn new_state(&self, context: &mut Context) -> Result<(), Error> {
+            Ok(context.reserve_cutoff(0)?)
         }
 
         fn process(
@@ -1495,9 +1494,8 @@ pub(crate) mod tests {
             (): &mut (),
             _: &mut RowBatch,
         ) -> Result<(), Error> {
-            let env = context.env();
-            let (_, number) = context.string_pool()?.intern_numbered(env, self.string)?;
-            assert_eq!(number, self.number);
+            assert_eq!(context.cutoff(0), self.was);
+            context.set_cutoff(0, Some(self.set));
             Ok(())
         }
     }
@@ -1518,10 +1516,10 @@ pub(crate) mod tests {
     fn a_pipeline_as_a_source_runs_on_its_callers_context() {
         let live = Rc::new(());
         let position = Position { live: live.clone() };
-        let steps = [transform(position), transform(Interns { string: b"x", number: 0 })];
+        let steps = [transform(position), transform(Publishes { was: None, set: 1 })];
         let inner = pipeline(Numbers { batches: 1 }, steps);
-        // The outer run's pool already has the inner run's string.
-        let outer = nested(inner, [transform(Interns { string: b"y", number: 1 })]);
+        // The outer run sees what the inner run published.
+        let outer = nested(inner, [transform(Publishes { was: Some(1), set: 2 })]);
         let query = Env::current();
         let mut execution = outer.start(query, None).unwrap();
         assert_eq!(batches(&mut execution).len(), 1);
