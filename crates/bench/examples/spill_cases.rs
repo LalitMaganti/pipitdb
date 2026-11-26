@@ -60,7 +60,8 @@ const SMALLEST: usize = 4;
 /// Each operator that holds rows, one at a time, over `t` and `u`. In `t`,
 /// `k` is unique, `g` has two rows a value, `v` is unique but a seventh
 /// null, `s` is a string a `g`, and `p` is 64 bytes a row. `u` has `uk`,
-/// unique, `us`, as `s` of `uk / 2`, and `uw`, an eleventh null.
+/// unique, `us`, as `s` of `uk / 2`, and `uw`, an eleventh null, and half
+/// as many rows.
 const CASES: &[Case] = &[
     Case {
         name: "aggregate_int_keys",
@@ -95,6 +96,16 @@ const CASES: &[Case] = &[
     Case {
         name: "left_join",
         query: "FROM t |> LEFT JOIN u ON g = uk |> SELECT k, uw",
+        ordered: false,
+    },
+    Case {
+        name: "join_hashed_keys",
+        query: "FROM t |> JOIN u ON v = uw |> SELECT k, uk",
+        ordered: false,
+    },
+    Case {
+        name: "left_join_build",
+        query: "FROM u |> LEFT JOIN t ON uk = g |> SELECT uk, k",
         ordered: false,
     },
     Case { name: "sort_int", query: "FROM t |> SELECT k, v |> ORDER BY k", ordered: true },
@@ -184,9 +195,17 @@ fn run_with(tables: &Tables, case: &Case, budget: usize) -> (Result<Summary, Str
     let got = run(tables, case, &env);
     let time = start.elapsed();
     #[cfg(feature = "spill")]
-    let spilled = Some(store.take_counts());
+    let (spilled, left) = {
+        let (written, read, left) = store.take_counts();
+        (Some((written, read)), left)
+    };
     #[cfg(not(feature = "spill"))]
-    let spilled = None;
+    let (spilled, left) = (None, 0);
+    let got = match got {
+        _ if left == 0 => got,
+        Ok(_) => Err(format!("{left} logs not deleted")),
+        Err(error) => Err(format!("{error}, and {left} logs not deleted")),
+    };
     (got, Run { time, peak: env.peak(), spilled })
 }
 
@@ -299,6 +318,11 @@ fn tables(rows: u32) -> Result<Tables, Error> {
             strings(env, &names)?,
             strings(env, &payloads)?,
         ]);
+        // `u` has half as many rows, so a join can build either side.
+        if start >= count / 2 {
+            continue;
+        }
+        let range = start..range.end.min(count / 2);
         let keys: Vec<i64> = range.map(|i| spread(i, 7).cast_signed()).collect();
         let names: Vec<Vec<u8>> = keys.iter().map(|&key| name(key / 2)).collect();
         let weights = keys.iter().map(|key| (key % 11 != 0).then_some(key * 3));
@@ -471,11 +495,13 @@ impl MemoryStore {
         STORE.with(|store| *store)
     }
 
-    /// The bytes written and read since last asked, checking every log was
-    /// deleted.
-    fn take_counts(&self) -> (u64, u64) {
-        assert!(self.logs.borrow().iter().all(Option::is_none), "a log wasn't deleted");
-        (self.written.take(), self.read.take())
+    /// The bytes written and read since last asked, and how many logs
+    /// weren't deleted, which it then deletes.
+    fn take_counts(&self) -> (u64, u64, usize) {
+        let mut logs = self.logs.borrow_mut();
+        let left = logs.iter().flatten().count();
+        logs.clear();
+        (self.written.take(), self.read.take(), left)
     }
 
     /// Calls `with` on `log`, if it's there and sealed is `sealed`.

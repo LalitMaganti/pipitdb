@@ -35,6 +35,8 @@ use crate::selection::{Kept, Selection};
 use crate::step::{DynOperator, Operator, Progress, Sink, Step, Transform};
 
 mod direct;
+#[cfg(feature = "spill")]
+mod spill;
 
 use direct::{Direct, Sequence, consecutive};
 
@@ -428,7 +430,15 @@ impl<'c> Op<'c> for JoinOp {
         if self.keeps_build() {
             probe_types.extend_within(probe.types());
         }
-        let build = lowering.add_sink(build, HashBuild { build_columns, held, keys, strings })?;
+        let hash_build = HashBuild {
+            build_columns,
+            held,
+            keys,
+            strings,
+            #[cfg(feature = "spill")]
+            keeps_nulls: self.keeps_build(),
+        };
+        let build = lowering.add_sink(build, hash_build)?;
         let join = Join {
             kind: self.kind,
             build,
@@ -550,6 +560,10 @@ struct HashBuild {
     /// The build column, by its place, of strings it holds as a dictionary,
     /// if any, for the join to output as one.
     strings: Option<u32>,
+    /// Whether the join outputs build rows with a null key, which match
+    /// none, so a build side that spills keeps them.
+    #[cfg(feature = "spill")]
+    keeps_nulls: bool,
 }
 
 /// What a run of a `HashBuild`'s pipeline builds.
@@ -558,6 +572,15 @@ struct Building {
     built: Option<Built>,
     /// Each batch's groups, as hashing finds them: a batch of `u32`s.
     groups: Buffer,
+    /// Whether it writes its rows to partitions once it can't hold them.
+    #[cfg(feature = "spill")]
+    spills: bool,
+    /// What the run's memory held before any rows were.
+    #[cfg(feature = "spill")]
+    base: usize,
+    /// Which bits of their keys' hash pick the partitions it writes to.
+    #[cfg(feature = "spill")]
+    level: u32,
 }
 
 /// What draining the build side makes.
@@ -586,6 +609,10 @@ struct Built {
     /// The build column of strings held as a dictionary, rather than in
     /// `rows`.
     strings: Option<Strings>,
+    /// Its rows, written to partitions once they couldn't be held, if they
+    /// were.
+    #[cfg(feature = "spill")]
+    spilled: Option<spill::Partitions>,
 }
 
 /// A build column of strings held as a dictionary of its distinct strings:
@@ -679,6 +706,10 @@ struct Probing {
     /// When it keeps the build rows, a null column of each probe column's
     /// type, a batch long.
     probe_nulls: SmallVec<ColumnView>,
+    /// Once its build side spilled, its probe rows' partitions and the pairs
+    /// of partitions left to join.
+    #[cfg(feature = "spill")]
+    spill: Option<spill::ProbeSpill>,
 }
 
 /// Writes to `groups` the group in `table` of the keys at `positions` of
@@ -916,6 +947,8 @@ impl Sink for HashBuild {
             sequence: if self.one_integer() { Sequence::Empty } else { Sequence::Broken },
             keys: SmallVec::new(env, 1 << 31)?,
             strings: None,
+            #[cfg(feature = "spill")]
+            spilled: None,
         };
         if let Some(at) = self.strings {
             built.rows.drop_column(context, at)?;
@@ -930,7 +963,16 @@ impl Sink for HashBuild {
             });
         }
         let groups = context.indices_buffer(BATCH_ROWS_MAX as usize * size_of::<u32>())?;
-        Ok(Building { built: Some(built), groups })
+        Ok(Building {
+            built: Some(built),
+            groups,
+            #[cfg(feature = "spill")]
+            spills: self.spills(env),
+            #[cfg(feature = "spill")]
+            base: env.used(),
+            #[cfg(feature = "spill")]
+            level: 0,
+        })
     }
 
     fn consume(
@@ -946,6 +988,12 @@ impl Sink for HashBuild {
         if selection.is_empty() {
             return Ok(());
         }
+        #[cfg(feature = "spill")]
+        if building.spills && self.spill_batch(context, building, batch, first)? {
+            return Ok(());
+        }
+        #[cfg(feature = "spill")]
+        let Some(built) = &mut building.built else { failed!() };
         if let Some(keys) = &self.keys {
             let groups = building.groups.as_mut_slice::<u32>();
             Self::hash(context, built, groups, keys, batch, first)?;
@@ -996,6 +1044,10 @@ impl Sink for HashBuild {
 
     fn finalize(&self, context: &mut Context, state: &mut Option<Built>) -> Result<(), Error> {
         let Some(built) = state else { failed!() };
+        #[cfg(feature = "spill")]
+        if built.spilled.is_some() {
+            return Ok(());
+        }
         // One integer key, each in one build row, is found by its value.
         match built.sequence {
             Sequence::From(min) => built.direct = Some(Direct::sequence(min, built.count)),
@@ -1239,6 +1291,8 @@ impl Operator for Join {
             build_matched: Bitmap::new(env, 0)?,
             unmatched: 0,
             probe_nulls,
+            #[cfg(feature = "spill")]
+            spill: None,
         })
     }
 
@@ -1250,6 +1304,10 @@ impl Operator for Join {
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
         self.with_build(context, probing, |context, built, probing| {
+            #[cfg(feature = "spill")]
+            if built.spilled.is_some() {
+                return self.spill_probe(context, built, probing, input, output);
+            }
             self.probe(context, built, probing, input, output)
         })
     }
@@ -1262,6 +1320,10 @@ impl Operator for Join {
         probing: &mut Probing,
         output: &mut RowBatch,
     ) -> Result<Progress, Error> {
+        #[cfg(feature = "spill")]
+        if let Some(progress) = self.finish_spilled(context, probing, output)? {
+            return Ok(progress);
+        }
         if !self.keeps_build {
             return Ok(Progress::NeedInput);
         }

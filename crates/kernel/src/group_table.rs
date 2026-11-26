@@ -511,6 +511,12 @@ impl GroupTable {
         Ok(())
     }
 
+    /// Key `k` of `group`, an integer key's value.
+    #[cfg(feature = "spill")]
+    pub(crate) fn key(&self, group: u32, k: usize) -> i64 {
+        *at!(self.records.record(group as usize), self.first + k)
+    }
+
     /// Key `k` of the groups in `range`, as a column of its type.
     pub(crate) fn write_keys(
         &self,
