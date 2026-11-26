@@ -198,6 +198,13 @@ impl Env {
         left.checked_sub(bytes).is_some_and(|left| left >= self.budget.limit / 8)
     }
 
+    /// How many bytes can be held on top of `used`, leaving an eighth of its
+    /// budget, as `leaves_room` does.
+    #[cfg(feature = "spill")]
+    pub(crate) fn room_above(&self, used: usize) -> usize {
+        (self.budget.limit - self.budget.limit / 8).saturating_sub(used)
+    }
+
     /// Where what doesn't fit in its budget goes, if anywhere.
     #[cfg(feature = "spill")]
     pub(crate) fn spill(&self) -> Option<&'static dyn SpillStore> {

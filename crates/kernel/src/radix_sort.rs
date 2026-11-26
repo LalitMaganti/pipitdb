@@ -31,9 +31,17 @@ pub(crate) struct Scratch(Array<u64>);
 impl Scratch {
     /// For sorting up to `count` words.
     pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
-        let len =
-            if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(Array::zeroed(env, len)?))
+        Ok(Scratch(Array::zeroed(env, Scratch::len(count))?))
+    }
+
+    /// How many bytes one for `count` words takes.
+    #[cfg(feature = "spill")]
+    pub(crate) fn bytes(count: usize) -> usize {
+        Scratch::len(count) * 8
+    }
+
+    fn len(count: usize) -> usize {
+        if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 }
     }
 }
 

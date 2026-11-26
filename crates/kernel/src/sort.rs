@@ -5,7 +5,11 @@
 use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
+#[cfg(feature = "spill")]
+use crate::radix_sort::Scratch;
 use crate::row_batch::RowBatch;
+#[cfg(feature = "spill")]
+use crate::sort_runs::{Runs, batch_bytes};
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
 use crate::step::Breaker;
@@ -20,36 +24,115 @@ pub struct Sort {
     keys: SmallVec<SortKey>,
 }
 
+pub struct SortState {
+    /// The rows held, sorted once all are in.
+    rows: SortedRows,
+    /// About how many bytes of rows `rows` holds.
+    #[cfg(feature = "spill")]
+    held: usize,
+    /// What the run's memory held before any rows were, so what the rows
+    /// take is known until the first run is written.
+    #[cfg(feature = "spill")]
+    base: usize,
+    /// The sorted runs written once it could hold no more, if any.
+    #[cfg(feature = "spill")]
+    runs: Option<Runs>,
+}
+
 impl Breaker for Sort {
     const NAME: &'static str = "Sort";
-    type State = SortedRows;
+    type State = SortState;
 
-    fn new_state(&self, context: &mut Context) -> Result<SortedRows, Error> {
-        Ok(SortedRows::new(context.env())?)
+    fn new_state(&self, context: &mut Context) -> Result<SortState, Error> {
+        Ok(SortState {
+            rows: SortedRows::new(context.env())?,
+            #[cfg(feature = "spill")]
+            held: 0,
+            #[cfg(feature = "spill")]
+            base: context.env().used(),
+            #[cfg(feature = "spill")]
+            runs: None,
+        })
     }
 
     fn consume(
         &self,
         context: &mut Context,
-        rows: &mut SortedRows,
+        state: &mut SortState,
         input: &RowBatch,
     ) -> Result<(), Error> {
-        rows.append(context, input, &self.keys)
+        #[cfg(feature = "spill")]
+        spill_if_full(context, state, input)?;
+        state.rows.append(context, input, &self.keys)
     }
 
-    fn finalize(&self, context: &mut Context, rows: &mut SortedRows) -> Result<(), Error> {
-        rows.sort(context)?;
-        rows.scatter(context)
+    fn finalize(&self, context: &mut Context, state: &mut SortState) -> Result<(), Error> {
+        #[cfg(feature = "spill")]
+        if let Some(runs) = &mut state.runs {
+            if state.rows.len() > 0 {
+                runs.write(context, &mut state.rows)?;
+                state.rows = SortedRows::new(context.env())?;
+            }
+            return runs.finish(context, &self.keys);
+        }
+        state.rows.sort(context)?;
+        state.rows.scatter(context)
     }
 
     fn serve(
         &self,
         context: &mut Context,
-        rows: &mut SortedRows,
+        state: &mut SortState,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        rows.serve(context, output)
+        #[cfg(feature = "spill")]
+        if let Some(runs) = &mut state.runs {
+            return runs.serve(context, &self.keys, output);
+        }
+        state.rows.serve(context, output)
     }
+}
+
+/// Writes the rows held as a sorted run if `input` wouldn't fit with
+/// them: the first time, if they wouldn't leave room to be sorted; and then
+/// once they hold as many bytes of rows as the first. Memory freed stays
+/// with the run's slabs, so only the first can be measured.
+#[cfg(feature = "spill")]
+fn spill_if_full(
+    context: &mut Context,
+    state: &mut SortState,
+    input: &RowBatch,
+) -> Result<(), Error> {
+    let env = context.env();
+    let Some(store) = env.spill() else { return Ok(()) };
+    let bytes = batch_bytes(input);
+    let full = if let Some(runs) = &state.runs {
+        state.held + bytes > runs.capacity()
+    } else {
+        // Sorting takes the radix sort's scratch, past a few thousand rows a
+        // fixed table of half a megabyte, then a word a row and as many again
+        // to merge, and the rows' places may double: about 24 bytes a row.
+        // Ranking strings takes what's hard to bound, so with string keys,
+        // room for the rows to double and then be sorted, as much again.
+        let rows = state.rows.len() as usize + input.selection().len() as usize;
+        let taken = env.used().saturating_sub(state.base);
+        let held = if state.rows.has_string_keys() { 3 * taken } else { 24 * rows };
+        let sorting = Scratch::bytes(rows) + held;
+        state.rows.len() > 0 && !env.leaves_room(sorting + 2 * bytes)
+    };
+    if full {
+        if let Some(runs) = &mut state.runs {
+            runs.write(context, &mut state.rows)?;
+        } else {
+            let available = env.room_above(state.base);
+            let runs = Runs::new(context, store, &mut state.rows, state.held, available)?;
+            state.runs = Some(runs);
+        }
+        state.rows = SortedRows::new(env)?;
+        state.held = 0;
+    }
+    state.held += bytes;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -238,5 +321,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn writes_sorted_runs_past_its_budget() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+        use crate::spill::tests::Strict;
+
+        // Keys out of order, a fifth of them null, and many ties.
+        const NAMES: [&str; 3] = ["x", "yy", "zzz"];
+        let name = |n: i64| NAMES[usize::try_from(n % 3).unwrap()];
+        let row = |n: i64| ((n % 5 != 0).then_some(n * 7919 % 1000), n, name(n));
+        let rows = Rows {
+            batches: (0..40_i64).map(|b| (b * 2000..(b + 1) * 2000).map(row).collect()).collect(),
+            drop: None,
+        };
+        let run = |limit: usize, store: Option<&'static Strict>| {
+            let env = Env::new(Memory::new(Heap, limit)).unwrap();
+            if let Some(store) = store {
+                env.spill_to(store);
+            }
+            let sort = sort(by(KEY_THEN_VALUE));
+            let context = &mut Context::new(&env, None);
+            let (mut out, mut i) = (Vec::new(), 0);
+            let mut state = Breaker::new_state(&sort, context)?;
+            let mut batch = RowBatch::new();
+            while rows.next(context, &mut i, &mut batch)? {
+                Breaker::consume(&sort, context, &mut state, &batch)?;
+            }
+            Breaker::finalize(&sort, context, &mut state)?;
+            loop {
+                let more = Breaker::serve(&sort, context, &mut state, &mut batch)?;
+                let (keys, values, names) = (batch.column(0), batch.column(1), batch.column(2));
+                for row in 0..batch.row_count() {
+                    let key = (!keys.is_null(row)).then(|| keys.int64s()[row as usize]);
+                    let name = names.string_values().get(row as usize).to_vec();
+                    out.push((key, values.int64s()[row as usize], name));
+                }
+                if !more {
+                    break;
+                }
+            }
+            batch.reset(0);
+            drop(state);
+            Ok::<_, Error>((out, env.peak()))
+        };
+        let (expected, peak) = run(usize::MAX, None).unwrap();
+        let mut sorted: Vec<_> = (0..80_000).map(row).collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        assert!(expected.iter().map(|r| (r.0, r.1)).eq(sorted.iter().map(|r| (r.0, r.1))));
+        let limit = peak / 4;
+        assert_eq!(run(limit, None).err(), Some(Error::OutOfMemory));
+        let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+        let (out, spilled) = run(limit, Some(store)).unwrap();
+        assert!(out == expected && spilled <= limit);
+        // It wrote more runs than it merges at once, and deleted them.
+        let logs = store.logs.borrow();
+        assert!(logs.len() > crate::sort_runs::FAN_IN_MAX);
+        assert!(logs.iter().all(Option::is_none));
+        drop(logs);
+        // From the least budget it runs in up, it runs in every one, and
+        // whether it runs or fails, it leaves no log behind.
+        let mut ran = false;
+        for limit in (peak / 32..=peak).step_by(peak / 32) {
+            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+            match run(limit, Some(store)) {
+                Ok((out, _)) => {
+                    assert_eq!(out, expected);
+                    ran = true;
+                }
+                Err(error) => assert!(!ran && error == Error::OutOfMemory, "{limit}: {error:?}"),
+            }
+            assert!(store.logs.borrow().iter().all(Option::is_none), "{limit} left a log");
+        }
+        assert!(ran);
     }
 }

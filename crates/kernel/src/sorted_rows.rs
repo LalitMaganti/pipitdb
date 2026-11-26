@@ -77,6 +77,12 @@ impl SortedRows {
         })
     }
 
+    /// Whether any key is a string, which sorting ranks first.
+    #[cfg(feature = "spill")]
+    pub(crate) fn has_string_keys(&self) -> bool {
+        self.columns.iter().any(|column| column.string().is_some())
+    }
+
     pub(crate) fn len(&self) -> u32 {
         self.rows.len()
     }

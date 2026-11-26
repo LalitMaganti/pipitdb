@@ -57,6 +57,8 @@ pub mod session;
 pub mod settings;
 mod slab_allocator;
 pub(crate) mod sort;
+#[cfg(feature = "spill")]
+mod sort_runs;
 mod sorted_rows;
 pub mod spill;
 pub(crate) mod statement;
