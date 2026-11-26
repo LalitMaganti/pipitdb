@@ -5,11 +5,15 @@
 //! Usage: `cargo run --profile speed -p pipitdb-bench --example spill_cases -- [CASE...]`
 //!
 //! `ROWS` sets each table's rows, 2^20 by default, and `DIVISORS` the budgets,
-//! as the peak divided by each, `2,4,8,16` by default. Prints a line per run:
-//! the case, its budget, whether it gave the unbudgeted run's rows, its time,
-//! its peak, and with the `spill` feature, the bytes it spilled and read back. A budget below what a scan alone needs is skipped: no query
-//! can run in less. Each case also runs at `SMALLEST` scans' worth, the
-//! budget every case should one day finish in.
+//! as the peak divided by each, `2,4,8,16` by default. Each case also runs at
+//! `SMALLEST` scans' worth, the budget every case should one day finish in.
+//! A smaller budget is skipped: it may hold less than a query needs to
+//! run at all.
+//!
+//! Prints a line per run: the case, its budget, whether it gave the
+//! unbudgeted run's rows, its time, its peak, and with the `spill` feature,
+//! the bytes it spilled and read back. With it, the run fails if a case that
+//! spills doesn't finish in every budget, as CI checks.
 
 #![allow(unsafe_code)]
 
@@ -44,15 +48,18 @@ static REGISTRY: Registry = Registry::new(&[
     pipit_pipesql::stages::JOINS,
 ]);
 
-/// A query, what it fills, and whether its rows come in an order it sets.
+/// A query, what it fills, whether its rows come in an order it sets, and
+/// whether it finishes in every budget, which the run fails without.
 struct Case {
     name: &'static str,
     query: &'static str,
     ordered: bool,
+    spills: bool,
 }
 
 /// A query that holds no rows, whose peak is the least any query needs.
-const SCAN: Case = Case { name: "scan", query: "FROM t |> SELECT k, s, p", ordered: false };
+const SCAN: Case =
+    Case { name: "scan", query: "FROM t |> SELECT k, s, p", ordered: false, spills: true };
 
 /// How many scans' worth of memory every case should finish in.
 const SMALLEST: usize = 4;
@@ -67,55 +74,85 @@ const CASES: &[Case] = &[
         name: "aggregate_int_keys",
         query: "FROM t |> AGGREGATE sum(v) AS total, count(*) AS n GROUP BY g",
         ordered: false,
+        spills: true,
     },
     Case {
         name: "aggregate_string_keys",
         query: "FROM t |> AGGREGATE sum(v) AS total GROUP BY s",
         ordered: false,
+        spills: false,
     },
     Case {
         name: "aggregate_string_min",
         query: "FROM t |> AGGREGATE min(s) AS least GROUP BY g",
         ordered: false,
+        spills: false,
     },
     Case {
         name: "aggregate_distinct",
         query: "FROM t |> AGGREGATE count(DISTINCT k) AS d",
         ordered: false,
+        spills: false,
     },
     Case {
         name: "join_int_keys",
         query: "FROM t |> JOIN u ON k = uk |> SELECT k, uw",
         ordered: false,
+        spills: true,
     },
     Case {
         name: "join_string_keys",
         query: "FROM t |> JOIN u ON s = us |> SELECT k, uw",
         ordered: false,
+        spills: false,
     },
     Case {
         name: "left_join",
         query: "FROM t |> LEFT JOIN u ON g = uk |> SELECT k, uw",
         ordered: false,
+        spills: true,
     },
     Case {
         name: "join_hashed_keys",
         query: "FROM t |> JOIN u ON v = uw |> SELECT k, uk",
         ordered: false,
+        spills: true,
     },
     Case {
         name: "left_join_build",
         query: "FROM u |> LEFT JOIN t ON uk = g |> SELECT uk, k",
         ordered: false,
+        spills: true,
     },
-    Case { name: "sort_int", query: "FROM t |> SELECT k, v |> ORDER BY k", ordered: true },
-    Case { name: "sort_string", query: "FROM t |> SELECT s, k |> ORDER BY s, k", ordered: true },
-    Case { name: "sort_wide", query: "FROM t |> SELECT k, p |> ORDER BY k", ordered: true },
-    Case { name: "sort_nulls", query: "FROM t |> SELECT v, k |> ORDER BY v DESC", ordered: true },
+    Case {
+        name: "sort_int",
+        query: "FROM t |> SELECT k, v |> ORDER BY k",
+        ordered: true,
+        spills: true,
+    },
+    Case {
+        name: "sort_string",
+        query: "FROM t |> SELECT s, k |> ORDER BY s, k",
+        ordered: true,
+        spills: true,
+    },
+    Case {
+        name: "sort_wide",
+        query: "FROM t |> SELECT k, p |> ORDER BY k",
+        ordered: true,
+        spills: true,
+    },
+    Case {
+        name: "sort_nulls",
+        query: "FROM t |> SELECT v, k |> ORDER BY v DESC",
+        ordered: true,
+        spills: true,
+    },
     Case {
         name: "top_k",
         query: "FROM t |> SELECT s, k |> ORDER BY s DESC, k |> LIMIT 10",
         ordered: true,
+        spills: true,
     },
 ];
 
@@ -134,7 +171,7 @@ fn main() -> Result<(), String> {
     };
     report(SCAN.name, "none", "ok", &scan);
     let least = scan.peak;
-    let mut failed = 0;
+    let (mut failed, mut regressed) = (0, 0);
     for case in CASES.iter().filter(|case| only.is_empty() || only.iter().any(|n| n == case.name)) {
         let (expected, unbudgeted) = match run_with(&tables, case, usize::MAX) {
             (Ok(rows), run) => {
@@ -149,7 +186,7 @@ fn main() -> Result<(), String> {
         let budgets = divisors.iter().map(|&d| (format!("1/{d}"), unbudgeted / d));
         let smallest = (format!("{SMALLEST}x scan"), SMALLEST * least);
         for (label, budget) in budgets.chain([smallest]) {
-            if budget < least {
+            if budget < SMALLEST * least {
                 continue;
             }
             let (got, run) = run_with(&tables, case, budget);
@@ -159,10 +196,14 @@ fn main() -> Result<(), String> {
                 Err(error) => error,
             };
             failed += usize::from(result != "ok");
+            regressed += usize::from(result != "ok" && case.spills && cfg!(feature = "spill"));
             report(case.name, &label, &result, &run);
         }
     }
     eprintln!("{failed} runs failed");
+    if regressed > 0 {
+        return Err(format!("{regressed} runs of cases that spill failed"));
+    }
     Ok(())
 }
 

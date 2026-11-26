@@ -33,6 +33,10 @@ jobs:
       - run: cargo test
       - run: cargo test -p pipitdb-pipesql --features diagnostics
       - run: cargo test -p pipitdb-kernel --features spill
+      # Fails if a case that spills doesn't finish in every budget.
+      - run: cargo run -p pipitdb-bench --example spill_cases --features spill
+        env:
+          ROWS: 262144
       # Small blocks, so the tests also cover growing and running out of them,
       # and shallow nesting and plans, so they cover setting them.
       - run: cargo test -p pipitdb-pipesql
