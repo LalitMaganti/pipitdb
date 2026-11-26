@@ -351,15 +351,16 @@ impl<'s> ChunkReader<'s> {
             let bits = validity.as_ref().map(Buffer::as_slice::<u8>);
             match data_type {
                 DataType::String => {
-                    // Views into the page, so no string is copied: the column
-                    // holds the page.
-                    let mut views = context.values_buffer(rows * 8)?;
+                    // Words into the page, so no string is copied: the column
+                    // holds the page. A null's is the empty string after it.
+                    let mut words = context.values_buffer(rows * 8)?;
                     let at = position.value;
-                    position.value = plain::views(page, at, views.as_mut_slice::<u32>(), valid)?;
+                    let out = words.as_mut_slice::<u64>();
+                    position.value = plain::string_words(page, at, out, valid)?;
                     if let Some(bits) = bits {
-                        bits::spread(views.as_mut_slice::<i64>(), valid, bits, 0);
+                        bits::spread(out, valid, bits, len as u64);
                     }
-                    ColumnView::strings(context, views, body.clone(), validity)?
+                    ColumnView::strings(context, words, body.clone(), validity)?
                 }
                 DataType::Int64 | DataType::Float64 => {
                     let mut out = context.values_buffer(rows * 8)?;
@@ -483,12 +484,13 @@ impl<'s> ChunkReader<'s> {
         BitSlice::of_mut(&mut *bits).clear(count);
         let (values, nullable, words, mut bounds) = match self.data_type {
             DataType::String => {
-                // Views into the page, then an empty string, for nulls.
-                let mut views = context.bytes_buffer((count + 1) * 8)?;
-                plain::views(page, 0, views.as_mut_slice::<u32>(), count)?;
-                *at_mut!(views.as_mut_slice::<i64>(), count) = 0;
-                let values = ColumnView::strings(context, views.clone(), body.clone(), None)?;
-                (values, ColumnView::strings(context, views, body, Some(nulls))?, None, None)
+                // Words into the page, then the empty string after it, for
+                // nulls.
+                let mut words = context.bytes_buffer((count + 1) * 8)?;
+                plain::string_words(page, 0, words.as_mut_slice::<u64>(), count)?;
+                *at_mut!(words.as_mut_slice::<u64>(), count) = len as u64;
+                let values = ColumnView::strings(context, words.clone(), body.clone(), None)?;
+                (values, ColumnView::strings(context, words, body, Some(nulls))?, None, None)
             }
             DataType::Int64 | DataType::Float64 => {
                 let mut values = context.bytes_buffer((count + 1) * 8)?;
@@ -524,17 +526,19 @@ impl<'s> ChunkReader<'s> {
     ) -> Result<(Buffer, usize), Error> {
         let len = usize::try_from(body.len).map_err(|_| Error::Corrupt)?;
         if self.codec == 0 {
-            let mut page = reusable(context, into, len)?;
+            let mut page = reusable(context, into, len + 4)?;
             self.source.read(body.at, at_mut!(page.as_mut_slice::<u8>(), ..len))?;
+            empty_after(&mut page, len);
             return Ok((page, len));
         }
         let mut stored = reusable(context, self.stored.take(), len)?;
         self.source.read(body.at, at_mut!(stored.as_mut_slice::<u8>(), ..len))?;
         let size = usize::try_from(body.size).map_err(|_| Error::Corrupt)?;
-        let mut page = reusable(context, into, size)?;
+        let mut page = reusable(context, into, size + 4)?;
         let (from, to) = (at!(stored.as_slice(), ..len), at_mut!(page.as_mut_slice(), ..size));
         self.codecs.decompress(self.codec, from, to)?;
         self.stored = Some(stored);
+        empty_after(&mut page, size);
         Ok((page, size))
     }
 
@@ -568,6 +572,12 @@ impl<'s> ChunkReader<'s> {
 
 /// `buffer` if nothing else holds it and it has `len` bytes, else a new one
 /// of `len`.
+/// Writes an empty string's length after the `len` bytes of `page`, for a
+/// null string's word.
+fn empty_after(page: &mut Buffer, len: usize) {
+    at_mut!(page.as_mut_slice::<u8>(), len..len + 4).fill(0);
+}
+
 fn reusable(context: &Context, buffer: Option<Buffer>, len: usize) -> Result<Buffer, Error> {
     match buffer {
         Some(buffer) if buffer.is_unique() && buffer.size_bytes() >= len => Ok(buffer),

@@ -1014,27 +1014,26 @@ mod tests {
     }
 
     /// Ten strings, ordered as bytes, not as text: `B` is before `a`, and
-    /// `é`, two bytes from 0xc3, after `zz`. Row 3 is null, and its view
+    /// `é`, two bytes from 0xc3, after `zz`. Row 3 is null, and its word
     /// points past the bytes, so reading it would fail.
     const STRINGS: [&[u8]; 10] =
         [b"", b"a", b"ab", b"", b"B", "é".as_bytes(), b"ab", b"abc", b"\0", b"zz"];
 
     fn strings() -> ColumnView {
         let env = Env::current();
-        let bytes: Vec<u8> = STRINGS.concat();
-        let mut views = Buffer::allocate(env, 10 * 8).unwrap();
-        let mut start = 0;
+        let mut bytes = Vec::new();
+        let mut words = Buffer::allocate(env, 10 * 8).unwrap();
         for (row, string) in STRINGS.iter().enumerate() {
-            let len = u32::try_from(string.len()).unwrap();
-            let view = if row == 3 { [1000, 4] } else { [start, len] };
-            views.as_mut_slice::<u32>()[2 * row..2 * row + 2].copy_from_slice(&view);
-            start += len;
+            let at = u64::try_from(bytes.len()).unwrap();
+            words.as_mut_slice::<u64>()[row] = if row == 3 { 1000 } else { at };
+            bytes.extend_from_slice(&u32::try_from(string.len()).unwrap().to_le_bytes());
+            bytes.extend_from_slice(string);
         }
         let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
         stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
         let mut validity = Buffer::allocate(env, 2).unwrap();
         validity.as_mut_slice::<u8>().copy_from_slice(&[!(1 << 3), 0b11]);
-        ColumnView::strings(&mut Context::new(env, None), views, stored, Some(validity)).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), words, stored, Some(validity)).unwrap()
     }
 
     #[test]
@@ -1063,12 +1062,8 @@ mod tests {
     #[test]
     fn filters_constant_strings_once() {
         let env = Env::current();
-        let mut views = Buffer::allocate(env, 8).unwrap();
-        views.as_mut_slice::<u32>().copy_from_slice(&[0, 2]);
-        let mut bytes = Buffer::allocate(env, 2).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(b"ab");
         let mut context = Context::new(env, None);
-        let value = ColumnView::strings(&mut context, views, bytes, None).unwrap();
+        let value = ColumnView::from_strings(&mut context, 1, |_| Some(&b"ab"[..])).unwrap();
         let column = ColumnView::constant(&mut context, &value, 10).unwrap();
         let equal = kept(|s| compare_string(&column, Comparison::Equal, b"ab", s, None));
         assert_eq!(equal, (0..10).collect::<Vec<u16>>());

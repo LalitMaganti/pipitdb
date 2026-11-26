@@ -594,8 +594,12 @@ impl Packing {
         let mut validity =
             context.small_buffer(BitSlice::<u8>::words_for(BATCH_ROWS_MAX as usize))?;
         validity.as_mut_slice::<u8>().fill(0);
-        let bytes =
-            if data_type.has_bytes() { Some(SmallVec::new(context.env(), 1 << 31)?) } else { None };
+        let mut bytes = None;
+        if data_type.has_bytes() {
+            // An empty string first, which every null and empty string is.
+            let empty = bytes.insert(SmallVec::new(context.env(), 1 << 31)?);
+            empty.extend_from_slice(&[0; 4])?;
+        }
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
     }
 
@@ -614,11 +618,8 @@ impl Packing {
                         *at!(values.words(), row as usize);
                 }
                 Some(bytes) => {
-                    let string = values.strings().get(row as usize);
-                    let view = view(bytes.len(), string.len())?;
-                    bytes.extend_from_slice(string)?;
-                    at_mut!(self.values.as_mut_slice::<u32>(), 2 * at..2 * at + 2)
-                        .copy_from_slice(&view);
+                    let string = if valid { values.strings().get(row as usize) } else { &[] };
+                    *at_mut!(self.values.as_mut_slice::<u64>(), at) = append(bytes, string)?;
                 }
             }
             self.rows += 1;
@@ -642,21 +643,27 @@ impl Packing {
     }
 }
 
-/// A string column's view of a string of `len` bytes from `start`.
-fn view(start: usize, len: usize) -> Result<[u32; 2], Error> {
-    let (Ok(start), Ok(len)) = (u32::try_from(start), u32::try_from(len)) else {
+/// Appends `string` to `bytes`, which start with an empty string, after its
+/// length, returning its word: the empty string's if it's empty.
+fn append(bytes: &mut SmallVec<u8>, string: &[u8]) -> Result<u64, Error> {
+    if string.is_empty() {
+        return Ok(0);
+    }
+    let (Ok(at), Ok(len)) = (u32::try_from(bytes.len()), u32::try_from(string.len())) else {
         return Err(Error::OutOfMemory);
     };
-    Ok([start, len])
+    bytes.extend_from_slice(&len.to_le_bytes())?;
+    bytes.extend_from_slice(string)?;
+    Ok(u64::from(at))
 }
 
 /// A flat column of `data_type` holding, for each row `kept`, the row at
 /// its place in `places` of its batch's column in `held`: the store's
 /// columns, how many each batch has, and which column. `kept` increase,
 /// the last below `places`' length. Other rows are unspecified, but a
-/// string's is empty. `nullable` is whether any has nulls, and `one`
-/// whether there's one batch held, whose strings' bytes are then shared
-/// rather than copied.
+/// string's is one of the column's. `nullable` is whether any has nulls,
+/// and `one` whether there's one batch held, whose strings' bytes are then
+/// shared rather than copied.
 fn gather(
     context: &mut Context,
     data_type: DataType,
@@ -690,10 +697,14 @@ fn gather(
         validity = nulls.then_some(buffer);
     }
     let words = at_mut!(values.as_mut_slice::<i64>(), ..rows);
+    // A row not kept takes the first kept row's string, which is one.
     if kept.len() < rows && data_type.has_bytes() {
-        words.fill(0);
+        let first = kept.first().map_or(0, |&r| {
+            let (source, row) = found(r);
+            source.word(row)
+        });
+        words.fill(first);
     }
-    // A string's word is its view.
     for &r in kept {
         let (source, row) = found(r);
         // SAFETY: as `kept` says.
@@ -702,24 +713,34 @@ fn gather(
     if !data_type.has_bytes() {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
-    if let (true, Some(bytes)) = (one, at!(held, 0).bytes()) {
+    if let (true, Some(bytes), false) = (one, at!(held, 0).bytes(), kept.is_empty()) {
         return Ok(ColumnView::strings(context, values, bytes.clone(), validity)?);
     }
-    let (views, _) = values.as_mut_slice::<u32>().as_chunks_mut::<2>();
-    let total: u64 = views.iter().map(|&[_, len]| u64::from(len)).sum();
-    // So no view's start or length is past 32 bits.
+    let words = at_mut!(values.as_mut_slice::<u64>(), ..rows);
+    let string = |r: u16| {
+        let (source, _) = found(r);
+        source.string(*at!(words, usize::from(r)))
+    };
+    // An empty string first, which every other row is.
+    let total = kept.iter().fold(4_u64, |total, &r| total + 4 + string(r).len() as u64);
+    // So no word's offset is past 32 bits.
     let Ok(total) = u32::try_from(total) else { return Err(Error::OutOfMemory) };
     let mut bytes = context.bytes_buffer(total as usize)?;
     let out = bytes.as_mut_slice::<u8>();
-    let mut start = 0;
+    at_mut!(out, ..4).fill(0);
+    let mut at = 4;
+    let mut rebased = [0_u64; BATCH_ROWS_MAX as usize];
     for &r in kept {
-        let (source, _) = found(r);
-        let out_view = at_mut!(views, usize::from(r));
-        let [from, len] = *out_view;
-        let string = source.string(from, len);
-        at_mut!(out, start as usize..(start + len) as usize).copy_from_slice(string);
-        *out_view = [start, len];
-        start += len;
+        let string = string(r);
+        let len = string.len();
+        #[expect(clippy::cast_possible_truncation, reason = "below `total`")]
+        at_mut!(out, at..at + 4).copy_from_slice(&(len as u32).to_le_bytes());
+        at_mut!(out, at + 4..at + 4 + len).copy_from_slice(string);
+        *at_mut!(rebased, usize::from(r)) = at as u64;
+        at += 4 + len;
+    }
+    for (word, &rebased) in words.iter_mut().zip(&rebased) {
+        *word = rebased;
     }
     Ok(ColumnView::strings(context, values, bytes, validity)?)
 }
@@ -727,7 +748,6 @@ fn gather(
 #[cfg(test)]
 mod tests {
     use alloc::format;
-    use alloc::string::String;
     use alloc::vec::Vec;
 
     use super::*;
@@ -744,22 +764,16 @@ mod tests {
         let mut ints = context.values_buffer(rows as usize * 8).unwrap();
         let mut validity = context.small_buffer(BitSlice::<u8>::words_for(rows as usize)).unwrap();
         validity.as_mut_slice::<u8>().fill(0);
-        let mut text = String::new();
-        let mut views = context.values_buffer(rows as usize * 8).unwrap();
+        let mut strings = Vec::new();
         for row in 0..rows {
             let value = value(base, row);
             ints.as_mut_slice::<i64>()[row as usize] = value.unwrap_or(0);
             BitSlice::of_mut(validity.as_mut_slice::<u8>()).set_if(row as usize, value.is_some());
-            let string = format!("v{}", value.unwrap_or(0));
-            let start = u32::try_from(text.len()).unwrap();
-            views.as_mut_slice::<u32>()[2 * row as usize..2 * row as usize + 2]
-                .copy_from_slice(&[start, u32::try_from(string.len()).unwrap()]);
-            text.push_str(&string);
+            strings.push(value.map(|value| format!("v{value}")));
         }
-        let mut bytes = context.bytes_buffer(text.len()).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(text.as_bytes());
-        let ints = ColumnView::new(context, DataType::Int64, ints, Some(validity.clone())).unwrap();
-        let strings = ColumnView::strings(context, views, bytes, Some(validity)).unwrap();
+        let ints = ColumnView::new(context, DataType::Int64, ints, Some(validity)).unwrap();
+        let string = |row: usize| strings[row].as_deref().map(str::as_bytes);
+        let strings = ColumnView::from_strings(context, rows as usize, string).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(rows);
         batch.push_column(ints).ok().unwrap();
@@ -783,21 +797,15 @@ mod tests {
     fn batch_without_nulls(context: &mut Context, base: i64) -> RowBatch<'static> {
         let rows = BATCH_ROWS_MAX as usize;
         let mut ints = context.values_buffer(rows * 8).unwrap();
-        let mut views = context.values_buffer(rows * 8).unwrap();
-        let mut text = String::new();
+        let mut strings = Vec::new();
         for row in 0..rows {
             let value = base + i64::try_from(row).unwrap();
             ints.as_mut_slice::<i64>()[row] = value;
-            let string = format!("v{value}");
-            let start = u32::try_from(text.len()).unwrap();
-            views.as_mut_slice::<u32>()[2 * row..2 * row + 2]
-                .copy_from_slice(&[start, u32::try_from(string.len()).unwrap()]);
-            text.push_str(&string);
+            strings.push(format!("v{value}"));
         }
-        let mut bytes = context.bytes_buffer(text.len()).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(text.as_bytes());
         let ints = ColumnView::new(context, DataType::Int64, ints, None).unwrap();
-        let strings = ColumnView::strings(context, views, bytes, None).unwrap();
+        let strings =
+            ColumnView::from_strings(context, rows, |row| Some(strings[row].as_bytes())).unwrap();
         let mut batch = RowBatch::new();
         batch.reset(BATCH_ROWS_MAX);
         batch.push_column(ints).ok().unwrap();
@@ -827,7 +835,8 @@ mod tests {
             first.get_or_insert_with(|| batch.column(0).clone());
             for row in (0..BATCH_ROWS_MAX).filter(|&row| keep(u16::try_from(row).unwrap())) {
                 let value = value(base, row);
-                expected.push((value, format!("v{}", value.unwrap_or(0)).into_bytes()));
+                let string = value.map_or_else(Vec::new, |value| format!("v{value}").into_bytes());
+                expected.push((value, string));
             }
             store.append(&mut context, &batch).unwrap();
         }
@@ -880,7 +889,7 @@ mod tests {
             .gather(&mut context, &mut out, (&rows, Kept::Prefix), 0, &mut |_, _| failed!())
             .unwrap();
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
-        let null = (None, b"v0".to_vec());
+        let null = (None, Vec::new());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
         assert_eq!(read(&out), [int(newest), null, int(10_000), int(0)]);
     }
@@ -906,7 +915,6 @@ mod tests {
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
         let got = read(&out);
         assert_eq!([&got[1], &got[3]], [&int(8), &int(4)]);
-        assert_eq!(got[0].1, b"");
     }
 
     #[test]

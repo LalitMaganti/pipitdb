@@ -949,20 +949,9 @@ mod tests {
 
     /// `values` as a string column, `None` null.
     fn strings(values: &[Option<&str>]) -> ColumnView {
-        let env = Env::current();
-        let bytes: StdVec<u8> = values.iter().flatten().flat_map(|v| v.bytes()).collect();
-        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
-        let mut validity = Buffer::allocate(env, 1).unwrap();
-        let mut start = 0;
-        for (i, value) in values.iter().enumerate() {
-            let len = u32::try_from(value.map_or(0, str::len)).unwrap();
-            views.as_mut_slice::<u32>()[2 * i..2 * i + 2].copy_from_slice(&[start, len]);
-            validity.as_mut_slice::<u8>()[0] |= u8::from(value.is_some()) << i;
-            start += len;
-        }
-        let mut stored = Buffer::allocate(env, bytes.len().max(1)).unwrap();
-        stored.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(&bytes);
-        ColumnView::strings(&mut Context::new(env, None), views, stored, Some(validity)).unwrap()
+        let context = &mut Context::new(Env::current(), None);
+        let value = |i: usize| values[i].map(str::as_bytes);
+        ColumnView::from_strings(context, values.len(), value).unwrap()
     }
 
     /// `values` with `indices` into them, as a dictionary column.

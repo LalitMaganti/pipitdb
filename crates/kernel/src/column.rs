@@ -150,11 +150,11 @@ pub(crate) struct GatherSource {
     /// The view.
     view: ColumnView,
     /// Its values, a word each: an integer, a float's bits, or a string's
-    /// view.
+    /// word.
     words: NonNull<[i64; BATCH_ROWS_MAX as usize]>,
     /// Which values aren't null, if any are.
     validity: Option<NonNull<[u8; BATCH_ROWS_MAX as usize / 8]>>,
-    /// What a string column's views are into, or none.
+    /// What a string column's words are into, or none.
     bytes: NonNull<[u8]>,
 }
 
@@ -193,7 +193,7 @@ impl GatherSource {
         &self.view
     }
 
-    /// What a string column's views are into, or none.
+    /// What a string column's words are into, or none.
     pub(crate) fn bytes(&self) -> Option<&Buffer> {
         self.view.header().bytes.as_ref()
     }
@@ -217,12 +217,12 @@ impl GatherSource {
         })
     }
 
-    /// The `len` bytes from `start` of a string column's bytes.
+    /// The string at `word` of a string column's bytes.
     #[inline]
-    pub(crate) fn string(&self, start: u32, len: u32) -> &[u8] {
+    pub(crate) fn string(&self, word: u64) -> &[u8] {
         // SAFETY: made from the view's bytes, which it keeps alive.
         let bytes = unsafe { self.bytes.as_ref() };
-        at!(bytes, start as usize..(start + len) as usize)
+        string_at(bytes, word)
     }
 }
 
@@ -296,22 +296,43 @@ impl ColumnView {
         ColumnView::new(context, DataType::Int64, words, nulls.then_some(bits))
     }
 
-    /// Strings as views: value `i` is the `views[2i + 1]` bytes of `bytes`
-    /// from `views[2i]`, so `views` holds two `u32`s a value. The strings
-    /// needn't be in order or next to each other, so they can stay where they
-    /// were read, such as in a Parquet page, between other bytes.
+    /// Strings as words: value `i` is the string at `words[i]` of `bytes`, a
+    /// 4-byte little-endian length and then that many bytes, as a Parquet
+    /// page holds them. The strings needn't be in order or next to each
+    /// other, so they can stay where they were read, between other bytes. A
+    /// null's word is that of an empty string.
     pub fn strings(
         context: &mut Context,
-        views: Buffer,
+        words: Buffer,
         bytes: Buffer,
         validity: Option<Buffer>,
     ) -> Result<ColumnView, AllocError> {
-        check!(views.size_bytes().is_multiple_of(8));
-        let Ok(len) = u32::try_from(views.size_bytes() / 8) else {
+        check!(words.size_bytes().is_multiple_of(8));
+        let Ok(len) = u32::try_from(words.size_bytes() / 8) else {
             failed!();
         };
         // Each value's range is checked when it's read.
-        ColumnView::flat(context, DataType::String, views, Some(bytes), validity, len)
+        ColumnView::flat(context, DataType::String, words, Some(bytes), validity, len)
+    }
+
+    /// `count` strings, string `i` being `string(i)`, null if `None`, in
+    /// buffers of their own from `context`.
+    pub fn from_strings<'s>(
+        context: &mut Context,
+        count: usize,
+        string: impl Fn(usize) -> Option<&'s [u8]>,
+    ) -> Result<ColumnView, AllocError> {
+        let mut bits = context.small_buffer(BitSlice::<u8>::words_for(count))?;
+        let valid = bits.as_mut_slice::<u8>();
+        valid.fill(0);
+        let mut nulls = false;
+        for i in 0..count {
+            let value = string(i).is_some();
+            BitSlice::of_mut(&mut *valid).set_if(i, value);
+            nulls |= !value;
+        }
+        let (words, bytes) = string_buffers(context, count, |i| string(i).unwrap_or_default())?;
+        ColumnView::strings(context, words, bytes, nulls.then_some(bits))
     }
 
     fn flat(
@@ -592,8 +613,8 @@ impl ColumnView {
                 Some(bits)
             }
         };
-        // A string's view is a word too: the views are gathered, and keep
-        // their bytes, so no string is copied.
+        // A string is a word too: the words are gathered, and keep their
+        // bytes, so no string is copied.
         let words = values.slice_of::<i64>();
         let mut out = context.values_buffer(rows * 8)?;
         let gathered = at_mut!(out.as_mut_slice::<i64>(), ..rows);
@@ -731,7 +752,7 @@ impl<'a> Values<'a> {
     pub fn strings(self) -> Strings<'a> {
         check!(self.header.data_type == DataType::String);
         let Some(bytes) = &self.header.bytes else { failed!() };
-        Strings { views: self.slice_of::<u32>(), bytes: bytes.as_slice() }
+        Strings { words: self.slice_of::<u64>(), bytes: bytes.as_slice() }
     }
 
     /// Which values aren't null, or `None` if none are, for reading in a loop.
@@ -754,28 +775,29 @@ impl<'a> Values<'a> {
     }
 }
 
-/// A string column's values: views into bytes.
+/// A string column's values: words into bytes, each where a string's length
+/// is, its bytes after it.
 #[derive(Clone, Copy)]
 pub struct Strings<'a> {
-    /// A start and length into `bytes` for each value.
-    views: &'a [u32],
-    /// What the views are into.
+    /// Where each value's length is in `bytes`, in its low half.
+    words: &'a [u64],
+    /// What the words are into.
     bytes: &'a [u8],
 }
 
 impl<'a> Strings<'a> {
     pub fn len(self) -> usize {
-        self.views.len() / 2
+        self.words.len()
     }
 
     pub fn is_empty(self) -> bool {
-        self.len() == 0
+        self.words.is_empty()
     }
 
-    /// The length of string `row`, found without touching its bytes.
+    /// The length of string `row`.
     #[inline]
     pub fn len_of(self, row: usize) -> usize {
-        *at!(self.views, 2 * row + 1) as usize
+        length_at(self.bytes, *at!(self.words, row))
     }
 
     /// As `len_of`, without checking `row` is one of the strings.
@@ -786,19 +808,81 @@ impl<'a> Strings<'a> {
     #[inline]
     pub unsafe fn len_of_unchecked(self, row: usize) -> usize {
         // SAFETY: guaranteed by the caller.
-        unsafe { *self.views.get_unchecked(2 * row + 1) as usize }
+        length_at(self.bytes, unsafe { *self.words.get_unchecked(row) })
     }
 
     #[inline]
     pub fn get(self, row: usize) -> &'a [u8] {
-        let (start, len) = (*at!(self.views, 2 * row) as usize, *at!(self.views, 2 * row + 1));
-        at!(self.bytes, start..start + len as usize)
+        string_at(self.bytes, *at!(self.words, row))
     }
 
     /// What the strings are in.
     pub fn bytes(self) -> &'a [u8] {
         self.bytes
     }
+}
+
+/// The length of the string at `word` of `bytes`, with one check, as
+/// filters read many.
+#[inline]
+fn length_at(bytes: &[u8], word: u64) -> usize {
+    #[expect(clippy::cast_possible_truncation, reason = "an offset is its low half")]
+    let at = word as u32 as usize;
+    check!(bytes.len().checked_sub(4).is_some_and(|last| at <= last));
+    // SAFETY: the 4 bytes from `at` are in `bytes`, as just checked.
+    let length = unsafe { bytes.as_ptr().add(at).cast::<[u8; 4]>().read_unaligned() };
+    u32::from_le_bytes(length) as usize
+}
+
+/// The words and bytes of `count` strings, string `i` being `string(i)`, in
+/// buffers from `context`. Every empty string is one, first in the bytes.
+pub(crate) fn string_buffers<'s>(
+    context: &mut Context,
+    count: usize,
+    string: impl Fn(usize) -> &'s [u8],
+) -> Result<(Buffer, Buffer), AllocError> {
+    let total = (0..count).fold(4, |total, i| {
+        let len = string(i).len();
+        total + if len == 0 { 0 } else { 4 + len }
+    });
+    // So no word's offset is past 32 bits.
+    if u32::try_from(total).is_err() {
+        return Err(AllocError);
+    }
+    let mut bytes = context.bytes_buffer(total)?;
+    let mut words = if count > BATCH_ROWS_MAX as usize {
+        context.bytes_buffer(count * 8)?
+    } else {
+        context.values_buffer(count * 8)?
+    };
+    let out = bytes.as_mut_slice::<u8>();
+    at_mut!(out, ..4).fill(0);
+    let mut at = 4;
+    for (i, word) in words.as_mut_slice::<u64>().iter_mut().enumerate() {
+        let value = string(i);
+        *word = 0;
+        if !value.is_empty() {
+            #[expect(clippy::cast_possible_truncation, reason = "below `total`")]
+            let len = value.len() as u32;
+            at_mut!(out, at..at + 4).copy_from_slice(&len.to_le_bytes());
+            at_mut!(out, at + 4..at + 4 + value.len()).copy_from_slice(value);
+            *word = at as u64;
+            at += 4 + value.len();
+        }
+    }
+    Ok((words, bytes))
+}
+
+/// The string at `word` of `bytes`.
+#[inline]
+pub(crate) fn string_at(bytes: &[u8], word: u64) -> &[u8] {
+    #[expect(clippy::cast_possible_truncation, reason = "an offset is its low half")]
+    let first = word as u32 as usize + 4;
+    let len = length_at(bytes, word);
+    // `first` is at most `bytes.len()`, as `length_at` checked.
+    check!(len <= bytes.len() - first);
+    // SAFETY: the `len` bytes from `first` are in `bytes`, as just checked.
+    unsafe { core::slice::from_raw_parts(bytes.as_ptr().add(first), len) }
 }
 
 /// A view's bitmap of the rows that aren't null.
@@ -871,25 +955,19 @@ mod tests {
             .int64s();
     }
 
-    /// `values`, one after another in a buffer, as views.
+    /// `values`, one after another in a buffer, as strings.
     fn strings(values: &[&str]) -> ColumnView {
-        let text: alloc::string::String = values.concat();
-        let mut at = 0;
-        let spans: alloc::vec::Vec<(u32, u32)> = values
-            .iter()
-            .map(|value| {
-                let span = (at, u32::try_from(value.len()).unwrap());
-                at += span.1;
-                span
-            })
-            .collect();
-        views(text.as_bytes(), &spans, None)
+        let value = |i: usize| Some(values[i].as_bytes());
+        ColumnView::from_strings(&mut Context::new(Env::current(), None), values.len(), value)
+            .unwrap()
     }
 
     #[test]
     fn strings_are_bytes() {
         // Not UTF-8: a lone continuation byte, and an overlong encoding.
-        let column = views(&[0x80, 0xc0, 0x80], &[(0, 1), (1, 2)], None);
+        let values: [&[u8]; 2] = [&[0x80], &[0xc0, 0x80]];
+        let context = &mut Context::new(Env::current(), None);
+        let column = ColumnView::from_strings(context, 2, |i| Some(values[i])).unwrap();
         let values = column.string_values();
         assert_eq!((values.get(0), values.get(1)), (&[0x80][..], &[0xc0, 0x80][..]));
     }
@@ -908,36 +986,36 @@ mod tests {
         assert_eq!((slice.get(0), slice.get(1)), (&b"cde"[..], &b"f"[..]));
     }
 
-    /// `values`, each a start and length into `bytes`, as views.
-    fn views(bytes: &[u8], values: &[(u32, u32)], validity: Option<u8>) -> ColumnView {
+    /// `words` into `bytes`, as strings.
+    fn words(bytes: &[u8], words: &[u64], validity: Option<u8>) -> ColumnView {
         let env = Env::current();
-        let mut page = Buffer::allocate(env, bytes.len().max(1)).unwrap();
-        page.as_mut_slice::<u8>()[..bytes.len()].copy_from_slice(bytes);
-        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
-        for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
-            view.copy_from_slice(&[start, len]);
-        }
+        let mut page = Buffer::allocate(env, bytes.len()).unwrap();
+        page.as_mut_slice::<u8>().copy_from_slice(bytes);
+        let mut out = Buffer::allocate(env, words.len() * 8).unwrap();
+        out.as_mut_slice::<u64>().copy_from_slice(words);
         let validity = validity.map(|bits| {
             let mut buffer = Buffer::allocate(env, 1).unwrap();
             buffer.as_mut_slice::<u8>()[0] = bits;
             buffer
         });
-        ColumnView::strings(&mut Context::new(env, None), views, page, validity).unwrap()
+        ColumnView::strings(&mut Context::new(env, None), out, page, validity).unwrap()
     }
 
     #[test]
-    fn reads_string_views_and_slices_of_them() {
-        // Out of order, sharing bytes, between other bytes, and a null.
-        let column = views(b"..hello..", &[(2, 5), (0, 0), (4, 3), (2, 2)], Some(0b1101));
+    fn reads_string_words_and_slices_of_them() {
+        // Out of order, sharing a string, between other bytes, and a null,
+        // which is the empty string.
+        let page = b"..\x05\0\0\0hello.\x03\0\0\0llo\0\0\0\0";
+        let column = words(page, &[2, 19, 12, 2], Some(0b1101));
         let values = column.string_values();
         assert_eq!(
-            (values.len(), values.get(0), values.get(2), values.get(3)),
-            (4, &b"hello"[..], &b"llo"[..], &b"he"[..])
+            (values.len(), values.get(0), values.get(1), values.get(2), values.get(3)),
+            (4, &b"hello"[..], &b""[..], &b"llo"[..], &b"hello"[..])
         );
         assert!(column.is_null(1));
         let sliced = column.slice(2, 2);
         let slice = sliced.string_values();
-        assert_eq!((slice.len(), slice.get(0), slice.get(1)), (2, &b"llo"[..], &b"he"[..]));
+        assert_eq!((slice.len(), slice.get(0), slice.get(1)), (2, &b"llo"[..], &b"hello"[..]));
     }
 
     #[test]

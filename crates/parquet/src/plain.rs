@@ -39,25 +39,23 @@ pub(crate) fn words(
     Ok(end)
 }
 
-/// Finds the first `valid` plain strings in `bytes` from `at`, writing
-/// where each starts and how long it is to `views`, two `u32`s each, and
-/// returns where they end.
-pub(crate) fn views(
+/// Finds the first `valid` plain strings in `bytes` from `at`, a length and
+/// then its bytes each, writing where each is to `words`, and returns where
+/// they end.
+pub(crate) fn string_words(
     bytes: &[u8],
     mut at: usize,
-    views: &mut [u32],
+    words: &mut [u64],
     valid: usize,
 ) -> Result<usize, Error> {
-    for view in at_mut!(views, ..2 * valid).as_chunks_mut::<2>().0 {
+    for word in at_mut!(words, ..valid) {
         let len = length(bytes, at)?;
-        let first = at + 4;
-        if first + len > bytes.len() {
+        if at + 4 + len > bytes.len() {
             return Err(Error::Corrupt);
         }
-        let span = (u32::try_from(first), u32::try_from(len));
-        let (Ok(start), Ok(len32)) = span else { return Err(Error::Unsupported) };
-        *view = [start, len32];
-        at = first + len;
+        let Ok(start) = u32::try_from(at) else { return Err(Error::Unsupported) };
+        *word = u64::from(start);
+        at += 4 + len;
     }
     Ok(at)
 }

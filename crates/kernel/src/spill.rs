@@ -57,7 +57,7 @@ pub struct SpilledColumn {
     pub validity: Option<ByteRange>,
 }
 
-/// How many rows' null bits, or strings' views, `write_column` appends at
+/// How many rows' null bits, or strings' words, `write_column` appends at
 /// once.
 const CHUNK_ROWS: u32 = 512;
 
@@ -65,7 +65,7 @@ const CHUNK_ROWS: u32 = 512;
 const CHUNK_BYTES: usize = CHUNK_ROWS as usize / 8;
 
 /// Appends `column`, which must be flat, to `log`: its values, or its
-/// strings' views and then bytes, then its null bitmap, if any.
+/// strings' words and then bytes, then its null bitmap, if any.
 pub fn write_column(
     store: &dyn SpillStore,
     log: LogId,
@@ -110,45 +110,58 @@ fn write_validity(
     Ok(block)
 }
 
-/// Appends `strings`' views, then their bytes, one after another, with the
-/// views pointing into them there, each a chunk at a time, as a block each.
+/// Appends `strings`' words, then their bytes, one after another, each
+/// after its length, with the words pointing into them there, each a chunk
+/// at a time, as a block each. The bytes start with an empty string, which
+/// every empty string is.
 fn write_strings(
     store: &dyn SpillStore,
     log: LogId,
     strings: Strings<'_>,
 ) -> Result<(ByteRange, Option<ByteRange>), Error> {
     let mut chunk = [0_u8; CHUNK_ROWS as usize * 8];
-    let (mut views, mut filled, mut start) = (None, 0, 0_u32);
+    let (mut words, mut filled, mut start) = (None, 0, 4_u64);
     for row in 0..strings.len() {
-        #[expect(clippy::cast_possible_truncation, reason = "a view's length is a `u32`")]
-        let len = strings.get(row).len() as u32;
-        at_mut!(chunk, filled..filled + 4).copy_from_slice(&start.to_le_bytes());
-        at_mut!(chunk, filled + 4..filled + 8).copy_from_slice(&len.to_le_bytes());
-        (filled, start) = (filled + 8, start + len);
+        let len = strings.len_of(row) as u64;
+        let word = if len == 0 { 0 } else { start };
+        at_mut!(chunk, filled..filled + 8).copy_from_slice(&word.to_le_bytes());
+        filled += 8;
+        start += if len == 0 { 0 } else { 4 + len };
         if filled == chunk.len() {
-            views = Some(grow(views, store.append(log, &chunk)?));
+            words = Some(grow(words, store.append(log, &chunk)?));
             filled = 0;
         }
     }
-    views = Some(grow(views, store.append(log, at!(chunk, ..filled))?));
-    let mut bytes = None;
+    words = Some(grow(words, store.append(log, at!(chunk, ..filled))?));
+    // So no word's offset is past 32 bits.
+    if u32::try_from(start).is_err() {
+        return Err(Error::OutOfMemory);
+    }
+    let mut bytes = Some(store.append(log, &[0; 4])?);
     filled = 0;
     for row in 0..strings.len() {
         let value = strings.get(row);
-        if filled + value.len() > chunk.len() {
+        if value.is_empty() {
+            continue;
+        }
+        if filled + 4 + value.len() > chunk.len() {
             bytes = Some(grow(bytes, store.append(log, at!(chunk, ..filled))?));
             filled = 0;
         }
-        if value.len() > chunk.len() {
+        #[expect(clippy::cast_possible_truncation, reason = "checked above")]
+        let len = (value.len() as u32).to_le_bytes();
+        if 4 + value.len() > chunk.len() {
+            bytes = Some(grow(bytes, store.append(log, &len)?));
             bytes = Some(grow(bytes, store.append(log, value)?));
         } else {
-            at_mut!(chunk, filled..filled + value.len()).copy_from_slice(value);
-            filled += value.len();
+            at_mut!(chunk, filled..filled + 4).copy_from_slice(&len);
+            at_mut!(chunk, filled + 4..filled + 4 + value.len()).copy_from_slice(value);
+            filled += 4 + value.len();
         }
     }
     bytes = Some(grow(bytes, store.append(log, at!(chunk, ..filled))?));
-    let Some(views) = views else { failed!() };
-    Ok((views, bytes))
+    let Some(words) = words else { failed!() };
+    Ok((words, bytes))
 }
 
 /// `appended` added to `block`, which it follows.
@@ -175,9 +188,9 @@ pub fn read_column(
     let mut values = context.values_buffer(size_bytes)?;
     store.read(log, spilled.values, values.as_mut_slice::<u8>())?;
     if has_bytes {
-        // Views were written little-endian.
-        for half in values.as_mut_slice::<u32>() {
-            *half = u32::from_le(*half);
+        // Words were written little-endian.
+        for word in values.as_mut_slice::<u64>() {
+            *word = u64::from_le(*word);
         }
     }
     let validity = match spilled.validity {
@@ -322,20 +335,10 @@ mod tests {
         let store = Strict::default();
         let words: StdVec<StdVec<u8>> =
             (0..700).map(|i| alloc::format!("word{i}").into_bytes()).collect();
-        let mut views = Buffer::allocate(env, words.len() * 8).unwrap();
-        let mut bytes = Buffer::allocate(env, words.iter().map(StdVec::len).sum()).unwrap();
-        let mut at = 0;
-        for (i, word) in words.iter().enumerate() {
-            bytes.as_mut_slice::<u8>()[at..at + word.len()].copy_from_slice(word);
-            let len = u32::try_from(word.len()).unwrap();
-            views.as_mut_slice::<u32>()[2 * i..2 * i + 2]
-                .copy_from_slice(&[u32::try_from(at).unwrap(), len]);
-            at += word.len();
-        }
-        let mut validity = Buffer::allocate(env, BitSlice::<u8>::words_for(words.len())).unwrap();
-        validity.as_mut_slice::<u8>().fill(0b1110_1111);
-        let whole = ColumnView::strings(&mut Context::new(env, None), views, bytes, Some(validity))
-            .unwrap();
+        // Every fifth null.
+        let word = |i: usize| (i % 8 != 4).then(|| words[i].as_slice());
+        let whole =
+            ColumnView::from_strings(&mut Context::new(env, None), words.len(), word).unwrap();
         let columns = [whole.clone(), whole.slice(3, 600)];
 
         let log = store.create().unwrap();
@@ -357,26 +360,35 @@ mod tests {
     fn strings_come_back_with_only_their_bytes() {
         let env = Env::current();
         let store = Strict::default();
-        // Longer than a chunk of appends, so they're written in parts.
-        let text: StdVec<u8> =
-            (0..3000_u32).map(|i| b'a' + u8::try_from(i % 26).unwrap()).collect();
+        // Strings between other bytes, longer than a chunk of appends in
+        // all, so they're written in parts, each read by several rows.
+        let mut text = StdVec::new();
+        let mut at = StdVec::new();
+        for i in 0..200_u32 {
+            text.push(b'.');
+            at.push(u64::try_from(text.len()).unwrap());
+            let len = i % 7;
+            text.extend_from_slice(&len.to_le_bytes());
+            text.extend((0..len).map(|j| b'a' + u8::try_from((i + j) % 26).unwrap()));
+        }
         let mut page = Buffer::allocate(env, text.len()).unwrap();
         page.as_mut_slice::<u8>().copy_from_slice(&text);
-        let spans: StdVec<(u32, u32)> = (0..600).map(|i| (i * 3 % 2000, i % 7)).collect();
-        let mut views = Buffer::allocate(env, spans.len() * 8).unwrap();
-        for (view, &(start, len)) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&spans) {
-            view.copy_from_slice(&[start, len]);
+        let mut words = Buffer::allocate(env, 600 * 8).unwrap();
+        for (i, word) in words.as_mut_slice::<u64>().iter_mut().enumerate() {
+            *word = at[i * 3 % 200];
         }
-        let column = ColumnView::strings(&mut Context::new(env, None), views, page, None).unwrap();
+        let column = ColumnView::strings(&mut Context::new(env, None), words, page, None).unwrap();
 
         let log = store.create().unwrap();
         let spilled = write_column(&store, log, &column).unwrap();
         store.seal(log).unwrap();
         let read = read_column(&mut Context::new(env, None), &store, log, &spilled).unwrap();
         let (got, want) = (read.string_values(), column.string_values());
-        // The strings overlapped, from a buffer of 3,000 bytes; written out,
-        // each has its own.
-        assert_eq!(spilled.bytes.unwrap().len, (0..600).map(|i| i % 7).sum::<u64>());
+        // Rows shared strings, between other bytes; written out, each has its
+        // own, but for the empty ones, which share the first.
+        let len = |i: u64| i * 3 % 200 % 7;
+        let taken = (0..600).map(|i| if len(i) == 0 { 0 } else { 4 + len(i) }).sum::<u64>();
+        assert_eq!(spilled.bytes.unwrap().len, 4 + taken);
         assert_eq!(got.len(), want.len());
         for row in 0..got.len() {
             assert_eq!(got.get(row), want.get(row));

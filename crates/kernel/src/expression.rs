@@ -268,7 +268,7 @@ pub(crate) fn constant(
     }
     let mut values = context.values_buffer(rows * 8)?;
     if step.data_type == DataType::String {
-        // Every row's view is of one copy of its bytes: none for a null.
+        // Every row's word is of one copy of its string: empty for a null.
         let text = match step.op {
             ExprOp::Constant => {
                 let literal = context.literals().and_then(|literals| literals.get(Id::raw(step.a)));
@@ -277,10 +277,12 @@ pub(crate) fn constant(
             }
             _ => &[],
         };
-        let mut bytes = context.bytes_buffer(text.len())?;
-        bytes.as_mut_slice::<u8>().copy_from_slice(text);
+        let mut bytes = context.bytes_buffer(4 + text.len())?;
         let Ok(len) = u32::try_from(text.len()) else { failed!() };
-        values.as_mut_slice::<u32>().as_chunks_mut::<2>().0.fill([0, len]);
+        let (length, rest) = bytes.as_mut_slice::<u8>().split_at_mut(4);
+        length.copy_from_slice(&len.to_le_bytes());
+        rest.copy_from_slice(text);
+        values.as_mut_slice::<u64>().fill(0);
         return Ok(Some(ColumnView::strings(context, values, bytes, validity)?));
     }
     if step.data_type == DataType::Float64 {
@@ -700,8 +702,7 @@ fn pack_words(context: &mut Context, rows: usize, words: &[u64]) -> Result<Buffe
 }
 
 /// The strings of a choice, row `r` from `column(which[r])`: the chosen
-/// ones' bytes, copied into one buffer. A null's view may not be of its
-/// bytes, so it's left empty.
+/// ones' bytes, copied into one buffer. A null is left empty.
 fn choose_strings<'r>(
     context: &mut Context,
     column: &dyn Fn(usize) -> &'r ColumnView,
@@ -716,20 +717,8 @@ fn choose_strings<'r>(
         let null = column.is_null(row as u32);
         if null { &[][..] } else { column.string_values().get(row) }
     };
-    let len: usize = (0..rows).map(|row| chosen(row).len()).sum();
-    let mut bytes = context.bytes_buffer(len)?;
-    let mut views = context.values_buffer(rows * 8)?;
-    let mut end = 0;
-    let out = bytes.as_mut_slice::<u8>();
-    for (row, view) in views.as_mut_slice::<u32>().as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let string = chosen(row);
-        at_mut!(out, end..end + string.len()).copy_from_slice(string);
-        #[expect(clippy::cast_possible_truncation, reason = "a batch's strings fit `u32`")]
-        let (start, len) = (end as u32, string.len() as u32);
-        *view = [start, len];
-        end += string.len();
-    }
-    ColumnView::strings(context, views, bytes, validity)
+    let (words, bytes) = crate::column::string_buffers(context, rows, chosen)?;
+    ColumnView::strings(context, words, bytes, validity)
 }
 
 /// The loop for each operation and type, kept to the arithmetic itself so

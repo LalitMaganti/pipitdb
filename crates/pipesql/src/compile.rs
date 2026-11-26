@@ -489,13 +489,11 @@ mod tests {
                 .unwrap()
         };
         let floats = [0.5_f64.to_bits().cast_signed(), 2.5_f64.to_bits().cast_signed()];
-        let mut views = Buffer::allocate(Env::current(), 16).unwrap();
-        views.as_mut_slice::<u32>().copy_from_slice(&[0, 4, 4, 0]);
-        let mut bytes = Buffer::allocate(Env::current(), 4).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(b"it's");
-        let strings =
-            ColumnView::strings(&mut Context::new(Env::current(), None), views, bytes, None)
-                .unwrap();
+        let values: [&[u8]; 2] = [b"it's", b""];
+        let strings = ColumnView::from_strings(&mut Context::new(Env::current(), None), 2, |i| {
+            Some(values[i])
+        })
+        .unwrap();
         let columns = [
             column(DataType::Int64, [1, 2]),
             column(DataType::Int64, [10, 20]),
