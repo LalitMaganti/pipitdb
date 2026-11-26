@@ -576,25 +576,35 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         }
         validity = Some(bits);
     }
-    let mut views =
+    let mut words =
         if large { context.bytes_buffer(rows * 8)? } else { context.values_buffer(rows * 8)? };
-    let (views_out, _) = views.as_mut_slice::<u32>().as_chunks_mut::<2>();
+    let words_out = words.as_mut_slice::<u64>();
+    // An empty string first, which every null and empty string is.
     let pool = context.string_pool()?;
-    let mut bytes = 0_u32;
-    for (row, view) in views_out.iter_mut().enumerate() {
+    let mut bytes = 4_u32;
+    for (row, word) in words_out.iter_mut().enumerate() {
         let len = pool.get(id(row)).map_or(0, <[u8]>::len);
         let len = u32::try_from(len).map_err(|_| Error::OutOfMemory)?;
-        *view = [bytes, len];
-        bytes = bytes.checked_add(len).ok_or(Error::OutOfMemory)?;
+        *word = if len == 0 { 0 } else { u64::from(bytes) };
+        let taken = if len == 0 { 0 } else { 4 + len };
+        bytes = bytes.checked_add(taken).ok_or(Error::OutOfMemory)?;
     }
     let mut stored = context.bytes_buffer(bytes as usize)?;
     let pool = context.string_pool()?;
     let out = stored.as_mut_slice::<u8>();
-    for (row, &[start, len]) in views_out.iter().enumerate() {
+    at_mut!(out, ..4).fill(0);
+    for (row, &word) in words_out.iter().enumerate() {
         let string = pool.get(id(row)).unwrap_or_default();
-        at_mut!(out, start as usize..(start + len) as usize).copy_from_slice(string);
+        if string.is_empty() {
+            continue;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "checked above")]
+        let (at, len) = (word as usize, string.len() as u32);
+        at_mut!(out, at..at + 4).copy_from_slice(&len.to_le_bytes());
+        at_mut!(out, at + 4..at + 4 + string.len()).copy_from_slice(string);
     }
-    Ok(ColumnView::strings(context, views, stored, validity)?)
+    // SAFETY: each word was written where its string is, just above.
+    Ok(unsafe { ColumnView::strings_unchecked(context, words, stored, validity)? })
 }
 
 /// Loads `count` rows that `select` keeps of key column `column`, all if

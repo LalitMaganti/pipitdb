@@ -204,16 +204,8 @@ pub fn perfetto_slices() -> &'static dyn Catalog {
     let rows = BATCH_ROWS_MAX as usize;
     let mut context = Context::new(env(), None);
     let names: Vec<String> = (0..64).map(|i| format!("name{i}")).collect();
-    let mut views = Buffer::allocate(crate::env(), names.len() * 8).expect("allocates");
-    let mut bytes = Vec::new();
-    for (view, name) in views.as_mut_slice::<u32>().chunks_mut(2).zip(&names) {
-        let start = u32::try_from(bytes.len()).expect("small");
-        view.copy_from_slice(&[start, u32::try_from(name.len()).expect("small")]);
-        bytes.extend_from_slice(name.as_bytes());
-    }
-    let mut stored = Buffer::allocate(crate::env(), bytes.len()).expect("allocates");
-    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-    let entries = ColumnView::strings(&mut context, views, stored, None).expect("allocates");
+    let name = |i: usize| Some(names[i].as_bytes());
+    let entries = ColumnView::from_strings(&mut context, names.len(), name).expect("allocates");
     let hash = |i: usize| u32::try_from(i).expect("small").wrapping_mul(2_654_435_761);
     let mut groups = Vec::new();
     for group in 0..(1 << 20) / rows {
