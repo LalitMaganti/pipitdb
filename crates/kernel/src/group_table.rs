@@ -42,7 +42,7 @@ const RECORD_AHEAD: usize = 8;
 #[inline]
 fn slot_of(hash: u64, slots: usize) -> usize {
     #[expect(clippy::cast_possible_truncation, reason = "below `slots`")]
-    let at = (hash >> (slots.leading_zeros() + 1)) as usize;
+    let at = (hash >> (u64::BITS - slots.trailing_zeros())) as usize;
     at
 }
 
@@ -767,5 +767,17 @@ fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
         if null != 0 {
             *hash = combine(*hash, null);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slot_of;
+
+    #[test]
+    fn picks_a_slot_by_the_hashs_top_bits() {
+        assert_eq!(slot_of(u64::MAX, 4096), 4095);
+        assert_eq!(slot_of(1 << 63, 4096), 2048);
+        assert_eq!(slot_of((1 << 52) - 1, 4096), 0);
     }
 }

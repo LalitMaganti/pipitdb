@@ -113,7 +113,7 @@ pub(super) fn plan<'g>(
     let mut exact = Exact::new(env, graph, estimator, &links, &mut can_run, count, single);
     // A graph of n relations has fewer than 2^n connected sets. Each set
     // the search visits but the relations is made by a pair it counted.
-    let small = (count <= SMALL_MAX).then_some(1 << count);
+    let small = (count <= SMALL_MAX).then(|| 1 << count);
     let Some(sets) = small.or_else(|| Some(exact.count(count)? + count)) else { return Ok(None) };
     exact.table(env, at!(rows, ..count), sets)?;
     // It visits no more than were counted, or than `SMALL_MAX` relations have.
