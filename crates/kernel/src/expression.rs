@@ -5,6 +5,7 @@
 use crate::containers::{BitSlice, SmallVec, SpillVec};
 use core::ops::BitOr;
 
+use crate::aggregate_function::is_valid;
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
 use crate::column::{ColumnView, DataType, Forms, Validity};
@@ -504,18 +505,24 @@ fn compare_each<T: Copy>(x: &[T], y: &[T], o: &mut [i64], f: impl Fn(T, T) -> bo
 }
 
 /// As `compare_numbers`, for strings, by their bytes, at the rows where
-/// neither is null: others' views may not be of their bytes.
+/// neither is null. Every row is compared, a null's too, as a null's view is
+/// of its column's bytes, an empty string's. Equality compares lengths
+/// first, so most unequal strings' bytes aren't read.
 fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
     let Some(comparison) = op.comparison() else { failed!() };
     let (left, right) = (a.string_values(), b.string_values());
+    let (left_valid, right_valid) = (a.validity(), b.validity());
+    let equal = matches!(comparison, Comparison::Equal | Comparison::NotEqual);
     for (row, o) in o.iter_mut().enumerate() {
-        #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
-        let at = row as u32;
-        if a.is_null(at) || b.is_null(at) {
-            *o = 0;
-            continue;
-        }
-        *o = i64::from(comparison.holds(left.get(row).cmp(right.get(row))));
+        let valid = left_valid.is_none_or(|valid| is_valid(valid, row))
+            && right_valid.is_none_or(|valid| is_valid(valid, row));
+        let (ours, theirs) = (left.get(row), right.get(row));
+        let holds = if equal {
+            (ours == theirs) == (comparison == Comparison::Equal)
+        } else {
+            comparison.holds(ours.cmp(theirs))
+        };
+        *o = i64::from(valid && holds);
     }
 }
 
