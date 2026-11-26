@@ -146,7 +146,7 @@ pub trait Scannable {
 /// are, the least and greatest of a column's values, `None` if it has none
 /// that aren't null, and whether its runs of rows, such as row groups,
 /// follow on in it: each run's values are above every value before it, and
-/// the bounds of any two batches of a run overlap.
+/// the bounds of any two batches of a run overlap, unless its values ascend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Summary {
     pub rows: i64,

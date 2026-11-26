@@ -30,6 +30,9 @@ impl Forms {
     /// Each row's value its own number, from a first: an id column, stored
     /// as nothing.
     pub const SEQUENCE: Forms = Forms(16);
+    /// Not a form but a request, of a reader that gains from it: bounded by
+    /// its own least and greatest values, where the maker finds them cheaply.
+    pub const BOUNDED: Forms = Forms(32);
 
     /// Whether every form in `other` is in this.
     pub fn contains(self, other: Forms) -> bool {

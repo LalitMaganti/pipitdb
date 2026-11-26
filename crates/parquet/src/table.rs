@@ -391,7 +391,7 @@ impl<'a> Scannable for ParquetTable<'a> {
     /// Constant where a page's run of one entry covers a batch, dictionary
     /// for strings' dictionary pages, and lazy, loaded a batch at a time.
     fn forms(&self, _: u32) -> Forms {
-        Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY | Forms::LAZY
+        Forms::FLAT | Forms::CONSTANT | Forms::DICTIONARY | Forms::LAZY | Forms::BOUNDED
     }
 
     fn new_loader(&self, context: &mut Context) -> Result<Loader<'a>, Error> {

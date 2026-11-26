@@ -374,8 +374,10 @@ fn first_read(
 /// output can make them flat.
 const OUTPUT_FORMS: Forms = Forms::FLAT.union(Forms::CONSTANT).union(Forms::DICTIONARY);
 
-/// Every form, which what reads a column narrows.
-const ANY_FORM: Forms = OUTPUT_FORMS.union(Forms::LAZY).union(Forms::SEQUENCE);
+/// Every form, which what reads a column narrows, and `BOUNDED`, which it
+/// keeps only if each reader asks for it.
+const ANY_FORM: Forms =
+    OUTPUT_FORMS.union(Forms::LAZY).union(Forms::SEQUENCE).union(Forms::BOUNDED);
 
 /// Chooses the forms each column is made in. A column may be made in any
 /// form every op that reads it accepts, as each passes it on as it is; its

@@ -132,7 +132,9 @@ impl<'c> Op<'c> for AggregateOp {
     /// Its keys in dictionaries too: a string key's entries are each
     /// interned once, rather than each row's. Only strings come in them.
     fn accepts(&self, _: &Exprs, column: ColumnId) -> Forms {
-        if self.keys.contains(&column) { Forms::FLAT | Forms::DICTIONARY } else { Forms::FLAT }
+        // Bounds a flush can be decided by.
+        let key = Forms::FLAT | Forms::DICTIONARY | Forms::BOUNDED;
+        if self.keys.contains(&column) { key } else { Forms::FLAT }
     }
 
     /// False for every column: what comes out is one row per group, and any

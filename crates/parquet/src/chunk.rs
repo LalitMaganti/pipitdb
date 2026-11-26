@@ -11,7 +11,7 @@ use pipit_kernel::context::Context;
 use pipit_kernel::env::MemoryKind;
 use pipit_kernel::row_batch::BATCH_ROWS_MAX;
 
-use crate::footer::{Chunk, Column};
+use crate::footer::{Chunk, Column, Physical};
 use crate::hybrid::{Hybrid, Run};
 use crate::thrift::Cursor;
 use crate::{Codec, Error};
@@ -55,6 +55,9 @@ pub struct ChunkReader<'s> {
     /// Bounds of the chunk's values, if known, from their type and
     /// statistics.
     bounds: Option<Bounds>,
+    /// How many values the chunk has, nulls included: a plain `INT64` page
+    /// of them all is checked for whether they ascend.
+    values: u64,
 }
 
 /// A batch's worth of `u32`s, for levels or indices.
@@ -88,6 +91,9 @@ pub struct Position {
     value: usize,
     /// How far the indices have been read.
     index: Hybrid,
+    /// Whether the page's values are all the chunk's, and ascend, once a
+    /// read asks for `Forms::BOUNDED`.
+    ascends: Option<bool>,
 }
 
 /// Where a page's body is.
@@ -140,6 +146,7 @@ impl<'s> ChunkReader<'s> {
             level: Hybrid::default(),
             value: 0,
             index: Hybrid::default(),
+            ascends: None,
         };
         let end = chunk.start.checked_add(chunk.len).ok_or(Error::Corrupt)?;
         let (page, dictionary_page, dictionary) = (None, None, None);
@@ -148,6 +155,7 @@ impl<'s> ChunkReader<'s> {
             codecs,
             codec: chunk.codec,
             bounds: bounds::of_chunk(column, chunk),
+            values: chunk.values,
             column,
             data_type,
             end,
@@ -366,13 +374,22 @@ impl<'s> ChunkReader<'s> {
                     let words = out.as_mut_slice::<i64>();
                     let (column, at) = (self.column, position.value);
                     position.value = plain::words(column, page, at, at_mut!(words, ..valid))?;
+                    // Rows of a page that ascends are bounded by its first and last.
+                    let ascends = forms.contains(Forms::BOUNDED)
+                        && *position.ascends.get_or_insert_with(|| {
+                            let start = if self.column.optional { position.levels.1 } else { 0 };
+                            self.column.physical == Physical::Int64
+                                && self.values == position.rows as u64
+                                && ascends(page, start, position.rows)
+                        });
+                    let bounds = match at!(words, ..valid) {
+                        &[min, .., max] if ascends => Some(Bounds { min, max }),
+                        _ => self.bounds,
+                    };
                     if let Some(bits) = bits {
                         bits::spread(words, valid, bits, 0);
                     }
-                    bounds::bounded(
-                        ColumnView::new(context, data_type, out, validity)?,
-                        self.bounds,
-                    )
+                    bounds::bounded(ColumnView::new(context, data_type, out, validity)?, bounds)
                 }
             }
         };
@@ -422,6 +439,7 @@ impl<'s> ChunkReader<'s> {
             level: Hybrid::default(),
             value: 0,
             index: Hybrid::default(),
+            ascends: None,
         };
         Ok(())
     }
@@ -564,6 +582,13 @@ impl<'s> ChunkReader<'s> {
             window *= 4;
         }
     }
+}
+
+/// Whether `page` ends in `rows` plain `INT64`s from `at`, so none is null,
+/// and they ascend.
+fn ascends(page: &[u8], at: usize, rows: usize) -> bool {
+    let Some((values, [])) = page.get(at..).map(<[u8]>::as_chunks::<8>) else { return false };
+    values.len() == rows && values.is_sorted_by_key(|&value| i64::from_le_bytes(value))
 }
 
 /// `buffer` if nothing else holds it and it has `len` bytes, else a new one
@@ -913,6 +938,28 @@ mod tests {
         assert_eq!(read_all(SMALL, 0), ids);
         assert_eq!(read_all(SMALL, 1), halves);
         assert_eq!(read_all(SMALL, 2), names);
+    }
+
+    #[test]
+    fn bounds_reads_of_a_page_that_ascends_by_their_values() {
+        let env = Env::current();
+        let mut context = Context::new(env, None);
+        // `id`'s bounds in its first row group, read 1000 rows at a time.
+        let mut bounds = |mut bytes: &[u8], forms| {
+            let source: &dyn ByteSource = &mut bytes;
+            let file = ParquetFile::open(env, source).unwrap();
+            let (column, chunk) = (file.columns()[0], file.chunk(0, 0));
+            let mut reader = ChunkReader::new(source, &Uncompressed, column, chunk).unwrap();
+            reader.page_left(&mut context).unwrap();
+            [0, 1].map(|_| reader.read(&mut context, 1000, forms).unwrap().bounds().unwrap())
+        };
+        let read = |min, max| Bounds { min, max };
+        let bounded = ANY.union(Forms::BOUNDED);
+        assert_eq!(bounds(SMALL, bounded), [read(0, 999), read(1000, 1999)]);
+        // Unasked, or with nulls, the row group's statistics bound them.
+        assert_eq!(bounds(SMALL, ANY), [read(0, 2047); 2]);
+        let [first, second] = bounds(NULLS, bounded);
+        assert_eq!((first, second.max), (second, 2046));
     }
 
     #[test]
