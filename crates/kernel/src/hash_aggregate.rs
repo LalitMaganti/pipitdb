@@ -380,9 +380,9 @@ mod tests {
     use super::*;
 
     use crate::buffer::Buffer;
-    use crate::column::DataType;
+    use crate::column::{Bounds, DataType};
     use crate::env::Env;
-    use crate::flush::flushed;
+    use crate::flush::{FlushAt, flushed};
     use crate::pipeline::{Execution, Pipeline};
     use crate::step::{DynSource, Source, Step};
 
@@ -418,7 +418,13 @@ mod tests {
             batch.reset(u32::try_from(rows.len()).unwrap());
             let keys: Vec<_> = rows.iter().map(|row| row.0).collect();
             let values: Vec<_> = rows.iter().map(|row| row.1).collect();
-            assert!(batch.push_column(column(&keys)).is_ok());
+            // Each batch's keys are bounded by their least and greatest.
+            let mut key = column(&keys);
+            if let Some(&min) = keys.iter().flatten().min() {
+                let max = *keys.iter().flatten().max().unwrap();
+                key = key.with_bounds(Bounds { min, max });
+            }
+            assert!(batch.push_column(key).is_ok());
             assert!(batch.push_column(column(&values)).is_ok());
             batch.selection_mut().retain(|row| !self.dropped.contains(&row));
             Ok(true)
@@ -526,10 +532,14 @@ mod tests {
         rows_out(pipeline.start_with_sinks(env, None, &sinks, None)?)
     }
 
-    /// As `run`, by the aggregate flushed as rows are grouped by the key at 0.
-    fn run_flushed(rows: Rows, spec: HashAggregateSpec) -> Result<Vec<Vec<Option<i64>>>, Error> {
+    /// As `run`, by the aggregate flushed at `at` of the key at 0.
+    fn run_flushed(
+        rows: Rows,
+        spec: HashAggregateSpec,
+        at: FlushAt,
+    ) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let env = Env::current();
-        let flushed = flushed(env, hash_aggregate(spec), 0).unwrap();
+        let flushed = flushed(env, hash_aggregate(spec), 0, at).unwrap();
         let steps = SmallVec::fixed_from(env, [Step::Operator(flushed)].into_iter()).unwrap();
         let pipeline = Pipeline::new(DynSource::new(env, rows).unwrap(), steps);
         rows_out(pipeline.start(env, None)?)
@@ -563,21 +573,24 @@ mod tests {
 
     #[test]
     fn outputs_groups_as_no_more_rows_reach_them() {
-        // Grouped by the key, though not sorted. Row 1 of each batch is
-        // dropped, so the third batch starts with the key the second ends
-        // with.
-        let keys = [[1, 1, 2], [2, 2, 3], [3, 4, 4], [8, 8, 6]];
-        let rows = || Rows {
-            batches: keys
+        // Row 1 of each batch is dropped.
+        let rows = |batches: [[i64; 3]; 4]| Rows {
+            batches: batches
                 .iter()
                 .map(|keys| keys.iter().map(|&k| (Some(k), Some(k * 10))).collect())
                 .collect(),
             dropped: alloc::vec![1],
         };
-        let expected = run(rows(), spec(&[0])).unwrap();
-        let mut by_key = spec(&[0]);
-        by_key.nullable_keys = 0;
-        assert_eq!(run_flushed(rows(), by_key).unwrap(), expected);
+        let by = |keys, at| {
+            let expected = run(rows(keys), spec(&[0])).unwrap();
+            let mut by_key = spec(&[0]);
+            by_key.nullable_keys = 0;
+            assert_eq!(run_flushed(rows(keys), by_key, at).unwrap(), expected);
+        };
+        // Runs of the first two batches, then one each, whose bounds follow
+        // on.
+        by([[2, 0, 1], [1, 5, 2], [7, 6, 6], [9, 8, 8]], FlushAt::Runs);
+        by([[1, 1, 2], [2, 2, 3], [3, 4, 4], [8, 8, 6]], FlushAt::Grouped);
     }
 
     #[test]

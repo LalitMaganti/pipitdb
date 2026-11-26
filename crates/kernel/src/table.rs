@@ -128,7 +128,7 @@ impl Scannable for Table {
     /// to read every value for.
     fn summary(&self, column: Option<u32>) -> Option<Summary> {
         let rows = self.row_groups.iter().map(|group| i64::from(group.row_count)).sum();
-        column.is_none().then_some(Summary { rows, bounds: None })
+        column.is_none().then_some(Summary { rows, bounds: None, follows_on: false })
     }
 
     /// An id, if every row group stores the column as a sequence, each

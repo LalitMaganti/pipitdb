@@ -10,15 +10,26 @@ use crate::error::Error;
 use crate::row_batch::RowBatch;
 use crate::step::{Breaker, DynOperator, Operator, Progress};
 
-/// The operator that runs `breaker` on rows grouped by the key at `key`, an
-/// `Int64` without nulls, flushing it where a batch's first value of the key
-/// differs from the last before it.
+/// Where a key's values say the rows before can be flushed.
+#[derive(PartialEq, Eq)]
+pub enum FlushAt {
+    /// Where a batch's first value of the key differs from the last before
+    /// it, as the rows are grouped by it.
+    Grouped,
+    /// Where a batch's bounds are above every value before it, of a scan
+    /// whose runs follow on, as `Summary` says.
+    Runs,
+}
+
+/// The operator that runs `breaker`, flushing it at `at` of the key at `key`,
+/// an `Int64` without nulls.
 pub fn flushed<'a, B: Breaker + 'a>(
     env: &Env,
     breaker: B,
     key: u32,
+    at: FlushAt,
 ) -> Result<DynOperator<'a>, AllocError> {
-    DynOperator::new(env, Flushed { breaker, key })
+    DynOperator::new(env, Flushed { breaker, key, at })
 }
 
 struct Flushed<B> {
@@ -26,6 +37,8 @@ struct Flushed<B> {
     breaker: B,
     /// Where the key is in batches.
     key: u32,
+    /// Where to flush.
+    at: FlushAt,
 }
 
 struct FlushedState<S> {
@@ -33,7 +46,8 @@ struct FlushedState<S> {
     breaker: Option<S>,
     /// Whether `breaker` is finalized, and being served.
     serving: bool,
-    /// The last value of the key consumed.
+    /// The last value of the key consumed, if `Grouped`, or at least every
+    /// one, if `Runs`.
     last: i64,
 }
 
@@ -42,7 +56,7 @@ impl<B: Breaker> Operator for Flushed<B> {
     type State = FlushedState<B::State>;
 
     fn new_state(&self, _: &mut Context) -> Result<Self::State, Error> {
-        Ok(FlushedState { breaker: None, serving: false, last: 0 })
+        Ok(FlushedState { breaker: None, serving: false, last: i64::MIN })
     }
 
     fn execute(
@@ -92,7 +106,14 @@ impl<B: Breaker> Flushed<B> {
     ) -> Result<bool, Error> {
         let kept = input.selection().kept();
         let len = input.selection().len();
-        let mut key = input.column(self.key).clone();
+        let key = input.column(self.key);
+        if self.at == FlushAt::Runs {
+            let (min, max) = key.bounds().map_or((i64::MIN, i64::MAX), |b| (b.min, b.max));
+            let flush = min > state.last;
+            state.last = state.last.max(max);
+            return Ok(flush);
+        }
+        let mut key = key.clone();
         key.make_in(context, Forms::FLAT)?;
         let values = key.int64s();
         let first = *at!(values, kept.row(0) as usize);

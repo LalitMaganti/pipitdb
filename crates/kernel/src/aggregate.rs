@@ -9,7 +9,7 @@ use crate::env::Env;
 use crate::error::Error;
 use crate::estimate::{Estimate, RowEstimate};
 use crate::expression::Exprs;
-use crate::flush::flushed;
+use crate::flush::{FlushAt, flushed};
 use crate::group_table::KEYS_MAX;
 use crate::hash_aggregate::hash_aggregate;
 use crate::lower::{LowerError, Lowering};
@@ -257,11 +257,18 @@ impl<'c> Op<'c> for AggregateOp {
         // Once no group so far gets more rows, they can be output and dropped.
         for (k, &key) in self.keys.iter().enumerate() {
             // Keys are `Int64`s or strings.
-            let int64 = (string_keys | nullable_keys) >> k & 1 == 0;
-            if int64 && lowering.query_rows().is_arranged(&[key], &[]) {
-                let flushed = flushed(env, breaker, lowering.query_position(key))?;
-                return lowering.add_operator(Step::Operator(flushed));
+            if (string_keys | nullable_keys) >> k & 1 != 0 {
+                continue;
             }
+            let at = if lowering.query_rows().is_arranged(&[key], &[]) {
+                FlushAt::Grouped
+            } else if lowering.query_follows_on(key) {
+                FlushAt::Runs
+            } else {
+                continue;
+            };
+            let flushed = flushed(env, breaker, lowering.query_position(key), at)?;
+            return lowering.add_operator(Step::Operator(flushed));
         }
         lowering.add_breaker(breaker)
     }

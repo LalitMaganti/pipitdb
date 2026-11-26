@@ -244,6 +244,14 @@ impl<'p, 'c> Lowering<'p, 'c> {
         at!(self.planned, self.plan.id_of(node) as usize).cutoff
     }
 
+    /// Whether the rows are of a scan whose runs follow on in `column`, as
+    /// `Summary` says.
+    pub fn query_follows_on(&self, column: ColumnId) -> bool {
+        let Some(scan) = self.query_rows().scan else { return false };
+        let summary = at!(self.plan.nodes, scan as usize).op.summary(Some(column));
+        summary.is_some_and(|summary| summary.follows_on)
+    }
+
     /// What is known of the rows the steps added so far output.
     pub fn query_rows(&self) -> &OutputProperties {
         self.rows
@@ -1343,7 +1351,7 @@ mod tests {
 
         fn summary(&self, column: Option<u32>) -> Option<Summary> {
             let bounds = column.map(|_| Bounds { min: -3, max: 9 });
-            self.knows.then_some(Summary { rows: 7, bounds })
+            self.knows.then_some(Summary { rows: 7, bounds, follows_on: false })
         }
     }
 
