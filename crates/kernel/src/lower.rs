@@ -11,12 +11,12 @@ use crate::expression::Exprs;
 use crate::names::{Name, Names};
 use crate::optimize::optimize;
 use crate::output_properties::{InputStep, OutputProperties, Planned, plan_nodes};
-use crate::pipeline::{Execution, Pipeline, SinkId, Sinks, served};
+use crate::pipeline::{Execution, Pipeline, Serve, SinkId, Sinks, serve};
 use crate::plan::{ColumnId, LogicalPlan, PLAN_NAME_BYTES_MAX, PlanNode, PlanNodeId, SortKey};
 use crate::settings::PLAN_DEPTH_MAX;
 use crate::sort::sort;
 use crate::statement::Statement;
-use crate::step::{Breaker, DynSource, Sink, Step};
+use crate::step::{Breaker, DynSink, DynSource, Sink, Step};
 use crate::top_k::top_k;
 
 /// Why a plan couldn't be planned or lowered.
@@ -182,9 +182,14 @@ impl<'p, 'c> Lowering<'p, 'c> {
     /// Ends the pipeline so far in `breaker`, as a sink, and starts the next
     /// with the source that serves what it builds.
     pub fn add_breaker<B: Breaker + 'c>(&mut self, breaker: B) -> Result<(), LowerError> {
+        let sink = DynSink::new(self.env, breaker)?;
+        self.add_dyn_breaker(sink, serve::<B>)
+    }
+
+    /// As `add_breaker`, of a breaker as `sink`, whose `serve` is `serve`.
+    fn add_dyn_breaker(&mut self, sink: DynSink<'c>, serve: Serve) -> Result<(), LowerError> {
         let input = self.end_pipeline()?;
-        let breaker = self.add_sink(input, breaker)?;
-        self.source = Some(served(self.env, breaker)?);
+        self.source = Some(self.sinks.add_breaker(self.env, input, sink, serve)?);
         Ok(())
     }
 
