@@ -442,24 +442,8 @@ fn joined_expected(keys: &[Vec<Option<i64>>], edges: &[(usize, usize)]) -> Vec<V
 /// A string column of `values`, flat, an empty string null.
 fn strings(values: &[&str]) -> ColumnView {
     let context = &mut Context::new(Env::current(), None);
-    let mut valid =
-        Buffer::allocate(Env::current(), BitSlice::<u8>::words_for(values.len())).unwrap();
-    valid.as_mut_slice::<u8>().fill(0);
-    for (row, value) in values.iter().enumerate() {
-        BitSlice::of_mut(valid.as_mut_slice::<u8>()).set_if(row, !value.is_empty());
-    }
-    let bytes: Vec<u8> = values.iter().flat_map(|value| value.bytes()).collect();
-    let mut stored = Buffer::allocate(Env::current(), bytes.len()).unwrap();
-    stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-    let mut views = Buffer::allocate(Env::current(), values.len() * 8).unwrap();
-    let mut at = 0;
-    for (view, value) in views.as_mut_slice::<u32>().chunks_mut(2).zip(values) {
-        let len = u32::try_from(value.len()).unwrap();
-        view.copy_from_slice(&[at, len]);
-        at += len;
-    }
-    let valid = values.iter().any(|value| value.is_empty()).then_some(valid);
-    ColumnView::strings(context, views, stored, valid).unwrap()
+    let value = |row: usize| Some(values[row].as_bytes()).filter(|value| !value.is_empty());
+    ColumnView::from_strings(context, values.len(), value).unwrap()
 }
 
 #[test]

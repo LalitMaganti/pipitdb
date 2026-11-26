@@ -79,22 +79,15 @@ mod tests {
         let mut keys = Buffer::allocate(env, n * 8).unwrap();
         let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(n)).unwrap();
         let mut values = Buffer::allocate(env, n * 8).unwrap();
-        let mut views = Buffer::allocate(env, n * 8).unwrap();
-        let mut bytes = Vec::new();
-        for (i, &(key, value, name)) in rows.iter().enumerate() {
+        for (i, &(key, value, _)) in rows.iter().enumerate() {
             keys.as_mut_slice::<i64>()[i] = key.unwrap_or(0);
             BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, key.is_some());
             values.as_mut_slice::<i64>()[i] = value;
-            let start = u32::try_from(bytes.len()).unwrap();
-            views.as_mut_slice::<u32>()[2 * i..2 * i + 2]
-                .copy_from_slice(&[start, u32::try_from(name.len()).unwrap()]);
-            bytes.extend_from_slice(name.as_bytes());
         }
-        let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
-        stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
         let keys = ColumnView::new(&mut context, DataType::Int64, keys, Some(bits)).unwrap();
         let values = ColumnView::new(&mut context, DataType::Int64, values, None).unwrap();
-        let names = ColumnView::strings(&mut context, views, stored, None).unwrap();
+        let name = |i: usize| Some(rows[i].2.as_bytes());
+        let names = ColumnView::from_strings(&mut context, n, name).unwrap();
         for column in [keys, values, names] {
             assert!(batch.push_column(column).is_ok());
         }
