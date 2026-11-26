@@ -904,9 +904,14 @@ mod tests {
             one.column(1).string_values().get(8).as_ptr()
         ));
         let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
-        let got = read(&out);
-        assert_eq!([&got[1], &got[3]], [&int(8), &int(4)]);
-        assert_eq!(got[0].1, b"");
+        // Only the kept rows' numbers: the others' are unspecified.
+        let (ints, strings) = (out.column(0), out.column(1));
+        let row = |r: u32| {
+            let int = (!ints.is_null(r)).then(|| ints.int64s()[r as usize]);
+            (int, strings.string_values().get(r as usize).to_vec())
+        };
+        assert_eq!([row(1), row(3)], [int(8), int(4)]);
+        assert_eq!(strings.string_values().get(0), b"");
     }
 
     #[test]

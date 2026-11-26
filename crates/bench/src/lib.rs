@@ -431,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "leaks its table, as `plan_and_run` takes a `'static` catalog")]
     fn sorts_by_columns_it_then_drops() {
         let sources: &'static [&dyn ByteSource] = Box::leak(Box::new([&NULLS as &dyn ByteSource]));
         let table = ParquetTable::open(env(), &Uncompressed, sources).unwrap();
