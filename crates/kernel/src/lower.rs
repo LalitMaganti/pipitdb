@@ -562,9 +562,9 @@ mod tests {
         assert_eq!(knows_of(both, &[0, 1], &asks[5..8]), ([true, true, true].to_vec(), 1));
     }
 
-    /// The steps of `Ab` scanned, its rows counted by `groups` of its
-    /// columns first, if given, then ordered by `keys`, by column, then
-    /// limited to `(count, offset)` rows, if given.
+    /// The steps of `Ab`, its `a` never null, scanned, its rows counted by
+    /// `groups` of its columns first, if given, then ordered by `keys`, by
+    /// column, then limited to `(count, offset)` rows, if given.
     fn ordered(
         groups: Option<&[usize]>,
         keys: &[(usize, bool)],
@@ -576,7 +576,7 @@ mod tests {
         let mut columns = SmallVec::fixed(env, 2).unwrap();
         let mut bindings = StdVec::new();
         for (column, name) in [(0, "a"), (1, "b")] {
-            let binding = plan.add_column(name, DataType::Int64, true).unwrap();
+            let binding = plan.add_column(name, DataType::Int64, column == 1).unwrap();
             assert!(
                 columns
                     .push(ScanColumn { column, binding: binding.column.0, forms: Forms::FLAT })
@@ -628,8 +628,9 @@ mod tests {
         assert_eq!(ordered(None, &[(0, false), (1, false)], None), "Scan");
         assert_eq!(ordered(None, &[(1, false)], None), "Scan | Sort / Served");
         assert_eq!(ordered(None, &[(0, true)], None), "Scan | Sort / Served");
-        // Groups come out in the order first seen, so in `a`'s order.
-        assert_eq!(ordered(Some(&[0]), &[(0, false)], None), "Scan | HashAggregate / Served");
+        // Groups come out in the order first seen, so in `a`'s order. As
+        // rows come in `a`'s order, its groups are output as each ends.
+        assert_eq!(ordered(Some(&[0]), &[(0, false)], None), "Scan | Flushed");
         assert_eq!(
             ordered(Some(&[1]), &[(1, false)], None),
             "Scan | HashAggregate / Served | Sort / Served"
