@@ -922,6 +922,28 @@ impl RawBlocks {
         self.first + self.arrays.len().saturating_sub(1) * BLOCK_RECORDS
     }
 
+    /// As `Blocks::reserve_bytes`.
+    #[cfg(feature = "spill")]
+    fn reserve_bytes(&self, len: usize) -> usize {
+        let (mut first, mut blocks, mut bytes) = (self.first, self.arrays.len(), 0);
+        while first + blocks.saturating_sub(1) * BLOCK_RECORDS < len {
+            let grow = first < BLOCK_RECORDS;
+            let records = if grow {
+                len.next_power_of_two().clamp(FIRST_RECORDS, BLOCK_RECORDS)
+            } else {
+                BLOCK_RECORDS
+            };
+            bytes += records * self.record_bytes;
+            if grow {
+                first = records;
+                blocks = blocks.max(1);
+            } else {
+                blocks += 1;
+            }
+        }
+        bytes
+    }
+
     /// As `Blocks::reserve`.
     #[inline(never)]
     fn reserve(&mut self, env: &Env, len: usize) -> Result<(), AllocError> {
@@ -979,6 +1001,12 @@ impl<T: Primitive> Blocks<T> {
     /// How many records there's room for.
     pub(crate) fn capacity(&self) -> usize {
         self.raw.capacity()
+    }
+
+    /// How many bytes `reserve(len)` allocates.
+    #[cfg(feature = "spill")]
+    pub(crate) fn reserve_bytes(&self, len: usize) -> usize {
+        self.raw.reserve_bytes(len)
     }
 
     /// Makes room for `len` records, zeroed: the first block grows by

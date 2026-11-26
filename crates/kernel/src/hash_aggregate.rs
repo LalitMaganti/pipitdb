@@ -13,10 +13,14 @@ use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
 use crate::flat_hash_map::{FlatHashMap, Key};
+#[cfg(feature = "spill")]
+use crate::group_table::NONE;
 use crate::group_table::{GroupTable, KEYS_MAX};
 use crate::murmur_hash;
 use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX, RowBatch};
 use crate::selection::Kept;
+#[cfg(feature = "spill")]
+use crate::spill::{LogId, SpillStore, read_batch, write_batch};
 use crate::step::Breaker;
 use crate::string_pool::CACHED_SLOTS;
 
@@ -52,6 +56,50 @@ pub struct State {
     distinct: SmallVec<Option<FlatHashMap<GroupValue, ()>>>,
     /// How many groups have been output.
     emitted: usize,
+    /// The rows of keys without a group, once its groups fill the budget.
+    #[cfg(feature = "spill")]
+    spilled: Option<Spilled>,
+}
+
+/// How many partitions the rows of keys without a group are written to,
+/// by four bits of their keys' hash.
+#[cfg(feature = "spill")]
+const PARTITIONS: usize = 16;
+
+/// Rows of keys without a group, written to a log a partition, to be
+/// aggregated a partition at a time once the groups held are output. A
+/// partition that again fills the budget is split by the next bits.
+#[cfg(feature = "spill")]
+struct Spilled {
+    /// The store the logs are in.
+    store: &'static dyn SpillStore,
+    /// Which bits of a hash pick the partition rows are written to.
+    level: u32,
+    /// Each partition being written, if any rows were.
+    writing: [Option<Partition>; PARTITIONS],
+    /// The partitions written, sealed, to aggregate next.
+    pending: SmallVec<Partition>,
+}
+
+/// A partition's log, of batches of the columns the aggregation reads.
+#[cfg(feature = "spill")]
+#[derive(Clone, Copy)]
+struct Partition {
+    /// The log.
+    log: LogId,
+    /// How many batches it holds.
+    batches: usize,
+    /// The level the rows it holds are split by if it fills the budget.
+    level: u32,
+}
+
+#[cfg(feature = "spill")]
+impl Drop for Spilled {
+    fn drop(&mut self) {
+        for partition in self.writing.iter().flatten().chain(self.pending.iter()) {
+            self.store.delete(partition.log);
+        }
+    }
 }
 
 impl HashAggregate {
@@ -98,6 +146,65 @@ impl HashAggregate {
         let inputs =
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
+    }
+
+    /// Adds the `rows` rows of `input` that `select` lists, or its first
+    /// `rows` if it lists none, to their groups, `numbers`, if it has keys.
+    fn update(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        input: &Flat,
+        select: &[u16],
+        rows: usize,
+        numbers: Option<&[u32]>,
+    ) -> Result<(), Error> {
+        let group_count = self.group_count(state);
+        let State { groups, total, seen, distinct, .. } = state;
+        let total = [total.as_mut_ptr()];
+        let base = self.state_base(groups, &total);
+        let mut overflow = false;
+        let mut offset = 0;
+        for (a, call) in self.spec.aggregates.iter().enumerate() {
+            if let Some(extreme) = string_extreme(*call) {
+                let states = Self::states(base, offset, None);
+                offset += StringExtreme::STATE_WORDS;
+                let column = input.column(call.column);
+                extreme.update(context, column, select, rows, numbers, states)?;
+                continue;
+            }
+            let function = make_aggregate_function(call.function, call.input_type);
+            let mut buffers = AggregateInputLoader::default();
+            let mut loaded = AggregateInput { values: &[], valid: None, rows };
+            if function.reads_input() {
+                loaded = buffers.load(context, input.column(call.column), select, rows)?;
+            }
+            let seen = if function.tracks_seen() {
+                at_mut!(seen, a).get(context.env(), group_count, loaded.valid.is_some())?
+            } else {
+                None
+            };
+            let states = Self::states(base, offset, seen);
+            offset += function.state_words();
+            if let Some(set) = at_mut!(distinct, a) {
+                // Only the rows with values their group hasn't had, as if the
+                // batch were only those.
+                let (values, firsts, rows) = first_values(context, set, &loaded, numbers)?;
+                let kept = at!(values.as_slice::<i64>(), ..rows);
+                let values = AggregateInput { values: kept, valid: None, rows };
+                let firsts = at!(firsts.as_slice::<u32>(), ..rows);
+                match numbers {
+                    Some(_) => function.update(&values, firsts, states, &mut overflow),
+                    None => function.update_group(&values, 0, states, &mut overflow),
+                }
+                continue;
+            }
+            match numbers {
+                Some(numbers) => function.update(&loaded, numbers, states, &mut overflow),
+                None => function.update_group(&loaded, 0, states, &mut overflow),
+            }
+        }
+        if overflow { Err(Error::Overflow) } else { Ok(()) }
     }
 }
 
@@ -215,13 +322,24 @@ impl Breaker for HashAggregate {
 
     fn new_state(&self, context: &mut Context) -> Result<State, Error> {
         let env = context.env();
-        let groups = GroupTable::new(
+        #[cfg_attr(not(feature = "spill"), expect(unused_mut, reason = "set to spill"))]
+        let mut groups = GroupTable::new(
             env,
             self.spec.key_columns.len(),
             self.spec.string_keys,
             self.spec.nullable_keys,
             self.state_words,
         )?;
+        #[cfg(feature = "spill")]
+        if env.spill().is_some() && self.spills() {
+            // A byte a group for each aggregate tracking which have seen a
+            // value.
+            let seen =
+                self.spec.aggregates.iter().map(|call| {
+                    make_aggregate_function(call.function, call.input_type).tracks_seen()
+                });
+            groups.freeze_when_full(seen.filter(|&seen| seen).count());
+        }
         let mut total = SmallVec::new(env, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
         let mut seen = SmallVec::fixed(env, self.spec.aggregates.len())?;
@@ -235,7 +353,16 @@ impl Breaker for HashAggregate {
             let set = if call.distinct { Some(FlatHashMap::for_len(env, 0)?) } else { None };
             distinct.push(set)?;
         }
-        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0 })
+        Ok(State {
+            groups,
+            total,
+            consumed: false,
+            seen,
+            distinct,
+            emitted: 0,
+            #[cfg(feature = "spill")]
+            spilled: None,
+        })
     }
 
     fn consume(
@@ -263,53 +390,20 @@ impl Breaker for HashAggregate {
             let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
             state.groups.find_or_create(context, keys, input.select(), groups)?;
         }
-        let group_count = self.group_count(state);
-        let State { groups, total, seen, distinct, .. } = state;
-        let total = [total.as_mut_ptr()];
-        let base = self.state_base(groups, &total);
-        let mut overflow = false;
-        let mut offset = 0;
-        for (a, call) in self.spec.aggregates.iter().enumerate() {
-            let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
-            if let Some(extreme) = string_extreme(*call) {
-                let states = Self::states(base, offset, None);
-                offset += StringExtreme::STATE_WORDS;
-                let column = input.column(call.column);
-                extreme.update(context, column, input.select(), rows, numbers, states)?;
-                continue;
+        #[cfg(feature = "spill")]
+        if state.groups.is_frozen() {
+            let Some(numbers) = &mut numbers else { failed!() };
+            let groups = at_mut!(numbers.as_mut_slice::<u32>(), ..rows);
+            let mut kept = [0; BATCH_ROWS_MAX as usize];
+            let rows = self.spill_rows(context, &mut state.spilled, &input, groups, &mut kept)?;
+            if rows == 0 {
+                return Ok(());
             }
-            let function = make_aggregate_function(call.function, call.input_type);
-            let mut buffers = AggregateInputLoader::default();
-            let mut loaded = AggregateInput { values: &[], valid: None, rows };
-            if function.reads_input() {
-                loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
-            }
-            let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(context.env(), group_count, loaded.valid.is_some())?
-            } else {
-                None
-            };
-            let states = Self::states(base, offset, seen);
-            offset += function.state_words();
-            if let Some(set) = at_mut!(distinct, a) {
-                // Only the rows with values their group hasn't had, as if the
-                // batch were only those.
-                let (values, firsts, rows) = first_values(context, set, &loaded, numbers)?;
-                let kept = at!(values.as_slice::<i64>(), ..rows);
-                let values = AggregateInput { values: kept, valid: None, rows };
-                let firsts = at!(firsts.as_slice::<u32>(), ..rows);
-                match numbers {
-                    Some(_) => function.update(&values, firsts, states, &mut overflow),
-                    None => function.update_group(&values, 0, states, &mut overflow),
-                }
-                continue;
-            }
-            match numbers {
-                Some(numbers) => function.update(&loaded, numbers, states, &mut overflow),
-                None => function.update_group(&loaded, 0, states, &mut overflow),
-            }
+            let numbers = Some(&*at!(groups, ..rows));
+            return self.update(context, state, &input, at!(kept, ..rows), rows, numbers);
         }
-        if overflow { Err(Error::Overflow) } else { Ok(()) }
+        let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
+        self.update(context, state, &input, input.select(), rows, numbers)
     }
 
     fn finalize(&self, _: &mut Context, _: &mut State) -> Result<(), Error> {
@@ -322,6 +416,12 @@ impl Breaker for HashAggregate {
         state: &mut State,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
+        #[cfg(feature = "spill")]
+        if state.emitted == self.group_count(state)
+            && let Some(spilled) = state.spilled.take()
+        {
+            self.replay(context, state, spilled)?;
+        }
         let groups = self.group_count(state);
         // Output up to a full batch of groups.
         let first = state.emitted;
@@ -365,7 +465,167 @@ impl Breaker for HashAggregate {
             let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
-        Ok(state.emitted < groups)
+        let more = state.emitted < groups;
+        #[cfg(feature = "spill")]
+        let more = more || state.spilled.is_some();
+        Ok(more)
+    }
+}
+
+#[cfg(feature = "spill")]
+impl HashAggregate {
+    /// Whether it can spill: it has keys, and keeps no strings in the run's
+    /// pool, which every pass would add to.
+    fn spills(&self) -> bool {
+        let strings = self.spec.aggregates.iter().any(|&call| string_extreme(call).is_some());
+        !self.spec.key_columns.is_empty() && self.spec.string_keys == 0 && !strings
+    }
+
+    /// Bit `p` set if it reads the column at position `p`, which the rows it
+    /// spills keep.
+    fn read_columns(&self) -> u64 {
+        self.read().fold(0, |read, p| read | 1 << p)
+    }
+
+    /// Writes the rows of `input` that `groups`, theirs, says have none to
+    /// `spilled`'s partitions, and keeps the others' groups at the start of
+    /// `groups`, and which rows of the batch they are in `kept`, returning
+    /// how many.
+    fn spill_rows(
+        &self,
+        context: &mut Context,
+        spilled: &mut Option<Spilled>,
+        input: &Flat,
+        groups: &mut [u32],
+        kept: &mut [u16; BATCH_ROWS_MAX as usize],
+    ) -> Result<usize, Error> {
+        let rows = groups.len();
+        let select = input.select();
+        let mut written = [0; BATCH_ROWS_MAX as usize];
+        let (mut k, mut w) = (0, 0);
+        for i in 0..rows {
+            #[expect(clippy::cast_possible_truncation, reason = "a row of a batch")]
+            let row = if select.is_empty() { i as u16 } else { *at!(select, i) };
+            let group = *at!(groups, i);
+            if group == NONE {
+                *at_mut!(written, w) = row;
+                w += 1;
+            } else {
+                *at_mut!(kept, k) = row;
+                *at_mut!(groups, k) = group;
+                k += 1;
+            }
+        }
+        if w == 0 {
+            return Ok(k);
+        }
+        if spilled.is_none() {
+            let Some(store) = context.env().spill() else { failed!() };
+            let pending = SmallVec::new(context.env(), 1 << 20)?;
+            *spilled = Some(Spilled { store, level: 0, writing: [None; PARTITIONS], pending });
+        }
+        let Some(spilled) = spilled else { failed!() };
+        // Without strings, each column read is flat.
+        let mut columns = [input.column(0); BATCH_COLUMNS_MAX as usize];
+        let read = self.read_columns();
+        let positions = (0..BATCH_COLUMNS_MAX).filter(|p| read >> p & 1 != 0);
+        for (column, position) in columns.iter_mut().zip(positions) {
+            *column = input.column(position);
+        }
+        let columns = at!(columns, ..read.count_ones() as usize);
+        let mut partitions = [0_u8; BATCH_ROWS_MAX as usize];
+        for (partition, &row) in partitions.iter_mut().zip(at!(written, ..w)) {
+            *partition = self.partition(input, row, spilled.level);
+        }
+        let mut rows = [0; BATCH_ROWS_MAX as usize];
+        for p in 0..PARTITIONS {
+            let mut count = 0;
+            for (&partition, &row) in partitions.iter().zip(at!(written, ..w)) {
+                *at_mut!(rows, count) = row;
+                count += usize::from(usize::from(partition) == p);
+            }
+            if count == 0 {
+                continue;
+            }
+            let slot = at_mut!(spilled.writing, p);
+            let level = spilled.level + 1;
+            let partition = match slot {
+                Some(partition) => partition,
+                None => slot.insert(Partition { log: spilled.store.create()?, batches: 0, level }),
+            };
+            #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
+            let rows_count = count as u32;
+            write_batch(spilled.store, partition.log, columns, at!(rows, ..count), rows_count)?;
+            partition.batches += 1;
+        }
+        Ok(k)
+    }
+
+    /// Which partition row `row` of `input` is written to at `level`, by
+    /// four bits of its keys' hash, the next four a level.
+    fn partition(&self, input: &Flat, row: u16, level: u32) -> u8 {
+        let mut hash = murmur_hash::SEED;
+        for &key in self.spec.key_columns.iter() {
+            let column = input.column(key);
+            let row = u32::from(row);
+            let value = *at!(column.int64s(), row as usize);
+            let word = if column.is_null(row) { u64::MAX } else { value.cast_unsigned() };
+            hash = murmur_hash::combine(hash, word);
+        }
+        (murmur_hash::mix(hash) >> (60 - 4 * (level % 16)) & 15) as u8
+    }
+
+    /// Seals the partitions `spilled` wrote and aggregates the next one into
+    /// `state`, made anew, so what it held is freed first. Without one, the
+    /// aggregation is done.
+    fn replay(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        mut spilled: Spilled,
+    ) -> Result<(), Error> {
+        // Each log is always one `spilled` holds, or the one being read, so
+        // it's deleted whatever fails.
+        for partition in &mut spilled.writing {
+            if let Some(written) = partition.take() {
+                if let Err(error) = spilled.pending.push(written) {
+                    spilled.store.delete(written.log);
+                    return Err(error.into());
+                }
+                spilled.store.seal(written.log)?;
+            }
+        }
+        let Some(Partition { log, batches, level }) = spilled.pending.pop() else { return Ok(()) };
+        let store = spilled.store;
+        spilled.level = level;
+        let read_columns = self.read_columns();
+        let (width, last) = (read_columns.count_ones() as usize, read_columns.ilog2());
+        let mut batch = RowBatch::new();
+        let mut at = 0;
+        let replayed = (|| {
+            *state = Breaker::new_state(self, context)?;
+            state.spilled = Some(spilled);
+            for _ in 0..batches {
+                let mut read = [const { None }; BATCH_COLUMNS_MAX as usize];
+                let mut positions = (0..=last).filter(|p| read_columns >> p & 1 != 0);
+                at = read_batch(context, store, log, at, width, |column| {
+                    let Some(position) = positions.next() else { failed!() };
+                    *at_mut!(read, position as usize) = Some(column);
+                    Ok(())
+                })?;
+                let Some(first) = read.iter().flatten().next().cloned() else { failed!() };
+                batch.reset(first.row_count());
+                // Columns it doesn't read are any of the right length.
+                for column in at!(read, ..=last as usize) {
+                    let column = column.clone().unwrap_or_else(|| first.clone());
+                    let Ok(()) = batch.push_column(column) else { failed!() };
+                }
+                Breaker::consume(self, context, state, &batch)?;
+            }
+            Ok(())
+        })();
+        store.delete(log);
+        replayed
     }
 }
 
@@ -891,5 +1151,87 @@ mod tests {
             };
             assert_eq!(run(rows, spec(keys)), Err(Error::Overflow));
         }
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn spills_rows_of_groups_past_its_budget() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+        use crate::spill::tests::Strict;
+
+        // Each key twice, a batch apart, with a value each time, or a null.
+        let (keys, batch) = (60_000_i64, 2000_i64);
+        let value = |k: i64, b: i64| (k % 7 != b % 2).then_some(k * 2 + b % 2);
+        let rows = Rows {
+            batches: (0..2 * keys / batch)
+                .map(|b| {
+                    (b / 2 * batch..(b / 2 + 1) * batch).map(|k| (Some(k), value(k, b))).collect()
+                })
+                .collect(),
+            dropped: Vec::new(),
+        };
+        // Each group's key and sum, sorted, and the most memory taken.
+        let run = |limit: usize, store: Option<&'static Strict>| {
+            let env = Env::new(Memory::new(Heap, limit)).unwrap();
+            if let Some(store) = store {
+                env.spill_to(store);
+            }
+            let mut spec = spec(&[0]);
+            spec.aggregates =
+                SmallVec::fixed_from(Env::current(), [spec.aggregates[2]].into_iter()).unwrap();
+            let aggregate = hash_aggregate(spec);
+            let context = &mut Context::new(&env, None);
+            let (mut out, mut i) = (Vec::new(), 0);
+            let mut state = Breaker::new_state(&aggregate, context)?;
+            let mut batch = RowBatch::new();
+            while rows.next(context, &mut i, &mut batch)? {
+                Breaker::consume(&aggregate, context, &mut state, &batch)?;
+            }
+            Breaker::finalize(&aggregate, context, &mut state)?;
+            loop {
+                let more = Breaker::serve(&aggregate, context, &mut state, &mut batch)?;
+                let (keys, sums) = (batch.column(0), batch.column(1));
+                for row in 0..batch.row_count() {
+                    let sum = (!sums.is_null(row)).then(|| sums.int64s()[row as usize]);
+                    out.push((keys.int64s()[row as usize], sum));
+                }
+                if !more {
+                    break;
+                }
+            }
+            batch.reset(0);
+            drop(state);
+            out.sort_unstable();
+            Ok::<_, Error>((out, env.peak()))
+        };
+        let (expected, peak) = run(usize::MAX, None).unwrap();
+        let sum = |k: i64| Some([0, 1].into_iter().filter_map(|b| value(k, b)).sum());
+        assert_eq!(expected, (0..keys).map(|k| (k, sum(k))).collect::<Vec<_>>());
+        let limit = peak / 4;
+        assert_eq!(run(limit, None).err(), Some(Error::OutOfMemory));
+        let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+        let (out, peak) = run(limit, Some(store)).unwrap();
+        assert!(out == expected && peak <= limit);
+        // It wrote to more than one log, as one pass didn't hold the rest,
+        // and deleted them.
+        let logs = store.logs.borrow();
+        assert!(logs.len() > 1 && logs.iter().all(Option::is_none));
+        drop(logs);
+        // From the least budget it runs in up, it runs in every one, and
+        // whether it runs or fails, it leaves no log behind.
+        let mut ran = false;
+        for limit in (peak / 32..=peak).step_by(peak / 64) {
+            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+            match run(limit, Some(store)) {
+                Ok((out, _)) => {
+                    assert_eq!(out, expected);
+                    ran = true;
+                }
+                Err(error) => assert!(!ran && error == Error::OutOfMemory, "{limit}: {error:?}"),
+            }
+            assert!(store.logs.borrow().iter().all(Option::is_none), "{limit} left a log");
+        }
+        assert!(ran);
     }
 }

@@ -31,6 +31,9 @@ check-lines = ["pipitdb-kernel/check-lines"]
 string-functions = ["pipitdb-pipesql/string-functions"]
 # Builds the size example, which `cargo test` can't: it has no unwinding.
 size = []
+# Lets the suite example spill, to where `SPILL` says, and the spill cases
+# example spill to memory.
+spill = ["pipitdb-kernel/spill"]
 
 # A library that uses the kernel, whose size CI checks against `sizes`.
 [[example]]

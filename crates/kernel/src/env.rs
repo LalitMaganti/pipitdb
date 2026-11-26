@@ -16,6 +16,8 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BYTES};
+#[cfg(feature = "spill")]
+use crate::spill::SpillStore;
 
 /// A query's environment. Its memory is its budget, which plans, states, lists and column data
 /// of no fixed size come from, and a `SlabAllocator` for each kind of
@@ -41,6 +43,9 @@ pub struct Env {
     free: unsafe fn(NonNull<Env>),
     /// The bytes of the allocation this is in.
     allocation_bytes: usize,
+    /// Where what doesn't fit in its budget goes, if anywhere.
+    #[cfg(feature = "spill")]
+    spill: Cell<Option<&'static dyn SpillStore>>,
 }
 
 /// Allocates from the allocator an `Env` was made with while the bytes
@@ -133,6 +138,8 @@ impl Env {
             (&raw mut (*env).allocators).write(allocators);
             (&raw mut (*env).free).write(free::<A>);
             (&raw mut (*env).allocation_bytes).write(layout.size());
+            #[cfg(feature = "spill")]
+            (&raw mut (*env).spill).write(Cell::new(None));
         }
         Ok(OwnedEnv(allocation.cast()))
     }
@@ -175,6 +182,26 @@ impl Env {
     /// The most bytes allocated at once.
     pub fn peak(&self) -> usize {
         self.budget.peak.get()
+    }
+
+    /// Makes `store` where what doesn't fit in its budget goes.
+    #[cfg(feature = "spill")]
+    pub fn spill_to(&self, store: &'static dyn SpillStore) {
+        self.spill.set(Some(store));
+    }
+
+    /// Whether `bytes` more leave an eighth of its budget: what spills grows
+    /// only while they do, so what runs after it still can.
+    #[cfg(feature = "spill")]
+    pub(crate) fn leaves_room(&self, bytes: usize) -> bool {
+        let left = self.budget.limit - self.used();
+        left.checked_sub(bytes).is_some_and(|left| left >= self.budget.limit / 8)
+    }
+
+    /// Where what doesn't fit in its budget goes, if anywhere.
+    #[cfg(feature = "spill")]
+    pub(crate) fn spill(&self) -> Option<&'static dyn SpillStore> {
+        self.spill.get()
     }
 }
 

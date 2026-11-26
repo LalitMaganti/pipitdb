@@ -7,11 +7,11 @@
 //! own threads, behind them.
 
 use crate::bytes::ByteRange;
-use crate::column::{ColumnView, DataType, Strings, Validity};
+use crate::column::{ColumnView, DataType};
 use crate::containers::BitSlice;
 use crate::context::Context;
 use crate::error::Error;
-use crate::row_batch::BATCH_ROWS_MAX;
+use crate::row_batch::{BATCH_COLUMNS_MAX, BATCH_ROWS_MAX};
 
 /// A log in a store, which the store names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -57,12 +57,8 @@ pub struct SpilledColumn {
     pub validity: Option<ByteRange>,
 }
 
-/// How many rows' null bits, or strings' views, `write_column` appends at
-/// once.
-const CHUNK_ROWS: u32 = 512;
-
-/// The bytes of `CHUNK_ROWS` rows' null bits.
-const CHUNK_BYTES: usize = CHUNK_ROWS as usize / 8;
+/// How many bytes `Appender` appends at once.
+const CHUNK_BYTES: usize = 4096;
 
 /// Appends `column`, which must be flat, to `log`: its values, or its
 /// strings' views and then bytes, then its null bitmap, if any.
@@ -71,91 +67,199 @@ pub fn write_column(
     log: LogId,
     column: &ColumnView,
 ) -> Result<SpilledColumn, Error> {
+    write_rows(store, log, column, &[], column.row_count())
+}
+
+/// As `write_column`, of the `count` rows of `column` that `select` lists,
+/// or its first `count` if it lists none.
+pub fn write_rows(
+    store: &dyn SpillStore,
+    log: LogId,
+    column: &ColumnView,
+    select: &[u16],
+    count: u32,
+) -> Result<SpilledColumn, Error> {
+    let row_of = |i: u32| if select.is_empty() { i } else { u32::from(*at!(select, i as usize)) };
     let (values, bytes) = if column.data_type().has_bytes() {
-        write_strings(store, log, column.string_values())?
+        // Each view says where its string starts among those written after.
+        let strings = column.string_values();
+        let (mut views, mut start) = (Appender::new(store, log), 0_u32);
+        for i in 0..count {
+            #[expect(clippy::cast_possible_truncation, reason = "a view's length is a `u32`")]
+            let len = strings.get(row_of(i) as usize).len() as u32;
+            views.push(&start.to_le_bytes())?;
+            views.push(&len.to_le_bytes())?;
+            start += len;
+        }
+        let views = views.end()?;
+        let mut bytes = Appender::new(store, log);
+        for i in 0..count {
+            bytes.push(strings.get(row_of(i) as usize))?;
+        }
+        (views, Some(bytes.end()?))
     } else {
-        (store.append(log, column.value_bytes())?, None)
+        let (words, mut values) = (column.value_bytes(), Appender::new(store, log));
+        for i in 0..count {
+            let at = row_of(i) as usize * 8;
+            values.push(at!(words, at..at + 8))?;
+        }
+        (values.end()?, None)
     };
-    let validity = match column.validity() {
-        None => None,
-        Some(validity) => Some(write_validity(store, log, validity)?),
+    let validity = if column.validity().is_none() {
+        None
+    } else {
+        let (mut bits, mut byte) = (Appender::new(store, log), 0_u8);
+        for i in 0..count {
+            byte |= u8::from(!column.is_null(row_of(i))) << (i % 8);
+            if i % 8 == 7 || i + 1 == count {
+                bits.push(&[byte])?;
+                byte = 0;
+            }
+        }
+        Some(bits.end()?)
     };
-    let (data_type, row_count) = (column.data_type(), column.row_count());
-    Ok(SpilledColumn { data_type, row_count, values, bytes, validity })
+    let data_type = column.data_type();
+    Ok(SpilledColumn { data_type, row_count: count, values, bytes, validity })
 }
 
-/// Appends `validity`'s bits from the first row, shifted a chunk at a time
-/// if the view starts mid-byte, so they need no memory.
-fn write_validity(
-    store: &dyn SpillStore,
-    log: LogId,
-    validity: Validity,
-) -> Result<ByteRange, Error> {
-    let (bits, shift) = validity.bits();
-    let len = BitSlice::<u8>::words_for(validity.row_count() as usize);
-    let mut chunk = [0_u8; CHUNK_BYTES];
-    let mut block = None;
-    for first in (0..len).step_by(CHUNK_BYTES) {
-        let count = (len - first).min(CHUNK_BYTES);
-        for (i, byte) in at_mut!(chunk, ..count).iter_mut().enumerate() {
-            let next = bits.get(first + i + 1).copied().unwrap_or(0);
-            let pair = u16::from(next) << 8 | u16::from(*at!(bits, first + i));
-            #[expect(clippy::cast_possible_truncation, reason = "a byte of the pair")]
-            let shifted = (pair >> shift) as u8;
-            *byte = shifted;
-        }
-        block = Some(grow(block, store.append(log, at!(chunk, ..count))?));
-    }
-    let Some(block) = block else { failed!() };
-    Ok(block)
+/// The types a batch's header names, by their number.
+const TYPES: [DataType; 3] = [DataType::Int64, DataType::Float64, DataType::String];
+
+/// The bytes of the header of a batch of `columns` columns: its rows, then
+/// a word for each column.
+fn header_bytes(columns: usize) -> usize {
+    8 * (1 + columns)
 }
 
-/// Appends `strings`' views, then their bytes, one after another, with the
-/// views pointing into them there, each a chunk at a time, as a block each.
-fn write_strings(
+/// Appends the `count` rows of `columns`, each flat, that `select` lists, or
+/// their first `count` if it lists none, to `log`, after a header saying
+/// how long each is, so `read_batch` needs only where it starts.
+pub fn write_batch(
     store: &dyn SpillStore,
     log: LogId,
-    strings: Strings<'_>,
-) -> Result<(ByteRange, Option<ByteRange>), Error> {
-    let mut chunk = [0_u8; CHUNK_ROWS as usize * 8];
-    let (mut views, mut filled, mut start) = (None, 0, 0_u32);
-    for row in 0..strings.len() {
-        #[expect(clippy::cast_possible_truncation, reason = "a view's length is a `u32`")]
-        let len = strings.get(row).len() as u32;
-        at_mut!(chunk, filled..filled + 4).copy_from_slice(&start.to_le_bytes());
-        at_mut!(chunk, filled + 4..filled + 8).copy_from_slice(&len.to_le_bytes());
-        (filled, start) = (filled + 8, start + len);
-        if filled == chunk.len() {
-            views = Some(grow(views, store.append(log, &chunk)?));
-            filled = 0;
+    columns: &[&ColumnView],
+    select: &[u16],
+    count: u32,
+) -> Result<(), Error> {
+    check!(columns.len() <= BATCH_COLUMNS_MAX as usize);
+    let mut header = [0_u8; 8 * (1 + BATCH_COLUMNS_MAX as usize)];
+    at_mut!(header, ..8).copy_from_slice(&u64::from(count).to_le_bytes());
+    for (word, column) in at_mut!(header, 8..).chunks_exact_mut(8).zip(columns) {
+        let mut bytes = 0_u64;
+        if column.data_type().has_bytes() {
+            let strings = column.string_values();
+            for i in 0..count {
+                let row = if select.is_empty() {
+                    i as usize
+                } else {
+                    usize::from(*at!(select, i as usize))
+                };
+                bytes += strings.get(row).len() as u64;
+            }
         }
+        let Some(kind) = TYPES.iter().position(|&kind| kind == column.data_type()) else {
+            failed!()
+        };
+        let nullable = u64::from(column.validity().is_some());
+        word.copy_from_slice(&(bytes << 8 | nullable << 4 | kind as u64).to_le_bytes());
     }
-    views = Some(grow(views, store.append(log, at!(chunk, ..filled))?));
-    let mut bytes = None;
-    filled = 0;
-    for row in 0..strings.len() {
-        let value = strings.get(row);
-        if filled + value.len() > chunk.len() {
-            bytes = Some(grow(bytes, store.append(log, at!(chunk, ..filled))?));
-            filled = 0;
+    store.append(log, at!(header, ..header_bytes(columns.len())))?;
+    for column in columns {
+        write_rows(store, log, column, select, count)?;
+    }
+    Ok(())
+}
+
+/// Reads the batch of `width` columns `write_batch` wrote at `at` of `log`,
+/// which is sealed, giving each column to `column`, and returns where the
+/// next batch starts.
+pub fn read_batch(
+    context: &mut Context,
+    store: &dyn SpillStore,
+    log: LogId,
+    at: u64,
+    width: usize,
+    mut column: impl FnMut(ColumnView) -> Result<(), Error>,
+) -> Result<u64, Error> {
+    check!(width <= BATCH_COLUMNS_MAX as usize);
+    let mut header = [0_u8; 8 * (1 + BATCH_COLUMNS_MAX as usize)];
+    let header = at_mut!(header, ..header_bytes(width));
+    store.read(log, ByteRange { offset: at, len: header.len() as u64 }, header)?;
+    let mut words = header.as_chunks::<8>().0.iter().map(|&word| u64::from_le_bytes(word));
+    let rows = words.next().unwrap_or(0);
+    let Ok(row_count) = u32::try_from(rows) else { return Err(Error::Io) };
+    let mut next = at + header.len() as u64;
+    let mut take = |len: u64| {
+        let block = ByteRange { offset: next, len };
+        next += len;
+        block
+    };
+    for word in words {
+        let Some(&data_type) = TYPES.get((word & 0xf) as usize) else { return Err(Error::Io) };
+        let values = take(rows * 8);
+        let bytes = data_type.has_bytes().then(|| take(word >> 8));
+        let validity = (word >> 4 & 1 != 0).then(|| take(rows.div_ceil(8)));
+        let spilled = SpilledColumn { data_type, row_count, values, bytes, validity };
+        column(read_column(context, store, log, &spilled)?)?;
+    }
+    Ok(next)
+}
+
+/// Appends bytes to a log a chunk at a time, as one block.
+struct Appender<'s> {
+    /// The store the log is in.
+    store: &'s dyn SpillStore,
+    /// The log.
+    log: LogId,
+    /// The bytes not yet appended.
+    chunk: [u8; CHUNK_BYTES],
+    /// How many of `chunk`'s are.
+    filled: usize,
+    /// What's been appended.
+    block: Option<ByteRange>,
+}
+
+impl<'s> Appender<'s> {
+    fn new(store: &'s dyn SpillStore, log: LogId) -> Appender<'s> {
+        Appender { store, log, chunk: [0; CHUNK_BYTES], filled: 0, block: None }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.filled + bytes.len() > CHUNK_BYTES {
+            self.flush()?;
         }
-        if value.len() > chunk.len() {
-            bytes = Some(grow(bytes, store.append(log, value)?));
+        if bytes.len() > CHUNK_BYTES {
+            let appended = self.store.append(self.log, bytes)?;
+            self.grow(appended);
         } else {
-            at_mut!(chunk, filled..filled + value.len()).copy_from_slice(value);
-            filled += value.len();
+            at_mut!(self.chunk, self.filled..self.filled + bytes.len()).copy_from_slice(bytes);
+            self.filled += bytes.len();
         }
+        Ok(())
     }
-    bytes = Some(grow(bytes, store.append(log, at!(chunk, ..filled))?));
-    let Some(views) = views else { failed!() };
-    Ok((views, bytes))
-}
 
-/// `appended` added to `block`, which it follows.
-fn grow(block: Option<ByteRange>, appended: ByteRange) -> ByteRange {
-    match block {
-        None => appended,
-        Some(block) => ByteRange { offset: block.offset, len: block.len + appended.len },
+    fn flush(&mut self) -> Result<(), Error> {
+        let filled = core::mem::take(&mut self.filled);
+        let appended = self.store.append(self.log, at!(self.chunk, ..filled))?;
+        self.grow(appended);
+        Ok(())
+    }
+
+    /// Adds `appended`, which follows it, to the block.
+    fn grow(&mut self, appended: ByteRange) {
+        self.block = Some(match self.block {
+            None => appended,
+            Some(block) => ByteRange { offset: block.offset, len: block.len + appended.len },
+        });
+    }
+
+    /// The block of every byte pushed, appended.
+    fn end(mut self) -> Result<ByteRange, Error> {
+        if self.filled > 0 || self.block.is_none() {
+            self.flush()?;
+        }
+        let Some(block) = self.block else { failed!() };
+        Ok(block)
     }
 }
 
@@ -200,7 +304,7 @@ pub fn read_column(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use alloc::vec::Vec as StdVec;
     use core::cell::RefCell;
 
@@ -214,13 +318,13 @@ mod tests {
     /// least `PART` bytes, except the last; nothing can be read before its
     /// log is sealed. Counts the requests a remote store would make.
     #[derive(Default)]
-    struct Strict {
-        logs: RefCell<StdVec<Option<Log>>>,
+    pub(crate) struct Strict {
+        pub(crate) logs: RefCell<StdVec<Option<Log>>>,
         requests: core::cell::Cell<u32>,
     }
 
     #[derive(Default)]
-    struct Log {
+    pub(crate) struct Log {
         uploaded: StdVec<u8>,
         pending: StdVec<u8>,
         sealed: bool,
