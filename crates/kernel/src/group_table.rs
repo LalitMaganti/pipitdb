@@ -81,6 +81,10 @@ pub(crate) struct GroupTable {
     /// Whether a key not found gets no group, `NONE`, rather than a new
     /// one: a join's build side, once built.
     frozen: bool,
+    /// Whether it freezes, rather than fail, when it can't grow: a grouping
+    /// that spills the rows of keys it hasn't.
+    #[cfg(feature = "spill")]
+    freezes_full: bool,
 }
 
 /// No group.
@@ -124,6 +128,8 @@ impl GroupTable {
             dictionaries: SmallVec::fixed_from(env, (0..keys).map(|_| None))?,
             number_groups: SmallVec::new(env, 1 << 31)?,
             frozen: false,
+            #[cfg(feature = "spill")]
+            freezes_full: false,
         })
     }
 
@@ -203,7 +209,8 @@ impl GroupTable {
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         // Only a table with null words takes keys that can be null.
         check!(self.first == 1 || nulls.is_none());
-        self.grow(context.env(), self.len() + count)?;
+        let room = self.grow(context.env(), self.len() + count);
+        self.or_freeze(room)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
         let mut starts = context.indices_buffer(count * 4)?;
@@ -418,10 +425,51 @@ impl GroupTable {
         Ok(group)
     }
 
+    /// `room`, the result of making room for more groups, unless it ran out
+    /// of memory and the table freezes when full and has groups: then it
+    /// freezes instead.
+    #[inline]
+    #[cfg_attr(not(feature = "spill"), expect(clippy::unused_self, reason = "it freezes to spill"))]
+    fn or_freeze(&mut self, room: Result<(), Error>) -> Result<(), Error> {
+        match room {
+            #[cfg(feature = "spill")]
+            Err(Error::OutOfMemory) if self.freezes_full && self.len() > 0 => {
+                self.frozen = true;
+                Ok(())
+            }
+            room => room,
+        }
+    }
+
+    /// Fails, if it freezes when full, unless `bytes` more leave `env` room,
+    /// so it freezes while what runs after it still has some.
+    #[cfg(feature = "spill")]
+    fn check_room(&self, env: &Env, bytes: usize) -> Result<(), Error> {
+        if self.freezes_full && !env.leaves_room(bytes) {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    /// Makes it freeze, rather than fail, when it can't grow.
+    #[cfg(feature = "spill")]
+    pub(crate) fn freeze_when_full(&mut self) {
+        self.freezes_full = true;
+    }
+
+    /// Whether a key not found gets no group.
+    #[cfg(feature = "spill")]
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
     /// Doubles the slots until at most two thirds are used by `groups`
     /// groups, and puts each group back in its slot.
     fn grow(&mut self, env: &Env, groups: usize) -> Result<(), Error> {
-        self.records.reserve(env, groups.min(GROUPS_MAX))?;
+        let records = groups.min(GROUPS_MAX);
+        #[cfg(feature = "spill")]
+        self.check_room(env, records.saturating_sub(self.records.capacity()) * self.stride * 8)?;
+        self.records.reserve(env, records)?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
         while groups * 3 > capacity * 2 {
@@ -430,6 +478,8 @@ impl GroupTable {
         if capacity == self.slots.len() {
             return Ok(());
         }
+        #[cfg(feature = "spill")]
+        self.check_room(env, capacity * 8)?;
         let mut slots = Array::zeroed(env, capacity)?;
         let mask = capacity - 1;
         // No need to hash the keys again: `slot_of` only uses bits a slot has.

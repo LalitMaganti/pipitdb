@@ -9,7 +9,9 @@
 //! `hits_0.parquet` and `hits_1.parquet` are both `hits`.
 //!
 //! `QUERY` runs only that query, `REPEAT` runs each that many times and times
-//! the last, and `QUIET` doesn't print rows.
+//! the last, and `QUIET` doesn't print rows. `BUDGET` is the bytes each timed
+//! run can take, and with the `spill` feature, `SPILL` the directory what
+//! doesn't fit goes to.
 
 #![allow(unsafe_code)]
 
@@ -122,6 +124,11 @@ fn main() -> Result<(), String> {
         .map(|(name, table)| (name.as_str(), table.iter().map(|f| f as &dyn ByteSource).collect()))
         .collect();
     let codecs = Counting::default();
+    // Every query's `Env` spills to the same store, which outlives them.
+    #[cfg(feature = "spill")]
+    let spill: Option<&'static pipit_file::spill::FileSpill> = std::env::var("SPILL")
+        .ok()
+        .map(|dir| &*Box::leak(Box::new(pipit_file::spill::FileSpill::new(dir))));
     let mut first = true;
     for line in queries.lines() {
         let mut fields = line.split('\t');
@@ -145,7 +152,13 @@ fn main() -> Result<(), String> {
             continue;
         }
         // Counts what the query holds at its peak, for the report.
-        let env = Env::new(Memory::new(Heap, usize::MAX)).map_err(|e| format!("{e:?}"))?;
+        let budget = std::env::var("BUDGET").ok().and_then(|n| n.parse().ok());
+        let env = Env::new(Memory::new(Heap, budget.unwrap_or(usize::MAX)))
+            .map_err(|e| format!("{e:?}"))?;
+        #[cfg(feature = "spill")]
+        if let Some(store) = spill {
+            env.spill_to(store);
+        }
         codecs.pages.set(0);
         codecs.bytes.set(0);
         // Each query opens its tables, reading their footers, as other
