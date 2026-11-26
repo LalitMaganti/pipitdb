@@ -61,6 +61,7 @@ mod sorted_rows;
 pub mod spill;
 pub(crate) mod statement;
 pub mod step;
+mod string_buffers;
 pub mod string_pool;
 pub mod table;
 pub(crate) mod top_k;

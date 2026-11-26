@@ -5,7 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Form, GatherSource};
+use crate::column::{ColumnView, DataType, Form, GatherSource, Held};
 use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
@@ -606,6 +606,7 @@ impl Packing {
     /// Packs `column`'s rows `rows`, after those packed.
     fn append(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
         let values = column.values();
+        let strings = self.bytes.as_ref().map(|_| values.strings());
         for i in rows {
             let row = kept.row(i);
             let at = self.rows as usize;
@@ -618,7 +619,8 @@ impl Packing {
                         *at!(values.words(), row as usize);
                 }
                 Some(bytes) => {
-                    let string = if valid { values.strings().get(row as usize) } else { &[] };
+                    let Some(strings) = strings else { failed!() };
+                    let string = if valid { strings.get(row as usize) } else { &[] };
                     *at_mut!(self.values.as_mut_slice::<u64>(), at) = append(bytes, string)?;
                 }
             }
@@ -697,14 +699,6 @@ fn gather(
         validity = nulls.then_some(buffer);
     }
     let words = at_mut!(values.as_mut_slice::<i64>(), ..rows);
-    // A row not kept takes the first kept row's string, which is one.
-    if kept.len() < rows && data_type.has_bytes() {
-        let first = kept.first().map_or(0, |&r| {
-            let (source, row) = found(r);
-            source.word(row)
-        });
-        words.fill(first);
-    }
     for &r in kept {
         let (source, row) = found(r);
         // SAFETY: as `kept` says.
@@ -713,36 +707,59 @@ fn gather(
     if !data_type.has_bytes() {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
-    if let (true, Some(bytes), false) = (one, at!(held, 0).bytes(), kept.is_empty()) {
-        return Ok(ColumnView::strings(context, values, bytes.clone(), validity)?);
-    }
     let words = at_mut!(values.as_mut_slice::<u64>(), ..rows);
-    let string = |r: u16| {
-        let (source, _) = found(r);
-        source.string(*at!(words, usize::from(r)))
+    let Some(&first) = kept.first() else {
+        // No row is kept, so each is the empty string.
+        words.fill(0);
+        let mut empty = context.bytes_buffer(4)?;
+        empty.as_mut_slice::<u8>().fill(0);
+        return Ok(ColumnView::strings(context, values, empty, validity)?);
     };
-    // An empty string first, which every other row is.
-    let total = kept.iter().fold(4_u64, |total, &r| total + 4 + string(r).len() as u64);
-    // So no word's offset is past 32 bits.
-    let Ok(total) = u32::try_from(total) else { return Err(Error::OutOfMemory) };
-    let mut bytes = context.bytes_buffer(total as usize)?;
-    let out = bytes.as_mut_slice::<u8>();
-    at_mut!(out, ..4).fill(0);
-    let mut at = 4;
-    let mut rebased = [0_u64; BATCH_ROWS_MAX as usize];
-    for &r in kept {
-        let string = string(r);
-        let len = string.len();
-        #[expect(clippy::cast_possible_truncation, reason = "below `total`")]
-        at_mut!(out, at..at + 4).copy_from_slice(&(len as u32).to_le_bytes());
-        at_mut!(out, at + 4..at + 4 + len).copy_from_slice(string);
-        *at_mut!(rebased, usize::from(r)) = at as u64;
-        at += 4 + len;
+    if one {
+        fill_not_kept(words, kept, *at!(words, usize::from(first)));
+        let (bytes, held) = at!(held, 0).shared_strings();
+        return Ok(ColumnView::strings_held(context, values, (bytes, held), validity)?);
     }
-    for (word, &rebased) in words.iter_mut().zip(&rebased) {
-        *word = rebased;
+    // Each word names its batch's buffer, registered, so no string is
+    // copied: the column holds each buffer each batch's point into, listed
+    // once a batch.
+    let mut ids = SmallVec::new(context.env(), 1 << 20)?;
+    let mut listed = SmallVec::new(context.env(), 1 << 20)?;
+    let found_all = (|| {
+        for &r in kept {
+            let (source, _) = found(r);
+            let word = source.registered(*at!(words, usize::from(r)))?;
+            *at_mut!(words, usize::from(r)) = word;
+            if source.list() {
+                listed.push(source)?;
+                source.ids(|id| ids.push(id))?;
+            }
+        }
+        Ok::<_, Error>(())
+    })();
+    for source in listed.iter() {
+        source.unlist();
     }
-    Ok(ColumnView::strings(context, values, bytes, validity)?)
+    found_all?;
+    fill_not_kept(words, kept, *at!(words, usize::from(first)));
+    let held = Held::of(context, &ids)?;
+    Ok(ColumnView::strings_held(context, values, (None, Some(held)), validity)?)
+}
+
+/// Writes `word` to each of `words` but those at `kept`, which increase, as
+/// a row not kept is any of the column's strings.
+fn fill_not_kept(words: &mut [u64], kept: &[u16], word: u64) {
+    if kept.len() == words.len() {
+        return;
+    }
+    let mut next = kept.iter().peekable();
+    for (r, out) in (0_u16..).zip(words.iter_mut()) {
+        if next.peek() == Some(&&r) {
+            next.next();
+        } else {
+            *out = word;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -892,6 +909,36 @@ mod tests {
         let null = (None, Vec::new());
         let newest = 10_000 + i64::from(BATCH_ROWS_MAX) - 1;
         assert_eq!(read(&out), [int(newest), null, int(10_000), int(0)]);
+    }
+
+    #[test]
+    fn gathers_strings_across_batches_without_copying_them() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+
+        let env = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let mut context = Context::new(&env, None);
+        let mut store = RowStore::new(&env).unwrap();
+        let (first, second) =
+            (batch(&mut context, 0, |_| true), batch(&mut context, 5000, |_| true));
+        store.append(&mut context, &first).unwrap();
+        store.append(&mut context, &second).unwrap();
+        let rows = [BATCH_ROWS_MAX + 1, 1, BATCH_ROWS_MAX + 2];
+        let mut out = RowBatch::new();
+        store
+            .gather(&mut context, &mut out, (&rows, Kept::Prefix), 0, &mut |_, _| failed!())
+            .unwrap();
+        // Each string is where its batch has it.
+        let at = |batch: &RowBatch, row: usize| batch.column(1).string_values().get(row).as_ptr();
+        assert!(core::ptr::eq(at(&out, 0), at(&second, 1)));
+        assert!(core::ptr::eq(at(&out, 1), at(&first, 1)));
+        // They outlive the store and the batches, until the column goes:
+        // then the `Env`, dropped, holds nothing.
+        drop((store, first, second));
+        let int = |value: i64| (Some(value), format!("v{value}").into_bytes());
+        assert_eq!(read(&out), [int(5001), int(1), int(5002)]);
+        out.reset(0);
+        drop(context);
     }
 
     #[test]

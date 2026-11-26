@@ -16,6 +16,7 @@ use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
 use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BYTES};
+use crate::string_buffers::StringBuffers;
 
 /// A query's environment. Its memory is its budget, which plans, states, lists and column data
 /// of no fixed size come from, and a `SlabAllocator` for each kind of
@@ -37,6 +38,8 @@ pub struct Env {
     /// Each of the allocators above, by `MemoryKind`, so finding one doesn't
     /// branch.
     allocators: [NonNull<dyn Allocator>; KIND_COUNT],
+    /// The buffers its string columns' words point into, by id.
+    strings: StringBuffers,
     /// Frees the allocation this is in, and the allocator in it.
     free: unsafe fn(NonNull<Env>),
     /// The bytes of the allocation this is in.
@@ -131,6 +134,7 @@ impl Env {
                 NonNull::from(&(*env).small),
             ];
             (&raw mut (*env).allocators).write(allocators);
+            (&raw mut (*env).strings).write(StringBuffers::new());
             (&raw mut (*env).free).write(free::<A>);
             (&raw mut (*env).allocation_bytes).write(layout.size());
         }
@@ -151,6 +155,11 @@ impl Env {
             static CURRENT: ThreadEnv = unsafe { ThreadEnv::new() };
         }
         CURRENT.with(ThreadEnv::get)
+    }
+
+    /// The buffers its string columns' words point into.
+    pub(crate) fn strings(&self) -> &StringBuffers {
+        &self.strings
     }
 
     /// The allocator memory of `kind` comes from.
@@ -196,7 +205,7 @@ impl Drop for OwnedEnv {
     fn drop(&mut self) {
         // Checked before anything is freed, so if it fails, what's still
         // allocated from it points to memory that's still there.
-        check!(self.holds_nothing());
+        check!(self.strings.free() && self.holds_nothing());
         // SAFETY: `free` was made for this `Env`'s allocation, and nothing
         // allocated from it is left.
         unsafe { (self.free)(self.0) }
@@ -208,7 +217,7 @@ impl OwnedEnv {
     /// for good if something is, which can then still use it: for a
     /// thread's `Env`, which may hold what's kept for the whole program.
     fn release(self) {
-        if !self.holds_nothing() {
+        if !self.strings.free() || !self.holds_nothing() {
             core::mem::forget(self);
         }
     }

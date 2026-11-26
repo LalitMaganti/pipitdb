@@ -306,6 +306,15 @@ pub fn compare_string(
     // One test for both `=` and `<>`, so the loop isn't copied.
     let equal = comparison == Comparison::Equal;
     let len = string.len();
+    if let Some(own) = strings.own() {
+        return retain_valid(column, selection, dropped, |row| {
+            let at = usize::from(row);
+            // SAFETY: every kept row is below `rows()`, which `strings` covers.
+            let same =
+                unsafe { own.len_of_unchecked(at) } == len && (len == 0 || own.get(at) == string);
+            same == equal
+        });
+    }
     retain_valid(column, selection, dropped, |row| {
         let at = usize::from(row);
         // SAFETY: every kept row is below `rows()`, which `strings` covers.

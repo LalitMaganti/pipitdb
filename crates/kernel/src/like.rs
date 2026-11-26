@@ -71,12 +71,15 @@ impl<'a> Contains<'a> {
         Contains { bytes, needle, from, until, next }
     }
 
-    /// Whether `text`, a string in the bytes, contains the needle.
+    /// Whether `text`, a string in the bytes or of a buffer of its own,
+    /// contains the needle.
     #[inline(never)]
     pub fn within(&self, text: &[u8]) -> bool {
         let start = text.as_ptr().addr().wrapping_sub(self.bytes.as_ptr().addr());
         let end = start.wrapping_add(text.len());
-        check!(start <= end && end <= self.bytes.len());
+        if start > end || end > self.bytes.len() {
+            return find(text, self.needle).is_some();
+        }
         let next = self.next.get();
         let known = self.from.get() <= start
             && if next == usize::MAX { end <= self.until.get() } else { next >= start };

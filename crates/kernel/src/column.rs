@@ -10,6 +10,7 @@ use crate::allocator::AllocError;
 use crate::buffer::{Buffer, Primitive};
 use crate::context::Context;
 use crate::row_batch::BATCH_ROWS_MAX;
+use crate::string_buffers::StringBuffers;
 
 /// A set of the forms a column may come in: what a plan lets a producer
 /// make a column in, and what a consumer takes it in. Every producer can
@@ -131,6 +132,7 @@ struct Header {
     kind: Kind,
     values: Buffer,
     bytes: Option<Buffer>,
+    held: Option<Held>,
     validity: Option<Buffer>,
     indices: Option<Buffer>,
     value_start: u32,
@@ -154,8 +156,12 @@ pub(crate) struct GatherSource {
     words: NonNull<[i64; BATCH_ROWS_MAX as usize]>,
     /// Which values aren't null, if any are.
     validity: Option<NonNull<[u8; BATCH_ROWS_MAX as usize / 8]>>,
-    /// What a string column's words are into, or none.
-    bytes: NonNull<[u8]>,
+    /// The id the column's own bytes are registered as, once they are,
+    /// which it holds, or 0.
+    registered: Cell<u32>,
+    /// Whether a gather has listed the buffers it points into, so it lists
+    /// them once.
+    listed: Cell<bool>,
 }
 
 impl GatherSource {
@@ -166,13 +172,13 @@ impl GatherSource {
         let start = (header.value_start + view.start) as usize;
         let at = |buffer: &Buffer, at: usize| buffer.as_ptr::<u8>().wrapping_add(at).cast_mut();
         let validity = header.validity.as_ref().map(|bits| at(bits, start / 8));
-        let bytes = header.bytes.as_ref().map_or(&[][..], Buffer::as_slice::<u8>);
         let Some(words) = NonNull::new(at(&header.values, start * 8)) else { failed!() };
         GatherSource {
             view: view.clone(),
             words: words.cast(),
             validity: validity.and_then(NonNull::new).map(NonNull::cast),
-            bytes: NonNull::from(bytes),
+            registered: Cell::new(0),
+            listed: Cell::new(false),
         }
     }
 
@@ -191,11 +197,6 @@ impl GatherSource {
 
     pub(crate) fn view(&self) -> &ColumnView {
         &self.view
-    }
-
-    /// What a string column's words are into, or none.
-    pub(crate) fn bytes(&self) -> Option<&Buffer> {
-        self.view.header().bytes.as_ref()
     }
 
     /// The word of row `row`, a row of a batch.
@@ -217,12 +218,93 @@ impl GatherSource {
         })
     }
 
-    /// The string at `word` of a string column's bytes.
-    #[inline]
-    pub(crate) fn string(&self, word: u64) -> &[u8] {
-        // SAFETY: made from the view's bytes, which it keeps alive.
-        let bytes = unsafe { self.bytes.as_ref() };
-        string_at(bytes, word)
+    /// Marks it listed, returning whether it wasn't.
+    pub(crate) fn list(&self) -> bool {
+        !self.listed.replace(true)
+    }
+
+    pub(crate) fn unlist(&self) {
+        self.listed.set(false);
+    }
+
+    /// Calls `each` with the id of each registered buffer the column's
+    /// strings point into: its own bytes', once registered, and those it
+    /// holds.
+    pub(crate) fn ids<E>(&self, mut each: impl FnMut(u32) -> Result<(), E>) -> Result<(), E> {
+        if self.registered.get() != 0 {
+            each(self.registered.get())?;
+        }
+        for &id in self.view.header().held.iter().flat_map(Held::ids) {
+            each(id)?;
+        }
+        Ok(())
+    }
+
+    /// What the column's strings are in, its own bytes and the registered
+    /// buffers it holds, for a column that shares them.
+    pub(crate) fn shared_strings(&self) -> (Option<Buffer>, Option<Held>) {
+        let header = self.view.header();
+        (header.bytes.clone(), header.held.clone())
+    }
+
+    /// `word`, a string column's, as a word that names its buffer: the id
+    /// the column's own bytes are registered as, the first time, if it
+    /// names none.
+    pub(crate) fn registered(&self, word: u64) -> Result<u64, AllocError> {
+        if word >> 32 != 0 {
+            return Ok(word);
+        }
+        if self.registered.get() == 0 {
+            let header = self.view.header();
+            let Some(bytes) = &header.bytes else { failed!() };
+            let env = header.values.env();
+            self.registered.set(env.strings().register(env, bytes.clone())?);
+        }
+        Ok(u64::from(self.registered.get()) << 32 | word)
+    }
+}
+
+impl Drop for GatherSource {
+    fn drop(&mut self) {
+        if self.registered.get() != 0 {
+            self.view.header().values.env().strings().release(self.registered.get());
+        }
+    }
+}
+
+/// Holds registered buffers of strings, by id, which a column's words point
+/// into: shared by the columns that share it, and let go of with the last.
+#[derive(Clone)]
+pub(crate) struct Held(Buffer);
+
+impl Held {
+    /// Holds each of `ids`, a buffer registered in `context`'s `Env`.
+    pub(crate) fn of(context: &mut Context, ids: &[u32]) -> Result<Held, AllocError> {
+        // Most columns point into a few buffers, a small slot's worth.
+        let size = size_of_val(ids);
+        let mut held =
+            if size <= 256 { context.small_buffer(size)? } else { context.bytes_buffer(size)? };
+        held.as_mut_slice::<u32>().copy_from_slice(ids);
+        let strings = context.env().strings();
+        for &id in ids {
+            strings.retain(id);
+        }
+        Ok(Held(held))
+    }
+
+    fn ids(&self) -> &[u32] {
+        self.0.as_slice()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if self.0.is_unique() {
+            let strings = self.0.env().strings();
+            for &id in self.0.as_slice::<u32>() {
+                strings.release(id);
+            }
+        }
     }
 }
 
@@ -274,7 +356,7 @@ impl ColumnView {
         let Ok(len) = u32::try_from(values.size_bytes() / data_type.width_bytes()) else {
             failed!();
         };
-        ColumnView::flat(context, data_type, values, None, validity, len)
+        ColumnView::flat(context, data_type, values, (None, None), validity, len)
     }
 
     /// `Int64` values, each null if `None`, in buffers of their own: for
@@ -307,12 +389,23 @@ impl ColumnView {
         bytes: Buffer,
         validity: Option<Buffer>,
     ) -> Result<ColumnView, AllocError> {
+        ColumnView::strings_held(context, words, (Some(bytes), None), validity)
+    }
+
+    /// As `strings`, of words into `bytes`, if any, and into the registered
+    /// buffers `held` holds, if any.
+    pub(crate) fn strings_held(
+        context: &mut Context,
+        words: Buffer,
+        (bytes, held): (Option<Buffer>, Option<Held>),
+        validity: Option<Buffer>,
+    ) -> Result<ColumnView, AllocError> {
         check!(words.size_bytes().is_multiple_of(8));
         let Ok(len) = u32::try_from(words.size_bytes() / 8) else {
             failed!();
         };
         // Each value's range is checked when it's read.
-        ColumnView::flat(context, DataType::String, words, Some(bytes), validity, len)
+        ColumnView::flat(context, DataType::String, words, (bytes, held), validity, len)
     }
 
     /// `count` strings, string `i` being `string(i)`, null if `None`, in
@@ -339,7 +432,7 @@ impl ColumnView {
         context: &mut Context,
         data_type: DataType,
         values: Buffer,
-        bytes: Option<Buffer>,
+        (bytes, held): (Option<Buffer>, Option<Held>),
         validity: Option<Buffer>,
         len: u32,
     ) -> Result<ColumnView, AllocError> {
@@ -353,6 +446,7 @@ impl ColumnView {
             kind,
             values,
             bytes,
+            held,
             validity,
             indices,
             value_start: 0,
@@ -408,6 +502,7 @@ impl ColumnView {
             kind: Kind::Sequence,
             values,
             bytes: None,
+            held: None,
             validity: None,
             indices: None,
             value_start: 0,
@@ -434,6 +529,7 @@ impl ColumnView {
             kind: Kind::Lazy,
             values,
             bytes: None,
+            held: None,
             validity: None,
             indices: None,
             value_start: 0,
@@ -466,6 +562,7 @@ impl ColumnView {
             kind: header.kind,
             values: header.values.clone(),
             bytes: header.bytes.clone(),
+            held: header.held.clone(),
             validity: header.validity.clone(),
             indices,
             value_start: values.start,
@@ -622,8 +719,9 @@ impl ColumnView {
             Form::Dictionary(indices) => gather(gathered, words, at!(indices, ..rows)),
             Form::Flat | Form::Constant | Form::Sequence(_) => gathered.fill(*at!(words, 0)),
         }
-        if let Some(bytes) = &values.header.bytes {
-            return ColumnView::strings(context, out, bytes.clone(), validity);
+        if values.header.data_type == DataType::String {
+            let (bytes, held) = (values.header.bytes.clone(), values.header.held.clone());
+            return ColumnView::strings_held(context, out, (bytes, held), validity);
         }
         let flat = ColumnView::new(context, self.data_type(), out, validity)?;
         flat.header().bounds.set(self.header().bounds.get());
@@ -751,8 +849,10 @@ impl<'a> Values<'a> {
 
     pub fn strings(self) -> Strings<'a> {
         check!(self.header.data_type == DataType::String);
-        let Some(bytes) = &self.header.bytes else { failed!() };
-        Strings { words: self.slice_of::<u64>(), bytes: bytes.as_slice() }
+        let bytes = self.header.bytes.as_ref().map_or(&[][..], Buffer::as_slice);
+        let buffers = self.header.values.env().strings();
+        let own = self.header.held.is_none();
+        Strings { words: self.slice_of::<u64>(), bytes, buffers, own }
     }
 
     /// Which values aren't null, or `None` if none are, for reading in a loop.
@@ -779,10 +879,15 @@ impl<'a> Values<'a> {
 /// is, its bytes after it.
 #[derive(Clone, Copy)]
 pub struct Strings<'a> {
-    /// Where each value's length is in `bytes`, in its low half.
+    /// Where each value's length is, in its low half, in its column's
+    /// `bytes` or, if its high half isn't 0, in that buffer of `buffers`.
     words: &'a [u64],
-    /// What the words are into.
+    /// What the words whose high half is 0 are into.
     bytes: &'a [u8],
+    /// The registered buffers the others are into, which the column holds.
+    buffers: &'a StringBuffers,
+    /// Whether it holds none, so every word's high half is 0.
+    own: bool,
 }
 
 impl<'a> Strings<'a> {
@@ -797,7 +902,8 @@ impl<'a> Strings<'a> {
     /// The length of string `row`.
     #[inline]
     pub fn len_of(self, row: usize) -> usize {
-        length_at(self.bytes, *at!(self.words, row))
+        let word = *at!(self.words, row);
+        length_at(self.bytes_of(word), word)
     }
 
     /// As `len_of`, without checking `row` is one of the strings.
@@ -808,17 +914,36 @@ impl<'a> Strings<'a> {
     #[inline]
     pub unsafe fn len_of_unchecked(self, row: usize) -> usize {
         // SAFETY: guaranteed by the caller.
-        length_at(self.bytes, unsafe { *self.words.get_unchecked(row) })
+        let word = unsafe { *self.words.get_unchecked(row) };
+        length_at(self.bytes_of(word), word)
     }
 
     #[inline]
     pub fn get(self, row: usize) -> &'a [u8] {
-        string_at(self.bytes, *at!(self.words, row))
+        let word = *at!(self.words, row);
+        string_at(self.bytes_of(word), word)
     }
 
-    /// What the strings are in.
+    /// What the strings whose words' high half is 0 are in: the column's
+    /// own bytes.
     pub fn bytes(self) -> &'a [u8] {
         self.bytes
+    }
+
+    /// What `word` points into.
+    #[inline]
+    fn bytes_of(self, word: u64) -> &'a [u8] {
+        match (word >> 32) as u32 {
+            0 => self.bytes,
+            id => self.buffers.bytes(id),
+        }
+    }
+
+    /// The strings, if every one is in its column's own bytes, as a scan's
+    /// are: read without asking which buffer each is in.
+    #[inline]
+    pub(crate) fn own(self) -> Option<OwnStrings<'a>> {
+        self.own.then_some(OwnStrings { words: self.words, bytes: self.bytes })
     }
 }
 
@@ -883,6 +1008,31 @@ pub(crate) fn string_at(bytes: &[u8], word: u64) -> &[u8] {
     check!(len <= bytes.len() - first);
     // SAFETY: the `len` bytes from `first` are in `bytes`, as just checked.
     unsafe { core::slice::from_raw_parts(bytes.as_ptr().add(first), len) }
+}
+
+/// A string column's values that are all in its own bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnStrings<'a> {
+    words: &'a [u64],
+    bytes: &'a [u8],
+}
+
+impl<'a> OwnStrings<'a> {
+    /// The length of string `row`, without checking `row` is one.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be below the number of strings.
+    #[inline]
+    pub(crate) unsafe fn len_of_unchecked(self, row: usize) -> usize {
+        // SAFETY: guaranteed by the caller.
+        length_at(self.bytes, unsafe { *self.words.get_unchecked(row) })
+    }
+
+    #[inline]
+    pub(crate) fn get(self, row: usize) -> &'a [u8] {
+        string_at(self.bytes, *at!(self.words, row))
+    }
 }
 
 /// A view's bitmap of the rows that aren't null.
