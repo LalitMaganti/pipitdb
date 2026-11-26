@@ -7,7 +7,7 @@
 use crate::aggregate_function::{gathered, is_valid};
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Form};
+use crate::column::{ColumnView, DataType, Form, Others, StringsIn};
 use crate::containers::{Array, BitSlice, Blocks, SmallVec, address};
 use crate::context::Context;
 use crate::env::Env;
@@ -15,7 +15,7 @@ use crate::error::Error;
 use crate::flat_hash_map::prefetch;
 use crate::murmur_hash::{SEED, combine};
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::string_pool::{CACHED_SLOTS, Id, NO_NUMBER};
+use crate::string_pool::{BLOCKS_MAX, CACHED_SLOTS, Id, NO_NUMBER, StringPool};
 
 /// The most keys a grouping can have: one bit each says which are null.
 pub(crate) const KEYS_MAX: usize = 64;
@@ -555,6 +555,27 @@ fn word(id: Id, number: u32) -> u64 {
     u64::from(id.raw_id()) | u64::from(number) << 32
 }
 
+/// A bit for each of `rows` rows, set if `id(row)` isn't null, or `None` if
+/// none is: of more rows than a batch's, its buffer is bytes.
+fn nulls_of(
+    context: &mut Context,
+    rows: usize,
+    id: impl Fn(usize) -> Id,
+) -> Result<Option<Buffer>, Error> {
+    if !(0..rows).any(|row| id(row).is_null()) {
+        return Ok(None);
+    }
+    let size = BitSlice::<u8>::words_for(rows);
+    let large = rows > BATCH_ROWS_MAX as usize;
+    let mut bits = if large { context.bytes_buffer(size)? } else { context.small_buffer(size)? };
+    for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
+        let row = start * 8;
+        let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
+        *bits = (0..8).fold(0, |bits, i| bits | valid(i));
+    }
+    Ok(Some(bits))
+}
+
 /// The strings of `ids`, ids in the run's pool in their low halves, 0 for
 /// null, as a string column: of more rows than a batch's, its buffers are
 /// bytes.
@@ -564,36 +585,61 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
     let large = rows > BATCH_ROWS_MAX as usize;
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
     let id = |row: usize| Id::raw(*at!(ids, row) as u32);
-    let mut validity = None;
-    if (0..rows).any(|row| id(row).is_null()) {
-        let size = BitSlice::<u8>::words_for(rows);
-        let mut bits =
-            if large { context.bytes_buffer(size)? } else { context.small_buffer(size)? };
-        for (start, bits) in bits.as_mut_slice::<u8>().iter_mut().enumerate() {
-            let row = start * 8;
-            let valid = |i: usize| u8::from(row + i < rows && !id(row + i).is_null()) << i;
-            *bits = (0..8).fold(0, |bits, i| bits | valid(i));
-        }
-        validity = Some(bits);
-    }
+    let validity = nulls_of(context, rows, id)?;
     let mut words =
         if large { context.bytes_buffer(rows * 8)? } else { context.values_buffer(rows * 8)? };
     let words_out = words.as_mut_slice::<u64>();
-    // An empty string first, which every null and empty string is.
+    // Each string in a block of the pool is pointed into where it is, so
+    // none is copied: the column holds each block. A string too large for a
+    // block is copied into bytes of the column's own, after an empty
+    // string, which every null is.
+    let env = context.env();
+    let mut blocks: SmallVec<u32> = SmallVec::new(env, BLOCKS_MAX)?;
+    // Each block's place in `blocks` plus one, or 0 if it isn't there yet.
+    let mut places = [0_u16; BLOCKS_MAX];
     let pool = context.string_pool()?;
     let mut bytes = 4_u32;
     for (row, word) in words_out.iter_mut().enumerate() {
+        if let Some((block, offset)) = StringPool::place(id(row)) {
+            let place = at_mut!(places, block as usize);
+            if *place == 0 {
+                blocks.push(block)?;
+                #[expect(clippy::cast_possible_truncation, reason = "at most `BLOCKS_MAX`")]
+                let count = blocks.len() as u16;
+                *place = count;
+            }
+            *word = u64::from(*place) << 32 | u64::from(offset);
+            continue;
+        }
         let len = pool.get(id(row)).map_or(0, <[u8]>::len);
         let len = u32::try_from(len).map_err(|_| Error::OutOfMemory)?;
         *word = if len == 0 { 0 } else { u64::from(bytes) };
         let taken = if len == 0 { 0 } else { 4 + len };
         bytes = bytes.checked_add(taken).ok_or(Error::OutOfMemory)?;
     }
+    // Most keys are in one block, which is then the column's own, so what
+    // reads them needn't ask which buffer each is in. A null's word, 0, is
+    // the empty string each block starts with.
+    if blocks.len() == 1 && bytes == 4 {
+        for word in words_out.iter_mut() {
+            *word &= u64::from(u32::MAX);
+        }
+        let slot = pool.block(*at!(blocks, 0));
+        // SAFETY: each word is where its string is in the block.
+        return Ok(unsafe { ColumnView::strings_in(context, words, slot.into_own(), validity)? });
+    }
+    let mut slots = SmallVec::fixed(env, blocks.len())?;
+    for &block in blocks.iter() {
+        slots.push(pool.block(block))?;
+    }
     let mut stored = context.bytes_buffer(bytes as usize)?;
     let pool = context.string_pool()?;
     let out = stored.as_mut_slice::<u8>();
     at_mut!(out, ..4).fill(0);
     for (row, &word) in words_out.iter().enumerate() {
+        if word >> 32 != 0 {
+            continue;
+        }
         let string = pool.get(id(row)).unwrap_or_default();
         if string.is_empty() {
             continue;
@@ -603,8 +649,14 @@ pub(crate) fn write_strings(context: &mut Context, ids: &[i64]) -> Result<Column
         at_mut!(out, at..at + 4).copy_from_slice(&len.to_le_bytes());
         at_mut!(out, at + 4..at + 4 + string.len()).copy_from_slice(string);
     }
+    let others = if slots.is_empty() {
+        None
+    } else {
+        Some(Others::of(context, slots.len(), slots.iter().cloned())?)
+    };
+    let strings = StringsIn { others, ..StringsIn::own(stored) };
     // SAFETY: each word was written where its string is, just above.
-    Ok(unsafe { ColumnView::strings_unchecked(context, words, stored, validity)? })
+    Ok(unsafe { ColumnView::strings_in(context, words, strings, validity)? })
 }
 
 /// Loads `count` rows that `select` keeps of key column `column`, all if
@@ -777,5 +829,58 @@ fn hash_rows(hashes: &mut [u64], keys: &[&[i64]], nulls: Option<&[u64]>) {
         if null != 0 {
             *hash = combine(*hash, null);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::Heap;
+    use crate::env::{Env, Memory};
+    use crate::string_pool::LARGE_STRING_BYTES_MIN;
+
+    #[test]
+    fn writes_strings_where_the_pool_has_them() {
+        let env = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let mut context = Context::new(&env, None);
+        let large = alloc::vec![b'x'; LARGE_STRING_BYTES_MIN];
+        let strings: [&[u8]; 4] = [b"apple", b"", &large, b"pear"];
+        let pool = context.string_pool().unwrap();
+        let mut ids: alloc::vec::Vec<i64> = strings
+            .iter()
+            .map(|&string| i64::from(pool.intern_string(&env, Some(string)).unwrap().raw_id()))
+            .collect();
+        ids.push(0);
+        let in_pool = pool.get(Id::raw(u32::try_from(ids[0]).unwrap())).unwrap().as_ptr();
+        let column = write_strings(&mut context, &ids).unwrap();
+        // A string in a block is read where the pool has it.
+        assert!(core::ptr::eq(column.string_values().get(0).as_ptr(), in_pool));
+        // The column holds the block past the pool, until it goes: then the
+        // `Env`, dropped, holds nothing.
+        drop(context);
+        let values = column.string_values();
+        let read: alloc::vec::Vec<&[u8]> = (0..4).map(|row| values.get(row)).collect();
+        assert_eq!(read, strings);
+        assert!(column.is_null(4));
+        drop(column);
+    }
+
+    #[test]
+    fn writes_a_null_as_the_empty_string_in_any_block() {
+        let env = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let mut context = Context::new(&env, None);
+        let pool = context.string_pool().unwrap();
+        // Strings enough to fill the first block, so the next is in another.
+        let filler = alloc::vec![b'f'; 1 << 16];
+        let mut last = Id::NULL;
+        for i in 0..64_u8 {
+            last = pool.intern_string(&env, Some(&[&filler[..], &[i]].concat())).unwrap();
+        }
+        let id = pool.intern_string(&env, Some(b"next")).unwrap();
+        assert!(StringPool::place(last).unwrap().0 >= 1);
+        let column = write_strings(&mut context, &[i64::from(id.raw_id()), 0]).unwrap();
+        assert_eq!(column.string_values().get(0), b"next");
+        assert!(column.is_null(1));
+        assert_eq!(column.string_values().get(1), b"");
     }
 }

@@ -501,24 +501,34 @@ fn compare_each<T: Copy>(x: &[T], y: &[T], o: &mut [i64], f: impl Fn(T, T) -> bo
 }
 
 /// As `compare_numbers`, for strings, by their bytes, at the rows where
-/// neither is null. Every row is compared, a null's too, as a null's view is
-/// of its column's bytes, an empty string's. Equality compares lengths
-/// first, so most unequal strings' bytes aren't read.
+/// neither is null. Every row is compared, a null's too, as a null's word
+/// is that of a string. Equality compares lengths first, so most unequal
+/// strings' bytes aren't read.
 fn compare_strings(op: ExprOp, a: &ColumnView, b: &ColumnView, o: &mut [i64]) {
     let Some(comparison) = op.comparison() else { failed!() };
     let (left, right) = (a.string_values(), b.string_values());
     let (left_valid, right_valid) = (a.validity(), b.validity());
+    let valid = |row: usize| {
+        left_valid.is_none_or(|valid| is_valid(valid, row))
+            && right_valid.is_none_or(|valid| is_valid(valid, row))
+    };
     let equal = matches!(comparison, Comparison::Equal | Comparison::NotEqual);
-    for (row, o) in o.iter_mut().enumerate() {
-        let valid = left_valid.is_none_or(|valid| is_valid(valid, row))
-            && right_valid.is_none_or(|valid| is_valid(valid, row));
-        let (ours, theirs) = (left.get(row), right.get(row));
-        let holds = if equal {
+    let holds = |ours: &[u8], theirs: &[u8]| {
+        if equal {
             (ours == theirs) == (comparison == Comparison::Equal)
         } else {
             comparison.holds(ours.cmp(theirs))
-        };
-        *o = i64::from(valid && holds);
+        }
+    };
+    // Most strings are in their columns' own bytes, read without asking.
+    if let (Some(left), Some(right)) = (left.own(), right.own()) {
+        for (row, o) in o.iter_mut().enumerate() {
+            *o = i64::from(valid(row) && holds(left.get(row), right.get(row)));
+        }
+        return;
+    }
+    for (row, o) in o.iter_mut().enumerate() {
+        *o = i64::from(valid(row) && holds(left.get(row), right.get(row)));
     }
 }
 

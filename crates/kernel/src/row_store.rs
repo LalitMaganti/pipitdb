@@ -606,6 +606,7 @@ impl Packing {
     /// Packs `column`'s rows `rows`, after those packed.
     fn append(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
         let values = column.values();
+        let strings = self.bytes.as_ref().map(|_| values.strings());
         for i in rows {
             let row = kept.row(i);
             let at = self.rows as usize;
@@ -618,7 +619,8 @@ impl Packing {
                         *at!(values.words(), row as usize);
                 }
                 Some(bytes) => {
-                    let string = if valid { values.strings().get(row as usize) } else { &[] };
+                    let Some(strings) = strings else { failed!() };
+                    let string = if valid { strings.get(row as usize) } else { &[] };
                     *at_mut!(self.values.as_mut_slice::<u64>(), at) = append(bytes, string)?;
                 }
             }
@@ -698,13 +700,10 @@ fn gather(
         validity = nulls.then_some(buffer);
     }
     let words = at_mut!(values.as_mut_slice::<i64>(), ..rows);
-    // A row not kept takes the first kept row's string, which is one.
-    if kept.len() < rows && data_type.has_bytes() {
-        let first = kept.first().map_or(0, |&r| {
-            let (source, row) = found(r);
-            source.word(row)
-        });
-        words.fill(first);
+    // A string row not kept takes the first kept row's string, which is one.
+    if let (true, Some(&first)) = (kept.len() < rows && data_type.has_bytes(), kept.first()) {
+        let (source, row) = found(first);
+        words.fill(source.word(row));
     }
     for &r in kept {
         let (source, row) = found(r);
@@ -714,19 +713,27 @@ fn gather(
     if !data_type.has_bytes() {
         return Ok(ColumnView::new(context, data_type, values, validity)?);
     }
-    if let (true, Some(bytes), false) = (one, at!(held, 0).bytes(), kept.is_empty()) {
-        // SAFETY: each word is one of the batch's, valid when it was made.
-        return Ok(unsafe {
-            ColumnView::strings_unchecked(context, values, bytes.clone(), validity)?
-        });
-    }
     let words = at_mut!(values.as_mut_slice::<u64>(), ..rows);
-    let string = |r: u16| {
+    if kept.is_empty() {
+        // No row is kept, so each is the empty string.
+        words.fill(0);
+        let mut empty = context.bytes_buffer(4)?;
+        empty.as_mut_slice::<u8>().fill(0);
+        return Ok(ColumnView::strings(context, values, empty, validity)?);
+    }
+    if one {
+        let strings = at!(held, 0).shared_strings();
+        // SAFETY: each word is one of the batch's, valid when it was made.
+        return Ok(unsafe { ColumnView::strings_in(context, values, strings, validity)? });
+    }
+    // The kept rows' strings, copied into one buffer, after an empty
+    // string, which every other row is: what reads them, often more than
+    // once a row, finds each in the column's own bytes, as cheaply as a
+    // string can be read.
+    let total = kept.iter().fold(4_u64, |total, &r| {
         let (source, _) = found(r);
-        source.string(*at!(words, usize::from(r)))
-    };
-    // An empty string first, which every other row is.
-    let total = kept.iter().fold(4_u64, |total, &r| total + 4 + string(r).len() as u64);
+        total + 4 + source.string(*at!(words, usize::from(r))).len() as u64
+    });
     // So no word's offset is past 32 bits.
     let Ok(total) = u32::try_from(total) else { return Err(Error::OutOfMemory) };
     let mut bytes = context.bytes_buffer(total as usize)?;
@@ -735,7 +742,8 @@ fn gather(
     let mut at = 4;
     let mut rebased = [0_u64; BATCH_ROWS_MAX as usize];
     for &r in kept {
-        let string = string(r);
+        let (source, _) = found(r);
+        let string = source.string(*at!(words, usize::from(r)));
         let len = string.len();
         #[expect(clippy::cast_possible_truncation, reason = "below `total`")]
         at_mut!(out, at..at + 4).copy_from_slice(&(len as u32).to_le_bytes());
@@ -743,9 +751,7 @@ fn gather(
         *at_mut!(rebased, usize::from(r)) = at as u64;
         at += 4 + len;
     }
-    for (word, &rebased) in words.iter_mut().zip(&rebased) {
-        *word = rebased;
-    }
+    words.copy_from_slice(at!(rebased, ..rows));
     // SAFETY: each word was written where its string is, just above.
     Ok(unsafe { ColumnView::strings_unchecked(context, values, bytes, validity)? })
 }

@@ -5,6 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::{Buffer, HEADER_BYTES};
+use crate::column::Slot;
 use crate::containers::{Array, SmallVec};
 use crate::env::{Env, MemoryKind};
 use crate::flat_hash_map::{FlatHashMap, Key, prefetch};
@@ -28,10 +29,10 @@ const BLOCK_BYTES: usize = BLOCK_OFFSET_MASK as usize + 1;
 /// How many bytes of strings a block holds.
 const BLOCK_CAPACITY: usize = BLOCK_BYTES - HEADER_BYTES;
 
-const BLOCKS_MAX: usize = 1 << BLOCK_INDEX_BITS;
+pub(crate) const BLOCKS_MAX: usize = 1 << BLOCK_INDEX_BITS;
 
 /// Strings this long or longer aren't put in a block, but stored apart.
-const LARGE_STRING_BYTES_MIN: usize = BLOCK_BYTES / 4;
+pub(crate) const LARGE_STRING_BYTES_MIN: usize = BLOCK_BYTES / 4;
 
 /// The bytes a string in a block takes besides its own: its size, and a nul
 /// after it.
@@ -133,6 +134,8 @@ struct Store {
     blocks: SmallVec<Buffer>,
     /// How many bytes of the last block are written.
     block_end: usize,
+    /// By block before the last, how many of its bytes are written.
+    ends: SmallVec<u32>,
     /// Each string too large for a block, with a nul after it.
     large_strings: SmallVec<Array<u8>>,
 }
@@ -160,11 +163,10 @@ impl StringPool {
         let mut store = Store {
             blocks: SmallVec::new(env, BLOCKS_MAX)?,
             block_end: 0,
+            ends: SmallVec::new(env, BLOCKS_MAX)?,
             large_strings: SmallVec::new(env, 1 << 31)?,
         };
         store.add_block(env)?;
-        // The null string's slot, so no string's id is 0.
-        store.insert_in_current_block(&[]);
         Ok(StringPool { store, string_index: FlatHashMap::new(env, INDEX_CAPACITY)? })
     }
 
@@ -324,7 +326,7 @@ impl Store {
         let Some(size) = block.get(offset..start).and_then(<[u8]>::first_chunk::<4>) else {
             failed!()
         };
-        at!(block, start..start + u32::from_ne_bytes(*size) as usize)
+        at!(block, start..start + u32::from_le_bytes(*size) as usize)
     }
 
     #[inline(never)]
@@ -332,9 +334,26 @@ impl Store {
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
         let block = unsafe { Buffer::allocate_uninit(env, MemoryKind::Base, BLOCK_CAPACITY) };
+        // The last block, done with, has all it will.
+        if !self.blocks.is_empty() {
+            #[expect(clippy::cast_possible_truncation, reason = "below `BLOCK_BYTES`")]
+            self.ends.push(self.block_end as u32)?;
+        }
         self.blocks.push(block?)?;
         self.block_end = 0;
+        // An empty string first, which a null's word into the block is:
+        // the first block's is the null string's slot, so no id is 0.
+        self.insert_in_current_block(&[]);
         Ok(())
+    }
+
+    /// Block `index`, as many of its bytes as are written, which words
+    /// into it may read: the pool appends only past them.
+    fn block(&self, index: u32) -> Slot {
+        let index = index as usize;
+        let last = index + 1 == self.blocks.len();
+        let end = if last { self.block_end } else { *at!(self.ends, index) as usize };
+        Slot::new(at!(self.blocks, index).clone(), end)
     }
 
     fn insert_string(&mut self, env: &Env, str: &[u8]) -> Result<Id, AllocError> {
@@ -357,18 +376,23 @@ impl Store {
     }
 
     /// Writes `str` at the end of the last block, which has room for it, and
-    /// returns where it starts.
+    /// returns where it starts. Words may point into the block before it,
+    /// so it's written past them, by pointer.
     #[inline(never)]
     fn insert_in_current_block(&mut self, str: &[u8]) -> u32 {
         let start = self.block_end;
-        let Some(block) = self.blocks.last_mut() else { failed!() };
-        let bytes = at_mut!(block.as_mut_slice::<u8>(), start..start + str.len() + METADATA_BYTES);
-        let (size, rest) = bytes.split_at_mut(4);
+        let Some(block) = self.blocks.last() else { failed!() };
+        check!(start + str.len() + METADATA_BYTES <= block.size_bytes());
         #[expect(clippy::cast_possible_truncation, reason = "below `LARGE_STRING_BYTES_MIN`")]
-        size.copy_from_slice(&(str.len() as u32).to_ne_bytes());
-        let (chars, nul) = rest.split_at_mut(str.len());
-        chars.copy_from_slice(str);
-        *at_mut!(nul, 0) = 0;
+        let size = (str.len() as u32).to_le_bytes();
+        // SAFETY: the bytes from `start` are in the block, as just checked,
+        // and none is read, as words point only below `block_end`.
+        unsafe {
+            let at = block.as_non_null().as_ptr().add(start);
+            core::ptr::copy_nonoverlapping(size.as_ptr(), at, 4);
+            core::ptr::copy_nonoverlapping(str.as_ptr(), at.add(4), str.len());
+            at.add(4 + str.len()).write(0);
+        }
         self.block_end = start + str.len() + METADATA_BYTES;
         #[expect(clippy::cast_possible_truncation, reason = "below `BLOCK_BYTES`")]
         let start = start as u32;
@@ -379,6 +403,19 @@ impl Store {
     fn get_large_string(&self, id: Id) -> &[u8] {
         let bytes = &**at!(self.large_strings, id.large_string_index() as usize);
         at!(bytes, ..bytes.len() - 1)
+    }
+}
+
+impl StringPool {
+    /// Where the string whose id is `id` is, its block and its offset in
+    /// it, or `None` if it's null or large, so not in a block.
+    pub(crate) fn place(id: Id) -> Option<(u32, u32)> {
+        (!id.is_null() && !id.is_large_string()).then(|| (id.block_index(), id.block_offset()))
+    }
+
+    /// As `Store::block`.
+    pub(crate) fn block(&self, index: u32) -> Slot {
+        self.store.block(index)
     }
 }
 
