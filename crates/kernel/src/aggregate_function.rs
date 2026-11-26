@@ -17,7 +17,7 @@ use crate::error::Error;
 use crate::group_table::write_strings;
 use crate::ordered::ordered_if;
 use crate::row_batch::BATCH_ROWS_MAX;
-use crate::string_pool::Id;
+use crate::string_pool::{Id, StringPool};
 
 /// What an aggregate reads of one batch: a value a row, contiguous, and
 /// which rows hold one.
@@ -526,8 +526,8 @@ impl AggregateFunction for Extreme {
 }
 
 /// `MIN` or `MAX` of strings: a group's least or greatest, by their bytes,
-/// null if it holds none. The state is the string's id in the run's pool, 0
-/// for none, so it needs no seen bytes. While a batch is read, it's instead
+/// null if it holds none. The state is the string's id in the aggregation's
+/// pool, 0 for none, so it needs no seen bytes. While a batch is read, it's instead
 /// `BATCH_ROW` and the row of the batch's best so far, and only each group's
 /// best of the batch is interned, so strings beaten within it never are.
 pub(crate) struct StringExtreme {
@@ -547,7 +547,7 @@ impl StringExtreme {
     /// group 0 if `None`.
     pub(crate) fn update(
         &self,
-        context: &mut Context,
+        (context, pool): (&mut Context, &mut StringPool),
         column: &ColumnView,
         select: &[u16],
         rows: usize,
@@ -573,7 +573,6 @@ impl StringExtreme {
         let touched = touched.as_mut_slice::<u32>();
         let mut count = 0;
         let env = context.env();
-        let pool = context.string_pool()?;
         for i in 0..rows {
             let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
             let Some(candidate) = string(row) else { continue };
@@ -611,6 +610,7 @@ impl StringExtreme {
     /// The string of each of `groups`, as a string column.
     pub(crate) fn finalize(
         context: &mut Context,
+        pool: &mut StringPool,
         states: &GroupStates,
         groups: &[u32],
     ) -> Result<ColumnView, Error> {
@@ -618,7 +618,7 @@ impl StringExtreme {
         for (id, &group) in ids.as_mut_slice::<i64>().iter_mut().zip(groups) {
             *id = states.word(group);
         }
-        write_strings(context, at!(ids.as_slice::<i64>(), ..groups.len()))
+        write_strings(context, pool, at!(ids.as_slice::<i64>(), ..groups.len()))
     }
 }
 

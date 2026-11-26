@@ -28,8 +28,6 @@ pub struct Context<'a> {
     env: &'a Env,
     /// Made when first reserved: most runs need none.
     selections: Option<SmallVec<Selection>>,
-    /// Made when first used: most runs intern no strings.
-    string_pool: Option<StringPool>,
     /// The strings the statement's conditions compare with, if it has any.
     literals: Option<&'a StringPool>,
     /// The functions the statement's expressions call, by id.
@@ -51,7 +49,6 @@ impl<'a> Context<'a> {
         Context {
             env,
             selections: None,
-            string_pool: None,
             literals: statement.and_then(Statement::literals),
             functions: statement.map_or(&[], Statement::functions),
             cutoffs: None,
@@ -189,16 +186,6 @@ impl<'a> Context<'a> {
     pub fn set_cutoff(&mut self, slot: u32, cutoff: Option<i64>) {
         let cutoffs = self.cutoffs.as_deref_mut().unwrap_or_default();
         *at_mut!(cutoffs, slot as usize) = cutoff;
-    }
-
-    /// The run's string pool, so the ids of strings interned anywhere in it
-    /// can be compared.
-    pub fn string_pool(&mut self) -> Result<&mut StringPool, AllocError> {
-        if self.string_pool.is_none() {
-            self.string_pool = Some(StringPool::new(self.env)?);
-        }
-        let Some(pool) = &mut self.string_pool else { failed!() };
-        Ok(pool)
     }
 }
 

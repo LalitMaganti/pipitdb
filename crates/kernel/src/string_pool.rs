@@ -26,8 +26,12 @@ const BLOCK_INDEX_MASK: u32 = !LARGE_STRING_FLAG_MASK & !BLOCK_OFFSET_MASK;
 /// Linux it's aligned to a huge page, which holds it.
 const BLOCK_BYTES: usize = BLOCK_OFFSET_MASK as usize + 1;
 
-/// How many bytes of strings a block holds.
+/// How many bytes of strings a block holds, at most.
 const BLOCK_CAPACITY: usize = BLOCK_BYTES - HEADER_BYTES;
+
+/// The first block's allocation: each next is twice the one before, up to
+/// `BLOCK_BYTES`, so a pool of few strings takes little.
+const FIRST_BLOCK_BYTES: usize = 1 << 12;
 
 const BLOCKS_MAX: usize = 1 << BLOCK_INDEX_BITS;
 
@@ -53,11 +57,11 @@ const CHUNK_ROWS: usize = 512;
 const INDEX_CAPACITY: usize = 4096;
 
 /// A string's id. If its top bit is set, the rest are an index into the
-/// large strings. Otherwise the next 9 bits are the index of the block it's
-/// in, and the last 22 bits where in the block it starts:
+/// large strings. Otherwise the next 10 bits are the index of the block it's
+/// in, and the last 21 bits where in the block it starts:
 ///
 /// ```text
-/// [31] [30:22] [21:0]
+/// [31] [30:21] [20:0]
 ///  |      |       +---- offset in block (or LSB of large string index).
 ///  |      +------------ block index (or MSB of large string index).
 ///  +------------------- 1: large string, 0: string in a block.
@@ -129,8 +133,8 @@ pub struct StringPool {
 /// Where a pool's strings are, apart from its index, so a string can be
 /// stored while its slot in the index is held.
 struct Store {
-    /// The blocks, of `BLOCK_CAPACITY` each, written up to `block_end` in
-    /// the last.
+    /// The blocks, each twice the one before up to `BLOCK_CAPACITY`, written
+    /// up to `block_end` in the last.
     blocks: SmallVec<Buffer>,
     /// How many bytes of the last block are written.
     block_end: usize,
@@ -166,8 +170,19 @@ impl StringPool {
             ends: SmallVec::new(env, BLOCKS_MAX)?,
             large_strings: SmallVec::new(env, 1 << 31)?,
         };
-        store.add_block(env)?;
+        store.add_block(env, 0)?;
         Ok(StringPool { store, string_index: FlatHashMap::new(env, INDEX_CAPACITY)? })
+    }
+
+    /// The pool in `slot`, made the first time, in memory from `env`.
+    pub(crate) fn made<'p>(
+        slot: &'p mut Option<StringPool>,
+        env: &Env,
+    ) -> Result<&'p mut StringPool, AllocError> {
+        match slot {
+            Some(pool) => Ok(pool),
+            None => Ok(slot.insert(StringPool::new(env)?)),
+        }
     }
 
     /// Interns `str` and returns its id: the same each time it's interned.
@@ -329,11 +344,16 @@ impl Store {
         at!(block, start..start + u32::from_le_bytes(*size) as usize)
     }
 
+    /// Adds a block with room for `bytes`, at most `BLOCK_CAPACITY`.
     #[inline(never)]
-    fn add_block(&mut self, env: &Env) -> Result<(), AllocError> {
+    fn add_block(&mut self, env: &Env, bytes: usize) -> Result<(), AllocError> {
+        let doubled = FIRST_BLOCK_BYTES << self.blocks.len().min(16);
+        // Room for the empty string it starts with, too.
+        let capacity = (doubled.min(BLOCK_BYTES) - HEADER_BYTES).max(bytes + METADATA_BYTES);
+        check!(capacity <= BLOCK_CAPACITY);
         // SAFETY: a block's bytes are read only below `block_end`, which
         // `insert_in_current_block` writes up to.
-        let block = unsafe { Buffer::allocate_uninit(env, MemoryKind::Base, BLOCK_CAPACITY) };
+        let block = unsafe { Buffer::allocate_uninit(env, MemoryKind::Base, capacity) };
         // The last block, done with, has all it will.
         if !self.blocks.is_empty() {
             #[expect(clippy::cast_possible_truncation, reason = "below `BLOCK_BYTES`")]
@@ -360,8 +380,9 @@ impl Store {
         if str.len() >= LARGE_STRING_BYTES_MIN {
             return self.insert_large_string(env, str);
         }
-        if self.block_end + str.len() + METADATA_BYTES > BLOCK_CAPACITY {
-            self.add_block(env)?;
+        let capacity = self.blocks.last().map_or(0, Buffer::size_bytes);
+        if self.block_end + str.len() + METADATA_BYTES > capacity {
+            self.add_block(env, str.len() + METADATA_BYTES)?;
         }
         Ok(Id::block_string(self.blocks.len() - 1, self.insert_in_current_block(str)))
     }
@@ -487,12 +508,19 @@ mod tests {
 
     #[test]
     fn fails_past_its_allocator() {
-        let limited = Env::new(crate::env::Memory::new(Heap, BLOCK_BYTES + (1 << 20))).unwrap();
-        let mut pool = StringPool::new(&limited).unwrap();
         let long = alloc::vec![b'y'; LARGE_STRING_BYTES_MIN - 2];
-        let ids: Vec<_> = (0..4_u8)
-            .map(|i| pool.intern_string(&limited, Some(&[&long[..], &[i]].concat())))
-            .collect();
+        let string = |i: u8| [&long[..], &[i]].concat();
+        // As much as three take, and half a fourth.
+        let unlimited = Env::new(crate::env::Memory::new(Heap, usize::MAX)).unwrap();
+        let mut pool = StringPool::new(&unlimited).unwrap();
+        for i in 0..3 {
+            pool.intern_string(&unlimited, Some(&string(i))).unwrap();
+        }
+        let limit = unlimited.peak() + LARGE_STRING_BYTES_MIN / 2;
+        drop(pool);
+        let limited = Env::new(crate::env::Memory::new(Heap, limit)).unwrap();
+        let mut pool = StringPool::new(&limited).unwrap();
+        let ids: Vec<_> = (0..4).map(|i| pool.intern_string(&limited, Some(&string(i)))).collect();
         assert!(ids[..3].iter().all(Result::is_ok));
         assert!(ids[3].is_err());
     }
