@@ -15,6 +15,9 @@ name = "pipit_kernel"
 check-lines = []
 # `Prepared::explain`, and the names of steps it writes.
 explain = []
+# Sinks that write what they hold to an `Env`'s `SpillStore` when their
+# budget is full, rather than fail.
+spill = []
 # `Global::current`, each thread's `Global`, which needs `std`.
 std = []
 
