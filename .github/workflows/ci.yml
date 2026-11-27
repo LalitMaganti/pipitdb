@@ -75,6 +75,21 @@ jobs:
           key: ${{ hashFiles('Cargo.toml') }}
       - run: cargo test -p pipitdb-kernel -p pipitdb-file -p pipitdb-pipesql -p pipitdb-diagnostics
 
+  # The engine where a pointer is 32 bits, as in Wasm and on microcontrollers.
+  i686:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - uses: ./.github/actions/setup-rust
+      - run: rustup target add i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+      - run: >-
+          cargo test --target i686-unknown-linux-gnu
+          -p pipitdb-kernel -p pipitdb-file -p pipitdb-pipesql -p pipitdb-parquet
+
   size:
     strategy:
       fail-fast: false
