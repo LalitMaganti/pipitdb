@@ -15,7 +15,11 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use crate::allocator::{AllocError, Allocator};
+#[cfg(feature = "spill")]
+use crate::manager::Manager;
 use crate::slab_allocator::{INDICES_BYTES, SMALL_BYTES, SlabAllocator, VALUES_BYTES};
+#[cfg(feature = "spill")]
+use crate::spill::SpillStore;
 
 /// A query's environment. Its memory is its budget, which plans, states, lists and column data
 /// of no fixed size come from, and a `SlabAllocator` for each kind of
@@ -41,6 +45,9 @@ pub struct Env {
     free: unsafe fn(NonNull<Env>),
     /// The bytes of the allocation this is in.
     allocation_bytes: usize,
+    /// Where what doesn't fit in its budget goes, if anywhere.
+    #[cfg(feature = "spill")]
+    spill: Cell<Option<&'static dyn SpillStore>>,
 }
 
 /// Allocates from the allocator an `Env` was made with while the bytes
@@ -54,6 +61,12 @@ struct Budget {
     used: Cell<usize>,
     /// The most bytes allocated at once.
     peak: Cell<usize>,
+    /// Makes room when an allocation doesn't fit.
+    #[cfg(feature = "spill")]
+    manager: Manager,
+    /// The `Env` it's in, which its manager spills sinks with.
+    #[cfg(feature = "spill")]
+    env: NonNull<Env>,
 }
 
 /// Which of an `Env`'s allocators memory comes from.
@@ -118,6 +131,10 @@ impl Env {
                 limit,
                 used: Cell::new(layout.size()),
                 peak: Cell::new(layout.size()),
+                #[cfg(feature = "spill")]
+                manager: Manager::new(),
+                #[cfg(feature = "spill")]
+                env: NonNull::new_unchecked(&raw mut (*at).env),
             });
             let budget: &'static Budget = &*budget;
             let env = &raw mut (*at).env;
@@ -133,6 +150,8 @@ impl Env {
             (&raw mut (*env).allocators).write(allocators);
             (&raw mut (*env).free).write(free::<A>);
             (&raw mut (*env).allocation_bytes).write(layout.size());
+            #[cfg(feature = "spill")]
+            (&raw mut (*env).spill).write(Cell::new(None));
         }
         Ok(OwnedEnv(allocation.cast()))
     }
@@ -164,17 +183,30 @@ impl Env {
     pub(crate) fn holds_nothing(&self) -> bool {
         let fixed = [&self.values, &self.indices, &self.small];
         let slabs: usize = fixed.iter().map(|fixed| fixed.slab_bytes()).sum();
-        fixed.iter().all(|fixed| fixed.is_idle()) && self.used() == self.allocation_bytes + slabs
+        let used = self.budget.used.get();
+        fixed.iter().all(|fixed| fixed.is_idle()) && used == self.allocation_bytes + slabs
     }
 
-    /// The bytes allocated now, this included.
-    pub fn used(&self) -> usize {
-        self.budget.used.get()
+    /// Runs `f`, a sink applying a batch it prepared, which allocates
+    /// nothing: with the `spill` feature, that's checked.
+    #[inline]
+    #[cfg_attr(not(feature = "spill"), expect(clippy::unused_self, reason = "checked to spill"))]
+    pub(crate) fn applying<R>(&self, f: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "spill")]
+        return self.budget.manager.still(f);
+        #[cfg(not(feature = "spill"))]
+        f()
     }
 
-    /// The most bytes allocated at once.
-    pub fn peak(&self) -> usize {
-        self.budget.peak.get()
+    /// Makes `store` where what doesn't fit in its budget goes.
+    #[cfg(feature = "spill")]
+    pub fn spill_to(&self, store: &'static dyn SpillStore) {
+        self.spill.set(Some(store));
+    }
+
+    #[cfg(feature = "spill")]
+    pub(crate) fn manager(&self) -> &Manager {
+        &self.budget.manager
     }
 }
 
@@ -203,7 +235,19 @@ impl Drop for OwnedEnv {
     }
 }
 
+/// What it holds is measured only by its owner: what runs in it doesn't
+/// decide by how much memory is left, which its manager alone does.
 impl OwnedEnv {
+    /// The bytes allocated now, this included.
+    pub fn used(&self) -> usize {
+        self.budget.used.get()
+    }
+
+    /// The most bytes allocated at once.
+    pub fn peak(&self) -> usize {
+        self.budget.peak.get()
+    }
+
     /// Frees the `Env` if nothing allocated from it is held, and keeps it
     /// for good if something is, which can then still use it: for a
     /// thread's `Env`, which may hold what's kept for the whole program.
@@ -273,15 +317,24 @@ impl Budget {
     /// Allocates `layout`, zeroed if `zeroed`, if it fits within the limit,
     /// and counts it.
     fn charge(&self, layout: Layout, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
-        let used = self.used.get().checked_add(layout.size()).ok_or(AllocError)?;
-        if used > self.limit {
-            return Err(AllocError);
+        let after =
+            || self.used.get().checked_add(layout.size()).filter(|&used| used <= self.limit);
+        #[cfg(feature = "spill")]
+        self.manager.check_may_allocate();
+        #[cfg(feature = "spill")]
+        if after().is_none() {
+            // SAFETY: the `Env` this is in outlives it.
+            let env = unsafe { self.env.as_ref() };
+            self.manager.make_room(env, || after().is_some());
         }
+        let used = after().ok_or(AllocError)?;
         // SAFETY: the allocator lives in the `Env`'s allocation, as this does.
         let base = unsafe { self.base.as_ref() };
         let ptr = if zeroed { base.allocate_zeroed(layout) } else { base.allocate(layout) }?;
         self.used.set(used);
         self.peak.set(self.peak.get().max(used));
+        #[cfg(feature = "spill")]
+        self.manager.allocated(layout.size());
         Ok(ptr)
     }
 }
@@ -300,6 +353,8 @@ unsafe impl Allocator for Budget {
         // SAFETY: forwarded from the caller; the allocator lives as this does.
         unsafe { self.base.as_ref().deallocate(ptr, layout) };
         self.used.set(self.used.get() - layout.size());
+        #[cfg(feature = "spill")]
+        self.manager.freed(layout.size());
     }
 
     unsafe fn discard(&self, ptr: NonNull<u8>, len: usize) {

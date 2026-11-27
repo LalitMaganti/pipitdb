@@ -306,12 +306,32 @@ pub(crate) fn built(context: &mut Context, id: u32) -> Result<NonNull<u8>, Error
     // One run, consuming into one local state, which it combines.
     let local = sink.new_local(context)?;
     {
+        // While its pipeline runs, the local state can be spilled when it
+        // isn't consuming.
+        #[cfg(feature = "spill")]
+        // SAFETY: `local` is the sink's, used only through its entry below.
+        let entry = unsafe { sink.entry(&local) };
+        #[cfg(feature = "spill")]
+        let registered = context.env().manager().register(&entry);
         let mut run = Run::new(pipeline, context, false, None)?;
         let mut batch = RowBatch::new();
         while run.next(context, &mut batch)? {
+            #[cfg(feature = "spill")]
+            {
+                let env = context.env();
+                // SAFETY: `local` is the sink's.
+                registered.consume(env, || unsafe { sink.consume(context, &local, &batch) })?;
+            }
             // SAFETY: `local` is the sink's.
-            unsafe { sink.consume(context, &local, &batch)? };
+            #[cfg(not(feature = "spill"))]
+            unsafe {
+                sink.consume(context, &local, &batch)?;
+            }
         }
+        drop(run);
+        // Spilling it fails what reads it next, the combine below.
+        #[cfg(feature = "spill")]
+        registered.run(|| Ok(()))?;
     }
     let state = sink.new_shared(context)?;
     // SAFETY: both states are the sink's.
@@ -1007,7 +1027,7 @@ pub(crate) mod tests {
     /// Outputs nothing, and checks when it finishes that nothing allocated
     /// from `live` is held: it uses only `empty` bytes.
     struct Released<'a> {
-        live: &'a Env,
+        live: &'a crate::env::OwnedEnv,
         empty: usize,
     }
 
