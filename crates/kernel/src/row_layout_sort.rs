@@ -411,6 +411,13 @@ pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<S
     if in_words {
         fixed = Some(SmallVec::fixed_from(env, rows.get(0).iter().copied())?);
     }
+    // Taken before any block is let go of, so failing leaves the rows as
+    // they were.
+    let mut scratch = Scratch::new(env, count as usize)?;
+    let mut other = None;
+    if existing.runs_len > 0 {
+        other = Some(Array::zeroed(env, count as usize)?);
+    }
     let batch = BATCH_ROWS_MAX as usize;
     // SAFETY: each of `out` is written, as `from..to` is as long.
     let mut words = unsafe {
@@ -428,10 +435,8 @@ pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<S
     if in_words {
         row_layout.free();
     }
-    let mut scratch = Scratch::new(env, count as usize)?;
     // 3. Merge the runs, or sort.
-    if existing.runs_len > 0 {
-        let mut other = Array::zeroed(env, count as usize)?;
+    if let Some(mut other) = other {
         if merge_runs(&mut words, &mut other, &mut existing) {
             words = other;
         }

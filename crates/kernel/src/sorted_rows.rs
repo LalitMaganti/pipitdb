@@ -81,6 +81,12 @@ impl SortedRows {
         self.rows.len()
     }
 
+    /// How many columns the rows have.
+    #[cfg(feature = "spill")]
+    pub(crate) fn width(&self) -> usize {
+        self.rows.width()
+    }
+
     /// Holds the rows `batch` keeps and their values for `keys`, which must
     /// be the same for every batch. Fails if a key's type isn't the one it
     /// had in the first batch.
@@ -112,6 +118,19 @@ impl SortedRows {
         keys: &[SortKey],
         laid_out: Option<&[u8]>,
     ) -> Result<(), Error> {
+        self.prepare(context, batch, keys)?;
+        context.env().applying(|| self.apply(context, batch, keys, laid_out))
+    }
+
+    /// Allocates all `apply` needs to hold the rows `batch` keeps, changing
+    /// only how the rows already held are. Fails if a key's type isn't the
+    /// one it had in the first batch.
+    pub(crate) fn prepare(
+        &mut self,
+        context: &mut Context,
+        batch: &RowBatch,
+        keys: &[SortKey],
+    ) -> Result<(), Error> {
         let count = batch.selection().len();
         if count == 0 {
             return Ok(());
@@ -131,7 +150,27 @@ impl SortedRows {
             if self.keys.is_none() {
                 self.keys = Some(RowBlocks::new(context, stride)?);
             }
-            let (Some(rows), Some(layout)) = (&mut self.keys, &self.layout) else { failed!() };
+            let Some(rows) = &mut self.keys else { failed!() };
+            rows.reserve(context, count)?;
+        }
+        self.rows.prepare(context, batch)
+    }
+
+    /// Holds the rows `batch` keeps and their keys, at `laid_out` if given,
+    /// as `prepare` made room to, allocating nothing.
+    pub(crate) fn apply(
+        &mut self,
+        context: &mut Context,
+        batch: &RowBatch,
+        keys: &[SortKey],
+        laid_out: Option<&[u8]>,
+    ) -> Result<(), Error> {
+        let count = batch.selection().len();
+        if count == 0 {
+            return Ok(());
+        }
+        if let (Some(rows), Some(layout)) = (&mut self.keys, &self.layout) {
+            let stride = layout.stride() as usize;
             // Rows can't be added once their keys are sorted.
             let first = rows.len();
             check!(first == self.rows.len());
@@ -146,7 +185,7 @@ impl SortedRows {
                 }
             })?;
         }
-        self.rows.append(context, batch)
+        self.rows.apply(batch)
     }
 
     /// How keys are laid out, fixed by the first batch's keys' types, which
@@ -161,6 +200,7 @@ impl SortedRows {
         if self.layout.is_none() {
             // Every key is laid out as nullable, as whether a column has nulls
             // can change from batch to batch.
+            self.columns.clear();
             let mut columns = SmallVec::fixed(env, keys.len())?;
             for key in keys {
                 let (column, data_type) = (key.column, data_type(key));

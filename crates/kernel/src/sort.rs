@@ -6,6 +6,8 @@ use crate::containers::SmallVec;
 use crate::context::Context;
 use crate::error::Error;
 use crate::row_batch::RowBatch;
+#[cfg(feature = "spill")]
+use crate::sort_runs::{CHUNK_ROWS, Runs};
 pub use crate::sorted_rows::SortKey;
 use crate::sorted_rows::SortedRows;
 use crate::step::Breaker;
@@ -20,35 +22,68 @@ pub struct Sort {
     keys: SmallVec<SortKey>,
 }
 
+pub struct SortState {
+    /// The rows held but for those in runs: every row, if it can't spill.
+    rows: SortedRows,
+    /// The rows sorted a chunk at a time, if it can spill.
+    #[cfg(feature = "spill")]
+    runs: Runs,
+}
+
 impl Breaker for Sort {
     const NAME: &'static str = "Sort";
-    type State = SortedRows;
+    type State = SortState;
 
-    fn new_state(&self, context: &mut Context) -> Result<SortedRows, Error> {
-        Ok(SortedRows::new(context.env())?)
+    fn new_state(&self, context: &mut Context) -> Result<SortState, Error> {
+        Ok(SortState {
+            rows: SortedRows::new(context.env())?,
+            #[cfg(feature = "spill")]
+            runs: Runs::new(context.env())?,
+        })
     }
 
     fn consume(
         &self,
         context: &mut Context,
-        rows: &mut SortedRows,
+        state: &mut SortState,
         input: &RowBatch,
     ) -> Result<(), Error> {
-        rows.append(context, input, &self.keys)
+        // Once the rows not in a run and the batch's would be past a chunk.
+        #[cfg(feature = "spill")]
+        if state.rows.len() > CHUNK_ROWS - input.selection().len()
+            && context.env().spill().is_some()
+        {
+            state.runs.hold(context, &mut state.rows)?;
+        }
+        state.rows.prepare(context, input, &self.keys)?;
+        context.env().applying(|| state.rows.apply(context, input, &self.keys, None))
     }
 
-    fn finalize(&self, context: &mut Context, rows: &mut SortedRows) -> Result<(), Error> {
-        rows.sort(context)?;
-        rows.scatter(context)
+    fn finalize(&self, context: &mut Context, state: &mut SortState) -> Result<(), Error> {
+        #[cfg(feature = "spill")]
+        if !state.runs.is_empty() {
+            return state.runs.finish(context, &self.keys, &mut state.rows);
+        }
+        state.rows.sort(context)?;
+        state.rows.scatter(context)
     }
 
     fn serve(
         &self,
         context: &mut Context,
-        rows: &mut SortedRows,
+        state: &mut SortState,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
-        rows.serve(context, output)
+        #[cfg(feature = "spill")]
+        if state.runs.is_merging() {
+            return state.runs.serve(context, &self.keys, output);
+        }
+        state.rows.serve(context, output)
+    }
+
+    #[cfg(feature = "spill")]
+    fn spill(&self, env: &crate::env::Env, state: &mut SortState) -> Result<bool, Error> {
+        state.runs.spill(env)
     }
 }
 
@@ -71,10 +106,9 @@ mod tests {
     /// Rows of a key, maybe null, a value and a name.
     type Row = (Option<i64>, i64, &'static str);
 
-    fn batch_of(rows: &[Row], batch: &mut RowBatch) {
+    fn batch_of(env: &Env, rows: &[Row], batch: &mut RowBatch) {
         let n = rows.len();
         batch.reset(u32::try_from(n).unwrap());
-        let env = Env::current();
         let mut context = Context::new(env, None);
         let mut keys = Buffer::allocate(env, n * 8).unwrap();
         let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(n)).unwrap();
@@ -109,13 +143,13 @@ mod tests {
 
         fn next(
             &self,
-            _: &mut Context,
+            context: &mut Context,
             i: &mut usize,
             batch: &mut RowBatch,
         ) -> Result<bool, Error> {
             let Some(rows) = self.batches.get(*i) else { return Ok(false) };
             *i += 1;
-            batch_of(rows, batch);
+            batch_of(context.env(), rows, batch);
             if let Some(drop) = self.drop {
                 batch.selection_mut().retain(|row| row % drop != 0);
             }
@@ -133,16 +167,28 @@ mod tests {
     /// By the key ascending, then the value descending.
     const KEY_THEN_VALUE: &[(u32, bool)] = &[(0, false), (1, true)];
 
+    /// A row out, its name's bytes held.
+    type Out = (Option<i64>, i64, Vec<u8>);
+
     /// Each row out of `breaker`, in order.
-    fn run<B: Breaker + 'static>(rows: Rows, breaker: B) -> Vec<(Option<i64>, i64, Vec<u8>)> {
+    fn run<B: Breaker + 'static>(rows: Rows, breaker: B) -> Vec<Out> {
+        run_in(Env::current(), rows, breaker).unwrap()
+    }
+
+    /// Each row out of `breaker`, in order, run in `run_env`.
+    fn run_in<B: Breaker + 'static>(
+        run_env: &Env,
+        rows: Rows,
+        breaker: B,
+    ) -> Result<Vec<Out>, Error> {
         let env = Env::current();
         let input =
             Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
         let (sinks, pipeline) = after_breaker(input, breaker, []);
-        let mut execution = pipeline.start_with_sinks(env, None, &sinks, None).unwrap();
+        let mut execution = pipeline.start_with_sinks(run_env, None, &sinks, None)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
-        while execution.next(&mut batch).unwrap() {
+        while execution.next(&mut batch)? {
             assert!(matches!(batch.selection().kept(), Kept::Prefix));
             let (keys, values, names) = (batch.column(0), batch.column(1), batch.column(2));
             for row in 0..batch.row_count() {
@@ -151,7 +197,7 @@ mod tests {
                 out.push((key, values.int64s()[row as usize], name));
             }
         }
-        out
+        Ok(out)
     }
 
     #[test]
@@ -186,7 +232,7 @@ mod tests {
         let keys = [SortKey { column: 0, descending: false }];
         let mut held = SortedRows::new(env).unwrap();
         let mut batch = RowBatch::new();
-        batch_of(&[(Some(1), 1, "a")], &mut batch);
+        batch_of(env, &[(Some(1), 1, "a")], &mut batch);
         assert!(held.append(&mut context, &batch, &keys).is_ok());
         let mut floats = RowBatch::new();
         floats.reset(1);
@@ -230,6 +276,54 @@ mod tests {
                     assert_eq!(top, all[..all.len().min(count as usize)], "{count}");
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    #[cfg_attr(miri, ignore = "slow under Miri")]
+    fn spills_sorted_runs_and_merges_them_within_a_budget() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+        use crate::spill::tests::Strict;
+
+        // Keys out of order, a fifth of them null, many ties, and names that
+        // tie too, the empty one among them; every other row kept.
+        const NAMES: [&str; 4] = ["", "x", "yy", "zzz"];
+        let row = |n: i64| {
+            let name = NAMES[usize::try_from(n % 4).unwrap()];
+            ((n % 5 != 0).then_some(n * 7919 % 1000), n, name)
+        };
+        let rows = || Rows {
+            batches: (0..80_i64).map(|b| (b * 2000..(b + 1) * 2000).map(row).collect()).collect(),
+            drop: Some(2),
+        };
+        // By name, then the key descending, nulls last; ties in the order
+        // rows came, as their values are.
+        let keys = || by(&[(2, false), (0, true)]);
+        let unlimited = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let expected = run_in(&unlimited, rows(), sort(keys())).unwrap();
+        let peak = unlimited.peak();
+        drop(unlimited);
+        assert_eq!(expected.len(), 80_000);
+        let order = |r: &Out| (r.2.clone(), core::cmp::Reverse(r.0.unwrap_or(i64::MIN)), r.1);
+        assert!(expected.windows(2).all(|w| order(&w[0]) < order(&w[1])));
+        // With room, its runs are sorted again as one, and nothing written.
+        let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+        let roomy = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        roomy.spill_to(store);
+        assert!(run_in(&roomy, rows(), sort(keys())).unwrap() == expected);
+        assert_eq!(store.logs(), (0, 0));
+        for divisor in [2, 4, 8] {
+            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+            let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
+            env.spill_to(store);
+            let got = run_in(&env, rows(), sort(keys()));
+            let got = got.unwrap_or_else(|e| panic!("{e:?} at 1/{divisor} of {peak}"));
+            assert!(got == expected, "differs at a budget of 1/{divisor}");
+            assert!(env.peak() <= peak / divisor);
+            let (made, left) = store.logs();
+            assert!(made > 0 && left == 0, "{made} logs made, {left} left at 1/{divisor}");
         }
     }
 }

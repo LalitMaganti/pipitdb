@@ -71,6 +71,11 @@ pub(crate) struct RowStore {
     packing: SmallVec<Packing>,
     /// How many rows are being packed.
     packed: u32,
+    /// By column, the rows of a batch past those `packing` had room for,
+    /// packed next once it's held.
+    overflow: SmallVec<Packing>,
+    /// How many rows `overflow` packs.
+    overflowed: u32,
     /// By column, a bit for whether any batch held has nulls in it; the
     /// last bit is for every column from there on.
     nullable: u64,
@@ -97,6 +102,8 @@ impl RowStore {
             places: SmallVec::new(env, 1 << 31)?,
             packing: SmallVec::new(env, 1 << 6)?,
             packed: 0,
+            overflow: SmallVec::new(env, 1 << 6)?,
+            overflowed: 0,
             nullable: 0,
             dropped: 0,
             placeholders: SmallVec::new(env, 1 << 6)?,
@@ -109,12 +116,19 @@ impl RowStore {
     #[inline(never)]
     pub(crate) fn len(&self) -> u32 {
         #[expect(clippy::cast_possible_truncation, reason = "at most 2^31")]
-        let len = self.dense + self.places.len() as u32 + self.packed;
+        let len = self.dense + self.places.len() as u32 + self.packed + self.overflowed;
         len
     }
 
     /// Holds the rows `batch` keeps. Every batch must have the same columns.
     pub(crate) fn append(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
+        self.prepare(context, batch)?;
+        context.env().applying(|| self.apply(batch))
+    }
+
+    /// Allocates all `apply` needs to hold the rows `batch` keeps, changing
+    /// only how the rows already held are.
+    pub(crate) fn prepare(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
         let count = batch.selection().len();
         if count == 0 {
             return Ok(());
@@ -126,26 +140,68 @@ impl RowStore {
         if shares(batch) {
             // Rows packed before come first.
             self.flush(context)?;
-            return self.hold(batch);
+            return self.reserve_hold(batch.column_count(), batch.selection().kept(), count);
+        }
+        if self.packed == BATCH_ROWS_MAX {
+            self.flush_packing(context)?;
+        }
+        // Rows past the packing's room go to the overflow.
+        let first = count.min(BATCH_ROWS_MAX - self.packed);
+        Self::make_packing(context, &mut self.packing, batch)?;
+        if first < count {
+            Self::make_packing(context, &mut self.overflow, batch)?;
+        }
+        let kept = batch.selection().kept();
+        for (c, packing) in (0..).zip(self.packing.iter_mut()) {
+            packing.reserve(batch.column(c), kept, 0..first)?;
+        }
+        for (c, packing) in (0..).zip(self.overflow.iter_mut()) {
+            packing.reserve(batch.column(c), kept, first..count)?;
+        }
+        Ok(())
+    }
+
+    /// Makes a packing for each of `batch`'s columns in `packing`, unless
+    /// there is one.
+    fn make_packing(
+        context: &mut Context,
+        packing: &mut SmallVec<Packing>,
+        batch: &RowBatch,
+    ) -> Result<(), Error> {
+        if !packing.is_empty() {
+            return Ok(());
         }
         let columns = (0..batch.column_count()).map(|c| batch.column(c));
-        let kept = batch.selection().kept();
-        let mut done = 0;
-        while done < count {
-            let take = (count - done).min(BATCH_ROWS_MAX - self.packed);
-            if self.packing.is_empty() {
-                for column in columns.clone() {
-                    self.packing.push(Packing::new(context, column.data_type())?)?;
-                }
-            }
-            for (packing, column) in self.packing.iter_mut().zip(columns.clone()) {
-                packing.append(column, kept, done..done + take)?;
-            }
-            (self.packed, done) = (self.packed + take, done + take);
-            if self.packed == BATCH_ROWS_MAX {
-                self.flush(context)?;
-            }
+        packing.reserve(columns.len())?;
+        for column in columns {
+            let made = Packing::new(context, column.data_type());
+            // So a retry starts from none.
+            let made = made.inspect_err(|_| while packing.pop().is_some() {})?;
+            packing.push(made)?;
         }
+        Ok(())
+    }
+
+    /// Holds the rows `batch` keeps, as `prepare` made room to, allocating
+    /// nothing.
+    pub(crate) fn apply(&mut self, batch: &RowBatch) -> Result<(), Error> {
+        let count = batch.selection().len();
+        if count == 0 {
+            return Ok(());
+        }
+        if shares(batch) {
+            return self.hold(batch);
+        }
+        let kept = batch.selection().kept();
+        let first = count.min(BATCH_ROWS_MAX - self.packed);
+        for (c, packing) in (0..).zip(self.packing.iter_mut()) {
+            packing.append(batch.column(c), kept, 0..first);
+        }
+        for (c, packing) in (0..).zip(self.overflow.iter_mut()) {
+            packing.append(batch.column(c), kept, first..count);
+        }
+        self.packed += first;
+        self.overflowed += count - first;
         Ok(())
     }
 
@@ -176,12 +232,30 @@ impl RowStore {
             .then(|| (self.dropped & ((1 << column) - 1)).count_ones() as usize)
     }
 
-    /// Holds `batch` as it is, sharing its buffers.
-    fn hold(&mut self, batch: &RowBatch) -> Result<(), Error> {
-        let held = self.batches;
-        if held as usize == BATCHES_MAX {
+    /// Makes room to hold a batch of `width` columns keeping `kept`, `count`
+    /// rows, so `hold` allocates nothing.
+    fn reserve_hold(&mut self, width: u32, kept: Kept, count: u32) -> Result<(), Error> {
+        if self.batches as usize == BATCHES_MAX {
             return Err(Error::OutOfMemory);
         }
+        self.held.reserve(width as usize)?;
+        if !self.holds_whole(kept) {
+            self.places.reserve(count as usize)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a batch keeping `kept` is held whole, each row its own place.
+    fn holds_whole(&self, kept: Kept) -> bool {
+        self.dense.is_multiple_of(BATCH_ROWS_MAX)
+            && matches!(kept, Kept::Prefix)
+            && self.places.is_empty()
+    }
+
+    /// Holds `batch` as it is, sharing its buffers, as `reserve_hold` made
+    /// room to.
+    fn hold(&mut self, batch: &RowBatch) -> Result<(), Error> {
+        let held = self.batches;
         self.width = batch.column_count();
         for c in 0..batch.column_count() {
             let column = batch.column(c);
@@ -190,8 +264,7 @@ impl RowStore {
             self.nullable |= u64::from(column.has_nulls()) << c.min(63);
         }
         let kept = batch.selection().kept();
-        let whole = self.dense.is_multiple_of(BATCH_ROWS_MAX) && matches!(kept, Kept::Prefix);
-        if whole && self.places.is_empty() {
+        if self.holds_whole(kept) {
             self.dense += batch.selection().len();
         } else {
             for i in 0..batch.selection().len() {
@@ -202,20 +275,30 @@ impl RowStore {
         Ok(())
     }
 
-    /// Holds the rows packed so far as one batch, so every row held is in a
-    /// batch.
+    /// Holds the rows packed so far, so every row held is in a batch. Fails,
+    /// if it does, holding them as they were.
     pub(crate) fn flush(&mut self, context: &mut Context) -> Result<(), Error> {
-        if self.packed == 0 {
-            return Ok(());
+        while self.packed > 0 {
+            self.flush_packing(context)?;
         }
+        Ok(())
+    }
+
+    /// Holds the rows of the packing as one batch, and packs the overflow's
+    /// next. Fails, if it does, holding them as they were.
+    fn flush_packing(&mut self, context: &mut Context) -> Result<(), Error> {
+        #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
+        self.reserve_hold(self.packing.len() as u32, Kept::Prefix, self.packed)?;
         let mut batch = RowBatch::new();
         batch.reset(self.packed);
         for packing in self.packing.iter() {
             let Ok(()) = batch.push_column(packing.take(context)?) else { failed!() };
         }
+        self.hold(&batch)?;
         while self.packing.pop().is_some() {}
-        self.packed = 0;
-        self.hold(&batch)
+        core::mem::swap(&mut self.packing, &mut self.overflow);
+        (self.packed, self.overflowed) = (self.overflowed, 0);
+        Ok(())
     }
 
     /// The string of the held row `row` in column `column`, a string column,
@@ -431,6 +514,12 @@ impl RowStore {
         Ok(())
     }
 
+    /// How many columns each batch held has.
+    #[cfg(feature = "spill")]
+    pub(crate) fn width(&self) -> usize {
+        self.width as usize
+    }
+
     /// Where row `row` is: its batch, shifted up `ROW_BITS`, and its row in it.
     fn place(&self, row: u32) -> u32 {
         if row < self.dense { row } else { *at!(self.places, (row - self.dense) as usize) }
@@ -603,8 +692,26 @@ impl Packing {
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
     }
 
-    /// Packs `column`'s rows `rows`, after those packed.
-    fn append(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
+    /// Makes room to pack `column`'s rows `rows` of those `kept` keeps.
+    fn reserve(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
+        let Some(bytes) = &mut self.bytes else { return Ok(()) };
+        let (values, strings) = (column.values(), column.values().strings());
+        let mut total = 0;
+        for i in rows {
+            let row = kept.row(i);
+            let len = if values.is_null(row) { 0 } else { strings.get(row as usize).len() };
+            total += if len == 0 { 0 } else { 4 + len };
+        }
+        // So no word's offset is past 32 bits.
+        if u32::try_from(bytes.len() + total).is_err() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(bytes.reserve(total)?)
+    }
+
+    /// Packs `column`'s rows `rows`, after those packed, as `reserve` made
+    /// room to.
+    fn append(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) {
         let values = column.values();
         let strings = self.bytes.as_ref().map(|_| values.strings());
         for i in rows {
@@ -621,12 +728,11 @@ impl Packing {
                 Some(bytes) => {
                     let Some(strings) = strings else { failed!() };
                     let string = if valid { strings.get(row as usize) } else { &[] };
-                    *at_mut!(self.values.as_mut_slice::<u64>(), at) = append(bytes, string)?;
+                    *at_mut!(self.values.as_mut_slice::<u64>(), at) = append(bytes, string);
                 }
             }
             self.rows += 1;
         }
-        Ok(())
     }
 
     /// The rows packed, as a flat column.
@@ -647,17 +753,21 @@ impl Packing {
 }
 
 /// Appends `string` to `bytes`, which start with an empty string, after its
-/// length, returning its word: the empty string's if it's empty.
-fn append(bytes: &mut SmallVec<u8>, string: &[u8]) -> Result<u64, Error> {
+/// length, returning its word: the empty string's if it's empty. There must
+/// be room for it, and its offset must fit 32 bits.
+fn append(bytes: &mut SmallVec<u8>, string: &[u8]) -> u64 {
     if string.is_empty() {
-        return Ok(0);
+        return 0;
     }
-    let (Ok(at), Ok(len)) = (u32::try_from(bytes.len()), u32::try_from(string.len())) else {
-        return Err(Error::OutOfMemory);
+    let at = bytes.len() as u64;
+    #[expect(clippy::cast_possible_truncation, reason = "checked by `reserve`")]
+    let len = string.len() as u32;
+    let (Ok(()), Ok(())) =
+        (bytes.extend_from_slice(&len.to_le_bytes()), bytes.extend_from_slice(string))
+    else {
+        failed!()
     };
-    bytes.extend_from_slice(&len.to_le_bytes())?;
-    bytes.extend_from_slice(string)?;
-    Ok(u64::from(at))
+    at
 }
 
 /// A flat column of `data_type` holding, for each row `kept`, the row at

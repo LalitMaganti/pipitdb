@@ -66,6 +66,21 @@ impl RowBlocks {
         unsafe { core::slice::from_raw_parts(block.as_non_null().as_ptr().add(at), self.stride) }
     }
 
+    /// Takes the blocks `count` more rows need, so appending them allocates
+    /// nothing.
+    pub(crate) fn reserve(&mut self, context: &mut Context, count: u32) -> Result<(), Error> {
+        let end = self.len.checked_add(count).ok_or(Error::OutOfMemory)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let (last, _) = self.locate(end - 1);
+        self.blocks.reserve((last + 1).saturating_sub(self.blocks.len()))?;
+        while self.blocks.len() <= last {
+            self.blocks.push(Some(context.values_buffer(BLOCK_BYTES)?))?;
+        }
+        Ok(())
+    }
+
     /// Appends `count` rows, which `write` writes into the bytes given, whole
     /// rows one after another, each call's first its row's number.
     pub(crate) fn extend(
@@ -95,6 +110,9 @@ impl RowBlocks {
     pub(crate) fn for_each_block_mut(&mut self, mut write: impl FnMut(u32, &mut [u8])) {
         let mut first = 0;
         for block in self.blocks.iter_mut() {
+            if first == self.len {
+                break;
+            }
             let rows = self.block_rows.min(self.len - first);
             let Some(block) = block else { failed!() };
             write(first, at_mut!(block.as_mut_slice::<u8>(), ..rows as usize * self.stride));
