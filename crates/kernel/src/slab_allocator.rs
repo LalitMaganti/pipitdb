@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn carves_blocks_exactly_and_hands_them_out_again() {
-        let env = Env::current();
+        let env = &Env::new(crate::env::Memory::new(crate::allocator::Heap, usize::MAX)).unwrap();
         let words = BATCH_ROWS_MAX as usize * 8;
         let before = env.used();
         let a = Buffer::allocate_in(env, MemoryKind::Values, words).unwrap();

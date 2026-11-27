@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn last_drop_frees() {
-        let env = Env::current();
+        let env = &Env::new(crate::env::Memory::new(crate::allocator::Heap, usize::MAX)).unwrap();
         let empty = env.used();
         let buffer = Buffer::allocate(env, 8).unwrap();
         let clone = buffer.clone();
