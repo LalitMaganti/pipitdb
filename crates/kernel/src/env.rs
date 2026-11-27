@@ -67,6 +67,21 @@ struct Budget {
     /// The `Env` it's in, which its manager spills sinks with.
     #[cfg(feature = "spill")]
     env: NonNull<Env>,
+    /// The bytes left of the reservation being drawn on, if any: what's
+    /// allocated then comes from them, and what's freed goes back.
+    #[cfg(feature = "spill")]
+    drawing: Cell<Option<NonNull<Cell<usize>>>>,
+}
+
+/// Bytes counted against an `Env`'s budget but not allocated, so its owner
+/// can allocate them later where nothing else may, such as while it spills.
+/// Allocating more than it holds then fails a check.
+#[cfg(feature = "spill")]
+pub(crate) struct Reservation {
+    /// The `Env` whose budget it's counted in.
+    env: NonNull<Env>,
+    /// The bytes it holds.
+    bytes: Cell<usize>,
 }
 
 /// Which of an `Env`'s allocators memory comes from.
@@ -135,6 +150,8 @@ impl Env {
                 manager: Manager::new(),
                 #[cfg(feature = "spill")]
                 env: NonNull::new_unchecked(&raw mut (*at).env),
+                #[cfg(feature = "spill")]
+                drawing: Cell::new(None),
             });
             let budget: &'static Budget = &*budget;
             let env = &raw mut (*at).env;
@@ -323,8 +340,28 @@ impl Budget {
     /// Allocates `layout`, zeroed if `zeroed`, if it fits within the limit,
     /// and counts it.
     fn charge(&self, layout: Layout, zeroed: bool) -> Result<NonNull<u8>, AllocError> {
-        let after =
-            || self.used.get().checked_add(layout.size()).filter(|&used| used <= self.limit);
+        // SAFETY: the allocator lives in the `Env`'s allocation, as this does.
+        let base = unsafe { self.base.as_ref() };
+        let allocate = || if zeroed { base.allocate_zeroed(layout) } else { base.allocate(layout) };
+        #[cfg(feature = "spill")]
+        if let Some(left) = self.drawing.get() {
+            // SAFETY: a reservation being drawn on outlives the drawing.
+            let left = unsafe { left.as_ref() };
+            check!(layout.size() <= left.get());
+            let ptr = allocate()?;
+            left.set(left.get() - layout.size());
+            return Ok(ptr);
+        }
+        let used = self.room_for(layout.size())?;
+        let ptr = allocate()?;
+        self.counted(used, layout.size());
+        Ok(ptr)
+    }
+
+    /// What's used with `bytes` more, if they fit within the limit, once
+    /// room is made if they don't.
+    fn room_for(&self, bytes: usize) -> Result<usize, AllocError> {
+        let after = || self.used.get().checked_add(bytes).filter(|&used| used <= self.limit);
         #[cfg(feature = "spill")]
         self.manager.check_may_allocate();
         #[cfg(feature = "spill")]
@@ -333,15 +370,81 @@ impl Budget {
             let env = unsafe { self.env.as_ref() };
             self.manager.make_room(env, || after().is_some());
         }
-        let used = after().ok_or(AllocError)?;
-        // SAFETY: the allocator lives in the `Env`'s allocation, as this does.
-        let base = unsafe { self.base.as_ref() };
-        let ptr = if zeroed { base.allocate_zeroed(layout) } else { base.allocate(layout) }?;
+        after().ok_or(AllocError)
+    }
+
+    /// Counts `bytes` more as used, `used` in all.
+    #[cfg_attr(not(feature = "spill"), expect(unused_variables, reason = "counted to spill"))]
+    fn counted(&self, used: usize, bytes: usize) {
         self.used.set(used);
         self.peak.set(self.peak.get().max(used));
         #[cfg(feature = "spill")]
-        self.manager.allocated(layout.size());
-        Ok(ptr)
+        self.manager.allocated(bytes);
+    }
+
+    /// Counts `bytes` as used no more.
+    fn uncount(&self, bytes: usize) {
+        self.used.set(self.used.get() - bytes);
+        #[cfg(feature = "spill")]
+        self.manager.freed(bytes);
+    }
+}
+
+#[cfg(feature = "spill")]
+impl Reservation {
+    /// One of nothing, from `env`'s budget.
+    pub(crate) fn new(env: &Env) -> Reservation {
+        Reservation { env: NonNull::from(env), bytes: Cell::new(0) }
+    }
+
+    fn budget(&self) -> &Budget {
+        // SAFETY: an `Env` outlives what's taken from it.
+        unsafe { &self.env.as_ref().budget }
+    }
+
+    /// Holds at least `bytes`, counting what more it needs as allocated,
+    /// which fails as an allocation does.
+    pub(crate) fn grow_to(&self, bytes: usize) -> Result<(), AllocError> {
+        let more = bytes.saturating_sub(self.bytes.get());
+        if more > 0 {
+            let budget = self.budget();
+            budget.counted(budget.room_for(more)?, more);
+            self.bytes.set(bytes);
+        }
+        Ok(())
+    }
+
+    /// Runs `f`, whose allocations come from what it holds and whose frees
+    /// go back to it, even where nothing else may allocate.
+    pub(crate) fn draw<R>(&self, f: impl FnOnce() -> R) -> R {
+        let budget = self.budget();
+        check!(budget.drawing.get().is_none());
+        budget.drawing.set(Some(NonNull::from(&self.bytes)));
+        let _drawing = Drawing(budget);
+        f()
+    }
+
+    /// Holds nothing, counting what it held as freed.
+    pub(crate) fn release(&self) {
+        self.budget().uncount(self.bytes.replace(0));
+    }
+}
+
+#[cfg(feature = "spill")]
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Ends `Reservation::draw` when dropped, even by a panic.
+#[cfg(feature = "spill")]
+struct Drawing<'b>(&'b Budget);
+
+#[cfg(feature = "spill")]
+impl Drop for Drawing<'_> {
+    fn drop(&mut self) {
+        self.0.drawing.set(None);
     }
 }
 
@@ -358,9 +461,14 @@ unsafe impl Allocator for Budget {
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         // SAFETY: forwarded from the caller; the allocator lives as this does.
         unsafe { self.base.as_ref().deallocate(ptr, layout) };
-        self.used.set(self.used.get() - layout.size());
         #[cfg(feature = "spill")]
-        self.manager.freed(layout.size());
+        if let Some(left) = self.drawing.get() {
+            // SAFETY: a reservation being drawn on outlives the drawing.
+            let left = unsafe { left.as_ref() };
+            left.set(left.get() + layout.size());
+            return;
+        }
+        self.uncount(layout.size());
     }
 
     unsafe fn discard(&self, ptr: NonNull<u8>, len: usize) {

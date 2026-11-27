@@ -9,7 +9,7 @@
 //! So that's always possible, a sink allocates only while it prepares a
 //! batch, before `Env::applying`, and changes nothing then that applying
 //! the batch wouldn't. Applying it and spilling allocate nothing, which the
-//! budget checks.
+//! budget checks, but for what a sink reserved while preparing.
 
 #![allow(unsafe_code)]
 

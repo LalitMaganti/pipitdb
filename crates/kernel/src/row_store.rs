@@ -69,7 +69,10 @@ pub(crate) struct RowStore {
     /// By column, the rows being packed, until there are a batch's worth or a
     /// batch is shared after them.
     packing: SmallVec<Packing>,
-    /// How many rows are being packed.
+    /// By column, the rows packed after a batch's worth in `packing`, until
+    /// that's held.
+    spare: SmallVec<Packing>,
+    /// How many rows are being packed, in both.
     packed: u32,
     /// By column, a bit for whether any batch held has nulls in it; the
     /// last bit is for every column from there on.
@@ -96,6 +99,7 @@ impl RowStore {
             dense: 0,
             places: SmallVec::new(env, 1 << 31)?,
             packing: SmallVec::new(env, 1 << 6)?,
+            spare: SmallVec::new(env, 1 << 6)?,
             packed: 0,
             nullable: 0,
             dropped: 0,
@@ -115,6 +119,13 @@ impl RowStore {
 
     /// Holds the rows `batch` keeps. Every batch must have the same columns.
     pub(crate) fn append(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
+        self.prepare(context, batch)?;
+        self.apply(batch)
+    }
+
+    /// Allocates all `apply` needs to hold the rows `batch` keeps, holding
+    /// only rows it already does: packed rows may be held as a batch.
+    pub(crate) fn prepare(&mut self, context: &mut Context, batch: &RowBatch) -> Result<(), Error> {
         let count = batch.selection().len();
         if count == 0 {
             return Ok(());
@@ -126,27 +137,65 @@ impl RowStore {
         if shares(batch) {
             // Rows packed before come first.
             self.flush(context)?;
-            return self.hold(batch);
+            if self.batches as usize == BATCHES_MAX {
+                return Err(Error::OutOfMemory);
+            }
+            self.held.reserve(batch.column_count() as usize)?;
+            if !self.holds_whole(batch) {
+                self.places.reserve(count as usize)?;
+            }
+            return Ok(());
         }
-        let columns = (0..batch.column_count()).map(|c| batch.column(c));
+        while self.packed >= BATCH_ROWS_MAX {
+            self.flush_one(context)?;
+        }
+        let first = count.min(BATCH_ROWS_MAX - self.packed);
         let kept = batch.selection().kept();
-        let mut done = 0;
-        while done < count {
-            let take = (count - done).min(BATCH_ROWS_MAX - self.packed);
-            if self.packing.is_empty() {
-                for column in columns.clone() {
-                    self.packing.push(Packing::new(context, column.data_type())?)?;
+        for (packings, rows) in [(&mut self.packing, 0..first), (&mut self.spare, first..count)] {
+            if rows.is_empty() {
+                continue;
+            }
+            if packings.is_empty() {
+                for c in 0..batch.column_count() {
+                    packings.push(Packing::new(context, batch.column(c).data_type())?)?;
                 }
             }
-            for (packing, column) in self.packing.iter_mut().zip(columns.clone()) {
-                packing.append(column, kept, done..done + take)?;
-            }
-            (self.packed, done) = (self.packed + take, done + take);
-            if self.packed == BATCH_ROWS_MAX {
-                self.flush(context)?;
+            for (c, packing) in (0..).zip(packings.iter_mut()) {
+                packing.reserve(batch.column(c), kept, rows.clone())?;
             }
         }
         Ok(())
+    }
+
+    /// Holds the rows `batch` keeps, as `prepare`d, allocating nothing.
+    pub(crate) fn apply(&mut self, batch: &RowBatch) -> Result<(), Error> {
+        let count = batch.selection().len();
+        if count == 0 {
+            return Ok(());
+        }
+        if shares(batch) {
+            return self.hold(batch);
+        }
+        let first = count.min(BATCH_ROWS_MAX - self.packed);
+        let kept = batch.selection().kept();
+        for (packings, rows) in [(&mut self.packing, 0..first), (&mut self.spare, first..count)] {
+            if rows.is_empty() {
+                continue;
+            }
+            for (c, packing) in (0..).zip(packings.iter_mut()) {
+                packing.append(batch.column(c), kept, rows.clone())?;
+            }
+        }
+        self.packed += count;
+        Ok(())
+    }
+
+    /// Whether `hold` holds `batch` whole, rather than by each row's place.
+    fn holds_whole(&self, batch: &RowBatch) -> bool {
+        let kept = batch.selection().kept();
+        self.dense.is_multiple_of(BATCH_ROWS_MAX)
+            && matches!(kept, Kept::Prefix)
+            && self.places.is_empty()
     }
 
     /// Stops holding column `column` of the rows appended from now on, which
@@ -190,8 +239,7 @@ impl RowStore {
             self.nullable |= u64::from(column.has_nulls()) << c.min(63);
         }
         let kept = batch.selection().kept();
-        let whole = self.dense.is_multiple_of(BATCH_ROWS_MAX) && matches!(kept, Kept::Prefix);
-        if whole && self.places.is_empty() {
+        if self.holds_whole(batch) {
             self.dense += batch.selection().len();
         } else {
             for i in 0..batch.selection().len() {
@@ -202,26 +250,102 @@ impl RowStore {
         Ok(())
     }
 
-    /// Holds the rows packed so far as one batch, so every row held is in a
+    /// Holds the rows packed so far as batches, so every row held is in a
     /// batch.
     pub(crate) fn flush(&mut self, context: &mut Context) -> Result<(), Error> {
-        if self.packed == 0 {
-            return Ok(());
+        while self.packed > 0 {
+            self.flush_one(context)?;
         }
+        Ok(())
+    }
+
+    /// Holds the rows of `packing` as one batch, and packs after them those
+    /// of `spare`.
+    fn flush_one(&mut self, context: &mut Context) -> Result<(), Error> {
+        let Some(rows) = self.packing.first().map(|packing| packing.rows) else { failed!() };
         let mut batch = RowBatch::new();
-        batch.reset(self.packed);
+        batch.reset(rows);
         for packing in self.packing.iter() {
             let Ok(()) = batch.push_column(packing.take(context)?) else { failed!() };
         }
         while self.packing.pop().is_some() {}
-        self.packed = 0;
+        core::mem::swap(&mut self.packing, &mut self.spare);
+        self.packed -= rows;
         self.hold(&batch)
     }
 
+    /// How many columns each row has.
+    #[cfg(feature = "spill")]
+    pub(crate) fn width(&self) -> u32 {
+        #[expect(clippy::cast_possible_truncation, reason = "at most 64")]
+        let packed = self.packing.len() as u32;
+        if self.batches > 0 { self.width } else { packed }
+    }
+
+    /// Column `column`'s type, of a column held.
+    #[cfg(feature = "spill")]
+    pub(crate) fn data_type(&self, column: u32) -> DataType {
+        match self.held.get(column as usize) {
+            Some(held) => held.view().data_type(),
+            None => at!(self.packing, column as usize).data_type,
+        }
+    }
+
+    /// Whether any row in column `column` may be null.
+    #[cfg(feature = "spill")]
+    pub(crate) fn may_be_null(&self, column: u32) -> bool {
+        let packed = self.packing.iter().chain(self.spare.iter());
+        let mut packed = packed.skip(column as usize).step_by(self.packing.len().max(1));
+        self.has_nulls(column) || packed.any(|packing| packing.nulls)
+    }
+
+    /// The value of the held row `row` in column `column`, a word, if not
+    /// null.
+    #[cfg(feature = "spill")]
+    pub(crate) fn word(&self, column: u32, row: u32) -> Option<i64> {
+        if let Some((packing, i)) = self.packed(column, row) {
+            return packing.word(i);
+        }
+        let (held, row) = self.find(self.place(row));
+        let source = at!(held, column as usize);
+        source.is_valid(row).then(|| source.word(row))
+    }
+
+    /// The packing that holds the held row `row` in column `column`, and
+    /// which of its rows it is, if it's packed.
+    #[inline]
+    fn packed(&self, column: u32, row: u32) -> Option<(&Packing, u32)> {
+        if self.packed == 0 {
+            return None;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "at most 2^31")]
+        let i = row.checked_sub(self.dense + self.places.len() as u32)?;
+        let (packings, i) = match i.checked_sub(BATCH_ROWS_MAX) {
+            None => (&self.packing, i),
+            Some(i) => (&self.spare, i),
+        };
+        Some((at!(packings, column as usize), i))
+    }
+
+    /// Holds no rows, keeping which columns are dropped, allocating
+    /// nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn clear(&mut self, env: &Env) -> Result<(), Error> {
+        check!(self.scattered == 0);
+        self.held = SmallVec::new(env, 1 << 31)?;
+        self.places.free();
+        while self.packing.pop().is_some() {}
+        while self.spare.pop().is_some() {}
+        (self.batches, self.dense, self.packed, self.nullable) = (0, 0, 0, 0);
+        Ok(())
+    }
+
     /// The string of the held row `row` in column `column`, a string column,
-    /// if not null. Rows packed must be flushed first.
+    /// if not null.
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
-        check!(self.packed == 0);
+        if let Some((packing, i)) = self.packed(column, row) {
+            return packing.string(i);
+        }
         let (held, row) = self.find(self.place(row));
         let values = at!(held, column as usize).view().values();
         (!values.is_null(row)).then(|| values.strings().get(row as usize))
@@ -601,6 +725,50 @@ impl Packing {
             empty.extend_from_slice(&[0; 4])?;
         }
         Ok(Packing { data_type, values, validity, nulls: false, bytes, rows: 0 })
+    }
+
+    /// Makes room for `column`'s rows `rows`, so `append` allocates nothing.
+    fn reserve(&mut self, column: &ColumnView, kept: Kept, rows: Range<u32>) -> Result<(), Error> {
+        let Some(bytes) = &mut self.bytes else { return Ok(()) };
+        let values = column.values();
+        let strings = values.strings();
+        let mut more = 0_usize;
+        for i in rows {
+            let row = kept.row(i);
+            if !values.is_null(row) {
+                let len = strings.len_of(row as usize);
+                more += if len == 0 { 0 } else { 4 + len };
+            }
+        }
+        // So no word's offset is past 32 bits.
+        if u32::try_from(bytes.len() + more).is_err() {
+            return Err(Error::OutOfMemory);
+        }
+        Ok(bytes.reserve(more)?)
+    }
+
+    /// Row `i`'s value, if not null.
+    #[cfg(feature = "spill")]
+    fn word(&self, i: u32) -> Option<i64> {
+        let valid = BitSlice::of(self.validity.as_slice::<u8>()).get(i as usize);
+        valid.then(|| *at!(self.values.as_slice::<i64>(), i as usize))
+    }
+
+    /// Row `i`'s string, of a string column, if not null.
+    fn string(&self, i: u32) -> Option<&[u8]> {
+        let Some(bytes) = &self.bytes else { failed!() };
+        if !BitSlice::of(self.validity.as_slice::<u8>()).get(i as usize) {
+            return None;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "an offset below 2^32")]
+        let word = *at!(self.values.as_slice::<u64>(), i as usize) as usize;
+        if word == 0 {
+            return Some(&[]);
+        }
+        let mut len = [0; 4];
+        len.copy_from_slice(at!(bytes, word..word + 4));
+        let len = u32::from_le_bytes(len) as usize;
+        Some(at!(bytes, word + 4..word + 4 + len))
     }
 
     /// Packs `column`'s rows `rows`, after those packed.

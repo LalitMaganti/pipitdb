@@ -31,9 +31,12 @@ pub(crate) struct Scratch(Array<u64>);
 impl Scratch {
     /// For sorting up to `count` words.
     pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
-        let len =
-            if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(Array::zeroed(env, len)?))
+        Ok(Scratch(Array::zeroed(env, Scratch::len(count))?))
+    }
+
+    /// How many words one for `count` words has.
+    pub(crate) fn len(count: usize) -> usize {
+        if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 }
     }
 }
 
@@ -215,11 +218,33 @@ struct Bucket {
     depth: usize,
 }
 
+/// The most buckets `msd_radix_sort` holds on its stack for `count`
+/// elements. Each bucket split leaves its children, at most 256 and each
+/// of two elements or more, on the stack, the largest below the rest, so
+/// a child split while any of its siblings wait is at most half its
+/// parent: each split's children waiting are at most half as many as the
+/// last's.
+pub(crate) fn msd_stack_len(count: usize) -> usize {
+    let (mut len, mut parent) = (1, count);
+    while parent >= 2 {
+        len += (parent / 2).min(256);
+        parent /= 2;
+    }
+    len
+}
+
+/// The bytes of `msd_radix_sort`'s stack for `count` elements.
+#[cfg(feature = "spill")]
+pub(crate) fn msd_stack_bytes(count: usize) -> usize {
+    if count <= 1 { 0 } else { msd_stack_len(count).next_power_of_two() * size_of::<Bucket>() }
+}
+
 /// Sorts `elements` by `key`, a string of bytes, with a most significant
 /// digit first radix sort, as Perfetto's `MsdRadixSort` does: the elements
 /// are split into buckets by their key's byte at a depth, each then by the
-/// next, from a stack rather than by recursion. Equal keys end up in any
-/// order. `scratch` must be at least as long.
+/// next, from a stack rather than by recursion, the largest of a split's
+/// last. Equal keys end up in any order. `scratch` must be at least as
+/// long.
 pub(crate) fn msd_radix_sort<'k, T: Copy>(
     env: &Env,
     elements: &mut [T],
@@ -232,7 +257,7 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
     let suffix = |element: &T, depth: usize| key(element).get(depth..).unwrap_or_default();
     // The byte of `key` at `depth`, plus one, or 0 for keys that short.
     let digit = |e: &T, depth| suffix(e, depth).first().map_or(0, |&b| usize::from(b) + 1);
-    let mut stack = SmallVec::new(env, 1 << 24)?;
+    let mut stack = SmallVec::fixed(env, msd_stack_len(elements.len()))?;
     stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
     while let Some(bucket) = stack.pop() {
         let (depth, items) = (bucket.depth, at_mut!(elements, bucket.start..bucket.end));
@@ -263,11 +288,19 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
         }
         // Each count is now where the next digit's bucket starts. Keys that
         // end at this depth are all equal: only longer ones go on.
+        // The largest goes below the rest, to be sorted last.
+        let (bottom, mut largest, mut most) = (stack.len(), stack.len(), 0);
         for d in (0..256).rev() {
             let (start, end) = (bucket.start + *at!(counts, d), bucket.start + *at!(counts, d + 1));
             if end - start > 1 {
+                if end - start > most {
+                    (largest, most) = (stack.len(), end - start);
+                }
                 stack.push(Bucket { start, end, depth: depth + 1 })?;
             }
+        }
+        if largest != bottom {
+            stack.swap(bottom, largest);
         }
     }
     Ok(())

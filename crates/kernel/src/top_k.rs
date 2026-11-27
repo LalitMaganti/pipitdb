@@ -107,7 +107,8 @@ impl Breaker for TopK {
     }
 
     fn finalize(&self, context: &mut Context, kept: &mut Kept) -> Result<(), Error> {
-        kept.rows.sort(context)?;
+        kept.rows.flush(context)?;
+        kept.rows.sort(context.env())?;
         kept.rows.truncate_order(self.count);
         Ok(())
     }
@@ -184,7 +185,8 @@ impl TopK {
     /// of them the cutoff.
     fn prune(&self, context: &mut Context, kept: &mut Kept) -> Result<(), Error> {
         let rows = &mut kept.rows;
-        rows.sort(context)?;
+        rows.flush(context)?;
+        rows.sort(context.env())?;
         rows.truncate_order(self.count);
         let mut first = SortedRows::new(context.env())?;
         let mut batch = RowBatch::new();
@@ -193,7 +195,6 @@ impl TopK {
             at += rows.gather(context, &mut batch, at)?;
             first.append(context, &batch, &self.keys)?;
         }
-        first.flush(context)?;
         let last = self.count - 1;
         let env = context.env();
         let keys = SmallVec::fixed_from(env, first.keys_of(last).iter().copied())?;

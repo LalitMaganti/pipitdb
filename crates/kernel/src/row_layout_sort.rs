@@ -428,23 +428,43 @@ pub(crate) fn sort_row_layout(env: &Env, row_layout: &mut RowBlocks) -> Result<S
     if in_words {
         row_layout.free();
     }
-    let mut scratch = Scratch::new(env, count as usize)?;
-    // 3. Merge the runs, or sort.
+    // 3. Merge the runs, or sort, with the scratch taken once the merge is
+    // done with its copy.
+    let mut scratch = None;
     if existing.runs_len > 0 {
         let mut other = Array::zeroed(env, count as usize)?;
         if merge_runs(&mut words, &mut other, &mut existing) {
             words = other;
         }
     } else {
-        sort_words(&mut words, &mut scratch);
+        sort_words(&mut words, scratch.insert(Scratch::new(env, count as usize)?));
     }
     // 4. If the words left out varying bytes, equal keys may still be
     // different rows: sort each tied group on the bytes after them.
     if varying.len() > packing.key_bytes {
+        let scratch = match &mut scratch {
+            Some(scratch) => scratch,
+            None => scratch.insert(Scratch::new(env, count as usize)?),
+        };
         let rows = Rows { blocks: row_layout, stride: row_layout.stride(), count };
-        sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, &mut scratch);
+        sort_ties(&mut words, rows, &varying, packing.key_bytes, packing, scratch);
     }
     Ok(Sorted::Words { words, packing, varying, fixed })
+}
+
+/// The most bytes `sort_row_layout` allocates at once for `count` rows of
+/// `stride` bytes: finding the bytes that vary, then those it keeps and
+/// each row's word, with a copy to merge into or the scratch.
+#[cfg(feature = "spill")]
+pub(crate) fn sorting_bytes(count: usize, stride: usize) -> usize {
+    if count <= 1 {
+        return 0;
+    }
+    let varying = 4 * stride.next_power_of_two();
+    let finding = stride + 8 * stride.div_ceil(8) + varying;
+    let words = 8 * count;
+    let kept = varying + stride.next_power_of_two() + words;
+    finding.max(kept + words.max(8 * Scratch::len(count)))
 }
 
 #[cfg(test)]
@@ -477,12 +497,11 @@ mod tests {
         let env = Env::current();
         let mut context = Context::new(env, None);
         let mut row_layout = RowBlocks::new(&context, stride).unwrap();
-        row_layout
-            .extend(&mut context, count, |first, bytes| {
-                let at = first as usize * stride;
-                bytes.copy_from_slice(&rows[at..at + bytes.len()]);
-            })
-            .unwrap();
+        row_layout.reserve(&mut context, count).unwrap();
+        row_layout.extend(count, |first, bytes| {
+            let at = first as usize * stride;
+            bytes.copy_from_slice(&rows[at..at + bytes.len()]);
+        });
         let sorted = sort_row_layout(env, &mut row_layout).unwrap();
         let indices: Vec<u32> = (0..count).map(|i| sorted.row(i)).collect();
         let mut expected: Vec<u32> = (0..count).collect();

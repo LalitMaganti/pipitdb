@@ -66,20 +66,25 @@ impl RowBlocks {
         unsafe { core::slice::from_raw_parts(block.as_non_null().as_ptr().add(at), self.stride) }
     }
 
-    /// Appends `count` rows, which `write` writes into the bytes given, whole
-    /// rows one after another, each call's first its row's number.
-    pub(crate) fn extend(
-        &mut self,
-        context: &mut Context,
-        count: u32,
-        mut write: impl FnMut(u32, &mut [u8]),
-    ) -> Result<(), Error> {
+    /// Takes the blocks `count` more rows need, so appending them allocates
+    /// nothing.
+    pub(crate) fn reserve(&mut self, context: &mut Context, count: u32) -> Result<(), Error> {
         let end = self.len.checked_add(count).ok_or(Error::OutOfMemory)?;
+        let blocks = end.div_ceil(self.block_rows) as usize;
+        self.blocks.reserve(blocks.saturating_sub(self.blocks.len()))?;
+        while self.blocks.len() < blocks {
+            self.blocks.push(Some(context.values_buffer(BLOCK_BYTES)?))?;
+        }
+        Ok(())
+    }
+
+    /// Appends `count` rows, whose blocks are reserved, which `write`
+    /// writes into the bytes given, whole rows one after another, each
+    /// call's first its row's number.
+    pub(crate) fn extend(&mut self, count: u32, mut write: impl FnMut(u32, &mut [u8])) {
+        let end = self.len + count;
         while self.len < end {
             let (block, at) = self.locate(self.len);
-            if block == self.blocks.len() {
-                self.blocks.push(Some(context.values_buffer(BLOCK_BYTES)?))?;
-            }
             let take = (self.block_rows as usize - at / self.stride).min((end - self.len) as usize);
             let Some(buffer) = at_mut!(self.blocks, block) else { failed!() };
             write(self.len, at_mut!(buffer.as_mut_slice::<u8>(), at..at + take * self.stride));
@@ -87,7 +92,6 @@ impl RowBlocks {
             let take = take as u32;
             self.len += take;
         }
-        Ok(())
     }
 
     /// Calls `write` with the rows of each block, and its first row's
@@ -113,6 +117,13 @@ impl RowBlocks {
             }
         }
         self.kept = self.kept.max(block);
+    }
+
+    /// Holds no rows, and lets go of every block, allocating nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn clear(&mut self) {
+        while self.blocks.pop().is_some() {}
+        (self.kept, self.len) = (0, 0);
     }
 
     /// Lets go of every block.

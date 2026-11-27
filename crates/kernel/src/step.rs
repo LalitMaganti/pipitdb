@@ -222,8 +222,8 @@ pub trait Sink {
     /// returning whether it held anything to write. Its pipeline's
     /// `Manager` calls it, when an allocation doesn't fit and `local` isn't
     /// consuming, or when one of `consume`'s doesn't, before consuming the
-    /// batch again. It must take no more memory than it frees, or it may
-    /// fail, as making room doesn't spill another sink. By default, it
+    /// batch again. It allocates nothing but what it reserved, as making
+    /// room doesn't spill another sink. By default, it
     /// holds nothing it can write.
     #[cfg(feature = "spill")]
     fn spill(&self, env: &Env, local: &mut Self::Local) -> Result<bool, Error> {
