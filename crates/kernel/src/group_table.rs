@@ -135,6 +135,53 @@ impl GroupTable {
         self.records.len()
     }
 
+    /// Group `group`'s key `k`: its word, or `None` if it's null. A string
+    /// key's word is its string's in the table's pool, which `string` gives.
+    #[cfg(feature = "spill")]
+    pub(crate) fn key(&self, group: u32, k: usize) -> Option<i64> {
+        let record = self.records.record(group as usize);
+        let null = self.first == 1 && *at!(record, 0) >> k & 1 != 0;
+        (!null).then(|| *at!(record, self.first + k))
+    }
+
+    /// The string of a string key's word, `None` for the null string.
+    #[cfg(feature = "spill")]
+    pub(crate) fn string(&self, word: i64) -> Option<&[u8]> {
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "an id")]
+        let id = Id::raw(word as u32);
+        self.pool.as_ref()?.get(id)
+    }
+
+    /// Whether key `k` is a string.
+    #[cfg(feature = "spill")]
+    pub(crate) fn is_string(&self, k: usize) -> bool {
+        self.string_keys >> k & 1 != 0
+    }
+
+    /// Whether key `k`, not a string, can be null.
+    #[cfg(feature = "spill")]
+    pub(crate) fn is_nullable(&self, k: usize) -> bool {
+        self.nullable >> k & 1 != 0
+    }
+
+    /// Word `w` of group `group`'s payload.
+    #[cfg(feature = "spill")]
+    pub(crate) fn payload_word(&self, group: u32, w: usize) -> i64 {
+        *at!(self.records.record(group as usize), self.first + self.keys + w)
+    }
+
+    /// Forgets every group, freeing what they took, allocating nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn free(&mut self, env: &Env) {
+        self.slots = Array::empty(env);
+        self.records.free(env);
+        self.pool = None;
+        for interned in self.dictionaries.iter_mut() {
+            *interned = None;
+        }
+        self.number_groups.free();
+    }
+
     /// Group `group`'s first payload word.
     pub(crate) fn payload(&self, group: u32) -> i64 {
         *at!(self.records.record(group as usize), self.first + self.keys)

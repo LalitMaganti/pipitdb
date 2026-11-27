@@ -73,19 +73,19 @@ const CASES: &[Case] = &[
         name: "aggregate_int_keys",
         query: "FROM t |> AGGREGATE sum(v) AS total, count(*) AS n GROUP BY g",
         ordered: false,
-        spills: false,
+        spills: true,
     },
     Case {
         name: "aggregate_string_keys",
         query: "FROM t |> AGGREGATE sum(v) AS total GROUP BY s",
         ordered: false,
-        spills: false,
+        spills: true,
     },
     Case {
         name: "aggregate_string_min",
         query: "FROM t |> AGGREGATE min(s) AS least GROUP BY g",
         ordered: false,
-        spills: false,
+        spills: true,
     },
     Case {
         name: "aggregate_distinct",

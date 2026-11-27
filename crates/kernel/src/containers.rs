@@ -987,6 +987,19 @@ impl<T: Primitive> Blocks<T> {
         self.raw.reserve(env, len)
     }
 
+    /// Frees every record, and the lists of their blocks, allocating
+    /// nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn free(&mut self, env: &Env) {
+        let (Ok(arrays), Ok(starts)) =
+            (SmallVec::new(env, BLOCKS_MAX), SmallVec::new(env, BLOCKS_MAX))
+        else {
+            failed!()
+        };
+        (self.raw.arrays, self.raw.starts) = (arrays, starts);
+        (self.raw.first, self.raw.len) = (0, 0);
+    }
+
     /// Adds a record, zeroed, in the room `reserve` made, and returns it.
     pub(crate) fn push(&mut self) -> &mut [T] {
         check!(self.raw.len < self.capacity());

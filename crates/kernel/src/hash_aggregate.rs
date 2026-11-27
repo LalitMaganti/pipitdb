@@ -20,6 +20,9 @@ use crate::selection::Kept;
 use crate::step::Breaker;
 use crate::string_pool::{CACHED_SLOTS, StringPool};
 
+#[cfg(feature = "spill")]
+mod spill;
+
 /// The breaker that aggregates by `spec`.
 pub fn hash_aggregate(spec: HashAggregateSpec) -> HashAggregate {
     HashAggregate::new(spec)
@@ -58,6 +61,13 @@ pub struct State {
     loaders: SmallVec<AggregateInputLoader>,
     /// For each aggregate, what preparing the batch being consumed found.
     prepared: SmallVec<Option<Prepared>>,
+    /// The partitions its groups are written to when it spills.
+    #[cfg(feature = "spill")]
+    spilled: spill::Spilled,
+    /// How many groups a batch has been applied to: those after were added
+    /// preparing one that wasn't, so hold nothing yet.
+    #[cfg(feature = "spill")]
+    applied: usize,
 }
 
 impl HashAggregate {
@@ -383,6 +393,10 @@ impl Breaker for HashAggregate {
             extremes: None,
             loaders,
             prepared,
+            #[cfg(feature = "spill")]
+            spilled: spill::Spilled::new(env)?,
+            #[cfg(feature = "spill")]
+            applied: 0,
         })
     }
 
@@ -400,6 +414,10 @@ impl Breaker for HashAggregate {
         let numbers = self.prepare(context, state, &input, rows)?;
         let numbers = numbers.as_ref().map(Buffer::as_slice);
         let applied = context.env().applying(|| self.apply(state, &input, rows, numbers));
+        #[cfg(feature = "spill")]
+        {
+            state.applied = state.groups.len();
+        }
         // Frees the batch's buffers.
         for loader in state.loaders.iter_mut() {
             *loader = AggregateInputLoader::new();
@@ -410,8 +428,16 @@ impl Breaker for HashAggregate {
         applied
     }
 
-    fn finalize(&self, _: &mut Context, _: &mut State) -> Result<(), Error> {
+    #[cfg_attr(not(feature = "spill"), expect(unused_variables, reason = "used to spill"))]
+    fn finalize(&self, context: &mut Context, state: &mut State) -> Result<(), Error> {
+        #[cfg(feature = "spill")]
+        self.seal(context.env(), state)?;
         Ok(())
+    }
+
+    #[cfg(feature = "spill")]
+    fn spill(&self, env: &crate::env::Env, state: &mut State) -> Result<bool, Error> {
+        self.spill_groups(env, state)
     }
 
     fn serve(
@@ -420,6 +446,11 @@ impl Breaker for HashAggregate {
         state: &mut State,
         output: &mut RowBatch,
     ) -> Result<bool, Error> {
+        // Once its groups are output, the next partition's, if it spilled.
+        #[cfg(feature = "spill")]
+        while state.emitted == self.group_count(state) && state.spilled.is_pending() {
+            self.merge_next(context, state)?;
+        }
         let groups = self.group_count(state);
         // Output up to a full batch of groups.
         let first = state.emitted;
@@ -465,7 +496,10 @@ impl Breaker for HashAggregate {
             let Ok(()) = output.push_column(column) else { failed!() };
         }
         state.emitted += count;
-        Ok(state.emitted < groups)
+        let more = state.emitted < groups;
+        #[cfg(feature = "spill")]
+        let more = more || state.spilled.is_pending();
+        Ok(more)
     }
 }
 
@@ -603,11 +637,20 @@ mod tests {
         rows: S,
         spec: HashAggregateSpec,
     ) -> Result<Vec<Vec<Option<i64>>>, Error> {
+        run_in(Env::current(), rows, spec)
+    }
+
+    /// As `run`, in `run_env`.
+    fn run_in<S: Source + 'static>(
+        run_env: &Env,
+        rows: S,
+        spec: HashAggregateSpec,
+    ) -> Result<Vec<Vec<Option<i64>>>, Error> {
         let env = Env::current();
         let input =
             Pipeline::new(DynSource::new(env, rows).unwrap(), SmallVec::new(env, 1).unwrap());
         let (sinks, pipeline) = after_breaker(input, hash_aggregate(spec), []);
-        let mut execution = pipeline.start_with_sinks(env, None, &sinks, None)?;
+        let mut execution = pipeline.start_with_sinks(run_env, None, &sinks, None)?;
         let mut batch = RowBatch::new();
         let mut out = Vec::new();
         while execution.next(&mut batch)? {
@@ -975,6 +1018,67 @@ mod tests {
                 dropped: Vec::new(),
             };
             assert_eq!(run(rows, spec(keys)), Err(Error::Overflow));
+        }
+    }
+
+    /// 32 batches of rows of 30,000 keys, some null, most in two batches, and
+    /// values, some null.
+    #[cfg(feature = "spill")]
+    fn many_groups() -> Rows {
+        let row = |row: i64| {
+            let key = row * 7919 % 30_000;
+            ((key % 97 != 0).then_some(key), (row % 13 != 0).then_some(row - 9000))
+        };
+        let batches = (0..32).map(|b| (0..2048).map(|i| row(b * 2048 + i)).collect()).collect();
+        Rows { batches, dropped: Vec::from([3]) }
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn spills_its_groups_and_merges_them_within_a_budget() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+        use crate::spill::tests::Strict;
+
+        let unlimited = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let expected = run_in(&unlimited, many_groups(), spec(&[0])).unwrap();
+        let peak = unlimited.peak();
+        drop(unlimited);
+        assert_eq!(expected.len(), 30_000 - 310 + 1);
+        // Below an eighth, a batch's new groups wouldn't fit.
+        for divisor in [2, 4, 8] {
+            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+            let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
+            env.spill_to(store);
+            let got = run_in(&env, many_groups(), spec(&[0]));
+            let got = got.unwrap_or_else(|e| panic!("{e:?} at 1/{divisor} of {peak}"));
+            assert!(got == expected, "differs at a budget of 1/{divisor}");
+            assert!(env.peak() <= peak / divisor);
+            let (made, left) = store.logs();
+            assert!(made > 0 && left == 0, "{made} logs made, {left} left at 1/{divisor}");
+        }
+    }
+
+    #[cfg(feature = "spill")]
+    #[test]
+    fn spills_groups_of_string_keys() {
+        use crate::allocator::Heap;
+        use crate::env::Memory;
+        use crate::spill::tests::Strict;
+
+        let spec = || HashAggregateSpec { string_keys: 1, ..spec(&[0]) };
+        let unlimited = Env::new(Memory::new(Heap, usize::MAX)).unwrap();
+        let expected = run_in(&unlimited, StringKeys(many_groups(), Vec::new()), spec()).unwrap();
+        let peak = unlimited.peak();
+        drop(unlimited);
+        for divisor in [2, 4, 8] {
+            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
+            let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
+            env.spill_to(store);
+            let got = run_in(&env, StringKeys(many_groups(), Vec::new()), spec()).unwrap();
+            assert!(got == expected, "differs at a budget of 1/{divisor}");
+            let (made, left) = store.logs();
+            assert!(made > 0 && left == 0, "{made} logs made, {left} left at 1/{divisor}");
         }
     }
 }
