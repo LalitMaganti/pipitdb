@@ -390,6 +390,15 @@ impl<T> SmallVec<T> {
         Ok(())
     }
 
+    /// Grows so `additional` more values fit without growing again. Fails if
+    /// that would take it past `max` or it can't grow.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), AllocError> {
+        if additional > self.capacity() - self.raw.len() {
+            self.raw.make_room(size_of::<T>(), additional)?;
+        }
+        Ok(())
+    }
+
     /// Adds copies of `values` at the end, in one go, growing if there isn't
     /// room. Fails, adding none, if that would take it past `max` or it
     /// can't grow.

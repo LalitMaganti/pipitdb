@@ -5,7 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::column::{ColumnView, DataType};
-use crate::containers::{Array, BitSlice, SmallVec};
+use crate::containers::{BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
 use crate::error::Error;
@@ -13,7 +13,7 @@ use crate::radix_sort::msd_radix_sort;
 use crate::row_batch::{BATCH_ROWS_MAX, RowBatch};
 use crate::row_blocks::RowBlocks;
 use crate::row_layout::{self, RowLayout, Word};
-use crate::row_layout_sort::{SlotInWords, Sorted, sort_row_layout};
+use crate::row_layout_sort::{SlotInWords, SortScratch, Sorted, sort_row_layout};
 use crate::row_store::RowStore;
 use crate::selection::Kept;
 
@@ -61,6 +61,8 @@ pub struct SortedRows {
     order_len: u32,
     /// How many rows of the order `serve` has output.
     served: u32,
+    /// What sorting the rows takes.
+    scratch: SortScratch,
 }
 
 impl SortedRows {
@@ -74,7 +76,15 @@ impl SortedRows {
             order: Sorted::Held { reverse: false, count: 0 },
             order_len: 0,
             served: 0,
+            scratch: SortScratch::new(env),
         })
+    }
+
+    /// Makes room to sort `count` more rows than it holds, once the first
+    /// batch's keys are checked, so sorting them allocates nothing.
+    pub(crate) fn reserve(&mut self, env: &Env, count: u32) -> Result<(), AllocError> {
+        let stride = self.layout().stride() as usize;
+        self.scratch.reserve(env, stride, self.rows.len() as usize + count as usize)
     }
 
     pub(crate) fn len(&self) -> u32 {
@@ -198,7 +208,7 @@ impl SortedRows {
     }
 
     /// The string of the held row `row` in column `column`, a string column,
-    /// if not null. Rows must be flushed first.
+    /// if not null.
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
         self.rows.string(column, row)
     }
@@ -219,15 +229,32 @@ impl SortedRows {
     /// the keys. Nulls sort as in SQLite: first ascending, last descending.
     /// Strings sort by their bytes.
     pub(crate) fn sort(&mut self, context: &mut Context) -> Result<(), Error> {
-        let env = context.env();
-        self.order = Sorted::Held { reverse: false, count: self.rows.len() };
-        self.order_len = self.rows.len();
-        let (Some(layout), Some(keys)) = (&self.layout, &mut self.keys) else { return Ok(()) };
-        self.rows.flush(context)?;
+        if self.layout.is_some() {
+            self.reserve(context.env(), 0)?;
+        }
+        self.sort_rows(context.env(), self.rows.len(), false);
+        Ok(())
+    }
+
+    /// As `sort`, of the first `count` rows, which room was made for, and
+    /// keeping their keys, allocating nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn sort_held(&mut self, env: &Env, count: u32) {
+        if let Some(keys) = &mut self.keys {
+            keys.truncate(count);
+        }
+        self.sort_rows(env, count, true);
+    }
+
+    fn sort_rows(&mut self, env: &Env, count: u32, keep: bool) {
+        self.order = Sorted::Held { reverse: false, count };
+        self.order_len = count;
+        let (Some(layout), Some(keys)) = (&self.layout, &mut self.keys) else { return };
         let stride = layout.stride() as usize;
         for (k, column) in self.columns.iter().enumerate() {
             let Some(column) = column.string() else { continue };
-            let ranks = rank_strings(env, &self.rows, column)?;
+            rank_strings(&mut self.scratch, &self.rows, column, count);
+            let ranks = self.scratch.ranks(count as usize);
             keys.for_each_block_mut(|first, bytes| {
                 let get =
                     |i: u32| Some(*at!(ranks, (first + i) as usize)).filter(|&r| r != NULL_RANK);
@@ -236,11 +263,45 @@ impl SortedRows {
                 RowLayout::write(layout.slot(k), count, get, bytes);
             });
         }
-        self.order = sort_row_layout(env, keys)?;
-        if self.decoded == 0 {
+        self.order = sort_row_layout(env, &mut self.scratch, keys, keep);
+        if self.decoded == 0 && !keep {
             keys.free();
         }
-        Ok(())
+    }
+
+    /// The row `i`th in order, once sorted.
+    #[cfg(feature = "spill")]
+    pub(crate) fn row_in_order(&self, i: u32) -> u32 {
+        self.order.row(&self.scratch, i)
+    }
+
+    /// How many columns its rows have.
+    #[cfg(feature = "spill")]
+    pub(crate) fn width(&self) -> u32 {
+        self.rows.width()
+    }
+
+    /// Column `column`'s type, and whether a row held may be null in it.
+    #[cfg(feature = "spill")]
+    pub(crate) fn column_type(&self, column: u32) -> (DataType, bool) {
+        if self.decoded >> column.min(63) & 1 != 0 {
+            return (at!(self.columns, first_key(&self.columns, column)).data_type, true);
+        }
+        self.rows.column_type(column)
+    }
+
+    /// The value of the held row `row` in column `column`, whose type has
+    /// no bytes, an integer or a float's bits, if not null. Its keys must
+    /// be held.
+    #[cfg(feature = "spill")]
+    pub(crate) fn value(&self, column: u32, row: u32) -> Option<i64> {
+        if self.decoded >> column.min(63) & 1 == 0 {
+            return self.rows.value(column, row);
+        }
+        let (k, keys) = (first_key(&self.columns, column), self.keys.as_ref());
+        let (Some(layout), Some(keys)) = (&self.layout, keys) else { failed!() };
+        let float = at!(self.columns, k).data_type == DataType::Float64;
+        row_layout::decode(layout.slot(k), keys.get(row), float)
     }
 
     /// Copies up to a batch's worth of rows into `out`, from position `at` in
@@ -266,10 +327,11 @@ impl SortedRows {
         let start = at.min(end);
         let mut rows = [0; BATCH_ROWS_MAX as usize];
         for (row, i) in rows.iter_mut().zip(start..end) {
-            *row = self.order.row(i);
+            *row = self.order.row(&self.scratch, i);
         }
         let rows = at!(rows, ..(end - start) as usize);
-        let (order, keys, columns) = (&self.order, &self.keys, &self.columns);
+        let (order, keys, columns, scratch) =
+            (self.order, &self.keys, &self.columns, &self.scratch);
         let mut nullable = 0_u64;
         for column in bits(self.decoded) {
             nullable |= u64::from(self.rows.has_nulls(column)) << column;
@@ -279,7 +341,7 @@ impl SortedRows {
             let Some(layout) = &self.layout else { failed!() };
             let (slot, data_type) = (layout.slot(k), at!(columns, k).data_type);
             let float = data_type == DataType::Float64;
-            let in_words = order.slot_in_words(slot, float);
+            let in_words = order.slot_in_words(scratch, slot, float);
             let range = start as usize..end as usize;
             let mut values = context.values_buffer(rows.len() * 8)?;
             if let Some((words, in_words)) = &in_words
@@ -323,10 +385,11 @@ impl SortedRows {
     /// sorted, so gathering them only views them. Rows still in the order
     /// they're held are viewed where they are anyway.
     pub(crate) fn scatter(&mut self, context: &mut Context) -> Result<(), Error> {
-        let Sorted::Words { words, packing, varying, fixed } = &mut self.order else {
+        let Sorted::Words { packing, in_words } = self.order else {
             return Ok(());
         };
-        let packing = *packing;
+        let (words, varying, fixed) = self.scratch.parts_mut();
+        let fixed = in_words.then_some(fixed);
         let words = at_mut!(words, ..self.order_len as usize);
         // Decoded columns are decoded from the words before scatter uses
         // their bits, if their keys are only there, or else from the keys,
@@ -338,8 +401,7 @@ impl SortedRows {
                 let k = first_key(&self.columns, column);
                 let (slot, float) =
                     (layout.slot(k), at!(self.columns, k).data_type == DataType::Float64);
-                let in_words =
-                    fixed.as_ref().map(|f| SlotInWords::new(packing, varying, f, slot, float));
+                let in_words = fixed.map(|f| SlotInWords::new(packing, varying, f, slot, float));
                 slots.push((column, slot, float, in_words))?;
             }
             let keys = &mut self.keys;
@@ -391,16 +453,17 @@ fn first_key(columns: &[KeyColumn], column: u32) -> usize {
 /// A null row's rank.
 const NULL_RANK: u32 = u32::MAX;
 
-/// Each held row's rank among the strings of `column`, a string column, of
-/// the rows held: equal strings rank equally. Null rows rank `NULL_RANK`.
-fn rank_strings(env: &Env, rows: &RowStore, column: u32) -> Result<Array<u32>, Error> {
+/// Ranks each of the first `count` rows held among the strings of
+/// `column`, a string column, of those rows, into `scratch.ranks`: equal
+/// strings rank equally. Null rows rank `NULL_RANK`.
+fn rank_strings(scratch: &mut SortScratch, rows: &RowStore, column: u32, count: u32) {
     let string = |row: &u32| rows.string(column, *row);
-    #[expect(clippy::cast_possible_truncation, reason = "a row held")]
-    let mut order = Array::from_fn(env, rows.len() as usize, |row| row as u32)?;
-    let mut scratch = Array::<u32>::zeroed(env, rows.len() as usize)?;
-    msd_radix_sort(env, &mut order, &mut scratch, |row| string(row).unwrap_or_default())?;
+    let (order, ranks, stack) = scratch.for_ranks(count as usize);
+    for (row, at) in (0..).zip(order.iter_mut()) {
+        *at = row;
+    }
+    msd_radix_sort(order, ranks, stack, |row| string(row).unwrap_or_default());
     // The sort is done with its scratch, so the ranks go there.
-    let mut ranks = scratch;
     let (mut rank, mut last) = (0, None);
     for row in order.iter() {
         let string = string(row);
@@ -409,7 +472,6 @@ fn rank_strings(env: &Env, rows: &RowStore, column: u32) -> Result<Array<u32>, E
         last = Some(value);
         *at_mut!(ranks, *row as usize) = if string.is_some() { rank } else { NULL_RANK };
     }
-    Ok(ranks)
 }
 
 /// Lays out at `rows` the keys of the rows `batch` keeps, by `layout`, from

@@ -1,8 +1,10 @@
 //! Sorting rows' words in place, most significant digit first, partitioning
 //! whole blocks at a time, and sorting strings by their bytes.
 
+#![allow(unsafe_code)]
+
 use crate::allocator::AllocError;
-use crate::containers::{Array, SmallVec};
+use crate::containers::Array;
 use crate::env::Env;
 
 /// How many bits one partition splits on.
@@ -33,7 +35,18 @@ impl Scratch {
     pub(crate) fn new(env: &Env, count: usize) -> Result<Scratch, AllocError> {
         let len =
             if count <= SMALL { count } else { BUCKETS * 2 * BLOCK + BLOCK + count / BLOCK + 2 };
-        Ok(Scratch(Array::zeroed(env, len)?))
+        // SAFETY: sorting writes each word it reads first.
+        Ok(Scratch(unsafe { Array::uninit(env, len)? }))
+    }
+
+    /// For sorting nothing, which allocates nothing.
+    pub(crate) fn empty(env: &Env) -> Scratch {
+        Scratch(Array::empty(env))
+    }
+
+    /// Its words, which `msd_radix_sort` keeps its buckets in.
+    pub(crate) fn words(&mut self) -> &mut [u64] {
+        &mut self.0
     }
 }
 
@@ -215,25 +228,64 @@ struct Bucket {
     depth: usize,
 }
 
+/// Buckets to sort, two words each, in words given.
+struct Stack<'s> {
+    words: &'s mut [u64],
+    len: usize,
+}
+
+impl Stack<'_> {
+    /// Pushes `bucket`, returning whether there was room.
+    fn push(&mut self, bucket: Bucket) -> bool {
+        if self.len + 2 > self.words.len() {
+            return false;
+        }
+        let range = (bucket.start as u64) << 32 | bucket.end as u64;
+        *at_mut!(self.words, self.len) = range;
+        *at_mut!(self.words, self.len + 1) = bucket.depth as u64;
+        self.len += 2;
+        true
+    }
+
+    #[expect(clippy::cast_possible_truncation, reason = "as pushed")]
+    fn pop(&mut self) -> Option<Bucket> {
+        self.len = self.len.checked_sub(2)?;
+        let (range, depth) = (*at!(self.words, self.len), *at!(self.words, self.len + 1));
+        Some(Bucket {
+            start: (range >> 32) as usize,
+            end: range as u32 as usize,
+            depth: depth as usize,
+        })
+    }
+}
+
 /// Sorts `elements` by `key`, a string of bytes, with a most significant
 /// digit first radix sort, as Perfetto's `MsdRadixSort` does: the elements
 /// are split into buckets by their key's byte at a depth, each then by the
-/// next, from a stack rather than by recursion. Equal keys end up in any
-/// order. `scratch` must be at least as long.
+/// next, from a stack in `stack` rather than by recursion. A bucket the
+/// stack has no room for is sorted by comparison. Equal keys end up in any
+/// order. `scratch` must be at least as long as `elements`, which must be
+/// fewer than 2^32.
 pub(crate) fn msd_radix_sort<'k, T: Copy>(
-    env: &Env,
     elements: &mut [T],
     scratch: &mut [T],
+    stack: &mut [u64],
     key: impl Fn(&T) -> &'k [u8],
-) -> Result<(), AllocError> {
+) {
     if elements.len() <= 1 {
-        return Ok(());
+        return;
     }
     let suffix = |element: &T, depth: usize| key(element).get(depth..).unwrap_or_default();
     // The byte of `key` at `depth`, plus one, or 0 for keys that short.
     let digit = |e: &T, depth| suffix(e, depth).first().map_or(0, |&b| usize::from(b) + 1);
-    let mut stack = SmallVec::new(env, 1 << 24)?;
-    stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
+    let compare = |items: &mut [T], depth: usize| {
+        items.sort_unstable_by(|a, b| suffix(a, depth).cmp(suffix(b, depth)));
+    };
+    let mut stack = Stack { words: stack, len: 0 };
+    if !stack.push(Bucket { start: 0, end: elements.len(), depth: 0 }) {
+        compare(elements, 0);
+        return;
+    }
     while let Some(bucket) = stack.pop() {
         let (depth, items) = (bucket.depth, at_mut!(elements, bucket.start..bucket.end));
         if items.len() <= MSD_INSERTION_SORT {
@@ -265,12 +317,12 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
         // end at this depth are all equal: only longer ones go on.
         for d in (0..256).rev() {
             let (start, end) = (bucket.start + *at!(counts, d), bucket.start + *at!(counts, d + 1));
-            if end - start > 1 {
-                stack.push(Bucket { start, end, depth: depth + 1 })?;
+            let next = Bucket { start, end, depth: depth + 1 };
+            if end - start > 1 && !stack.push(next) {
+                compare(at_mut!(elements, start..end), depth + 1);
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -306,7 +358,6 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn sorts_strings_by_their_bytes() {
-        let env = Env::current();
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let strings: Vec<Vec<u8>> = (0..2000)
             .map(|_| {
@@ -318,12 +369,18 @@ mod tests {
                 (0..len).map(|i| b"ab\xffz"[((seed >> (8 * i)) % 4) as usize]).collect()
             })
             .collect();
-        let mut order: Vec<u32> = (0..2000).collect();
-        let mut scratch = order.clone();
-        msd_radix_sort(env, &mut order, &mut scratch, |&i| strings[i as usize].as_slice()).unwrap();
-        let sorted: Vec<&Vec<u8>> = order.iter().map(|&i| &strings[i as usize]).collect();
         let mut expected: Vec<&Vec<u8>> = strings.iter().collect();
         expected.sort();
-        assert_eq!(sorted, expected);
+        // With room for every bucket, and for only a few.
+        for stack in [2000, 8] {
+            let mut order: Vec<u32> = (0..2000).collect();
+            let mut scratch = order.clone();
+            let mut stack = alloc::vec![0; stack];
+            msd_radix_sort(&mut order, &mut scratch, &mut stack, |&i| {
+                strings[i as usize].as_slice()
+            });
+            let sorted: Vec<&Vec<u8>> = order.iter().map(|&i| &strings[i as usize]).collect();
+            assert_eq!(sorted, expected);
+        }
     }
 }

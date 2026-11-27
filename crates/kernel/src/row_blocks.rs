@@ -90,6 +90,13 @@ impl RowBlocks {
         Ok(())
     }
 
+    /// Keeps the first `len` rows, forgetting the rest.
+    #[cfg(feature = "spill")]
+    pub(crate) fn truncate(&mut self, len: u32) {
+        check!(len <= self.len);
+        self.len = len;
+    }
+
     /// Calls `write` with the rows of each block, and its first row's
     /// number.
     pub(crate) fn for_each_block_mut(&mut self, mut write: impl FnMut(u32, &mut [u8])) {
