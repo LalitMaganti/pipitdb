@@ -159,6 +159,21 @@ impl<'a> Sinks<'a> {
         Ok(SinkId { index, list: self.list, sink: PhantomData })
     }
 
+    /// Ends `pipeline` in a breaker, as `sink`, whose `serve` is `serve`,
+    /// and returns the source that serves what it builds: the first of the
+    /// pipeline after it. Not generic, so each breaker type adds only what
+    /// makes its sink.
+    pub(crate) fn add_breaker(
+        &mut self,
+        env: &Env,
+        pipeline: Pipeline<'a>,
+        sink: DynSink<'a>,
+        serve: Serve,
+    ) -> Result<DynSource<'a>, AllocError> {
+        let index = self.add_dyn(SinkPipeline { pipeline, sink })?;
+        DynSource::new(env, Served { index, list: self.list, serve })
+    }
+
     /// As `add`, of any type, returning where it is.
     fn add_dyn(&mut self, pipeline: SinkPipeline<'a>) -> Result<u32, AllocError> {
         #[expect(clippy::cast_possible_truncation, reason = "at most `PLAN_NODES_MAX`")]
@@ -195,23 +210,13 @@ impl<T> Clone for SinkId<T> {
 
 impl<T> Copy for SinkId<T> {}
 
-/// The source that serves what `breaker` builds: the first of the pipeline
-/// after it.
-pub fn served<'a, B: Breaker + 'a>(
-    env: &Env,
-    breaker: SinkId<B>,
-) -> Result<DynSource<'a>, AllocError> {
-    let (index, list) = (breaker.index, breaker.list);
-    DynSource::new(env, Served { index, list, serve: serve::<B> })
-}
-
 /// Serves the next rows of what breaker `B`, at `breaker`, built, at
 /// `state`, as `Breaker::serve`.
 ///
 /// # Safety
 ///
 /// `breaker` must be a `B`, and `state` its state, finalized.
-unsafe fn serve<B: Breaker>(
+pub(crate) unsafe fn serve<B: Breaker>(
     breaker: NonNull<()>,
     context: &mut Context,
     state: NonNull<u8>,
@@ -252,7 +257,7 @@ struct Served {
 }
 
 /// A breaker's `serve`, given it and its state.
-type Serve =
+pub(crate) type Serve =
     unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &mut RowBatch) -> Result<bool, Error>;
 
 impl Source for Served {
@@ -823,9 +828,10 @@ pub(crate) mod tests {
     ) -> (Sinks<'a>, Pipeline<'a>) {
         let env = Env::current();
         let mut sinks = Sinks::new(env).unwrap();
-        let breaker = sinks.add(env, input, breaker).unwrap();
+        let sink = DynSink::new(env, breaker).unwrap();
+        let served = sinks.add_breaker(env, input, sink, serve::<B>).unwrap();
         let steps = SmallVec::fixed_from(env, after.into_iter()).unwrap();
-        (sinks, Pipeline::new(served(env, breaker).unwrap(), steps))
+        (sinks, Pipeline::new(served, steps))
     }
 
     fn int64s(values: &[i64]) -> ColumnView {
