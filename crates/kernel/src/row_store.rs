@@ -268,6 +268,14 @@ impl RowStore {
         for packing in self.packing.iter() {
             let Ok(()) = batch.push_column(packing.take(context)?) else { failed!() };
         }
+        if self.batches as usize == BATCHES_MAX {
+            return Err(Error::OutOfMemory);
+        }
+        // So `hold` can't fail once the packed rows are let go.
+        self.held.reserve(batch.column_count() as usize)?;
+        if !self.holds_whole(&batch) {
+            self.places.reserve(rows as usize)?;
+        }
         while self.packing.pop().is_some() {}
         core::mem::swap(&mut self.packing, &mut self.spare);
         self.packed -= rows;
