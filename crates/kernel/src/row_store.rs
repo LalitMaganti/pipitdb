@@ -16,9 +16,11 @@ use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::ptr;
 
-/// The bits of a row's place that say which row of its batch it is.
-const ROW_BITS: u32 = 11;
-const _: () = assert!(BATCH_ROWS_MAX <= 1 << ROW_BITS);
+/// The bits of a row's place that say which row of its batch it is. A
+/// dense row's place is its index, so a full batch must be `1 << ROW_BITS`
+/// rows.
+const ROW_BITS: u32 = BATCH_ROWS_MAX.trailing_zeros();
+const _: () = assert!(BATCH_ROWS_MAX.is_power_of_two());
 
 /// Keeps the bits of a row's place that say which row of its batch it is.
 const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
