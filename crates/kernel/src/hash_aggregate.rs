@@ -371,7 +371,6 @@ impl Breaker for HashAggregate {
 
 #[cfg(test)]
 mod tests {
-    use crate::containers::BitSlice;
     use crate::pipeline::tests::after_breaker;
     use alloc::format;
     use alloc::string::String;
@@ -426,23 +425,9 @@ mod tests {
 
     /// A string column of `values`, null where `None`.
     fn strings(values: &[Option<String>]) -> ColumnView {
-        let env = Env::current();
-        let mut views = Buffer::allocate(env, values.len() * 8).unwrap();
-        let mut bits = Buffer::allocate(env, BitSlice::<u8>::words_for(values.len())).unwrap();
-        let mut bytes = Vec::new();
-        for (i, value) in values.iter().enumerate() {
-            let value = value.as_deref().unwrap_or_default();
-            let view = [u32::try_from(bytes.len()).unwrap(), u32::try_from(value.len()).unwrap()];
-            views.as_mut_slice::<u32>()[2 * i..2 * i + 2].copy_from_slice(&view);
-            bytes.extend_from_slice(value.as_bytes());
-        }
-        for (i, value) in values.iter().enumerate() {
-            BitSlice::of_mut(bits.as_mut_slice::<u8>()).set_if(i, value.is_some());
-        }
-        let mut stored = Buffer::allocate(env, bytes.len()).unwrap();
-        stored.as_mut_slice::<u8>().copy_from_slice(&bytes);
-        let validity = values.iter().any(Option::is_none).then_some(bits);
-        ColumnView::strings(&mut Context::new(env, None), views, stored, validity).unwrap()
+        let context = &mut Context::new(Env::current(), None);
+        let value = |i: usize| values[i].as_deref().map(str::as_bytes);
+        ColumnView::from_strings(context, values.len(), value).unwrap()
     }
 
     /// `Rows`, with its key `k` as a string column, of each key's digits:

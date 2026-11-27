@@ -61,23 +61,33 @@ impl Function for Replace {
         let rows = text.row_count() as usize;
         let validity = validity_of(context, arguments)?;
         let strings = text.string_values();
-        let mut views = context.values_buffer(rows * 8)?;
+        let mut words = context.values_buffer(rows * 8)?;
+        // An empty string first, which every null and empty string is.
         let mut out = SmallVec::new(context.env(), 1 << 31)?;
-        for (row, view) in views.as_mut_slice::<u32>().as_chunks_mut::<2>().0.iter_mut().enumerate()
-        {
-            let start = out.len();
-            // A null's view may not be of its bytes.
+        out.extend_from_slice(&[0; 4])?;
+        for (row, word) in words.as_mut_slice::<u64>().iter_mut().enumerate() {
+            *word = 0;
             #[expect(clippy::cast_possible_truncation, reason = "a batch's rows")]
-            if !text.is_null(row as u32) {
-                self.replace(strings.get(row), &mut out)?;
+            if text.is_null(row as u32) {
+                continue;
+            }
+            // Its length is written once it's known.
+            let start = out.len();
+            out.extend_from_slice(&[0; 4])?;
+            self.replace(strings.get(row), &mut out)?;
+            let len = out.len() - start - 4;
+            if len == 0 {
+                out.truncate(start);
+                continue;
             }
             #[expect(clippy::cast_possible_truncation, reason = "at most `1 << 31` bytes")]
-            let view_of = [start as u32, (out.len() - start) as u32];
-            *view = view_of;
+            pipit_kernel::at_mut!(out, start..start + 4)
+                .copy_from_slice(&(len as u32).to_le_bytes());
+            *word = start as u64;
         }
         let mut bytes = context.bytes_buffer(out.len())?;
         bytes.as_mut_slice::<u8>().copy_from_slice(&out);
-        Ok(ColumnView::strings(context, views, bytes, validity)?)
+        Ok(ColumnView::strings(context, words, bytes, validity)?)
     }
 }
 
@@ -189,7 +199,6 @@ mod engine {
 
 #[cfg(test)]
 mod tests {
-    use pipit_kernel::buffer::Buffer;
     use pipit_kernel::env::Env;
     use pipit_kernel::scannable::{Catalog, DynScannable};
     use pipit_kernel::selection::Kept;
@@ -215,16 +224,8 @@ mod tests {
     }
 
     fn catalog() -> Tables {
-        let text = ROWS.concat();
-        let mut views = Buffer::allocate(Env::current(), ROWS.len() * 8).unwrap();
-        let mut start = 0;
-        for (view, row) in views.as_mut_slice::<u32>().chunks_mut(2).zip(ROWS) {
-            view.copy_from_slice(&[start, u32::try_from(row.len()).unwrap()]);
-            start += u32::try_from(row.len()).unwrap();
-        }
-        let mut bytes = Buffer::allocate(Env::current(), text.len()).unwrap();
-        bytes.as_mut_slice::<u8>().copy_from_slice(text.as_bytes());
-        let s = ColumnView::strings(&mut Context::new(Env::current(), None), views, bytes, None)
+        let context = &mut Context::new(Env::current(), None);
+        let s = ColumnView::from_strings(context, ROWS.len(), |row| Some(ROWS[row].as_bytes()))
             .unwrap();
         let table = Table::new(Env::current(), &[("s", DataType::String)], &[&[s]]).unwrap();
         Tables(DynScannable::new(Env::current(), table).unwrap())
