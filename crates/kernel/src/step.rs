@@ -180,6 +180,10 @@ pub trait Sink {
 
     fn new_local(&self, context: &mut Context) -> Result<Self::Local, Error>;
 
+    /// A sink that can spill prepares the batch first: it allocates all it
+    /// needs, changing nothing that applying the batch wouldn't. Then it
+    /// applies it, changing its state, allocating nothing. Failing for want
+    /// of memory then leaves it as it was.
     fn consume(
         &self,
         context: &mut Context,

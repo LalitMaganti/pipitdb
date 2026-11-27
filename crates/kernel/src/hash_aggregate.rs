@@ -54,6 +54,10 @@ pub struct State {
     emitted: usize,
     /// The strings string `MIN` and `MAX` keep, made with the first.
     extremes: Option<StringPool>,
+    /// For each aggregate, its input for the batch being consumed.
+    loaders: SmallVec<AggregateInputLoader>,
+    /// For each aggregate, what preparing the batch being consumed found.
+    prepared: SmallVec<Option<Prepared>>,
 }
 
 impl HashAggregate {
@@ -101,6 +105,134 @@ impl HashAggregate {
             self.spec.aggregates.iter().filter(|call| call.function != Function::CountStar);
         self.spec.key_columns.iter().copied().chain(inputs.map(|call| call.column))
     }
+}
+
+impl HashAggregate {
+    /// Finds the group of each of the `rows` rows of `input`, adding groups
+    /// for keys new to it, and everything each aggregate needs to add them to
+    /// their states, allocating all it needs: each aggregate's input, seen
+    /// bytes, distinct values and best strings. Changes no group's state.
+    /// Returns each row's group, unless there are no keys.
+    fn prepare(
+        &self,
+        context: &mut Context,
+        state: &mut State,
+        input: &Flat,
+        rows: usize,
+    ) -> Result<Option<Buffer>, Error> {
+        // Groups are numbered in the order first seen, so a row starts a new
+        // group when its number equals the group count. With no keys, every
+        // row is in the one group.
+        state.consumed = true;
+        let mut numbers = None;
+        if !self.spec.key_columns.is_empty() {
+            let mut keys = [input.column(0); KEYS_MAX];
+            for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
+                *key = input.column(column);
+            }
+            let keys = at!(keys, ..self.spec.key_columns.len());
+            let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
+            state.groups.find_or_create(context, keys, input.select(), groups)?;
+        }
+        let group_count = self.group_count(state);
+        let groups_of = numbers.as_ref().map(Buffer::as_slice::<u32>);
+        let State { groups, total, seen, distinct, extremes, loaders, prepared, .. } = state;
+        let total = [total.as_mut_ptr()];
+        let base = self.state_base(groups, &total);
+        let mut offset = 0;
+        for (a, call) in self.spec.aggregates.iter().enumerate() {
+            let column = input.column(call.column);
+            if let Some(extreme) = string_extreme(*call) {
+                let states = Self::states(base, offset, None);
+                offset += StringExtreme::STATE_WORDS;
+                let pool = StringPool::made(extremes, context.env())?;
+                let select = input.select();
+                let (found, count) =
+                    extreme.prepare((context, pool), column, select, rows, groups_of, states)?;
+                *at_mut!(prepared, a) = Some(Prepared::Strings(found, count));
+                continue;
+            }
+            let function = make_aggregate_function(call.function, call.input_type);
+            offset += function.state_words();
+            let loader = at_mut!(loaders, a);
+            if function.reads_input() {
+                loader.prepare(context, column, input.select(), rows)?;
+            }
+            if function.tracks_seen() {
+                at_mut!(seen, a).get(context.env(), group_count, loader.has_nulls())?;
+            }
+            if let Some(set) = at_mut!(distinct, a) {
+                let values = if function.reads_input() {
+                    loader.input(column, rows)
+                } else {
+                    AggregateInput { values: &[], valid: None, rows }
+                };
+                let (values, firsts, kept) = first_values(context, set, &values, groups_of)?;
+                *at_mut!(prepared, a) = Some(Prepared::Distinct(values, firsts, kept));
+            }
+        }
+        Ok(numbers)
+    }
+
+    /// Adds the `rows` rows of `input` to their groups, `numbers`, if there
+    /// are keys, by what `prepare` found, allocating nothing.
+    fn apply(
+        &self,
+        state: &mut State,
+        input: &Flat,
+        rows: usize,
+        numbers: Option<&[u32]>,
+    ) -> Result<(), Error> {
+        let State { groups, total, seen, loaders, prepared, .. } = state;
+        let total = [total.as_mut_ptr()];
+        let base = self.state_base(groups, &total);
+        let mut overflow = false;
+        let mut offset = 0;
+        for (a, call) in self.spec.aggregates.iter().enumerate() {
+            if string_extreme(*call).is_some() {
+                let states = Self::states(base, offset, None);
+                offset += StringExtreme::STATE_WORDS;
+                let Some(Prepared::Strings(found, count)) = at!(prepared, a) else { failed!() };
+                StringExtreme::apply(found, *count, states);
+                continue;
+            }
+            let function = make_aggregate_function(call.function, call.input_type);
+            let seen = if function.tracks_seen() { at!(seen, a).tracked() } else { None };
+            let states = Self::states(base, offset, seen);
+            offset += function.state_words();
+            let input = if let Some(Prepared::Distinct(values, firsts, kept)) = at!(prepared, a) {
+                // Only the rows with values their group hasn't had, as if the
+                // batch were only those.
+                let kept = *kept;
+                let values = at!(values.as_slice::<i64>(), ..kept);
+                let values = AggregateInput { values, valid: None, rows: kept };
+                let firsts = at!(firsts.as_slice::<u32>(), ..kept);
+                match numbers {
+                    Some(_) => function.update(&values, firsts, states, &mut overflow),
+                    None => function.update_group(&values, 0, states, &mut overflow),
+                }
+                continue;
+            } else if function.reads_input() {
+                at!(loaders, a).input(input.column(call.column), rows)
+            } else {
+                AggregateInput { values: &[], valid: None, rows }
+            };
+            match numbers {
+                Some(numbers) => function.update(&input, numbers, states, &mut overflow),
+                None => function.update_group(&input, 0, states, &mut overflow),
+            }
+        }
+        if overflow { Err(Error::Overflow) } else { Ok(()) }
+    }
+}
+
+/// What preparing an aggregate for a batch found, for applying it.
+enum Prepared {
+    /// A `StringExtreme`'s best strings, and how many.
+    Strings(Buffer, usize),
+    /// A `DISTINCT` aggregate's values new to their groups, their groups, and
+    /// how many.
+    Distinct(Buffer, Buffer, usize),
 }
 
 /// The function that computes `call`, if it's `MIN` or `MAX` of strings.
@@ -237,7 +369,21 @@ impl Breaker for HashAggregate {
             let set = if call.distinct { Some(FlatHashMap::for_len(env, 0)?) } else { None };
             distinct.push(set)?;
         }
-        Ok(State { groups, total, consumed: false, seen, distinct, emitted: 0, extremes: None })
+        let aggregates = self.spec.aggregates.len();
+        let loaders =
+            SmallVec::fixed_from(env, (0..aggregates).map(|_| AggregateInputLoader::new()))?;
+        let prepared = SmallVec::fixed_from(env, (0..aggregates).map(|_| None))?;
+        Ok(State {
+            groups,
+            total,
+            consumed: false,
+            seen,
+            distinct,
+            emitted: 0,
+            extremes: None,
+            loaders,
+            prepared,
+        })
     }
 
     fn consume(
@@ -251,69 +397,16 @@ impl Breaker for HashAggregate {
             return Ok(());
         }
         let input = Flat::new(context, input, self.read())?;
-        // Find each row's group. Groups are numbered in the order first seen,
-        // so a row starts a new group when its number equals the group count.
-        // With no keys, every row is in the one group.
-        state.consumed = true;
-        let mut numbers = None;
-        if !self.spec.key_columns.is_empty() {
-            let mut keys = [input.column(0); KEYS_MAX];
-            for (key, &column) in keys.iter_mut().zip(self.spec.key_columns.iter()) {
-                *key = input.column(column);
-            }
-            let keys = at!(keys, ..self.spec.key_columns.len());
-            let groups = numbers.insert(context.indices_buffer(rows * 4)?).as_mut_slice::<u32>();
-            state.groups.find_or_create(context, keys, input.select(), groups)?;
+        let numbers = self.prepare(context, state, &input, rows)?;
+        let applied = self.apply(state, &input, rows, numbers.as_ref().map(Buffer::as_slice));
+        // Frees the batch's buffers.
+        for loader in state.loaders.iter_mut() {
+            *loader = AggregateInputLoader::new();
         }
-        let group_count = self.group_count(state);
-        let State { groups, total, seen, distinct, extremes, .. } = state;
-        let total = [total.as_mut_ptr()];
-        let base = self.state_base(groups, &total);
-        let mut overflow = false;
-        let mut offset = 0;
-        for (a, call) in self.spec.aggregates.iter().enumerate() {
-            let numbers = numbers.as_ref().map(Buffer::as_slice::<u32>);
-            if let Some(extreme) = string_extreme(*call) {
-                let states = Self::states(base, offset, None);
-                offset += StringExtreme::STATE_WORDS;
-                let column = input.column(call.column);
-                let pool = StringPool::made(extremes, context.env())?;
-                let select = input.select();
-                extreme.update((context, pool), column, select, rows, numbers, states)?;
-                continue;
-            }
-            let function = make_aggregate_function(call.function, call.input_type);
-            let mut buffers = AggregateInputLoader::default();
-            let mut loaded = AggregateInput { values: &[], valid: None, rows };
-            if function.reads_input() {
-                loaded = buffers.load(context, input.column(call.column), input.select(), rows)?;
-            }
-            let seen = if function.tracks_seen() {
-                at_mut!(seen, a).get(context.env(), group_count, loaded.valid.is_some())?
-            } else {
-                None
-            };
-            let states = Self::states(base, offset, seen);
-            offset += function.state_words();
-            if let Some(set) = at_mut!(distinct, a) {
-                // Only the rows with values their group hasn't had, as if the
-                // batch were only those.
-                let (values, firsts, rows) = first_values(context, set, &loaded, numbers)?;
-                let kept = at!(values.as_slice::<i64>(), ..rows);
-                let values = AggregateInput { values: kept, valid: None, rows };
-                let firsts = at!(firsts.as_slice::<u32>(), ..rows);
-                match numbers {
-                    Some(_) => function.update(&values, firsts, states, &mut overflow),
-                    None => function.update_group(&values, 0, states, &mut overflow),
-                }
-                continue;
-            }
-            match numbers {
-                Some(numbers) => function.update(&loaded, numbers, states, &mut overflow),
-                None => function.update_group(&loaded, 0, states, &mut overflow),
-            }
+        for prepared in state.prepared.iter_mut() {
+            *prepared = None;
         }
-        if overflow { Err(Error::Overflow) } else { Ok(()) }
+        applied
     }
 
     fn finalize(&self, _: &mut Context, _: &mut State) -> Result<(), Error> {
