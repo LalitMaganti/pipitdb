@@ -172,6 +172,20 @@ impl SeenBytes {
         Ok(SeenBytes { bytes: Blocks::new(env, 1)?, tracking: false, groups: 0 })
     }
 
+    /// Whether `group` has seen a value.
+    #[cfg(feature = "spill")]
+    pub(crate) fn seen(&self, group: u32) -> bool {
+        // SAFETY: a byte is kept for each group while tracking.
+        !self.tracking || unsafe { *self.bytes.record_ptr(group as usize) } != 0
+    }
+
+    /// Forgets every group, freeing their bytes, allocating nothing.
+    #[cfg(feature = "spill")]
+    pub(crate) fn free(&mut self, env: &Env) {
+        self.bytes.free(env);
+        (self.tracking, self.groups) = (false, 0);
+    }
+
     /// As `get`, without asking for more groups, so without allocating.
     pub(crate) fn tracked(&self) -> Option<&[*mut u8]> {
         self.tracking.then(|| self.bytes.starts())
@@ -235,6 +249,40 @@ pub(crate) trait AggregateFunction {
     /// Writes the result of each of `groups` to `values`, and to `valid`, a
     /// bit each, whether it holds one.
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]);
+    /// Adds the state of each of `other`'s groups `from` into that of its
+    /// group in `groups`, as if its rows had been added there. A zeroed
+    /// state, not seen, adds nothing.
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        overflow: &mut bool,
+    );
+}
+
+/// Calls `add` with the state of each of `groups`, `words` words, and that
+/// of its group in `other` `from`, marking it seen if that one was.
+#[cfg(feature = "spill")]
+fn combine(
+    mut states: GroupStates,
+    groups: &[u32],
+    other: &GroupStates,
+    from: &[u32],
+    words: usize,
+    mut add: impl FnMut(&mut [i64], &[i64]),
+) {
+    for (&group, &from) in groups.iter().zip(from) {
+        // SAFETY: both groups exist, so their states do, of `words` words.
+        let (state, from_state) = unsafe {
+            let state = core::slice::from_raw_parts_mut(states.state(group), words);
+            (state, core::slice::from_raw_parts(other.state(from), words))
+        };
+        add(state, from_state);
+        states.mark(group, other.seen(from));
+    }
 }
 
 /// The function that computes `function` of values of `input`.
@@ -390,6 +438,20 @@ impl AggregateFunction for CountStar {
         *states.word_mut(group) += i64::try_from(input.rows).unwrap_or(0);
     }
 
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        _: &mut bool,
+    ) {
+        combine(states, groups, other, from, 1, |count, other| {
+            *at_mut!(count, 0) += *at!(other, 0);
+        });
+    }
+
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
         for (value, &group) in values.iter_mut().zip(groups) {
             *value = states.word(group);
@@ -427,6 +489,20 @@ impl AggregateFunction for Count {
         _: &mut bool,
     ) {
         *states.word_mut(group) += i64::try_from(input.count_valid()).unwrap_or(0);
+    }
+
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        _: &mut bool,
+    ) {
+        combine(states, groups, other, from, 1, |count, other| {
+            *at_mut!(count, 0) += *at!(other, 0);
+        });
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
@@ -478,6 +554,22 @@ impl AggregateFunction for Sum {
         *states.word_mut(group) = total;
         *overflow |= sum.is_err() || o;
         states.mark(group, input.count_valid() != 0);
+    }
+
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        overflow: &mut bool,
+    ) {
+        combine(states, groups, other, from, 1, |total, other| {
+            let (sum, o) = at!(total, 0).overflowing_add(*at!(other, 0));
+            *at_mut!(total, 0) = sum;
+            *overflow |= o;
+        });
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
@@ -545,6 +637,21 @@ impl AggregateFunction for Extreme {
         }
         *states.word_mut(group) = best.cast_signed();
         states.mark(group, input.count_valid() != 0);
+    }
+
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        _: &mut bool,
+    ) {
+        combine(states, groups, other, from, 1, |best, other| {
+            let best = at_mut!(best, 0);
+            *best = best.cast_unsigned().max(at!(other, 0).cast_unsigned()).cast_signed();
+        });
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
@@ -735,6 +842,21 @@ impl AggregateFunction for Avg {
         *at_mut!(state, AVG_COUNT) += i64::try_from(input.count_valid()).unwrap_or(0);
     }
 
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        _: &mut bool,
+    ) {
+        combine(states, groups, other, from, AVG_COUNT + 1, |state, other| {
+            set_int128(state, int128(state) + int128(other));
+            *at_mut!(state, AVG_COUNT) += *at!(other, AVG_COUNT);
+        });
+    }
+
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
         for (value, &group) in values.iter_mut().zip(groups) {
             let state = Avg::state(&states, group);
@@ -799,6 +921,22 @@ impl AggregateFunction for DoubleSum {
         let sum = double(*at!(state, 0), true) + batch_double_sum(input);
         *at_mut!(state, 0) = sum.to_bits().cast_signed();
         *at_mut!(state, 1) += i64::try_from(input.count_valid()).unwrap_or(0);
+    }
+
+    #[cfg(feature = "spill")]
+    fn merge(
+        &self,
+        states: GroupStates,
+        groups: &[u32],
+        other: &GroupStates,
+        from: &[u32],
+        _: &mut bool,
+    ) {
+        combine(states, groups, other, from, 2, |state, other| {
+            let total = double(*at!(state, 0), true) + double(*at!(other, 0), true);
+            *at_mut!(state, 0) = total.to_bits().cast_signed();
+            *at_mut!(state, 1) += *at!(other, 1);
+        });
     }
 
     fn finalize(&self, states: GroupStates, groups: &[u32], values: &mut [i64], valid: &mut [u8]) {
