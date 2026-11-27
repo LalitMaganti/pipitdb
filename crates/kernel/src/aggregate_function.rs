@@ -53,7 +53,6 @@ impl AggregateInput<'_> {
 /// Loads a batch's column at the rows it keeps into the shape
 /// `AggregateInput` describes, pointing at the column's own values when it
 /// keeps every row and copying them otherwise.
-#[derive(Default)]
 pub(crate) struct AggregateInputLoader {
     /// The values, if copied.
     values: Option<Buffer>,
@@ -62,19 +61,45 @@ pub(crate) struct AggregateInputLoader {
 }
 
 impl AggregateInputLoader {
+    pub(crate) const fn new() -> AggregateInputLoader {
+        AggregateInputLoader { values: None, valid: None }
+    }
+
+    /// Whether what `prepare` loaded holds nulls.
+    pub(crate) fn has_nulls(&self) -> bool {
+        self.valid.is_some()
+    }
+
     /// Loads the first `rows` rows `select` keeps of `column`, a flat
-    /// `Int64` or `Float64`, or the first `rows` of it if `select` is empty.
-    pub(crate) fn load<'a>(
-        &'a mut self,
+    /// `Int64` or `Float64`, or the first `rows` of it if `select` is empty,
+    /// copying them only if `select` isn't, for `input`.
+    pub(crate) fn prepare(
+        &mut self,
         context: &mut Context,
-        column: &'a ColumnView,
+        column: &ColumnView,
         select: &[u16],
         rows: usize,
-    ) -> Result<AggregateInput<'a>, Error> {
+    ) -> Result<(), Error> {
         let AggregateInputLoader { values, valid } = self;
-        let values = gathered(context, select, column.values().words(), values)?;
+        *values = None;
+        if !select.is_empty() {
+            let copy = values.insert(context.values_buffer(select.len() * 8)?);
+            let words = column.values().words();
+            for (out, &row) in copy.as_mut_slice::<i64>().iter_mut().zip(select) {
+                *out = *at!(words, usize::from(row));
+            }
+        }
         *valid = validity(context, column, select, rows)?;
-        Ok(AggregateInput { values, valid: valid.as_ref().map(Buffer::as_slice), rows })
+        Ok(())
+    }
+
+    /// What `prepare` loaded of `column`.
+    pub(crate) fn input<'a>(&'a self, column: &'a ColumnView, rows: usize) -> AggregateInput<'a> {
+        let values = match &self.values {
+            Some(copy) => copy.as_slice(),
+            None => column.values().words(),
+        };
+        AggregateInput { values, valid: self.valid.as_ref().map(Buffer::as_slice), rows }
     }
 }
 
@@ -145,6 +170,11 @@ pub(crate) struct SeenBytes {
 impl SeenBytes {
     pub(crate) fn new(env: &Env) -> Result<SeenBytes, AllocError> {
         Ok(SeenBytes { bytes: Blocks::new(env, 1)?, tracking: false, groups: 0 })
+    }
+
+    /// As `get`, without asking for more groups, so without allocating.
+    pub(crate) fn tracked(&self) -> Option<&[*mut u8]> {
+        self.tracking.then(|| self.bytes.starts())
     }
 
     /// What to pass as `GroupStates::seen` for a batch with `groups` groups
@@ -542,10 +572,11 @@ impl StringExtreme {
     /// How many words of state each group keeps.
     pub(crate) const STATE_WORDS: usize = 1;
 
-    /// Adds the first `rows` rows that `select` keeps of `column`, all if
-    /// it's empty, into the state of their group, `groups[row]`, or of
-    /// group 0 if `None`.
-    pub(crate) fn update(
+    /// For each group of the first `rows` rows `select` keeps of `column`
+    /// whose best string of them beats its state's, that string, interned:
+    /// a word each, the group above its id, and how many. Every state is as
+    /// it was when it returns.
+    pub(crate) fn prepare(
         &self,
         (context, pool): (&mut Context, &mut StringPool),
         column: &ColumnView,
@@ -553,7 +584,7 @@ impl StringExtreme {
         rows: usize,
         groups: Option<&[u32]>,
         mut states: GroupStates,
-    ) -> Result<(), Error> {
+    ) -> Result<(Buffer, usize), Error> {
         check!(column.data_type() == DataType::String);
         let values = column.values();
         let strings = values.strings();
@@ -569,10 +600,13 @@ impl StringExtreme {
             (!values.is_null(value as u32)).then(|| strings.get(value))
         };
         let wanted = if self.max { Ordering::Greater } else { Ordering::Less };
-        let mut touched = context.indices_buffer(rows * 4)?;
-        let touched = touched.as_mut_slice::<u32>();
+        // Each group's best row of the batch is marked in its state, as
+        // `BATCH_ROW` and the row, and its word before kept, to put back.
+        let mut touched = context.values_buffer(rows * 8)?;
+        let mut before = context.values_buffer(rows * 8)?;
+        let (touched_out, before_out) =
+            (touched.as_mut_slice::<u64>(), before.as_mut_slice::<i64>());
         let mut count = 0;
-        let env = context.env();
         for i in 0..rows {
             let row = if select.is_empty() { i } else { usize::from(*at!(select, i)) };
             let Some(candidate) = string(row) else { continue };
@@ -588,10 +622,10 @@ impl StringExtreme {
             } else {
                 pool.get(Id::raw(state as u32))
             };
-            let better = best.is_none_or(|best| candidate.cmp(best) == wanted);
-            if better {
+            if best.is_none_or(|best| candidate.cmp(best) == wanted) {
                 if state & BATCH_ROW == 0 {
-                    *at_mut!(touched, count) = group;
+                    *at_mut!(touched_out, count) = u64::from(group);
+                    *at_mut!(before_out, count) = state;
                     count += 1;
                 }
                 #[expect(clippy::cast_possible_wrap, reason = "a batch's row")]
@@ -599,12 +633,36 @@ impl StringExtreme {
                 *states.word_mut(group) = BATCH_ROW | row;
             }
         }
-        for &group in at!(touched, ..count) {
+        let env = context.env();
+        let mut failed = None;
+        for k in 0..count {
+            #[expect(clippy::cast_possible_truncation, reason = "a group")]
+            let group = *at!(touched_out, k) as u32;
             #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a row")]
             let row = (states.word(group) & !BATCH_ROW) as usize;
-            *states.word_mut(group) = i64::from(pool.intern_string(env, string(row))?.raw_id());
+            *states.word_mut(group) = *at!(before_out, k);
+            if failed.is_none() {
+                match pool.intern_string(env, string(row)) {
+                    Ok(id) => {
+                        *at_mut!(touched_out, k) = u64::from(group) << 32 | u64::from(id.raw_id());
+                    }
+                    Err(error) => failed = Some(error),
+                }
+            }
         }
-        Ok(())
+        if let Some(error) = failed {
+            return Err(error.into());
+        }
+        Ok((touched, count))
+    }
+
+    /// Sets each group's state to what `prepare` found: `count` words of
+    /// `prepared`.
+    pub(crate) fn apply(prepared: &Buffer, count: usize, mut states: GroupStates) {
+        for &pair in at!(prepared.as_slice::<u64>(), ..count) {
+            let group = (pair >> 32) as u32;
+            *states.word_mut(group) = (pair & 0xffff_ffff).cast_signed();
+        }
     }
 
     /// The string of each of `groups`, as a string column.
