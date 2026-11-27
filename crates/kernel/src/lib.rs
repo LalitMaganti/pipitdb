@@ -34,6 +34,8 @@ pub(crate) mod like;
 pub(crate) mod limit;
 mod listed;
 pub(crate) mod lower;
+#[cfg(feature = "spill")]
+mod manager;
 mod murmur_hash;
 pub mod names;
 pub mod ops;

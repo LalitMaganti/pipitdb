@@ -398,7 +398,8 @@ impl Breaker for HashAggregate {
         }
         let input = Flat::new(context, input, self.read())?;
         let numbers = self.prepare(context, state, &input, rows)?;
-        let applied = self.apply(state, &input, rows, numbers.as_ref().map(Buffer::as_slice));
+        let numbers = numbers.as_ref().map(Buffer::as_slice);
+        let applied = context.env().applying(|| self.apply(state, &input, rows, numbers));
         // Frees the batch's buffers.
         for loader in state.loaders.iter_mut() {
             *loader = AggregateInputLoader::new();

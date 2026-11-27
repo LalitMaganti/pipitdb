@@ -118,6 +118,13 @@ pub trait Breaker {
         state: &mut Self::State,
         output: &mut RowBatch,
     ) -> Result<bool, Error>;
+
+    /// As `Sink::spill`.
+    #[cfg(feature = "spill")]
+    fn spill(&self, env: &Env, state: &mut Self::State) -> Result<bool, Error> {
+        let _ = (env, state);
+        Ok(false)
+    }
 }
 
 /// A breaker is the sink of the pipeline it consumes: one run's state, as
@@ -161,6 +168,12 @@ impl<B: Breaker> Sink for B {
         let Some(state) = state else { failed!() };
         Breaker::finalize(self, context, state)
     }
+
+    #[cfg(feature = "spill")]
+    fn spill(&self, env: &Env, local: &mut Self::Local) -> Result<bool, Error> {
+        let Some(local) = local else { failed!() };
+        Breaker::spill(self, env, local)
+    }
 }
 
 /// Consumes every batch of the pipeline it ends, building what a step of
@@ -182,8 +195,10 @@ pub trait Sink {
 
     /// A sink that can spill prepares the batch first: it allocates all it
     /// needs, changing nothing that applying the batch wouldn't. Then it
-    /// applies it, changing its state, allocating nothing. Failing for want
-    /// of memory then leaves it as it was.
+    /// applies it, in `Env::applying`, changing its state,
+    /// allocating nothing, which with the `spill` feature is checked.
+    /// Failing for want of memory then leaves it as it was, so its manager
+    /// can spill it and it can consume the batch again.
     fn consume(
         &self,
         context: &mut Context,
@@ -202,6 +217,19 @@ pub trait Sink {
 
     /// Called once, after every run is combined.
     fn finalize(&self, context: &mut Context, state: &mut Self::State) -> Result<(), Error>;
+
+    /// Writes what `local` holds to `env`'s spill store and frees it,
+    /// returning whether it held anything to write. Its pipeline's
+    /// `Manager` calls it, when an allocation doesn't fit and `local` isn't
+    /// consuming, or when one of `consume`'s doesn't, before consuming the
+    /// batch again. It must take no more memory than it frees, or it may
+    /// fail, as making room doesn't spill another sink. By default, it
+    /// holds nothing it can write.
+    #[cfg(feature = "spill")]
+    fn spill(&self, env: &Env, local: &mut Self::Local) -> Result<bool, Error> {
+        let _ = (env, local);
+        Ok(false)
+    }
 }
 
 /// What an operator did with its input.
@@ -337,6 +365,8 @@ pub struct SinkFunctions {
     consume: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, &RowBatch) -> Sunk,
     combine: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>, NonNull<u8>) -> Sunk,
     finalize: unsafe fn(NonNull<()>, &mut Context, NonNull<u8>) -> Sunk,
+    #[cfg(feature = "spill")]
+    spill: crate::manager::SpillFn,
 }
 
 type Sunk = Result<(), Error>;
@@ -454,6 +484,11 @@ impl<'a, T: Sink + 'a> Functions<'a, T> {
             finalize: |sink, context, state| unsafe {
                 value_of::<T>(sink).finalize(context, state_of::<T::State>(state))
             },
+            // SAFETY: as above.
+            #[cfg(feature = "spill")]
+            spill: |sink, env, local| unsafe {
+                value_of::<T>(sink).spill(env, state_of::<T::Local>(local))
+            },
         },
     };
 }
@@ -558,6 +593,19 @@ impl<'a> DynSink<'a> {
         // SAFETY: `new_local` makes a local state of this sink, of its
         // layout, which `drop_local` drops.
         unsafe { OwnedState::new(context, self.step.as_ptr(), made) }
+    }
+
+    /// An entry for `local`, which its manager spills through.
+    ///
+    /// # Safety
+    ///
+    /// `local` must be one of this sink's local states, from `new_local`,
+    /// used only through the entry while it's registered.
+    #[cfg(feature = "spill")]
+    pub(crate) unsafe fn entry(&self, local: &OwnedState) -> crate::manager::Entry {
+        let spill = self.functions.run.spill;
+        // SAFETY: upheld by the caller; the sink lives as long as its state.
+        unsafe { crate::manager::Entry::new(self.step.as_ptr(), local.state, spill) }
     }
 
     /// Its new shared state.
