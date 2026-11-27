@@ -11,6 +11,8 @@ use crate::column::{self, ColumnView, DataType, Strings, Validity};
 use crate::containers::BitSlice;
 use crate::context::Context;
 use crate::error::Error;
+#[cfg(feature = "spill")]
+use crate::row_batch::BATCH_COLUMNS_MAX;
 use crate::row_batch::BATCH_ROWS_MAX;
 
 /// A log in a store, which the store names.
@@ -216,8 +218,205 @@ pub fn read_column(
     Ok(ColumnView::strings(context, values, bytes, validity)?)
 }
 
+/// The rows of a batch that `write_batch` writes, a column at a time, from
+/// wherever they're held.
+#[cfg(feature = "spill")]
+pub(crate) trait Rows {
+    /// How many there are, at most a batch's.
+    fn count(&self) -> u32;
+    /// How many columns they have.
+    fn width(&self) -> usize;
+    /// Column `column`'s type, and whether it may be null.
+    fn column(&self, column: usize) -> (DataType, bool);
+    /// Whether row `row` of column `column`, which may be null, is.
+    fn is_null(&self, column: usize, row: u32) -> bool;
+    /// Row `row`'s value of column `column`, whose type has no bytes.
+    fn word(&self, column: usize, row: u32) -> u64;
+    /// Row `row`'s string of column `column`, whose type has bytes: empty
+    /// if it's null.
+    fn string(&self, column: usize, row: u32) -> &[u8];
+}
+
+/// The types a batch's header names, by their number.
+#[cfg(feature = "spill")]
+const TYPES: [DataType; 3] = [DataType::Int64, DataType::Float64, DataType::String];
+
+/// Appends `rows` to `log`, after a header saying how long each column
+/// is, so `read_batch` needs only where it starts. Each column is written
+/// as `write_column` writes one. It allocates nothing.
+#[cfg(feature = "spill")]
+pub(crate) fn write_batch(
+    store: &dyn SpillStore,
+    log: LogId,
+    rows: &dyn Rows,
+) -> Result<(), Error> {
+    let (count, width) = (rows.count(), rows.width());
+    check!(count <= BATCH_ROWS_MAX && width <= BATCH_COLUMNS_MAX as usize);
+    let mut header = Appender::new(store, log);
+    header.push(&u64::from(count).to_le_bytes())?;
+    header.push(&(width as u64).to_le_bytes())?;
+    for c in 0..width {
+        let (data_type, nullable) = rows.column(c);
+        let Some(kind) = TYPES.iter().position(|&kind| kind == data_type) else { failed!() };
+        let mut bytes = 0_u64;
+        if data_type.has_bytes() {
+            bytes = 4 + (0..count).map(|row| strings_bytes(rows.string(c, row))).sum::<u64>();
+        }
+        let word = bytes << 8 | u64::from(nullable) << 4 | kind as u64;
+        header.push(&word.to_le_bytes())?;
+    }
+    header.end()?;
+    for c in 0..width {
+        let (data_type, nullable) = rows.column(c);
+        let mut values = Appender::new(store, log);
+        if data_type.has_bytes() {
+            let mut start = 4_u64;
+            for row in 0..count {
+                let len = strings_bytes(rows.string(c, row));
+                let word = if len == 0 { 0 } else { start };
+                values.push(&word.to_le_bytes())?;
+                start += len;
+            }
+            values.end()?;
+            // So no word's offset is past 32 bits.
+            if u32::try_from(start).is_err() {
+                return Err(Error::OutOfMemory);
+            }
+            let mut bytes = Appender::new(store, log);
+            bytes.push(&[0; 4])?;
+            for row in 0..count {
+                let string = rows.string(c, row);
+                if !string.is_empty() {
+                    #[expect(clippy::cast_possible_truncation, reason = "checked above")]
+                    bytes.push(&(string.len() as u32).to_le_bytes())?;
+                    bytes.push(string)?;
+                }
+            }
+            bytes.end()?;
+        } else {
+            for row in 0..count {
+                values.push(&rows.word(c, row).to_ne_bytes())?;
+            }
+            values.end()?;
+        }
+        if nullable {
+            let (mut bits, mut byte) = (Appender::new(store, log), 0_u8);
+            for row in 0..count {
+                byte |= u8::from(!rows.is_null(c, row)) << (row % 8);
+                if row % 8 == 7 || row + 1 == count {
+                    bits.push(&[byte])?;
+                    byte = 0;
+                }
+            }
+            if count > 0 {
+                bits.end()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The bytes `string` takes among a column's bytes: none if it's empty,
+/// as every empty string is the one they start with.
+#[cfg(feature = "spill")]
+fn strings_bytes(string: &[u8]) -> u64 {
+    if string.is_empty() { 0 } else { 4 + string.len() as u64 }
+}
+
+/// Reads the batch `write_batch` wrote at `at` of `log`, which is sealed,
+/// giving each column to `column` in turn, and returns its rows and where
+/// the next batch starts.
+#[cfg(feature = "spill")]
+pub(crate) fn read_batch(
+    context: &mut Context,
+    store: &dyn SpillStore,
+    log: LogId,
+    at: u64,
+    mut column: impl FnMut(&mut Context, ColumnView) -> Result<(), Error>,
+) -> Result<(u32, u64), Error> {
+    let mut words = [0_u8; 16];
+    store.read(log, ByteRange { offset: at, len: 16 }, &mut words)?;
+    let (rows, width) = words.split_at(8);
+    let word = |bytes: &[u8]| bytes.first_chunk::<8>().map_or(0, |&word| u64::from_le_bytes(word));
+    let (rows, width) = (word(rows), word(width));
+    let (Ok(row_count), Ok(width)) = (u32::try_from(rows), usize::try_from(width)) else {
+        return Err(Error::Corrupt);
+    };
+    if row_count > BATCH_ROWS_MAX || width > BATCH_COLUMNS_MAX as usize {
+        return Err(Error::Corrupt);
+    }
+    let mut header = [0_u8; 8 * BATCH_COLUMNS_MAX as usize];
+    let header = at_mut!(header, ..8 * width);
+    let mut next = at + 16;
+    store.read(log, ByteRange { offset: next, len: header.len() as u64 }, header)?;
+    next += header.len() as u64;
+    for word in header.as_chunks::<8>().0.iter().map(|&word| u64::from_le_bytes(word)) {
+        let mut take = |len: u64| {
+            let block = ByteRange { offset: next, len };
+            next += len;
+            block
+        };
+        let Some(&data_type) = TYPES.get((word & 0xf) as usize) else { return Err(Error::Corrupt) };
+        let values = take(rows * 8);
+        let bytes = data_type.has_bytes().then(|| take(word >> 8));
+        let validity = (word >> 4 & 1 != 0 && rows > 0).then(|| take(rows.div_ceil(8)));
+        let spilled = SpilledColumn { data_type, row_count, values, bytes, validity };
+        let read = read_column(context, store, log, &spilled)?;
+        column(context, read)?;
+    }
+    Ok((row_count, next))
+}
+
+/// Appends bytes to a log a chunk at a time, as one block.
+#[cfg(feature = "spill")]
+struct Appender<'s> {
+    /// The store the log is in.
+    store: &'s dyn SpillStore,
+    /// The log.
+    log: LogId,
+    /// The bytes not yet appended.
+    chunk: [u8; APPENDED_BYTES],
+    /// How many of `chunk`'s are.
+    filled: usize,
+}
+
+/// How many bytes an `Appender` appends at once, at most.
+#[cfg(feature = "spill")]
+const APPENDED_BYTES: usize = 4096;
+
+#[cfg(feature = "spill")]
+impl<'s> Appender<'s> {
+    fn new(store: &'s dyn SpillStore, log: LogId) -> Appender<'s> {
+        Appender { store, log, chunk: [0; APPENDED_BYTES], filled: 0 }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.filled + bytes.len() > APPENDED_BYTES {
+            self.flush()?;
+        }
+        if bytes.len() > APPENDED_BYTES {
+            self.store.append(self.log, bytes)?;
+        } else {
+            at_mut!(self.chunk, self.filled..self.filled + bytes.len()).copy_from_slice(bytes);
+            self.filled += bytes.len();
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        if self.filled > 0 {
+            self.store.append(self.log, at!(self.chunk, ..core::mem::take(&mut self.filled)))?;
+        }
+        Ok(())
+    }
+
+    fn end(mut self) -> Result<(), Error> {
+        self.flush()
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use alloc::vec::Vec as StdVec;
     use core::cell::RefCell;
 
@@ -231,7 +430,7 @@ mod tests {
     /// least `PART` bytes, except the last; nothing can be read before its
     /// log is sealed. Counts the requests a remote store would make.
     #[derive(Default)]
-    struct Strict {
+    pub(crate) struct Strict {
         logs: RefCell<StdVec<Option<Log>>>,
         requests: core::cell::Cell<u32>,
     }
@@ -250,6 +449,13 @@ mod tests {
     }
 
     impl Strict {
+        /// How many logs it was asked to make, and how many aren't deleted.
+        #[cfg(feature = "spill")]
+        pub(crate) fn logs(&self) -> (usize, usize) {
+            let logs = self.logs.borrow();
+            (logs.len(), logs.iter().filter(|log| log.is_some()).count())
+        }
+
         fn upload(&self, log: &mut Log) {
             self.requests.set(self.requests.get() + 1);
             log.uploaded.append(&mut log.pending);

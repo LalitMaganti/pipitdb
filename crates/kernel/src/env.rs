@@ -204,6 +204,12 @@ impl Env {
         self.spill.set(Some(store));
     }
 
+    /// Where what doesn't fit in its budget goes, if anywhere.
+    #[cfg(feature = "spill")]
+    pub(crate) fn spill(&self) -> Option<&'static dyn SpillStore> {
+        self.spill.get()
+    }
+
     #[cfg(feature = "spill")]
     pub(crate) fn manager(&self) -> &Manager {
         &self.budget.manager
