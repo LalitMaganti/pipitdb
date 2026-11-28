@@ -484,9 +484,10 @@ impl<'a> Scannable for ParquetTable<'a> {
     }
 
     /// From the footers: the rows' count, and a column's least and greatest
-    /// values, if every row group's statistics hold them exactly.
+    /// values, if every row group's statistics hold them exactly, and
+    /// whether its row groups may come in its order.
     fn summary(&self, column: Option<u32>) -> Option<Summary> {
-        let (mut rows, mut bounds) = (0, None::<Bounds>);
+        let (mut rows, mut bounds, mut runs, mut ascends) = (0, None::<Bounds>, 0, true);
         for file in self.files.iter() {
             for group in 0..file.footer.row_groups() {
                 rows += i64::try_from(file.footer.group_rows(group)).ok()?;
@@ -496,13 +497,16 @@ impl<'a> Scannable for ParquetTable<'a> {
                     return None;
                 }
                 let next = bounds::of_chunk(*at!(file.footer.columns(), c as usize), chunk)?;
-                bounds = Some(bounds.map_or(next, |b| Bounds {
-                    min: b.min.min(next.min),
-                    max: b.max.max(next.max),
+                // Nulls come first, so only in the first run.
+                ascends &= runs == 0 || chunk.nulls == Some(0);
+                runs += 1;
+                bounds = Some(bounds.map_or(next, |b| {
+                    ascends &= next.min >= b.max;
+                    Bounds { min: b.min.min(next.min), max: b.max.max(next.max) }
                 }));
             }
         }
-        Some(Summary { rows, bounds })
+        Some(Summary { rows, bounds, ascends: ascends && runs > 1 })
     }
 
     /// Skips the row groups whose footer statistics rule out a condition,

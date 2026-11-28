@@ -215,13 +215,16 @@ impl Breaker for HashAggregate {
 
     fn new_state(&self, context: &mut Context) -> Result<State, Error> {
         let env = context.env();
-        let groups = GroupTable::new(
+        let mut groups = GroupTable::new(
             env,
             self.spec.key_columns.len(),
             self.spec.string_keys,
             self.spec.nullable_keys,
             self.state_words,
         )?;
+        if let Some(k) = self.spec.ordered {
+            groups.watch(k);
+        }
         let mut total = SmallVec::new(env, self.state_words.next_power_of_two().max(1))?;
         total.extend_zeroed(self.state_words)?;
         let mut seen = SmallVec::fixed(env, self.spec.aggregates.len())?;
@@ -494,6 +497,7 @@ mod tests {
             string_keys: 0,
             nullable_keys: u64::MAX,
             aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
+            ordered: None,
         }
     }
 
@@ -688,6 +692,7 @@ mod tests {
                 string_keys: 0,
                 nullable_keys: u64::MAX,
                 aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
+                ordered: None,
             }
         };
         let digits = ["9", "10", "5", "100", "7"].map(|text| Some(String::from(text)));
@@ -782,6 +787,7 @@ mod tests {
                 string_keys: 0,
                 nullable_keys: u64::MAX,
                 aggregates: SmallVec::fixed_from(env, aggregates).unwrap(),
+                ordered: None,
             };
             let out = run(rows, spec).unwrap();
             let mean = out[0][keys.len()].map(|bits| f64::from_bits(bits.cast_unsigned()));
@@ -802,6 +808,7 @@ mod tests {
             string_keys: 0,
             nullable_keys: u64::MAX,
             aggregates: SmallVec::fixed_from(env, [call].into_iter()).unwrap(),
+            ordered: None,
         };
         assert_eq!(run(rows, spec).unwrap(), [alloc::vec![None]]);
     }
@@ -829,6 +836,7 @@ mod tests {
                 string_keys: 0,
                 nullable_keys: u64::MAX,
                 aggregates: SmallVec::fixed_from(env, calls.into_iter()).unwrap(),
+                ordered: None,
             }
         };
         // Repeats within and across batches, a null, row 3 of each batch

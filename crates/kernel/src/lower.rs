@@ -249,6 +249,14 @@ impl<'p, 'c> Lowering<'p, 'c> {
         at!(self.planned, self.plan.id_of(node) as usize).cutoff
     }
 
+    /// Whether the rows are a scan's whose runs may come in `column`'s
+    /// order, as `Summary` says.
+    pub fn query_ascends(&self, column: ColumnId) -> bool {
+        let Some(scan) = self.query_rows().scan else { return false };
+        let summary = at!(self.plan.nodes, scan as usize).op.summary(Some(column));
+        summary.is_some_and(|summary| summary.ascends)
+    }
+
     /// What is known of the rows the steps added so far output.
     pub fn query_rows(&self) -> &OutputProperties {
         self.rows
@@ -1347,7 +1355,7 @@ mod tests {
 
         fn summary(&self, column: Option<u32>) -> Option<Summary> {
             let bounds = column.map(|_| Bounds { min: -3, max: 9 });
-            self.knows.then_some(Summary { rows: 7, bounds })
+            self.knows.then_some(Summary { rows: 7, bounds, ascends: false })
         }
     }
 

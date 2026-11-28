@@ -81,6 +81,21 @@ pub(crate) struct GroupTable {
     /// Whether a key not found gets no group, `NONE`, rather than a new
     /// one: a join's build side, once built.
     frozen: bool,
+    /// The key whose values are watched for going up, if any: while no
+    /// batch's go below any before, groups of lower values get no more rows.
+    ordered: Option<usize>,
+    /// The most of `ordered`'s values of groups before `looked`: nulls are
+    /// least.
+    most: (bool, i64),
+    /// How many groups, from the first, `most` covers.
+    looked: usize,
+    /// The least of `ordered`'s values of the batch groups were last retired
+    /// at: they're retired again only once it's past, so each group is put
+    /// back in the slots at most once.
+    retired_at: (bool, i64),
+    /// How many groups, from the first, are no longer in the slots, as no
+    /// row after can be theirs.
+    retired: usize,
 }
 
 /// No group.
@@ -124,11 +139,97 @@ impl GroupTable {
             dictionaries: SmallVec::fixed_from(env, (0..keys).map(|_| None))?,
             number_groups: SmallVec::new(env, 1 << 31)?,
             frozen: false,
+            ordered: None,
+            most: (false, i64::MIN),
+            looked: 0,
+            retired_at: (false, i64::MIN),
+            retired: 0,
         })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Watches key `k`, an `Int64`, for going up, nulls first, so groups it's
+    /// past leave the slots and the slots stay small.
+    pub(crate) fn watch(&mut self, k: usize) {
+        check!(k < self.keys && self.string_keys >> k & 1 == 0);
+        self.ordered = Some(k);
+    }
+
+    /// If `values`, the ordered key's of a batch of `count` rows, go below
+    /// one before, puts every group back in the slots and stops watching. If
+    /// not, and the slots would have to grow for the batch, takes the groups
+    /// so far out of them instead, but those the key hasn't passed. Only a
+    /// table that's retired groups, or would grow, looks.
+    #[inline(never)]
+    fn retire_past(
+        &mut self,
+        env: &Env,
+        values: &[i64],
+        nulls: Option<&[u64]>,
+        count: usize,
+    ) -> Result<(), Error> {
+        let Some(k) = self.ordered else { return Ok(()) };
+        let room = (self.len() - self.retired + count) * 3 > self.slots.len() * 2;
+        if self.retired == 0 && !room {
+            return Ok(());
+        }
+        // A key's place in the order: nulls first, then the rest.
+        let first = self.first;
+        let place = move |record: &[i64]| {
+            (first == 0 || *at!(record, 0) >> k & 1 == 0, *at!(record, first + k))
+        };
+        // Every key before is a group's, so the most is of the groups.
+        for group in self.looked..self.len() {
+            self.most = self.most.max(place(self.records.record(group)));
+        }
+        self.looked = self.len();
+        let null = |row: usize| nulls.is_some_and(|nulls| *at!(nulls, row) >> k & 1 != 0);
+        let least = (0..values.len())
+            .fold((true, i64::MAX), |least, row| least.min((!null(row), *at!(values, row))));
+        if least < self.most {
+            if self.retired > 0 {
+                self.ordered = None;
+                self.retired = 0;
+                self.grow(env, self.len())?;
+                self.slots.fill(0);
+                for group in 0..self.len() {
+                    self.index(group);
+                }
+            }
+        } else if room && least > self.retired_at {
+            self.retired_at = least;
+            let (from, to) = (self.retired, self.len());
+            self.slots.fill(0);
+            self.retired = to;
+            // Of the groups since, those a later row can still be in.
+            for group in from..to {
+                if place(self.records.record(group)) >= least {
+                    self.index(group);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts group `group` in the slots, which have room for it.
+    #[inline(never)]
+    fn index(&mut self, group: usize) {
+        let record = self.records.record(group);
+        let mut hash = at!(record, self.first..self.first + self.keys)
+            .iter()
+            .fold(SEED, |hash, &key| combine(hash, key.cast_unsigned()));
+        if self.first == 1 && *at!(record, 0) != 0 {
+            hash = combine(hash, at!(record, 0).cast_unsigned());
+        }
+        let mask = self.slots.len() - 1;
+        let mut at = slot_of(hash, self.slots.len());
+        while *at!(self.slots, at) != 0 {
+            at = (at + 1) & mask;
+        }
+        *at_mut!(self.slots, at) = salt(hash) | (group as u64 + 1);
     }
 
     /// Group `group`'s first payload word.
@@ -203,6 +304,9 @@ impl GroupTable {
         let nulls = nulls.as_ref().map(Buffer::as_slice);
         // Only a table with null words takes keys that can be null.
         check!(self.first == 1 || nulls.is_none());
+        if let Some(k) = self.ordered {
+            self.retire_past(context.env(), at!(at!(keys, k), ..count), nulls, count)?;
+        }
         self.grow(context.env(), self.len() + count)?;
         // Rows often come in runs of one key, as a session's do: then only
         // each run's first row is found, and the rest take its group.
@@ -424,7 +528,9 @@ impl GroupTable {
         self.records.reserve(env, groups.min(GROUPS_MAX))?;
         let mut capacity =
             if self.slots.is_empty() { 2 * BATCH_ROWS_MAX as usize } else { self.slots.len() };
-        while groups * 3 > capacity * 2 {
+        // Only groups not retired are in the slots.
+        let indexed = groups - self.retired;
+        while indexed * 3 > capacity * 2 {
             capacity *= 2;
         }
         if capacity == self.slots.len() {

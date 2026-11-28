@@ -253,7 +253,10 @@ impl<'c> Op<'c> for AggregateOp {
         for (k, &key) in self.keys.iter().enumerate() {
             nullable_keys |= u64::from(lowering.query_rows().nullable_of(key)) << k;
         }
-        let spec = HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates };
+        let ordered = (0..self.keys.len())
+            .find(|&k| string_keys >> k & 1 == 0 && lowering.query_ascends(*at!(self.keys, k)));
+        let spec =
+            HashAggregateSpec { key_columns, string_keys, nullable_keys, aggregates, ordered };
         lowering.add_breaker(hash_aggregate(spec))
     }
 }
@@ -273,6 +276,10 @@ pub struct HashAggregateSpec {
     pub nullable_keys: u64,
     /// Each aggregate.
     pub aggregates: SmallVec<AggregateCall>,
+    /// A key, an `Int64`, whose values may go up, nulls first, so the
+    /// aggregate watches them to drop the groups they've passed from its
+    /// table, if any.
+    pub ordered: Option<usize>,
 }
 
 /// One aggregate a breaker computes, as Perfetto's `AggregateCall`.
