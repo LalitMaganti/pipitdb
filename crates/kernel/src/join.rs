@@ -967,7 +967,12 @@ impl Sink for HashBuild {
         };
         let mut columns = RowBatch::new();
         columns.reset(batch.row_count());
-        if build_columns.iter().enumerate().all(|c| matches!(column(c).form(), Form::Flat)) {
+        // Borrowed only where the batch borrows them too: the row store holds
+        // borrowed columns by sharing them, which for a scan's would keep its
+        // pages for the few rows a filter left.
+        let flat = |c| matches!(column(c).form(), Form::Flat);
+        let borrowed = |(i, &c): (usize, &u32)| i == at || batch.is_borrowed(c);
+        if build_columns.iter().enumerate().all(|c| flat(c) && borrowed(c)) {
             columns.push_borrowed(build_columns.iter().enumerate().map(column));
         } else {
             // A row store holds flat columns, and keys can come as sequences.
