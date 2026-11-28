@@ -5,7 +5,7 @@
 
 use crate::allocator::AllocError;
 use crate::buffer::Buffer;
-use crate::column::{ColumnView, DataType, Form, GatherSource};
+use crate::column::{ColumnView, DataType, Form, GatherSource, StringRef};
 use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
@@ -223,10 +223,15 @@ impl RowStore {
     /// The string of the held row `row` in column `column`, a string column,
     /// if not null. Rows packed must be flushed first.
     pub(crate) fn string(&self, column: u32, row: u32) -> Option<&[u8]> {
+        self.string_ref(column, row).map(StringRef::get)
+    }
+
+    /// As `string`, as a `StringRef`, a word, for holding many.
+    pub(crate) fn string_ref(&self, column: u32, row: u32) -> Option<StringRef<'_>> {
         check!(self.packed == 0);
         let (held, row) = self.find(self.place(row));
-        let values = at!(held, column as usize).view().values();
-        (!values.is_null(row)).then(|| values.strings().get(row as usize))
+        let source = at!(held, column as usize);
+        source.is_valid(row).then(|| source.string_ref(source.word(row).cast_unsigned()))
     }
 
     /// Fills `out` with up to a batch's worth of `rows`, in that order and
