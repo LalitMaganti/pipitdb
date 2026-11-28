@@ -670,6 +670,15 @@ mod tests {
     }
 
     #[test]
+    fn computes_over_a_sort_of_no_rows() {
+        // A sort of no rows serves a batch of none, which no step is given.
+        assert_eq!(
+            kept("FROM t |> WHERE a < 0 |> ORDER BY b |> EXTEND a + 1 AS c |> SELECT c"),
+            []
+        );
+    }
+
+    #[test]
     fn joins_using_columns() {
         let names = |query| run(query).into_iter().map(|(name, _)| name).collect::<StdVec<_>>();
         // The column joined on once, first, then the rest of each side's.
