@@ -4,7 +4,6 @@
 #![forbid(unsafe_code)]
 
 pub mod source;
-pub mod spill;
 
 use std::fs::File;
 

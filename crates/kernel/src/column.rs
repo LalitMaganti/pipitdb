@@ -734,12 +734,6 @@ impl ColumnView {
         self.values().is_null(value)
     }
 
-    /// A flat view's values, as bytes.
-    pub(crate) fn value_bytes(&self) -> &[u8] {
-        self.check_flat();
-        self.values().slice_of::<u8>()
-    }
-
     fn check_flat(&self) {
         check!(self.header().kind == Kind::Flat);
     }
