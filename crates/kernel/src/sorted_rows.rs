@@ -4,7 +4,7 @@
 //! and rows are copied out once, in that order.
 
 use crate::allocator::AllocError;
-use crate::column::{ColumnView, DataType};
+use crate::column::{ColumnView, DataType, StringRef};
 use crate::containers::{Array, BitSlice, SmallVec};
 use crate::context::Context;
 use crate::env::Env;
@@ -394,7 +394,9 @@ const NULL_RANK: u32 = u32::MAX;
 /// Each held row's rank among the strings of `column`, a string column, of
 /// the rows held: equal strings rank equally. Null rows rank `NULL_RANK`.
 fn rank_strings(env: &Env, rows: &RowStore, column: u32) -> Result<Array<u32>, Error> {
-    let string = |row: &u32| rows.string(column, *row);
+    // Each row's string, found once: sorting reads it again at every byte.
+    let found = SmallVec::fixed_from(env, (0..rows.len()).map(|row| rows.string_ref(column, row)))?;
+    let string = |row: &u32| at!(found, *row as usize).map(StringRef::get);
     #[expect(clippy::cast_possible_truncation, reason = "a row held")]
     let mut order = Array::from_fn(env, rows.len() as usize, |row| row as u32)?;
     let mut scratch = Array::<u32>::zeroed(env, rows.len() as usize)?;

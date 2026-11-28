@@ -4,6 +4,7 @@
 
 use crate::containers::BitSlice;
 use core::cell::Cell;
+use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
@@ -223,6 +224,40 @@ impl GatherSource {
         // SAFETY: made from the view's bytes, which it keeps alive, and
         // `word` is one of its words, valid when it was made.
         unsafe { string_at(self.bytes.as_ref(), word) }
+    }
+
+    /// As `string`, as a `StringRef`.
+    #[inline]
+    pub(crate) fn string_ref(&self, word: u64) -> StringRef<'_> {
+        #[expect(clippy::cast_possible_truncation, reason = "an offset is its low half")]
+        let at = word as u32 as usize;
+        // SAFETY: `word` is one of the view's, so its length is at `at`, in
+        // the bytes.
+        let length = unsafe { self.bytes.cast::<u8>().add(at) };
+        StringRef { length, bytes: PhantomData }
+    }
+}
+
+/// A string of a column, as where its length is, its bytes after it: a
+/// word, where the slice it reads as is two.
+#[derive(Clone, Copy)]
+pub(crate) struct StringRef<'a> {
+    length: NonNull<u8>,
+    bytes: PhantomData<&'a [u8]>,
+}
+
+impl<'a> StringRef<'a> {
+    #[inline]
+    pub(crate) fn get(self) -> &'a [u8] {
+        // SAFETY: `string_ref` made it from a valid word of a column that
+        // outlives `'a`: its length, then that many bytes.
+        unsafe {
+            let length = self.length.cast::<[u8; 4]>().read_unaligned();
+            core::slice::from_raw_parts(
+                self.length.as_ptr().add(4),
+                u32::from_le_bytes(length) as usize,
+            )
+        }
     }
 }
 

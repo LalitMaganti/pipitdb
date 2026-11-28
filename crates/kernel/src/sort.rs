@@ -198,6 +198,18 @@ mod tests {
     }
 
     #[test]
+    fn sorts_strings_that_share_long_prefixes() {
+        const NAMES: [&str; 6] = ["", "http://a/", "http://a/b", "http://a/ba", "http://b", "zz"];
+        // Enough rows that they're sorted by their bytes, not one by one.
+        let rows: Vec<Row> =
+            (0..60).map(|i| (None, i, NAMES[usize::try_from(i * 5 % 6).unwrap()])).collect();
+        let rows = Rows { batches: alloc::vec![rows], drop: None };
+        let sorted = run(rows, sort(by(&[(2, false)])));
+        // By name, then in the order rows came, as their values are.
+        assert!(sorted.windows(2).all(|w| (&w[0].2, w[0].1) < (&w[1].2, w[1].1)));
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore = "slow under Miri")]
     fn top_k_keeps_the_first_rows_a_sort_would() {
         // Names that tie, share prefixes, and include the empty one.

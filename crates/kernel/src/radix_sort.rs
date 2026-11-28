@@ -236,6 +236,13 @@ pub(crate) fn msd_radix_sort<'k, T: Copy>(
     stack.push(Bucket { start: 0, end: elements.len(), depth: 0 })?;
     while let Some(bucket) = stack.pop() {
         let (depth, items) = (bucket.depth, at_mut!(elements, bucket.start..bucket.end));
+        // The bytes every key shares, skipped in one pass, not a pass each.
+        let first = suffix(at!(items, 0), depth);
+        let shared = items.iter().fold(first.len(), |shared, element| {
+            let key = suffix(element, depth);
+            first.iter().zip(key).take(shared).take_while(|(a, b)| a == b).count()
+        });
+        let depth = depth + shared;
         if items.len() <= MSD_INSERTION_SORT {
             for i in 1..items.len() {
                 let mut j = i;
