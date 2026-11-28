@@ -456,6 +456,19 @@ pub(crate) mod tests {
             (logs.len(), logs.iter().filter(|log| log.is_some()).count())
         }
 
+        /// Runs `f` with a store that lives as long as an `Env` needs, which
+        /// `f` must drop before it returns; then frees it.
+        #[cfg(feature = "spill")]
+        #[allow(unsafe_code)]
+        pub(crate) fn scoped<R>(f: impl FnOnce(&'static Strict) -> R) -> R {
+            let store = alloc::boxed::Box::into_raw(alloc::boxed::Box::<Strict>::default());
+            // SAFETY: freed only below, once nothing `f` made is left.
+            let result = f(unsafe { &*store });
+            // SAFETY: made by `Box::into_raw` above, and `f` holds it no more.
+            drop(unsafe { alloc::boxed::Box::from_raw(store) });
+            result
+        }
+
         fn upload(&self, log: &mut Log) {
             self.requests.set(self.requests.get() + 1);
             log.uploaded.append(&mut log.pending);

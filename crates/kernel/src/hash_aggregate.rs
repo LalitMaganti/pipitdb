@@ -1020,15 +1020,24 @@ mod tests {
         }
     }
 
-    /// 32 batches of rows of 30,000 keys, some null, most in two batches, and
+    /// How many keys `many_groups` has, in how many batches, and the
+    /// fractions of the peak they're aggregated in: fewer under Miri, which
+    /// is slow, but still enough to spill.
+    #[cfg(feature = "spill")]
+    const MANY: (i64, i64, &[usize]) =
+        if cfg!(miri) { (4000, 4, &[2]) } else { (30_000, 32, &[2, 4, 8]) };
+
+    /// Batches of rows of `MANY`'s keys, some null, most in two batches, and
     /// values, some null.
     #[cfg(feature = "spill")]
     fn many_groups() -> Rows {
+        let (keys, batches, _) = MANY;
         let row = |row: i64| {
-            let key = row * 7919 % 30_000;
+            let key = row * 7919 % keys;
             ((key % 97 != 0).then_some(key), (row % 13 != 0).then_some(row - 9000))
         };
-        let batches = (0..32).map(|b| (0..2048).map(|i| row(b * 2048 + i)).collect()).collect();
+        let batches =
+            (0..batches).map(|b| (0..2048).map(|i| row(b * 2048 + i)).collect()).collect();
         Rows { batches, dropped: Vec::from([3]) }
     }
 
@@ -1043,17 +1052,20 @@ mod tests {
         let expected = run_in(&unlimited, many_groups(), spec(&[0])).unwrap();
         let peak = unlimited.peak();
         drop(unlimited);
-        assert_eq!(expected.len(), 30_000 - 310 + 1);
+        let keys = usize::try_from(MANY.0).unwrap();
+        assert_eq!(expected.len(), keys - keys.div_ceil(97) + 1);
         // Below an eighth, a batch's new groups wouldn't fit.
-        for divisor in [2, 4, 8] {
-            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
-            let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
-            env.spill_to(store);
-            let got = run_in(&env, many_groups(), spec(&[0]));
-            let got = got.unwrap_or_else(|e| panic!("{e:?} at 1/{divisor} of {peak}"));
-            assert!(got == expected, "differs at a budget of 1/{divisor}");
-            assert!(env.peak() <= peak / divisor);
-            let (made, left) = store.logs();
+        for &divisor in MANY.2 {
+            let (made, left) = Strict::scoped(|store| {
+                let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
+                env.spill_to(store);
+                let got = run_in(&env, many_groups(), spec(&[0]));
+                let got = got.unwrap_or_else(|e| panic!("{e:?} at 1/{divisor} of {peak}"));
+                assert!(got == expected, "differs at a budget of 1/{divisor}");
+                assert!(env.peak() <= peak / divisor);
+                drop(env);
+                store.logs()
+            });
             assert!(made > 0 && left == 0, "{made} logs made, {left} left at 1/{divisor}");
         }
     }
@@ -1070,13 +1082,15 @@ mod tests {
         let expected = run_in(&unlimited, StringKeys(many_groups(), Vec::new()), spec()).unwrap();
         let peak = unlimited.peak();
         drop(unlimited);
-        for divisor in [2, 4, 8] {
-            let store: &'static Strict = alloc::boxed::Box::leak(alloc::boxed::Box::default());
-            let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
-            env.spill_to(store);
-            let got = run_in(&env, StringKeys(many_groups(), Vec::new()), spec()).unwrap();
-            assert!(got == expected, "differs at a budget of 1/{divisor}");
-            let (made, left) = store.logs();
+        for &divisor in MANY.2 {
+            let (made, left) = Strict::scoped(|store| {
+                let env = Env::new(Memory::new(Heap, peak / divisor)).unwrap();
+                env.spill_to(store);
+                let got = run_in(&env, StringKeys(many_groups(), Vec::new()), spec()).unwrap();
+                assert!(got == expected, "differs at a budget of 1/{divisor}");
+                drop(env);
+                store.logs()
+            });
             assert!(made > 0 && left == 0, "{made} logs made, {left} left at 1/{divisor}");
         }
     }
