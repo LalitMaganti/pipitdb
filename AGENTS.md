@@ -18,6 +18,7 @@
 - The engine works only in batches. An integration that works in bigger units, such as Parquet's row groups or S3's parts, converts to and from batches itself, as cheaply as it can, without the rest knowing.
 - Threads are the executor's job, a bonus on a single thread that's already competitive: it runs copies of the work between pipeline breakers, so operators aren't written for threads. A step that holds rows back is a `Breaker`, such as a sort or an aggregation. Breakers will build small local results in each copy and merge them, but merging comes with that executor.
 - In the kernel and pipesql, use `check!` instead of `assert!`, and `at!`/`at_mut!` instead of indexing with `[]`: they cost a few bytes in release builds.
+- A `check!` is only for bugs in the engine. A query, its data or running out of memory must never reach one: each returns an error.
 - Prefer lookup tables to branches. Build them as a `static` with a `const fn`, so they are computed at compile time.
 - Prefer a few smoke tests over testing every combination.
 - Develop, debug and profile with `--profile profiling`, which is built as `speed` is but with thin LTO, so it rebuilds quickly. `release`, `speed` and `bench` use fat LTO: keep them for size, which `release` measures, and for benchmark numbers.
