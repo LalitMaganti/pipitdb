@@ -679,6 +679,18 @@ mod tests {
     }
 
     #[test]
+    fn joins_a_column_of_two_names() {
+        // Two names of one column, before a join whose rows a left join then
+        // builds: each name's values come out, and every column after them.
+        let query =
+            "FROM ids |> EXTEND id AS i |> JOIN t ON b = id |> LEFT JOIN ids AS o ON o.id = b";
+        let columns = run(query);
+        let names: StdVec<_> = columns.iter().map(|(name, _)| name.as_slice()).collect();
+        assert_eq!(names, [&b"id"[..], b"v", b"i", b"a", b"b", b"f", b"s", b"id", b"v"]);
+        assert_eq!(columns[0].1, columns[2].1);
+    }
+
+    #[test]
     fn joins_using_columns() {
         let names = |query| run(query).into_iter().map(|(name, _)| name).collect::<StdVec<_>>();
         // The column joined on once, first, then the rest of each side's.

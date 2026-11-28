@@ -1,6 +1,6 @@
 //! Joining two relations' rows.
 
-use crate::containers::SmallVec;
+use crate::containers::{Bitmap, SmallVec};
 use crate::error::Error;
 pub use crate::join::JoinKind;
 use crate::join::JoinOp;
@@ -59,7 +59,12 @@ impl Join for Builder<'_> {
                 at_mut!(self.plan.columns, column as usize).nullable = true;
             }
         }
-        let columns = [probe_columns, build_columns];
+        let mut columns = [probe_columns, build_columns];
+        // Ids are places in the plan's columns, and no column is both sides'.
+        let mut seen = Bitmap::new(env, self.plan.columns.len())?;
+        for columns in &mut columns {
+            distinct(&mut seen, columns);
+        }
         Ok(Joining { kind, inputs: [probe, build], columns })
     }
 
@@ -76,4 +81,19 @@ impl Join for Builder<'_> {
         let op = JoinOp::new(env, kind, conjuncts, columns)?;
         self.add(DynOp::new(env, op)?, inputs)
     }
+}
+
+/// Keeps the first of each column in `columns` not in `seen`, adding them:
+/// a column of two names, as an alias makes, is joined once.
+fn distinct(seen: &mut Bitmap, columns: &mut SmallVec<ColumnId>) {
+    let mut kept = 0;
+    for i in 0..columns.len() {
+        let column = *at!(columns, i);
+        if !seen.get(column as usize) {
+            seen.set(column as usize);
+            *at_mut!(columns, kept) = column;
+            kept += 1;
+        }
+    }
+    columns.truncate(kept);
 }
