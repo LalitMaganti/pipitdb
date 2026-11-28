@@ -670,7 +670,12 @@ impl<'p> Run<'p> {
             return made;
         }
         let mut i = first;
-        while i < end {
+        // No step gets a batch with no rows: it would do nothing with it, or
+        // load values no one reads, and one served empty may have no columns.
+        while !batch.selection().is_empty() {
+            if i == end {
+                return Made::Batch;
+            }
             let Step::Transform(transform) = at!(self.pipeline.steps, i) else {
                 failed!();
             };
@@ -678,14 +683,9 @@ impl<'p> Run<'p> {
             if let Err(error) = unsafe { transform.process(context, self.state(Some(i)), batch) } {
                 return self.fail(error);
             }
-            // Later steps would do nothing with it, or load values no one
-            // reads.
-            if batch.selection().is_empty() {
-                return Made::Nothing;
-            }
             i += 1;
         }
-        if batch.selection().is_empty() { Made::Nothing } else { Made::Batch }
+        Made::Nothing
     }
 
     fn read_source(&self, context: &mut Context, batch: &mut RowBatch<'p>) -> Made {
