@@ -1,6 +1,6 @@
 [package]
 name = "pipitdb-file"
-description = "What pipitdb needs from the operating system's files, such as spilling to local disk."
+description = "What pipitdb needs from the operating system's files, such as reading tables from local disk."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -58,7 +58,6 @@ pub mod settings;
 mod slab_allocator;
 pub(crate) mod sort;
 mod sorted_rows;
-pub mod spill;
 pub(crate) mod statement;
 pub mod step;
 pub mod string_pool;
